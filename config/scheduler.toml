@@ -52,6 +52,17 @@ max_cities_per_day = 40
 # (issue #282), so what it can displace is that reservation, never the night.
 # refresh_slots = 10
 
+# The FILL (issue #404). Unset (the default) means none: a night collects only
+# its due slate. Set, a night whose due slate ended on its own goes on to
+# refresh cities EARLY, stalest-first, once every default-membership channel's
+# last success is at least this many days old, admitting a city only if EVERY
+# channel it would run fits its budget (and the deadline), never a subset. It
+# never runs an opt-in channel and never runs on --provider/--city/--limit.
+# fill_host_ceilings is an optional lower rolling-24h ceiling per metered host
+# that the fill alone prices against. See docs/scheduler.md.
+# fill_min_days = 30
+# fill_host_ceilings = { mapillary_tiles = 2260 }
+
 # Hours before backup-status reports the cron timer-watchdog (issue #369) as
 # stale. Off (0) by default, so a laptop without the crontab stays green; prod
 # sets 48. See docs/scheduler.md, "The user timers after a reboot".

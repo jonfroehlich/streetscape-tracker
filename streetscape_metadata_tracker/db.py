@@ -20,7 +20,7 @@ import hashlib
 import logging
 import os
 import sqlite3
-from collections.abc import Iterable, Sequence
+from collections.abc import Collection, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
@@ -30,7 +30,7 @@ from .naming import sanitize_city_query_str
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 
 # The v16 per-host ledger (issue #385). One constant, spliced into _SCHEMA
 # below AND executed by _migrate_v15_to_v16, which runs before _SCHEMA and needs
@@ -438,6 +438,56 @@ CREATE INDEX IF NOT EXISTS idx_provider_screen_date
 -- The DDL itself is _HOST_USAGE_DDL, appended below.
 """
     + _HOST_USAGE_DDL
+    + """
+-- v18 (issue #404): which collections were EARLY REFRESHES -- taken by
+-- run-due's fill phase on a night the due slate left under-full, before the
+-- channel's cycle_days - grace_days wall. One row per (city, channel, run
+-- date) the fill collected successfully. A shortened interval is then a fact
+-- in the series rather than something inferred from run dates.
+--
+-- Its own table rather than a column on `runs`, because a walk channel's run
+-- lives in street_walks, and because the migration is then purely additive
+-- (the v2 -> v3 pattern): no function, the CREATE TABLE IF NOT EXISTS builds
+-- it on any older catalog, and pre-#404 code ignores it after a rollback.
+-- prior_success_at is the channel's last success BEFORE the fill run, so the
+-- interval the fill shortened is recorded with it; floor_days is the
+-- [schedule].fill_min_days it was admitted under.
+--
+-- `channel` holds a SCHEDULER CHANNEL name (gsv, gsv_streets, mapillary,
+-- mapillary_streets -- the schedule_state.provider vocabulary), deliberately
+-- not called `provider`: everywhere else in this catalog `provider` names an
+-- imagery provider (runs.provider, street_walks.provider), and a walk channel
+-- is not one. A grid channel's name IS its runs.provider, so the aggregate
+-- joins grid rows on (city_id, channel = runs.provider, run_date).
+--
+-- network_type is the walk's OSM network type ([providers.<walk>].network_type
+-- at the time) and NULL for a grid channel. Recorded now, while the table is
+-- empty, because a walk series is keyed by network type (street_walks has one
+-- series per type) and a later join of these rows onto street_walks needs it:
+-- (city_id, STREET_CHANNELS[channel], network_type, run_date). Not in the key,
+-- because a channel runs ONE network type a night.
+CREATE TABLE IF NOT EXISTS early_refreshes (
+    city_id          TEXT NOT NULL REFERENCES cities(city_id),
+    channel          TEXT NOT NULL,
+    run_date         TEXT NOT NULL,
+    network_type     TEXT,
+    prior_success_at TEXT NOT NULL,
+    floor_days       INTEGER NOT NULL,
+    recorded_at      TEXT NOT NULL,
+    PRIMARY KEY (city_id, channel, run_date)
+);
+-- v18 (issue #404): the nights the fill ATTEMPTED a city, written at
+-- admission, whatever its channels then did. What finds an ORPHANED fill
+-- checkpoint (a fill crawl that paused, on a channel nothing due-side will
+-- resume): keyed on the attempt, not on early_refreshes, which needs some
+-- channel to have SUCCEEDED -- a city whose gsv failed while its mapillary
+-- paused has no early refresh at all. Additive in the same v17 -> v18 rung.
+CREATE TABLE IF NOT EXISTS fill_attempts (
+    city_id  TEXT NOT NULL REFERENCES cities(city_id),
+    run_date TEXT NOT NULL,
+    PRIMARY KEY (city_id, run_date)
+);
+"""
 )
 
 # v1 → v2: add the provider dimension. Three tables need constraint changes
@@ -789,6 +839,10 @@ def init_schema(conn: sqlite3.Connection) -> None:
     if user_version == 16:
         _migrate_add_query_radius_columns(conn)
         user_version = 17
+    # v17 -> v18 (issue #404): the early_refreshes and fill_attempts tables.
+    # Purely additive, so like v2 -> v3 it needs no migration function.
+    if user_version == 17:
+        user_version = 18
     conn.executescript(_SCHEMA)
     # The GSV query-radius pair (issue #367) is ALSO added on every connect, not
     # only on its rung: while in flight it and PR #388 both stamped v16, so a
@@ -2221,6 +2275,202 @@ def get_host_usage(conn: sqlite3.Connection, host: str, since: datetime) -> int:
         (host, _utc_iso(since)),
     ).fetchone()
     return int(row[0])
+
+
+def record_early_refresh(
+    conn: sqlite3.Connection,
+    city_id: str,
+    channel: str,
+    run_date: date,
+    *,
+    prior_success_at: str,
+    floor_days: int,
+    network_type: str | None = None,
+) -> None:
+    """Record that ``channel``'s ``run_date`` collection of a city was an early refresh (#404).
+
+    ``channel`` is a scheduler channel name (``gsv_streets``, not ``gsv``) and
+    ``network_type`` is set for a walk channel only. Written by ``run-due``'s
+    fill phase after the channel succeeded. Idempotent on the key, so a second
+    write for the same night replaces the first.
+    """
+    conn.execute(
+        """INSERT OR REPLACE INTO early_refreshes
+           (city_id, channel, run_date, network_type, prior_success_at, floor_days,
+            recorded_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (
+            city_id,
+            channel,
+            run_date.isoformat(),
+            network_type,
+            prior_success_at,
+            floor_days,
+            utc_now_iso(),
+        ),
+    )
+    conn.commit()
+
+
+def get_early_refresh_keys(conn: sqlite3.Connection) -> set[tuple[str, str, str]]:
+    """Every early refresh as ``(city_id, channel, run_date)`` (issue #404).
+
+    One query for the catalog, for the aggregate builder, which marks each
+    matching GRID run in ``cities.json.gz`` (a grid channel's name is its
+    ``runs.provider``; a walk channel's rows match no run).
+    """
+    return {
+        (row["city_id"], row["channel"], row["run_date"])
+        for row in conn.execute("SELECT city_id, channel, run_date FROM early_refreshes")
+    }
+
+
+def record_fill_attempt(conn: sqlite3.Connection, city_id: str, run_date: date) -> None:
+    """Record that the fill attempted ``city_id`` on ``run_date`` (issue #404); idempotent."""
+    conn.execute(
+        "INSERT OR IGNORE INTO fill_attempts (city_id, run_date) VALUES (?, ?)",
+        (city_id, run_date.isoformat()),
+    )
+    conn.commit()
+
+
+def prune_fill_attempts(conn: sqlite3.Connection, before: date) -> int:
+    """Delete fill attempts dated before ``before``; return the count (issue #404).
+
+    An attempt only matters while a checkpoint it could have left is alive, so
+    the fill prunes everything older than CHECKPOINT_MAX_AGE_S as it starts.
+    """
+    cur = conn.execute("DELETE FROM fill_attempts WHERE run_date < ?", (before.isoformat(),))
+    conn.commit()
+    return cur.rowcount
+
+
+def get_recent_fill_attempt_city_ids(conn: sqlite3.Connection, since: date) -> set[str]:
+    """Cities the fill attempted on or after ``since`` (issue #404).
+
+    The candidates for an ORPHANED fill checkpoint: the fill attempted the
+    city, one of its resumable channels paused, and that channel is not due,
+    so nothing but the fill resumes it.
+    """
+    return {
+        row["city_id"]
+        for row in conn.execute(
+            "SELECT DISTINCT city_id FROM fill_attempts WHERE run_date >= ?",
+            (since.isoformat(),),
+        )
+    }
+
+
+def delete_early_refresh_for_run(conn: sqlite3.Connection, run_id: int) -> int:
+    """Drop the early-refresh mark of the grid run ``run_id``, if it has one (#404).
+
+    For the scripts that DELETE a run: a mark left behind would point at a run
+    that no longer exists, and a re-collection on the same date would inherit
+    it. Call BEFORE deleting the run (the key is read off it). Does not commit;
+    the caller's transaction does.
+    """
+    row = conn.execute(
+        "SELECT city_id, provider, run_date FROM runs WHERE run_id = ?", (run_id,)
+    ).fetchone()
+    if row is None:
+        return 0
+    cur = conn.execute(
+        "DELETE FROM early_refreshes WHERE city_id = ? AND channel = ? AND run_date = ?",
+        (row["city_id"], row["provider"], row["run_date"]),
+    )
+    return cur.rowcount
+
+
+def get_fill_candidates(
+    conn: sqlite3.Connection,
+    *,
+    today: date,
+    channels: Sequence[str],
+    default_membership: dict[str, bool],
+    fill_min_days: int,
+    due_threshold_days: int,
+    ran_since: str | None = None,
+    ran_tonight: dict[str, Collection[str]] | None = None,
+) -> list[tuple[CityRow, dict[str, str]]]:
+    """Cities ``run-due``'s fill phase may refresh early, and the channels it would run (#404).
+
+    The fill ALIGNS a city: it runs every channel the city is a member of
+    (``channels`` is every enabled channel, opt-in ones included) on one UTC
+    date. A channel that already ran tonight is on that date already and is
+    left out of the run: live, one that succeeded at or after ``ran_since``
+    (the batch start); in the dry run, the city's channels in ``ran_tonight``
+    (tonight's due slate, assumed to succeed). Every OTHER member channel must
+    have succeeded before, at least ``fill_min_days`` ago (the floor) and
+    under ``due_threshold_days`` (``cycle_days - grace_days``) ago -- a due
+    or never-collected channel belongs to the due phase (a late opt-in
+    enrolment is caught up there, through the bounded hoist, and the fill then
+    finishes the city's other channels the same night). One channel short of
+    the floor skips the city whole.
+
+    No consecutive failure since its last success: on a DEFAULT channel that
+    skips the city, so the fill adds at most one failure per channel between
+    successes and can never quarantine it. On an OPT-IN channel it drops only
+    that channel from the run -- a failing KartaView must not freeze the city
+    out of the fill for good -- and the scheduler reports it as a blocked
+    realignment.
+
+    Returns ``(city, {channel to run: last_success_at})``, ordered:
+
+    1. a city PARTLY collected tonight first: its fresh channel will be under
+       the floor tomorrow, so tonight is its one chance to be aligned;
+    2. then by the day of the oldest last success among the channels to run;
+    3. then MISALIGNED before aligned (member channels on different days);
+    4. then ``city_id``.
+    """
+    if not channels:
+        return []
+    states: dict[str, dict[str, sqlite3.Row]] = {}
+    marks = ",".join("?" for _ in channels)
+    for row in conn.execute(
+        f"""SELECT city_id, provider, member, last_success_at, consecutive_failures,
+                   julianday(?) - julianday(last_success_at) AS age_days
+            FROM schedule_state WHERE provider IN ({marks})""",
+        (today.isoformat(), *channels),
+    ):
+        states.setdefault(row["city_id"], {})[row["provider"]] = row
+    ranked = []
+    for city in get_all_cities(conn, enabled_only=True):
+        rows = states.get(city.city_id, {})
+        assumed = set((ran_tonight or {}).get(city.city_id, ()))
+        days: set[str | None] = set()
+        to_run: dict[str, str] = {}
+        partial = False
+        ok = True
+        for channel in channels:
+            row = rows.get(channel)
+            member = row["member"] if row is not None else None
+            if (default_membership[channel] if member is None else member) != 1:
+                continue
+            last = row["last_success_at"] if row is not None else None
+            if channel in assumed or (
+                last is not None and ran_since is not None and last >= ran_since
+            ):
+                days.add(today.isoformat())
+                partial = True
+                continue  # already collected tonight: on tonight's date
+            days.add(last[:10] if last else None)
+            if row is not None and row["consecutive_failures"] > 0:
+                if default_membership[channel]:
+                    ok = False
+                    break
+                continue  # a failing opt-in channel: dropped, reported by the caller
+            if last is None or not (fill_min_days <= row["age_days"] < due_threshold_days):
+                ok = False
+                break
+            to_run[channel] = last
+        if not ok or not to_run:
+            continue
+        stale = min(v[:10] for v in to_run.values())
+        ranked.append(
+            (0 if partial else 1, stale, 0 if len(days) > 1 else 1, city.city_id, city, to_run)
+        )
+    ranked.sort(key=lambda t: t[:4])
+    return [(city, to_run) for *_k, city, to_run in ranked]
 
 
 def prune_host_usage(conn: sqlite3.Connection, before: datetime) -> int:

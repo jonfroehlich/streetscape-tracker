@@ -641,11 +641,18 @@ def _load_city_json(json_path: str) -> dict[str, Any] | None:
         return None
 
 
-def _build_provider_summary(runs, latest_json, data_dir, conn) -> dict[str, Any]:
+def _build_provider_summary(
+    runs, latest_json, data_dir, conn, early_refreshes: frozenset[tuple[str, str, str]]
+) -> dict[str, Any]:
     """
     Build one provider's {latest, runs, change} block for a city's
     aggregate record. `runs` is that provider's run series (oldest first)
     and `latest_json` the loaded per-run JSON of its newest run.
+
+    `early_refreshes` is ``db.get_early_refresh_keys`` read once for the
+    catalog: a run whose ``(city_id, provider, run_date)`` is in it was taken
+    by run-due's fill phase before its cycle wall (issue #404), and its
+    ``runs[]`` entry carries ``"early_refresh": true``.
     """
     from . import db  # local import to keep module import order simple
 
@@ -737,22 +744,29 @@ def _build_provider_summary(runs, latest_json, data_dir, conn) -> dict[str, Any]
             "diff_file": diff_row["detail_filename"],
         }
 
+    runs_out = []
+    for r in runs:
+        entry = {
+            "run_date": r.run_date,
+            "is_baseline": r.is_baseline,
+            "data_file": r.csv_filename,
+            "json_file": r.json_filename,
+            "unique_panos": r.unique_panos,
+            "unique_google_panos": r.unique_google_panos,
+            "coverage_rate_percent": r.coverage_rate_pct,
+            "any_imagery_coverage_rate_percent": r.any_imagery_coverage_rate_pct,
+            "median_pano_age_years": r.median_pano_age_years,
+        }
+        # Issue #404. Present only when true, so every run the fill did not
+        # take is byte-identical to its pre-#404 form and the aggregate keeps
+        # schema_version 4 (the additive-field rule the per-run v2 summary
+        # follows for its v17 columns).
+        if (r.city_id, r.provider, r.run_date) in early_refreshes:
+            entry["early_refresh"] = True
+        runs_out.append(entry)
     return {
         "latest": latest_block,
-        "runs": [
-            {
-                "run_date": r.run_date,
-                "is_baseline": r.is_baseline,
-                "data_file": r.csv_filename,
-                "json_file": r.json_filename,
-                "unique_panos": r.unique_panos,
-                "unique_google_panos": r.unique_google_panos,
-                "coverage_rate_percent": r.coverage_rate_pct,
-                "any_imagery_coverage_rate_percent": r.any_imagery_coverage_rate_pct,
-                "median_pano_age_years": r.median_pano_age_years,
-            }
-            for r in runs
-        ],
+        "runs": runs_out,
         "change": change,
     }
 
@@ -801,6 +815,7 @@ def generate_aggregate_v2(conn, data_dir: str) -> dict[str, Any]:
     # disable=None is not enough (it inspects stderr, then flushes both).
     # One query for the catalog rather than a lookup per city (issue #301).
     exclusions_by_city = db.get_channel_exclusions_all(conn)
+    early_refreshes = frozenset(db.get_early_refresh_keys(conn))
     for city in progress(db.get_all_cities(conn), desc="Aggregating cities", unit="city"):
         runs_by_provider: dict[str, list] = {}
         for run in db.get_runs_for_city(conn, city.city_id, provider=None):
@@ -835,7 +850,9 @@ def generate_aggregate_v2(conn, data_dir: str) -> dict[str, Any]:
                     f"per-run JSON ({json_filename or latest.json_filename})"
                 )
                 continue
-            providers_out[provider] = _build_provider_summary(runs, latest_json, data_dir, conn)
+            providers_out[provider] = _build_provider_summary(
+                runs, latest_json, data_dir, conn, early_refreshes
+            )
             latest_run_jsons_by_provider.setdefault(provider, []).append(latest_json)
             if city_block is None:  # gsv first, so GSV's city block wins
                 city_block = latest_json["city"]

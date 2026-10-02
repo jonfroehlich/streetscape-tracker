@@ -526,3 +526,35 @@ def test_format_mismatch_is_reported_not_fatal(source_root, data_dir, tmp_path):
     assert "ERROR" in result.stdout
     assert "sniffs as 'v2'" in result.stdout
     assert "0 baseline runs registered" in result.stdout
+
+
+def test_deleting_an_archival_run_drops_its_early_refresh_mark(conn, data_dir):
+    """Issue #404: a mark must not outlive its run (a re-import on the same
+    date would otherwise inherit it). The mapillary mark on the same date is
+    another channel's and stays."""
+    from datetime import date
+
+    from scripts.import_archival_scrapes import delete_run
+
+    city_id = db.register_city(
+        conn,
+        city_name="Bend",
+        state_name="Oregon",
+        state_code="OR",
+        country_name="United States",
+        country_code="us",
+        center_lat=44.05,
+        center_lon=-121.31,
+        grid_width_m=1000,
+        grid_height_m=1000,
+        step_m=20,
+    )
+    csv = f"{city_id}_width_1000_height_1000_step_20_2026-07-15.csv.gz"
+    run_id = db.register_run(conn, city_id=city_id, run_date=date(2026, 7, 15), csv_filename=csv)
+    for channel in ("gsv", "mapillary"):
+        db.record_early_refresh(
+            conn, city_id, channel, date(2026, 7, 15), prior_success_at="2026-06-01", floor_days=30
+        )
+    row = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+    delete_run(conn, data_dir, row, execute=True)
+    assert db.get_early_refresh_keys(conn) == {(city_id, "mapillary", "2026-07-15")}

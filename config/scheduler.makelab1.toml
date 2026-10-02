@@ -98,6 +98,17 @@ max_batch_hours = 12
 # slate after the hoist, so these 10 run whether the cap or the deadline ends
 # the night.
 refresh_slots = 10
+# The FILL (issue #404): once the due slate is worked through, refresh cities
+# EARLY, stalest-first, whose every default channel last succeeded at least
+# this many days ago -- admitted whole (every channel fits its budget, the
+# Mapillary pair fits the ceiling below, the time fits the deadline) or not at
+# all. cycle_days stays the guarantee. Counted against max_cities_per_day.
+# Delete these two lines to switch it off; nothing else depends on them.
+fill_min_days = 30
+# The fill's own rolling-24h ceiling on the tile CDN, BELOW the 3,000 budget the
+# due slate keeps: 2,260 is the highest combined (grid + walk) night the #292
+# window measured clean, which #404 says to start the fill at.
+fill_host_ceilings = { mapillary_tiles = 2260 }
 # The cron timer-watchdog (issue #369) writes logs/timer_watchdog_status.json on
 # every run; backup-status goes unhealthy (and its noon timer alerts) when that
 # heartbeat is missing or older than this. The two watchdogs cover each other:
