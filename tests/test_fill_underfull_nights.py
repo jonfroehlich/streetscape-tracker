@@ -829,12 +829,16 @@ def _freeze_network(data_dir, city_id):
         fh.write("<graphml/>")
 
 
-def _live_checkpoints(monkeypatch, live):
-    """Fake `_sweep_checkpoint_progress`: a live checkpoint for each (city, channel) in ``live``."""
+def _live_checkpoints(monkeypatch, live, ages=None):
+    """Fake `_sweep_checkpoint_progress`: a live checkpoint for each (city, channel) in ``live``.
+
+    ``ages`` optionally gives a city's checkpoint age in seconds (default 1 h).
+    """
 
     def progress(cfg, city, channel):
         if (city.city_id, channel) in live:
-            return {"age_s": 3600.0, "units_done": 1, "unit_count": 2, "unit_name": "tiles"}
+            age = (ages or {}).get(city.city_id, 3600.0)
+            return {"age_s": age, "units_done": 1, "unit_count": 2, "unit_name": "tiles"}
         return None
 
     monkeypatch.setattr(sched, "_sweep_checkpoint_progress", progress)
@@ -952,9 +956,11 @@ def test_a_paused_fill_crawl_is_resumed_first_by_the_next_nights_fill(conn, monk
     ran, _ = _run_night(
         monkeypatch, conn, _grid_cfg(max_cities_per_day=2), outcome=night2, today=tomorrow
     )
-    assert ran[0] == (cid, "mapillary"), "the orphaned checkpoint is resumed before any new city"
-    assert (cid, "gsv") not in ran
+    # The orphan first, before any new city -- and gsv re-run beside it (free
+    # metadata), so the city's channels share the resume date (review 411c #6).
+    assert ran[:2] == [(cid, "gsv"), (cid, "mapillary")], "the orphan leads, realigned"
     assert _cities_in(ran) == [cid, other]
+    assert (cid, "gsv", "2026-10-02", 30) in _early_rows(conn)
     rows = _early_rows(conn)
     assert (cid, "mapillary", "2026-10-02", 30) in rows
     prior = conn.execute(
@@ -971,9 +977,7 @@ def test_a_paused_fill_crawl_is_resumed_even_while_a_backlog_holds_the_fill(
     """Nothing else resumes it, so the hold (which waits on due work) does not."""
     caplog.set_level("INFO")
     cid = _city(conn, "Paused", {"gsv": 2, "mapillary": 60})
-    db.record_early_refresh(
-        conn, cid, "gsv", TODAY - timedelta(days=2), prior_success_at="x", floor_days=30
-    )
+    db.record_fill_attempt(conn, cid, TODAY - timedelta(days=2))
     _live_checkpoints(monkeypatch, {(cid, "mapillary")})
     held = _city(conn, "Eligible", {"gsv": 60, "mapillary": 60})
     due = _city(conn, "Due", {"gsv": 85, "mapillary": 20})
@@ -989,8 +993,11 @@ def test_a_paused_fill_crawl_is_resumed_even_while_a_backlog_holds_the_fill(
 
     ran, _ = _run_night(monkeypatch, conn, cfg)
 
+    # gsv's remainder cannot take a realigning gsv run, so the paused crawl is
+    # resumed alone: the resume is what must not wait.
     assert ran == [(cid, "mapillary")]
     assert all(c not in (held, due) for c, _ in ran)
+    assert any("resuming the paused crawl alone" in r.message for r in caplog.records)
     assert "held: backlog (gsv 1 due not attempted)" in _done_line(caplog)
 
 
@@ -1493,3 +1500,322 @@ def test_only_an_early_success_is_marked_an_early_refresh():
     assert not sched._is_early(cfg, TODAY, None)
     # A naive legacy stamp is read as UTC.
     assert sched._is_early(cfg, TODAY, "2026-09-01T00:00:00")
+
+
+# ---------------------------------------------------------------------------
+# Review round 3 (PR #411, review-411c)
+# ---------------------------------------------------------------------------
+
+
+def test_a_due_city_whose_grid_needs_more_than_the_window_does_not_hold_the_fill(
+    conn, monkeypatch, caplog
+):
+    """Review-411c #1 (probe P1): the #373 gate defers the giant's gsv AND, to
+    keep the pair, its mapillary -- resumable, so it never looked never-fits on
+    its own, and it held the fill every night. Killed by dropping the window
+    arm, and by dropping the first-grid cascade."""
+    caplog.set_level("INFO")
+    giant = _register(conn, "Giant")
+    fill = _city(conn, "Eligible", {"gsv": 60, "mapillary": 60})
+    real = sched.city_timeout_estimate_seconds
+
+    def est(cfg, city, channel, conn=None, **k):
+        if city.city_id == giant and channel == "gsv":
+            return int(13 * 3600)
+        return real(cfg, city, channel, conn=conn, **k)
+
+    monkeypatch.setattr(sched, "city_timeout_estimate_seconds", est)
+    ran, _ = _run_night(monkeypatch, conn, _grid_cfg())
+
+    assert all(c != giant for c, _ in ran)
+    assert (fill, "gsv") in ran and (fill, "mapillary") in ran
+    assert any("deferred with its first grid channel gsv" in r.message for r in caplog.records)
+
+
+def test_a_paused_fill_grid_resumes_with_the_walk_it_held_back(conn, monkeypatch, caplog, data_dir):
+    """Review-411c #2 (probe P2): night 1 pauses mapillary, so its walk is
+    deferred behind the sibling sweep; night 2's resume runs the walk too, and
+    gsv beside them, so the whole city lands on one date."""
+    from streetscape_metadata_tracker.download_common import SWEEP_INCOMPLETE_EXIT_CODE
+
+    caplog.set_level("INFO")
+    cid = _city(conn, "Pair", {"gsv": 60, "mapillary": 60, "mapillary_streets": 60})
+    _freeze_network(data_dir, cid)
+    live: set = set()
+    _live_checkpoints(monkeypatch, live)
+
+    def n1(city, p):
+        if p == "mapillary":
+            live.add((cid, "mapillary"))
+            return _outcome(SWEEP_INCOMPLETE_EXIT_CODE)
+        return True
+
+    ran1, _ = _run_night(monkeypatch, conn, _pair_cfg(data_dir), outcome=n1)
+    assert ran1 == [(cid, "gsv"), (cid, "mapillary")], "the walk was deferred behind it"
+    monkeypatch.setattr(clock, "_utc_clock", lambda: NOW + timedelta(days=1))
+
+    def n2(city, p):
+        live.discard((city.city_id, p))
+        return True
+
+    ran2, _ = _run_night(
+        monkeypatch, conn, _pair_cfg(data_dir), outcome=n2, today=TODAY + timedelta(days=1)
+    )
+    assert ran2 == [(cid, "gsv"), (cid, "mapillary"), (cid, "mapillary_streets")]
+    days = {
+        r[0][:10]
+        for r in conn.execute(
+            "SELECT last_success_at FROM schedule_state WHERE city_id = ? AND provider IN "
+            "('gsv', 'mapillary', 'mapillary_streets')",
+            (cid,),
+        )
+    }
+    assert days == {"2026-10-02"}, "one date across the city"
+
+
+def test_the_dry_run_does_not_hold_on_a_due_pair_that_can_never_fit(conn, monkeypatch, capsys):
+    """Review-411c #3: the preview's hold reads `_never_fits_tonight` as the
+    night does, so a due gsv priced over the whole budget holds nothing."""
+    giant = _register(conn, "Giant", width=40_000, height=40_000)
+    fill = _city(conn, "Eligible", {"gsv": 60, "mapillary": 60})
+    budget = sched.estimate_requests(db.resolve_city(conn, giant), "gsv") - 1
+    cfg = _grid_cfg(
+        providers={
+            "gsv": ProviderConfig(daily_request_budget=budget),
+            "mapillary": ProviderConfig(daily_request_budget=3_500),
+        }
+    )
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+    sched.cmd_run_due(cfg, dry_run=True, today=TODAY)
+    out = capsys.readouterr().out
+    assert "Fill: holding gsv" not in out
+    assert fill in out.split("Would FILL", 1)[1]
+
+
+def test_a_resumer_never_runs_a_failing_channel(conn, monkeypatch):
+    """Review-411c #4 (probe P3): a quarantined (or once-failed) paused channel
+    is not resumed. Killed by dropping the failure test in `_resumable_member`."""
+    cid = _city(conn, "Q", {"gsv": 2, "mapillary": 60})
+    _seed(conn, cid, "mapillary", 60, failures=1)
+    db.record_fill_attempt(conn, cid, TODAY - timedelta(days=2))
+    _live_checkpoints(monkeypatch, {(cid, "mapillary")})
+    ran, _ = _run_night(monkeypatch, conn, _grid_cfg())
+    assert (cid, "mapillary") not in ran
+
+
+def test_an_orphan_with_no_success_at_all_is_still_resumed(conn, monkeypatch):
+    """Review-411c #5 (probe P4): gsv FAILED and mapillary PAUSED, so no early
+    refresh was written; the fill ATTEMPT is what finds the orphan. Killed by
+    keying resumers on early_refreshes again."""
+    from streetscape_metadata_tracker.download_common import SWEEP_INCOMPLETE_EXIT_CODE
+
+    cid = _city(conn, "P", {"gsv": 60, "mapillary": 60})
+    live: set = set()
+    _live_checkpoints(monkeypatch, live)
+
+    def n1(city, p):
+        if p == "gsv":
+            return _outcome(1)
+        live.add((cid, "mapillary"))
+        return _outcome(SWEEP_INCOMPLETE_EXIT_CODE)
+
+    _run_night(monkeypatch, conn, _grid_cfg(), outcome=n1)
+    assert db.get_early_refresh_keys(conn) == set()
+    monkeypatch.setattr(clock, "_utc_clock", lambda: NOW + timedelta(days=1))
+    ran2, _ = _run_night(monkeypatch, conn, _grid_cfg(), today=TODAY + timedelta(days=1))
+    # gsv failed, so it is not realigned (no failure-carrying channel is run).
+    assert ran2 == [(cid, "mapillary")]
+
+
+def test_a_city_due_tonight_on_another_channel_still_has_its_orphan_resumed(conn, monkeypatch):
+    """Review-411c #5: a city due tonight only on KartaView is not skipped
+    whole -- its fill-paused mapillary is resumed (the due slate does not hold
+    mapillary for it). Killed by excluding every due city."""
+    cid = _city(conn, "Both", {"gsv": 2, "mapillary": 60})
+    db.set_channel_membership(conn, cid, "kartaview", True, cycle_days=90)
+    db.record_fill_attempt(conn, cid, TODAY - timedelta(days=2))
+    _live_checkpoints(monkeypatch, {(cid, "mapillary")})
+    cfg = _grid_cfg(
+        providers={
+            "gsv": ProviderConfig(daily_request_budget=10_000_000),
+            "mapillary": ProviderConfig(daily_request_budget=3_500),
+            "kartaview": ProviderConfig(daily_request_budget=10_000),
+        }
+    )
+    ran, _ = _run_night(monkeypatch, conn, cfg)
+    assert (cid, "kartaview") in ran and (cid, "mapillary") in ran
+
+
+def test_a_channel_due_tonight_is_never_resumed_by_the_fill(conn, monkeypatch):
+    """The other half: a checkpoint on a channel the due slate holds is the due
+    path's to resume, so the fill does not launch it a second time."""
+    cid = _city(conn, "Due", {"gsv": 2, "mapillary": 85})
+    db.record_fill_attempt(conn, cid, TODAY - timedelta(days=2))
+    _live_checkpoints(monkeypatch, {(cid, "mapillary")})
+    ran, _ = _run_night(monkeypatch, conn, _grid_cfg())
+    assert ran.count((cid, "mapillary")) == 1
+
+
+def test_resumers_are_members_of_enabled_cities_only(conn, monkeypatch):
+    """Killed by dropping the membership test, and by dropping the enabled test."""
+    outsider = _city(conn, "Outsider", {"gsv": 2, "mapillary": 60, "kartaview": 60})
+    off = _city(conn, "Off", {"gsv": 2, "mapillary": 60})
+    conn.execute("UPDATE cities SET enabled = 0 WHERE city_id = ?", (off,))
+    conn.commit()
+    for cid in (outsider, off):
+        db.record_fill_attempt(conn, cid, TODAY - timedelta(days=2))
+    _live_checkpoints(monkeypatch, {(outsider, "kartaview"), (off, "mapillary")})
+    cfg = _grid_cfg(
+        providers={
+            "gsv": ProviderConfig(daily_request_budget=10_000_000),
+            "mapillary": ProviderConfig(daily_request_budget=3_500),
+            "kartaview": ProviderConfig(daily_request_budget=10_000),
+        }
+    )
+    ran, _ = _run_night(monkeypatch, conn, cfg)
+    assert (outsider, "kartaview") not in ran
+    assert all(c != off for c, _ in ran)
+
+
+def test_the_checkpoint_nearest_its_age_wall_is_resumed_first(conn, monkeypatch):
+    """With room for one city, the older checkpoint wins. Killed by ordering
+    resumers youngest-first."""
+    young = _city(conn, "Aaa", {"gsv": 2, "mapillary": 60})
+    old = _city(conn, "Zzz", {"gsv": 2, "mapillary": 60})
+    for cid in (young, old):
+        db.record_fill_attempt(conn, cid, TODAY - timedelta(days=2))
+    _live_checkpoints(
+        monkeypatch, {(young, "mapillary"), (old, "mapillary")}, ages={young: 3600.0, old: 86400.0}
+    )
+    ran, _ = _run_night(monkeypatch, conn, _grid_cfg(max_cities_per_day=1))
+    assert _cities_in(ran) == [old]
+
+
+def test_the_launch_check_draws_the_host_and_the_clock_down_in_launch_order(conn, monkeypatch):
+    """Review-411c #6/#9: each resumable channel is planned against what the
+    city's EARLIER channels leave of the host room and of the clock. Killed by
+    not drawing either down."""
+    cid = _city(conn, "Pair", {"gsv": 60, "mapillary": 60, "mapillary_streets": 60})
+    city = db.resolve_city(conn, cid)
+    seen = []
+
+    def plan(cfg, city, channel, conn, *, est, remaining, remaining_s, **_):
+        seen.append((channel, remaining, remaining_s))
+        return sched.SweepLaunchPlan(60, max(est, remaining), remaining, None, "", "")
+
+    monkeypatch.setattr(sched, "_sweep_launch_plan", plan)
+    v = sched._fill_launch_refusal(
+        _grid_cfg(),
+        conn,
+        city,
+        ["gsv", "mapillary", "mapillary_streets"],
+        est={"gsv": 1_000, "mapillary": 40, "mapillary_streets": 30},
+        channel_room={"gsv": 10**9, "mapillary": 3_500, "mapillary_streets": 1_750},
+        host_room={"mapillary_tiles": 100},
+        remaining_s=10_000.0,
+        need_s={"gsv": 1_200, "mapillary": 800, "mapillary_streets": None},
+    )
+    assert v is None
+    assert seen == [("mapillary", 100, 8_800.0), ("mapillary_streets", 60, 8_000.0)]
+
+
+def test_the_fills_retry_pass_leaves_the_due_phases_strandings_alone(
+    conn, monkeypatch, caplog, data_dir
+):
+    """Review-411c #7: one due-phase stranding (already retried by the due
+    pass) and one fill stranding (a resume that realigned gsv_streets). The
+    fill's pass asks only about its own -- without `only=` it reached for a
+    city it never touched and the fill died. The subject counts only the due
+    stranding; the fill's is "not lost". Killed by dropping `only=`, and by
+    dropping the filter it feeds."""
+    from streetscape_metadata_tracker.download_common import HOST_EXIT_CODES, HOST_OVERPASS
+
+    caplog.set_level("INFO")
+    due = _register(conn, "Due")
+    resumed = _city(conn, "Resumed", {"gsv": 2, "gsv_streets": 2, "mapillary": 60})
+    db.record_fill_attempt(conn, resumed, TODAY - timedelta(days=2))
+    _live_checkpoints(monkeypatch, {(resumed, "mapillary")})
+    for cid in (due, resumed):
+        _freeze_network(data_dir, cid)
+    cfg = _grid_cfg(
+        data_dir=data_dir,
+        providers={
+            "gsv": ProviderConfig(daily_request_budget=10_000_000),
+            "gsv_streets": ProviderConfig(daily_request_budget=10_000_000),
+            "mapillary": ProviderConfig(daily_request_budget=3_500),
+        },
+    )
+    subjects = []
+    ran, _ = _run_night(
+        monkeypatch,
+        conn,
+        cfg,
+        outcome=lambda city, p: (
+            _outcome(HOST_EXIT_CODES[HOST_OVERPASS]) if p == "gsv_streets" else True
+        ),
+    )
+    assert (resumed, "gsv_streets") in ran
+    done = _done_line(caplog)
+    assert "unexpected error in the fill phase" not in done
+    assert "2 city(ies) STRANDED un-walked (1 in the fill, not lost)" in done
+
+    # The subject: one due stranding, not two.
+    breaker = sched.HostBreaker()
+    breaker.strand(due, "gsv_streets")
+    breaker.strand(resumed, "gsv_streets")
+    breaker.fill_stranded[(resumed, "gsv_streets")] = "2026-10-24"
+    breaker.add(HOST_OVERPASS)
+    breaker.latched.add(HOST_OVERPASS)
+    monkeypatch.setattr(sched, "send_alert", lambda cfg, subject, body: subjects.append(subject))
+    cfg.alerts.enabled = True
+    sched._finish_batch(
+        cfg, conn, "summary", succeeded=1, attempted=1, today=TODAY, blocked_hosts=breaker
+    )
+    assert subjects and "1 city(ies) STRANDED un-walked" in subjects[0]
+
+
+def test_a_fill_crash_is_named_as_the_fills_in_the_subject(conn, monkeypatch, caplog):
+    """Review-411c #10: the subject says FILL CRASHED, not LOOP CRASHED."""
+    _city(conn, "Eligible", {"gsv": 60, "mapillary": 60})
+    seen = {}
+
+    def boom(*a, **k):
+        raise RuntimeError("simulated")
+
+    real = sched._finish_batch
+
+    def spy(*a, **k):
+        seen.update(k)
+        return real(*a, **k)
+
+    monkeypatch.setattr(sched.db, "get_fill_candidates", boom)
+    monkeypatch.setattr(sched, "_finish_batch", spy)
+    _run_night(monkeypatch, conn, _grid_cfg())
+    assert seen["crashed"] == "FILL" and seen["errored"] is True
+
+
+def test_a_walk_the_fill_did_not_hold_behind_a_sibling_checkpoint(
+    conn, monkeypatch, caplog, data_dir
+):
+    """Review-411c #8 (M9): a due walk deferred behind its grid sibling's
+    in-flight sweep does not hold its channel -- a fill city on that walk
+    channel still runs. Killed by dropping the sibling arm."""
+    from streetscape_metadata_tracker.download_common import SWEEP_INCOMPLETE_EXIT_CODE
+
+    caplog.set_level("INFO")
+    due = _city(conn, "Due", {"gsv": 10})  # due on both mapillary channels (never)
+    fill = _city(conn, "Walker", {"gsv": 60, "mapillary_streets": 60})
+    db.set_channel_membership(conn, fill, "mapillary", False, cycle_days=90)
+    _freeze_network(data_dir, fill)
+    live: set = set()
+    _live_checkpoints(monkeypatch, live)
+
+    def outcome(city, p):
+        if city.city_id == due and p == "mapillary":
+            live.add((due, "mapillary"))
+            return _outcome(SWEEP_INCOMPLETE_EXIT_CODE)
+        return True
+
+    ran, _ = _run_night(monkeypatch, conn, _pair_cfg(data_dir), outcome=outcome)
+    assert (due, "mapillary_streets") not in ran
+    assert (fill, "mapillary_streets") in ran

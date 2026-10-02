@@ -476,6 +476,17 @@ CREATE TABLE IF NOT EXISTS early_refreshes (
     recorded_at      TEXT NOT NULL,
     PRIMARY KEY (city_id, channel, run_date)
 );
+-- v18 (issue #404): the nights the fill ATTEMPTED a city, written at
+-- admission, whatever its channels then did. What finds an ORPHANED fill
+-- checkpoint (a fill crawl that paused, on a channel nothing due-side will
+-- resume): keyed on the attempt, not on early_refreshes, which needs some
+-- channel to have SUCCEEDED -- a city whose gsv failed while its mapillary
+-- paused has no early refresh at all. Additive in the same v17 -> v18 rung.
+CREATE TABLE IF NOT EXISTS fill_attempts (
+    city_id  TEXT NOT NULL REFERENCES cities(city_id),
+    run_date TEXT NOT NULL,
+    PRIMARY KEY (city_id, run_date)
+);
 """
 )
 
@@ -2276,17 +2287,26 @@ def get_early_refresh_keys(conn: sqlite3.Connection) -> set[tuple[str, str, str]
     }
 
 
-def get_recent_early_refresh_city_ids(conn: sqlite3.Connection, since: date) -> set[str]:
-    """Cities the fill touched on or after ``since`` (issue #404).
+def record_fill_attempt(conn: sqlite3.Connection, city_id: str, run_date: date) -> None:
+    """Record that the fill attempted ``city_id`` on ``run_date`` (issue #404); idempotent."""
+    conn.execute(
+        "INSERT OR IGNORE INTO fill_attempts (city_id, run_date) VALUES (?, ?)",
+        (city_id, run_date.isoformat()),
+    )
+    conn.commit()
 
-    The candidates for an ORPHANED fill checkpoint: a fill city whose resumable
-    channel paused carries an early_refreshes row for its other channels, and
-    is not due on the paused one, so nothing but the fill resumes it.
+
+def get_recent_fill_attempt_city_ids(conn: sqlite3.Connection, since: date) -> set[str]:
+    """Cities the fill attempted on or after ``since`` (issue #404).
+
+    The candidates for an ORPHANED fill checkpoint: the fill attempted the
+    city, one of its resumable channels paused, and that channel is not due,
+    so nothing but the fill resumes it.
     """
     return {
         row["city_id"]
         for row in conn.execute(
-            "SELECT DISTINCT city_id FROM early_refreshes WHERE run_date >= ?",
+            "SELECT DISTINCT city_id FROM fill_attempts WHERE run_date >= ?",
             (since.isoformat(),),
         )
     }

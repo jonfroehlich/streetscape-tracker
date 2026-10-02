@@ -8835,9 +8835,16 @@ def cmd_run_due(
                 budget_left[provider] -= spend
                 for host in wanted:
                     host_spent[host] += spend
-                if spend < est:
+                if spend < est and (
+                    cfg.fill_min_days is None
+                    or _never_fits_tonight(
+                        cfg, conn, city, provider, providers_for_city[city.city_id]
+                    )
+                    is None
+                ):
                     # Deferred or capped: the night would leave this due
-                    # channel unfinished, which holds the fill (issue #404).
+                    # channel unfinished, which holds it in the fill (issue
+                    # #404) -- unless no night could run it, the live rule.
                     preview_unfinished[provider] += 1
         if cfg.fill_min_days is not None:
             _print_fill_preview(
@@ -9042,6 +9049,7 @@ def cmd_run_due(
         attempted,
         today,
         errored=stop_reason in (_STOP_REASON_ERROR, _STOP_REASON_FILL_ERROR),
+        crashed="FILL" if stop_reason == _STOP_REASON_FILL_ERROR else "LOOP",
         backup_error=backup_error,
         plan_error=plan_error,
         blocked_hosts=blocked_hosts,
@@ -10872,6 +10880,7 @@ def _fill_launch_refusal(
     channel_room: dict[str, int],
     host_room: dict[str, int],
     remaining_s: float | None,
+    need_s: dict[str, int | None] | None = None,
 ) -> FillVerdict | None:
     """Would the LAUNCH path run every resumable channel of this city uncapped? (#404)
 
@@ -10890,18 +10899,29 @@ def _fill_launch_refusal(
     earlier channels on that host are priced at -- the drawdown the night
     produces, in launch order. The host room here is the fill's (the smaller of
     the budget and the fill ceiling), so this can only decline more than the
-    live gate would, never less.
+    live gate would, never less. The CLOCK is drawn down the same way: a
+    channel is planned against ``remaining_s`` less the derived needs
+    (``need_s``) of the city's earlier channels -- exact at one lane, and
+    conservative at two, where the earlier channels overlap it.
 
     Shared with the dry run, which passes ``remaining_s=None`` like its own
     resumable preview.
     """
     drawn: Counter[str] = Counter()
+    clock_spent = 0.0
     for channel in channels:
         host = CHANNEL_METERED_HOST.get(channel)
         if is_resumable_channel(channel):
             remaining = channel_room[channel]
             if host is not None and host in host_room:
                 remaining = min(remaining, host_room[host] - drawn[host])
+            # A walk whose grid sibling runs EARLIER in this same run is not
+            # behind that sibling's checkpoint at its own launch: the sibling
+            # is admitted uncapped (asked first, below), so it completes and
+            # lands its census before the walk launches -- the resume of a
+            # paused grid with the walk it held back is exactly that case.
+            sibling = STREET_CHANNELS.get(channel)
+            ahead = channels[: channels.index(channel)]
             plan = _sweep_launch_plan(
                 cfg,
                 city,
@@ -10909,8 +10929,8 @@ def _fill_launch_refusal(
                 conn,
                 est=est[channel],
                 remaining=remaining,
-                remaining_s=remaining_s,
-                city_channels=channels,
+                remaining_s=None if remaining_s is None else remaining_s - clock_spent,
+                city_channels=[c for c in channels if not (c == sibling and c in ahead)],
             )
             if plan.skip is not None:
                 return FillVerdict(
@@ -10928,6 +10948,7 @@ def _fill_launch_refusal(
                 )
         if host is not None:
             drawn[host] += est[channel]
+        clock_spent += (need_s or {}).get(channel) or 0
     return None
 
 
@@ -11105,8 +11126,24 @@ def _never_fits_tonight(
       waiting on the sibling's multi-night sweep, which is itself the backlog
       the hold already sees (the sibling's own pair is unattempted).
 
-    A resumable channel is never "never": it launches capped and resumes.
+    * any channel of a city whose FIRST channel is a non-resumable grid run
+      that needs more than the whole window: the #373 gate defers the whole
+      city with it ("deferring the rest of this city ... paired"), so the
+      cascaded pair -- a resumable mapillary included -- is never attempted
+      either, every night, for the same reason.
+
+    A resumable channel is otherwise never "never": it launches capped and
+    resumes.
     """
+    first = city_channels[0] if city_channels else None
+    if (
+        first is not None
+        and first != channel
+        and not is_street_channel(first)
+        and not is_resumable_channel(first)
+        and _needs_more_than_the_window(cfg, conn, city, first)
+    ):
+        return f"deferred with its first grid channel {first}, which needs more than the whole batch window"
     if is_street_channel(channel):
         sibling = STREET_CHANNELS[channel]
         if sibling in city_channels and _sweep_checkpoint_progress(cfg, city, sibling) is not None:
@@ -11115,10 +11152,17 @@ def _never_fits_tonight(
         return None
     if _channel_estimate(cfg, city, channel, conn) > cfg.providers[channel].daily_request_budget:
         return "priced over its whole daily budget"
-    need = city_timeout_estimate_seconds(cfg, city, channel, conn=conn)
-    if need is not None and need > cfg.max_batch_hours * 3600.0:
+    if _needs_more_than_the_window(cfg, conn, city, channel):
         return "needs more than the whole batch window"
     return None
+
+
+def _needs_more_than_the_window(
+    cfg: "SchedulerConfig", conn, city: db.CityRow, channel: str
+) -> bool:
+    """Does this channel's derived need exceed the whole ``max_batch_hours`` window (#373)?"""
+    need = city_timeout_estimate_seconds(cfg, city, channel, conn=conn)
+    return need is not None and need > cfg.max_batch_hours * 3600.0
 
 
 def _fill_backlog(
@@ -11177,54 +11221,106 @@ def _fill_resumers(
     today: date,
     channels: Sequence[str],
     providers_for_city: dict[str, list[str]],
-) -> list[tuple[db.CityRow, dict[str, str]]]:
+) -> list[tuple[db.CityRow, dict[str, str | None], dict[str, str | None]]]:
     """ORPHANED fill checkpoints: a fill crawl that paused, waiting for nobody (#404).
 
     A fill city is not due on any channel, so when one of its resumable
     channels pauses (exit 83, its spend outran its estimate) the due path never
     resumes it -- that channel is not due for weeks, and the checkpoint is
     discarded at CHECKPOINT_MAX_AGE_S (7 days) with the spend thrown away.
-    These are the cities the fill touched within that age whose default
-    resumable channel still holds a live checkpoint and who are not on
-    tonight's due slate (a due city's checkpoint is the due path's to resume).
 
-    Returns ``(city, {paused channel: last_success_at})``, the checkpoint
-    nearest its age wall first, so the one about to expire is resumed first.
+    The candidates are the cities the fill ATTEMPTED within that age
+    (``fill_attempts``, written at admission -- not ``early_refreshes``, which
+    needs some channel to have succeeded, so a city whose gsv failed while its
+    mapillary paused would have been missed). Per city, the channels resumed
+    are its member, resumable channels with a live checkpoint and no failure
+    since their last success, which tonight's due slate does NOT hold (a due
+    channel's checkpoint is the due path's to resume; the city's other
+    channels are still the fill's).
+
+    The resume brings the city back onto ONE date (Jon: the same cities across
+    all providers on the same UTC date). Its run is:
+
+    * the paused channels;
+    * every member walk whose grid sibling is paused -- it was deferred behind
+      that sibling's in-flight sweep (#274) and has not run either;
+    * every other member channel that is FREE to re-run on the resume date:
+      one with no per-IP metered host (gsv, gsv_streets -- metadata, no
+      charge), so the city's grid and walk land on the resume date beside the
+      resumed crawl. A walk among them only if its network is frozen.
+
+    What stays on the earlier date is stated in docs/scheduler.md: a channel
+    on a per-IP host that already succeeded (a KartaView or Panoramax census
+    beside a paused Mapillary one) is NOT re-paid to realign one night.
+
+    Returns ``(city, core, whole)`` -- ``core`` the paused channels and their
+    deferred walks, ``whole`` that plus the free realignments -- the checkpoint
+    nearest its age wall first. The fill tries ``whole`` and falls back to
+    ``core`` when the realignment does not fit tonight: the resume is what
+    must not wait, since the checkpoint expires.
     """
     wall_days = math.ceil(CHECKPOINT_MAX_AGE_S / 86400) + 1
     out = []
     for city_id in sorted(
-        db.get_recent_early_refresh_city_ids(conn, today - timedelta(days=wall_days))
+        db.get_recent_fill_attempt_city_ids(conn, today - timedelta(days=wall_days))
     ):
-        if city_id in providers_for_city:
-            continue
         city = db.resolve_city(conn, city_id)
         if city is None or not city.enabled:
             continue
-        paused: dict[str, str] = {}
+        due_tonight = set(providers_for_city.get(city_id, ()))
+        rows = {
+            row["provider"]: row
+            for row in conn.execute(
+                "SELECT provider, member, last_success_at, consecutive_failures "
+                "FROM schedule_state WHERE city_id = ?",
+                (city_id,),
+            )
+        }
+        usable = {c for c in channels if _resumable_member(rows.get(c), c, due_tonight)}
+        last = {c: (rows[c]["last_success_at"] if c in rows else None) for c in channels}
+        paused: dict[str, str | None] = {}
         oldest = 0.0
         for channel in channels:
-            if not is_resumable_channel(channel):
+            if not is_resumable_channel(channel) or channel not in usable:
                 continue
             progress = _sweep_checkpoint_progress(cfg, city, channel)
             if progress is None:
                 continue
-            row = conn.execute(
-                "SELECT last_success_at, member FROM schedule_state "
-                "WHERE city_id = ? AND provider = ?",
-                (city_id, channel),
-            ).fetchone()
-            if row is None or row["last_success_at"] is None:
-                continue
-            member = row["member"]
-            if (CHANNEL_DEFAULT_MEMBERSHIP[channel] if member is None else member) != 1:
-                continue
-            paused[channel] = row["last_success_at"]
+            paused[channel] = last[channel]
             oldest = max(oldest, float(progress["age_s"] or 0.0))
-        if paused:
-            out.append((oldest, city, paused))
+        if not paused:
+            continue
+        core = dict(paused)
+        extra: dict[str, str | None] = {}
+        for channel in channels:
+            if channel in core or channel not in usable:
+                continue
+            if is_street_channel(channel) and STREET_CHANNELS[channel] in paused:
+                core[channel] = last[channel]
+            elif CHANNEL_METERED_HOST.get(channel) is None and last[channel] is not None:
+                if is_street_channel(channel) and not _walk_network_is_frozen(cfg, city, channel):
+                    continue
+                extra[channel] = last[channel]
+        whole = {c: {**core, **extra}[c] for c in channels if c in core or c in extra}
+        out.append((oldest, city, {c: core[c] for c in channels if c in core}, whole))
     out.sort(key=lambda t: (-t[0], t[1].city_id))
-    return [(city, paused) for _age, city, paused in out]
+    return [(city, core, whole) for _age, city, core, whole in out]
+
+
+def _resumable_member(row, channel: str, due_tonight: set[str]) -> bool:
+    """May the fill resume (or realign) ``channel`` for this city tonight? (#404)
+
+    A member (through the channel default when ``member`` is NULL), not held
+    by tonight's due slate on that channel, and with no failure since its last
+    success -- the candidates' own rule, so a resume can never run a failing
+    or quarantined channel.
+    """
+    member = None if row is None else row["member"]
+    if (CHANNEL_DEFAULT_MEMBERSHIP[channel] if member is None else member) != 1:
+        return False
+    if channel in due_tonight:
+        return False
+    return row is None or row["consecutive_failures"] == 0
 
 
 @dataclass
@@ -11355,7 +11451,7 @@ def _fill_judge(
     verdict = _fill_verdict(channels, est, channel_room, host_room, need, remaining_s)
     if verdict.admit:
         launch = _fill_launch_refusal(
-            cfg, conn, city, channels, est, channel_room, host_room, remaining_s
+            cfg, conn, city, channels, est, channel_room, host_room, remaining_s, need
         )
         if launch is not None:
             verdict = launch
@@ -11551,7 +11647,7 @@ def _print_fill_preview(
     fill_spent: Counter[str] = Counter()
     held: set[str] = set()
 
-    def consider(city, city_channels, label) -> bool:
+    def consider(city, city_channels, label, count: bool = True) -> bool:
         nonlocal admitted
         verdict, est = _fill_judge(
             cfg,
@@ -11567,7 +11663,8 @@ def _print_fill_preview(
             held=held if label == "fill" else frozenset(),
         )
         if not verdict.admit:
-            declined[verdict.blocker] += 1
+            if count:
+                declined[verdict.blocker] += 1
             return False
         admitted += 1
         for channel in city_channels:
@@ -11582,10 +11679,16 @@ def _print_fill_preview(
     resumers = _fill_resumers(cfg, conn, today, channels, providers_for_city)
     if resumers:
         print(f"Would RESUME {len(resumers)} paused fill crawl(s) first:")
-        for city, paused in resumers:
+        for city, core, whole in resumers:
             if admitted >= room:
                 break
-            consider(city, [c for c in channels if c in paused], "fill resume")
+            # The live order: the realigning run first, the paused crawl alone
+            # if that does not fit -- counted as one decline at most.
+            if core != whole and consider(
+                city, [c for c in channels if c in whole], "fill resume", count=False
+            ):
+                continue
+            consider(city, [c for c in channels if c in core], "fill resume")
     backlog = {c: n for c, n in unfinished.items() if c in channels}
     if backlog:
         held.update(backlog)
@@ -11674,7 +11777,12 @@ def _run_fill(
     window_since = clock.utc_now() - HOST_BUDGET_WINDOW
     baseline: dict[str, int] = {}
 
-    def attempt(city: db.CityRow, prior: dict[str, str | None], label: str) -> str | None:
+    def attempt(
+        city: db.CityRow,
+        prior: dict[str, str | None],
+        label: str,
+        fallback: dict[str, str | None] | None = None,
+    ) -> str | None:
         """Admit and run one city; return why the pass must END, or None."""
         nonlocal processed
         if processed >= max_cities:
@@ -11685,26 +11793,40 @@ def _run_fill(
         remaining_s = batch_deadline - time.monotonic()
         if remaining_s <= _MIN_PACED_LAUNCH_S:
             return f"deadline ({cfg.max_batch_hours:g} h)"
+
+        def judge(run):
+            return _fill_admission(
+                cfg,
+                conn,
+                today,
+                city,
+                [c for c in channels if c in run],
+                remaining_s,
+                blocked_hosts,
+                reserve=reserve,
+                window_since=window_since,
+                baseline=baseline,
+                held=held if label == "fill" else frozenset(),
+            )
+
+        verdict = judge(prior)
+        if not verdict.admit and fallback is not None:
+            logger.info(
+                f"{city.city_id} [{label}]: the realigning run does not fit ({verdict.message}); "
+                f"resuming the paused crawl alone"
+            )
+            prior = fallback
+            verdict = judge(prior)
         city_channels = [c for c in channels if c in prior]
-        verdict = _fill_admission(
-            cfg,
-            conn,
-            today,
-            city,
-            city_channels,
-            remaining_s,
-            blocked_hosts,
-            reserve=reserve,
-            window_since=window_since,
-            baseline=baseline,
-            held=held if label == "fill" else frozenset(),
-        )
         if not verdict.admit:
             report.declined[verdict.blocker] += 1
             trailing[verdict.blocker] += 1
             logger.info(f"{city.city_id} [{label}]: declined — {verdict.message}")
             return None
         trailing.clear()
+        # Written BEFORE the launch: what keys an orphaned checkpoint's resume
+        # is that the fill attempted the city, whatever its channels then did.
+        db.record_fill_attempt(conn, city.city_id, today)
         dated = [p for p in prior.values() if p is not None]
         logger.info(
             f"{city.city_id} [{label}]: {', '.join(city_channels)} "
@@ -11763,8 +11885,8 @@ def _run_fill(
                 f"Fill: resuming {len(resumers)} paused fill crawl(s) first, before their "
                 f"checkpoints reach the {CHECKPOINT_MAX_AGE_S / 86400:.0f}-day age wall"
             )
-        for city, paused in resumers:
-            ended = attempt(city, paused, "fill resume")
+        for city, core, whole in resumers:
+            ended = attempt(city, whole, "fill resume", fallback=core if core != whole else None)
             if ended is not None:
                 break
         trailing.clear()
@@ -11836,6 +11958,18 @@ def _run_fill(
             if pass_stop == _STOP_REASON_SIGTERM:
                 report.stop_reason = _STOP_REASON_SIGTERM
         for (cid, walk), prior_success in walk_prior.items():
+            if walk not in blocked_hosts.stranded.get(cid, ()):
+                report.early_refreshes += _record_early_refreshes(
+                    cfg, conn, touched[cid], today, {walk: prior_success}
+                )
+    except Exception:
+        logger.exception("Fill phase aborted by an unexpected error")
+        report.ended_by = report.stop_reason = _STOP_REASON_FILL_ERROR
+    finally:
+        # In a `finally`: a fill walk still stranded must be booked as the
+        # FILL's even when the phase raised, or it lands in the due paragraph
+        # of the alert with a `run-due --city` command that is a no-op for it.
+        for (cid, walk), prior_success in walk_prior.items():
             if walk in blocked_hosts.stranded.get(cid, ()):
                 due_on = (
                     (datetime.fromisoformat(prior_success).date() + timedelta(days=threshold))
@@ -11843,13 +11977,6 @@ def _run_fill(
                     else today
                 ).isoformat()
                 blocked_hosts.fill_stranded[(cid, walk)] = due_on
-            else:
-                report.early_refreshes += _record_early_refreshes(
-                    cfg, conn, touched[cid], today, {walk: prior_success}
-                )
-    except Exception:
-        logger.exception("Fill phase aborted by an unexpected error")
-        report.ended_by = report.stop_reason = _STOP_REASON_FILL_ERROR
     logger.info("Fill: " + report.summary_clause(cfg.fill_min_days))
     return report
 
@@ -12155,8 +12282,12 @@ def _finish_batch(
     blocked_hosts: HostBreaker | set[str] | None = None,
     busy_hosts: Counter[str] | None = None,
     rejected_argv: ArgvRejections | None = None,
+    crashed: str = "LOOP",
 ) -> int:
     """Rebuild the published indexes, back up the catalog, publish, alert.
+
+    ``crashed`` names what raised when ``errored`` is set -- ``"LOOP"`` (the
+    city loop) or ``"FILL"`` (the #404 fill phase) -- for the alert subject.
 
     Kept separate from the city loop so it runs no matter how the night ended
     (issue #167). ``errored`` marks a night whose loop raised: it still
@@ -12402,7 +12533,7 @@ def _finish_batch(
             # Without its own part, a night that BOTH crashed in the loop and
             # failed an index reported only the index — the crash, the more
             # serious of the two, appeared nowhere in the subject.
-            parts.append("LOOP CRASHED")
+            parts.append(f"{crashed} CRASHED")
         if tail_errors:
             parts.append(f"{len(tail_errors)} published index(es) FAILED")
         if plan_error:
@@ -12415,8 +12546,15 @@ def _finish_batch(
             # into a clean subject -- but named as what it is, since the
             # operator's next move differs: nothing to wait out.
             parts.append(f"{len(blocked_hosts.recovered)} host(s) REFUSED then recovered")
-        if blocked_hosts.stranded:
-            parts.append(f"{len(blocked_hosts.stranded)} city(ies) STRANDED un-walked")
+        # The FILL's strandings (#404) are not lost -- the body says so -- so the
+        # subject counts only the due phase's, the ones that need a command.
+        due_stranded = {
+            cid
+            for cid, walks in blocked_hosts.stranded.items()
+            if any((cid, w) not in blocked_hosts.fill_stranded for w in walks)
+        }
+        if due_stranded:
+            parts.append(f"{len(due_stranded)} city(ies) STRANDED un-walked")
         if busy_hosts:
             parts.append(f"{sum(busy_hosts.values())} channel(s) SKIPPED (host busy)")
         if busy_recovered:

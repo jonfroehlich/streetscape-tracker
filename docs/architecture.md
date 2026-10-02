@@ -44,6 +44,7 @@ It is **local-only and never rsynced** — it lives in exactly one place, which 
 | `street_walks` | UNIQUE(city_id, provider, network_type, run_date) | Road-walk collection runs (#99) — a second modality with its own unit of observation |
 | `street_walk_diffs` | UNIQUE(from_walk_id, to_walk_id) | Walk-to-walk street-coverage diffs (#101) |
 | `early_refreshes` | PK(city_id, channel, run_date) | Collections `run-due`'s fill phase took before the channel's cycle wall (#404, v18): `channel` is a SCHEDULER channel (`gsv_streets`, not `gsv`), `network_type` is set for a walk only, with the prior success and the floor admitted under |
+| `fill_attempts` | PK(city_id, run_date) | The nights the fill ATTEMPTED a city (#404, v18), written at admission: what finds an orphaned fill checkpoint whatever the city's channels then did |
 | `driving_plan_snapshots` | UNIQUE(fetch_date) | One row per fetch of Google's driving-plan feed (#176); the only family not city-keyed |
 | `driving_plan_entries` | FK → snapshot | The feed's rows, exploded per (record, district), stored verbatim |
 | `provider_screen` | PK(provider, city_id, screen_date) | Dated whole-catalog growth screen (#316) — **upper bounds**, never counts; a zero is conclusive, a positive number means "look closer" |
