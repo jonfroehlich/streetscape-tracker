@@ -1,7 +1,10 @@
-# Deploying the Streetscape Tracker scheduler on makelab1
+# Deploying the Streetscape Tracker scheduler on makelab2
 
 The scheduler runs as a **user-level systemd timer** on
-`makelab1.cs.washington.edu` (a RHEL 9-family host): a oneshot service fires
+`makelab2.cs.washington.edu`; it ran on makelab1 until the cutover described in
+[Host = makelab2](#host--makelab2-and-the-shared-home-cutover-model), and the
+production config keeps its historical name `config/scheduler.makelab1.toml`.
+A oneshot service fires
 nightly, collects the cities due that day (staggered quarterly cycle,
 bounded by a daily API-request budget), diffs each against its previous
 run, regenerates the aggregate JSON, and publishes `data/` to the public
@@ -10,16 +13,19 @@ missed days self-heal.
 
 ## Where things live
 
-makelab1 is the **compute** host; storage is NFS from other servers, so
-this is deliberately split:
+makelab2 is both the **compute** host and the **storage** host: the checkout,
+`data/`, the catalog and `logs/` sit on its local ZFS pool (`make2pool`), so
+collection is data-local with no NFS hop.
+makelab1 sees the same path over NFS, but must never run the scheduler (see the
+cutover section).
 
 | What | Path | Notes |
 |------|------|-------|
-| Code + data + DB + logs + `.env` | `/projects/makeabilitylab/streetscape-tracker/` | On the lab fileserver (backed up, group `makelab`). **Not web-served.** Shared with other lab services. |
+| Code + data + DB + logs + `.env` | `/projects/makeabilitylab/streetscape-tracker/` | Local ZFS on makelab2 (group `makelab`), NFS-exported to makelab1. Backed up only since 2026-08-05 (see [Backups](#backups-verified-with-cse-it-2026-08-05--issue-145)). **Not web-served.** Shared with other lab services. |
 | Convenience symlink | `~/streetscape-tracker` → the path above | Lets the generic `%h/streetscape-tracker` systemd units and `.env` resolve. |
 | Public web docroot | `/cse/web/research/makelab/public/streetscape-tracker/` | On a *different* host (the web-file server); served at `makeabilitylab.cs.washington.edu/public/streetscape-tracker/`. Holds only the flattened website + published `*.csv.gz`/`*.json.gz`. |
 
-Because makelab1 mounts the docroot directly, **publishing is a local
+Because the collection host mounts the docroot directly, **publishing is a local
 rsync — no SSH to the docroot host**. That is declared as `local = true` in the
 config's `[publish]` block, so a hand-run publish behaves like the nightly one;
 the systemd unit also still exports `STREETSCAPE_PUBLISH_LOCAL=1` as a
@@ -28,7 +34,7 @@ belt-and-braces fallback for older checkouts (issue #215).
 ## 1. One-time setup
 
 ```bash
-ssh makelab1.cs.washington.edu
+ssh makelab2.cs.washington.edu
 
 # Clone onto lab storage, and symlink it into home for the systemd units
 git clone https://github.com/jonfroehlich/streetscape-tracker.git /projects/makeabilitylab/streetscape-tracker
@@ -36,12 +42,14 @@ ln -s /projects/makeabilitylab/streetscape-tracker ~/streetscape-tracker
 
 cd ~/streetscape-tracker
 python3.11 -m venv .venv          # 3.11+ for tomllib
+# On makelab2 the live venv is .venv-makelab2 instead (uv-managed, so it runs on
+# both boxes); see "Host = makelab2" below for how to provision it.
 # requirements.lock pins exact versions (uv pip compile --universal) so the
 # deploy matches CI byte-for-byte; requirements.txt holds the loose floors.
 .venv/bin/pip install -r requirements.lock
 
 # API keys — copy your working .env up from the laptop (least error-prone):
-#   (from the laptop)  scp .env makelab1.cs.washington.edu:/projects/makeabilitylab/streetscape-tracker/.env
+#   (from the laptop)  scp .env makelab2.cs.washington.edu:/projects/makeabilitylab/streetscape-tracker/.env
 chmod 600 .env                    # seal the keys; the parent dir is group-readable
 ```
 
@@ -68,13 +76,13 @@ Then copy `data/` up (includes the `.db`; the `-wal`/`-shm` sidecars will be
 empty after the checkpoint):
 
 ```bash
-rsync -azh --progress data/ makelab1.cs.washington.edu:/projects/makeabilitylab/streetscape-tracker/data/
+rsync -azh --progress data/ makelab2.cs.washington.edu:/projects/makeabilitylab/streetscape-tracker/data/
 ```
 
-That's it — makelab1 now has your exact catalog. The migration script below is
+That's it — makelab2 now has your exact catalog. The migration script below is
 a **safety-net no-op** in this path: with the catalog already populated it just
 re-confirms every file is registered and reports zero changes. Run it only to
-verify (or if you ever seed makelab1 from data files *without* copying the DB —
+verify (or if you ever seed the host from data files *without* copying the DB —
 note that route loses the #91 boundary re-registrations, which live solely in
 the catalog):
 
