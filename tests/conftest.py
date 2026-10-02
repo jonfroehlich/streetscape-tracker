@@ -2,6 +2,7 @@
 
 import gzip
 import os
+import socket
 import sys
 import time
 from datetime import UTC, date, datetime
@@ -649,6 +650,129 @@ def stamp_census_cache(
     with open(os.path.join(cache_path, CENSUS_CACHE_MARKER), "w", encoding="utf-8") as fh:
         json.dump(marker, fh)
     return cache_path
+
+
+# The real socket connect, saved at import so the guard below can delegate to it.
+_REAL_SOCKET_CONNECT = socket.socket.connect
+_REAL_SOCKET_CONNECT_EX = socket.socket.connect_ex
+_LOOPBACK = {"127.0.0.1", "::1", "localhost"}
+
+
+class RealNetworkBlocked(OSError):
+    """A test tried to open a real (non-loopback) network connection."""
+
+
+@pytest.fixture(autouse=True)
+def _no_real_network(monkeypatch, request):
+    """
+    FAIL any test that opens a real network connection (review of PR #411).
+
+    The suite's rule is "fast, no real network", and until this guard it was a
+    convention: a scheduler test outside tests/test_scheduler.py ran run-due
+    without that file's local stubs and made 168 real GETs of Google's
+    driving-plan feed. Every non-loopback AF_INET/AF_INET6 ``connect`` now
+    raises :class:`RealNetworkBlocked` (an ``OSError``, so the code under test
+    sees an ordinary transport failure) AND the test is failed at teardown --
+    because code that swallows an ``OSError`` (the driving-plan hook reports a
+    failed fetch as a string) would otherwise turn the attempt into a pass.
+
+    Loopback and AF_UNIX stay open: an in-process server or a local socketpair
+    is not "the network".
+    """
+    attempts: list = []
+
+    def _check(sock, address):
+        if sock.family in (socket.AF_INET, socket.AF_INET6):
+            host = address[0] if isinstance(address, tuple) else address
+            if host not in _LOOPBACK:
+                attempts.append(address)
+                raise RealNetworkBlocked(f"test attempted a real network connection to {address}")
+
+    def connect(self, address):
+        _check(self, address)
+        return _REAL_SOCKET_CONNECT(self, address)
+
+    def connect_ex(self, address):
+        _check(self, address)
+        return _REAL_SOCKET_CONNECT_EX(self, address)
+
+    monkeypatch.setattr(socket.socket, "connect", connect)
+    monkeypatch.setattr(socket.socket, "connect_ex", connect_ex)
+    yield
+    if attempts:
+        pytest.fail(
+            f"{request.node.nodeid} attempted {len(attempts)} real network connection(s), "
+            f"e.g. {attempts[0]} -- stub the call (see tests/conftest.py)",
+            pytrace=False,
+        )
+
+
+@pytest.fixture(autouse=True)
+def _scheduler_config_defaults_in_tmp(monkeypatch, tmp_path):
+    """
+    A ``SchedulerConfig`` built in a test without explicit paths writes under
+    ``tmp_path``, never the repo (review of PR #411).
+
+    The class defaults are ``<repo>/data``, ``<repo>/backups`` and
+    ``<repo>/logs`` -- right for an operator, and from the production checkout
+    exactly where the published site and the real backups live. Tests built
+    configs with defaults and reached the tail: ``regenerate-aggregate`` tests
+    left ``data/provider_screen.json.gz`` in the working tree, and the fill
+    tests ``data/driving_plan.json.gz`` and ``backups/``. Only the DEFAULT is
+    redirected: a test passing a path, or ``load_scheduler_config`` (which
+    always passes one), is untouched.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    real_init = sched.SchedulerConfig.__init__
+
+    def init(self, *args, **kwargs):
+        kwargs.setdefault("data_dir", str(tmp_path / "default_data"))
+        kwargs.setdefault("backup_dir", str(tmp_path / "default_backups"))
+        kwargs.setdefault("log_dir", str(tmp_path / "default_logs"))
+        real_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(sched.SchedulerConfig, "__init__", init)
+
+
+@pytest.fixture(autouse=True)
+def _no_nightly_side_effects(monkeypatch, request):
+    """
+    Neutralize run-due's three nightly side effects for the WHOLE suite.
+
+    Moved here from tests/test_scheduler.py (review of PR #411): defined there,
+    they covered that file only, and tests/test_fill_underfull_nights.py ran
+    run-due without them -- fetching Google's driving-plan feed for real and
+    writing ``archive/gsv_driving_plan/``, ``data/driving_plan.json.gz`` and
+    ``backups/`` relative to the working directory. From the production
+    checkout during a live batch that would overwrite published data and the
+    real catalog backup.
+
+    * ``_fetch_driving_plan_nightly`` -- the feed snapshot (#176): a real GET
+      and archive writes;
+    * ``catalog_backup.write_backup`` -- the dated catalog backup (#145), whose
+      ``backup_dir`` defaults to <repo>/backups;
+    * ``generate_driving_plan_summary`` -- the tail's published join, whose
+      ``data_dir`` defaults to <repo>/data.
+
+    The dedicated tests restore the real functions explicitly (see the
+    ``_REAL_*`` names in tests/test_scheduler.py). ``write_backup`` is the unit
+    under test in tests/test_catalog_backup.py, which therefore keeps it.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    monkeypatch.setattr(sched, "_fetch_driving_plan_nightly", lambda cfg, conn, today: None)
+    monkeypatch.setattr(
+        sched, "generate_driving_plan_summary", lambda conn, data_dir: {"records": []}
+    )
+    if request.module.__name__.rsplit(".", 1)[-1] != "test_catalog_backup":
+        monkeypatch.setattr(
+            sched.catalog_backup,
+            "write_backup",
+            lambda conn, backup_dir, when, **kw: sched.catalog_backup.BackupResult(
+                ok=True, path=os.path.join(backup_dir, "stubbed.backup")
+            ),
+        )
 
 
 @pytest.fixture(autouse=True)

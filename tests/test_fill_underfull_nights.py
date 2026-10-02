@@ -105,6 +105,10 @@ def _grid_cfg(**overrides):
         },
     )
     overrides.setdefault("fill_min_days", 30)
+    # Hermetic on its own, not only through conftest: no driving-plan fetch.
+    # (conftest also stubs the hook and puts a default config's data, backup and
+    # log dirs under tmp_path.)
+    overrides.setdefault("driving_plan", sched.DrivingPlanConfig(enabled=False))
     overrides.setdefault("max_cities_per_day", 40)
     overrides.setdefault("max_batch_hours", 12.0)
     return SchedulerConfig(providers=providers, publish_enabled=False, **overrides)

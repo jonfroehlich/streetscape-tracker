@@ -65,7 +65,7 @@ def _reserve(cfg, max_cities=None):
     )
 
 
-# The real nightly hooks, saved before the autouse stubs below replace them so
+# The real nightly hooks, saved before conftest's autouse stubs replace them so
 # the dedicated driving-plan / backup tests can exercise them.
 _REAL_DRIVING_PLAN_HOOK = _sched._fetch_driving_plan_nightly
 _REAL_WRITE_BACKUP = _sched.catalog_backup.write_backup
@@ -76,56 +76,9 @@ _REAL_PLAN_SUMMARY = _sched.generate_driving_plan_summary
 _REAL_HOST_RECHECKS = dict(_sched.HOST_RECHECKS)
 
 
-@pytest.fixture(autouse=True)
-def _no_driving_plan_fetch(monkeypatch):
-    """run-due snapshots the driving-plan feed before the city loop (issue
-    #176). Stub the hook for every test so the suite stays hermetic — no
-    network, no writes to the real archive/ dir; the driving-plan tests
-    restore _REAL_DRIVING_PLAN_HOOK explicitly."""
-    monkeypatch.setattr(_sched, "_fetch_driving_plan_nightly", lambda cfg, conn, today: None)
-
-
-@pytest.fixture(autouse=True)
-def _no_real_catalog_backup(monkeypatch):
-    """
-    run-due backs the catalog up before the city loop AND in the tail (issue
-    #145). Stub it for every test, because SchedulerConfig's backup_dir defaults
-    to <repo>/backups: without this, every test reaching either hook writes a
-    real backup of its fixture catalog into the developer's working tree. That
-    is not hypothetical — the tail backup predates this fixture and had been
-    dropping fixture-sized files into the repo's logs/ for as long as it
-    existed, where they were indistinguishable from a real catalog backup.
-
-    The dedicated backup tests restore _REAL_WRITE_BACKUP and point backup_dir
-    at tmp_path.
-    """
-    monkeypatch.setattr(
-        _sched.catalog_backup,
-        "write_backup",
-        lambda conn, backup_dir, when, **kw: _sched.catalog_backup.BackupResult(
-            ok=True, path=os.path.join(backup_dir, "stubbed.backup")
-        ),
-    )
-
-
-@pytest.fixture(autouse=True)
-def _no_driving_plan_summary(monkeypatch):
-    """
-    The tail regenerates driving_plan.json.gz UNCONDITIONALLY — deliberately
-    not gated on `succeeded > 0`, since Google's feed changes on its own
-    schedule and gating would leave the published plan stale on exactly the
-    quiet nights. That means every run-due test reaches it, and
-    SchedulerConfig's data_dir defaults to <repo>/data, so without this stub
-    the suite writes a fixture-sized artifact into the developer's working
-    tree — the same hazard _no_real_catalog_backup exists for, and the reason
-    the writer now creates its parent directory rather than failing.
-
-    The dedicated driving-plan tests restore _REAL_PLAN_SUMMARY and point
-    data_dir at tmp_path.
-    """
-    monkeypatch.setattr(
-        _sched, "generate_driving_plan_summary", lambda conn, data_dir: {"records": []}
-    )
+# The three autouse stubs these restore (driving-plan fetch, catalog backup,
+# driving-plan summary) live in tests/conftest.py as `_no_nightly_side_effects`,
+# suite-wide since the PR #411 review.
 
 
 def _register(conn, name, width=5000, height=5000, step=20):
@@ -928,7 +881,7 @@ def test_regenerate_aggregate_parses_publish_flag():
     assert b.command == "regenerate-aggregate" and b.publish and b.config == "/x.toml"
 
 
-def test_regenerate_aggregate_rebuilds_without_publish(conn, monkeypatch):
+def test_regenerate_aggregate_rebuilds_without_publish(conn, data_dir, monkeypatch):
     """regenerate-aggregate rebuilds the aggregate and, without --publish,
     never touches the publish script."""
     from streetscape_metadata_tracker import scheduler as sched
@@ -947,14 +900,14 @@ def test_regenerate_aggregate_rebuilds_without_publish(conn, monkeypatch):
     )
     monkeypatch.setattr(sched, "_publish", lambda cfg, ctx: calls.__setitem__("publish", 1) or 0)
 
-    rc = sched.cmd_regenerate(SchedulerConfig(publish_enabled=False))
+    rc = sched.cmd_regenerate(SchedulerConfig(publish_enabled=False, data_dir=data_dir))
     # The streetwalk manifest is rebuilt alongside the aggregate: both are
     # catalog-derived indexes the frontend fetches, and regenerate-aggregate is
     # the documented recovery path after a manual/killed run (issue #155).
     assert rc == 0 and calls == {"agg": 1, "manifest": 1, "publish": 0}
 
 
-def test_regenerate_aggregate_publishes_on_flag(conn, monkeypatch):
+def test_regenerate_aggregate_publishes_on_flag(conn, data_dir, monkeypatch):
     """--publish runs the publish step even when [publish].enabled is false,
     and a publish failure surfaces as a nonzero exit."""
     from streetscape_metadata_tracker import scheduler as sched
@@ -965,14 +918,26 @@ def test_regenerate_aggregate_publishes_on_flag(conn, monkeypatch):
 
     published = []
     monkeypatch.setattr(sched, "_publish", lambda cfg, ctx: published.append(ctx) or 0)
-    assert sched.cmd_regenerate(SchedulerConfig(publish_enabled=False), publish=True) == 0
+    assert (
+        sched.cmd_regenerate(
+            SchedulerConfig(publish_enabled=False, data_dir=data_dir), publish=True
+        )
+        == 0
+    )
     assert published  # publish ran despite publish_enabled=False
 
     monkeypatch.setattr(sched, "_publish", lambda cfg, ctx: 1)  # simulate rsync failure
-    assert sched.cmd_regenerate(SchedulerConfig(publish_enabled=False), publish=True) == 1
+    assert (
+        sched.cmd_regenerate(
+            SchedulerConfig(publish_enabled=False, data_dir=data_dir), publish=True
+        )
+        == 1
+    )
 
 
-def test_regenerate_aggregate_reports_a_failed_driving_plan_rebuild(conn, monkeypatch, capsys):
+def test_regenerate_aggregate_reports_a_failed_driving_plan_rebuild(
+    conn, data_dir, monkeypatch, capsys
+):
     """
     The driving-plan join is failure-guarded so an OSError there cannot cost the
     caller its publish (#167) — but rebuilding the published JSON is this
@@ -992,7 +957,9 @@ def test_regenerate_aggregate_reports_a_failed_driving_plan_rebuild(conn, monkey
     published = []
     monkeypatch.setattr(sched, "_publish", lambda cfg, ctx: published.append(ctx) or 0)
 
-    rc = sched.cmd_regenerate(SchedulerConfig(publish_enabled=False), publish=True)
+    rc = sched.cmd_regenerate(
+        SchedulerConfig(publish_enabled=False, data_dir=data_dir), publish=True
+    )
 
     assert rc == 1
     assert published  # the two artifacts that DID rebuild still reach the site
