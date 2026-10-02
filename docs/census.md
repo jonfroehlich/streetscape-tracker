@@ -467,15 +467,40 @@ That last figure is RAW PACE and is not the per-city timeout: `scheduler._tile_c
 The v2 endpoint's H3 `grid` layer — aggregated counters rather than rows — is the *screen* instrument phase 1 used to price the whole catalog for 113 requests, and it is not read by the collector at all.
 At z6 its hexagons measured H3 resolution 7 (~5.2 km²), not the resolution 6 phase 1 recorded (#406), so the screen now reads the resolution off every id it decodes rather than trusting either figure ([`scheduler.md`](scheduler.md)).
 
-### 2. A 403 or 429 is a per-IP refusal, and a 404 is an empty tile
+### 2. A 403 or 429 is a per-IP refusal, a 204 is an empty tile, and a 404 is not
 
 **There is no credential**, which changes what a 4xx can mean.
 On Mapillary and KartaView a 403 is a rejected token and is deliberately typed as a plain `DownloadError` scoped to the credential; here it cannot be, so **403 and 429 are both `HostBlockedError` at the first request** — stop, never retry, and let the scheduler's night-level breaker see it.
 `HOST_PANORAMAX` is the fourth locked host, with exit codes **84 blocked / 85 busy**, continuing past 83 rather than filling the 77/78 gap that stays open because those are `EX_NOPERM`/`EX_CONFIG`.
 
-**A 404 is an ANSWER, not a failure** — the opposite of Mapillary's reading, and measured rather than assumed: phase 1 saw 0 empty tiles across 3,321 requests *including 20 cities that hold no imagery at all*, because an empty area answers 200 with no picture layer.
-That reading needs a guard, and it is the one piece of this module with no Mapillary counterpart: **a lattice where every tile 404s is refused**.
-An empty city answers 200, so a whole lattice of 404s is what a moved or renamed endpoint looks like — and without the guard the run would finalize 0 panos and `diff.py` would report every pano in the city removed, into an immutable dated snapshot.
+**A 204 is the EMPTY TILE** — measured 2026-10-01 (#407): an ocean tile answers 204 with 0 bytes, the meta-catalog's source returns 204 for an empty tile and never 404, and a z6 world screen the same day saw 201 × 200, 34 × 204 and 0 × 404.
+It is an answer, so `_fetch_tile` returns `b""` and reports it through `on_empty` — which the growth screen counts and the grid collector deliberately does not pass, because nothing there reads the count — and the collector **commits it as a zero-row tile** — most z15 tiles over a real bbox are empty, so holding them back would leave every checkpoint incomplete and every cache entry refused.
+Before #407 a 204 fell through `raise_for_status` (not an error) and `read()` returned `b""`: handled correctly by accident and counted by nobody, while the code and these docs called 404 the empty tile.
+
+**A 404 is NOT an empty tile.** On a host that never 404s a tile route, a 404 means the URL is not one it serves — a moved or renamed endpoint — and the ground under it was never read.
+`_fetch_tile` raises `TileNotServedError`, which is deliberately neither a `DownloadError` (one stray 404 would end the city) nor an `aiohttp.ClientError` (backoff would retry an unrouted path), so a lone 404 is a **failed tile**: REQUEST_FAILED under #168's tolerance, never committed, never a measured absence.
+The guard with no Mapillary counterpart is that **a lattice where every tile 404s is refused by name** as a moved endpoint, before the generic tolerance would refuse it as "N tiles failed" and point the operator at the night instead of the URL.
+**It reads the WHOLE lattice, never this invocation's share**, so it can never refuse a city the tolerance accepts.
+A 404 is never committed, so every re-run asks again for exactly the tiles that 404ed — a resume, a re-finalize under `--force`, or `reconcile_cache_hit` handing the crawl's own cache entry back so its failed tiles are re-probed.
+Keyed on `todo`, a 324-tile city with two persistent 404s published at 0.6% on night 1 and was refused as a moved endpoint on every re-run until the seven-day wall.
+A resume whose remaining tiles all 404 is priced by the tolerance instead, which names the endpoint itself when every failure it counted was a 404.
+**It keys on the 404, never on emptiness**: a lattice of 204s is a city the host says holds nothing, which 730 of 1,144 catalog cities genuinely do, and it publishes as ZERO_RESULTS.
+
+**An empty census after a positive run is refused (the collapse guard).**
+A meta-catalog that lost its index would answer 204 for every tile, which looks exactly like a city that lost every picture, and published it reads as "every picture removed".
+So `refuse_empty_census` (on `fetch_city_images_async` and both wrappers) raises `PanoramaxCollapseError` when the census holds no imagery, and the CALLER arms it from the series' history, because only the caller has a catalog.
+The grid run (`cli.py`) arms it when the previous Panoramax run of the city held imagery (`db.run_held_imagery`); the road walk (`collect.py`) arms it when the previous walk of the same city and `--network-type` covered any street length (`db.street_walk_held_imagery`).
+`--allow-panoramax-collapse` on either CLI disarms it, and the accepted empty run becomes the series' new baseline.
+It reads the assembled census, not this run's 204 count, because only the census survives every route: on a re-finalize the 204 tiles were committed earlier and this run saw none.
+It runs before promotion, so a refused census never becomes the shared entry a walk would reuse for free, and it is checked on cache reuse too.
+**It exits 1, the ordinary failure family**: it is not a per-IP refusal (blocked codes would trip the night's breaker for every other Panoramax city), and not a resumable pause (exit 83 is amnestied, which would hide a real collapse forever).
+A counted `consecutive_failure` and an alert are what a collapse needs until someone decides.
+
+**A tolerated 404 promotes.** A census with failed tiles inside the tolerance is complete in the #318 sense (every tile fetched or recorded failed), so it is promoted into the #290 cache with the 404 tiles in the marker's `failed` list.
+A road walk reusing it for 0 requests therefore marks its samples under those tiles REQUEST_FAILED, exactly as the grid run marked its points.
+
+The growth screen reads the same `_fetch_tile` differently on purpose — any 404 ends its pass (an unread z6 tile is every city under it), and an all-204 pass is refused, since 201 of 235 world tiles hold imagery and a pass of nothing is a meta-catalog serving nothing.
+The bounded z14 **measure does not apply that refusal**: it follows a positive screen whose upper bound came from a hexagon far larger than the city, so a city whose own tiles all answer 204 is a legitimate exact zero, and the measure prints rather than writes.
 
 ### 3. `type` is two-state, and the raw value is published anyway
 
@@ -491,7 +516,8 @@ The rest of the run schema is deliberately thin — `account_id`, `sequence_id`,
 An MVT feature id is numbered per tile, so the fallback mints id `0` in every tile of the city, and `dedupe_census` factorizes on `id`: those collisions would silently collapse distinct pictures into one across the whole city.
 A picture the layer does not name is dropped instead.
 
-**Pacing is 30/min with jitter 0.6**, half the Mapillary channels' configured rate against a host with strictly less published guidance — nothing documents a limit anywhere found, and no `X-RateLimit-*` or `Retry-After` header comes back.
+**Pacing defaults to 30/min with jitter 0.6** against a host with strictly less published guidance than Mapillary — nothing documents a limit anywhere found, and no `X-RateLimit-*` or `Retry-After` header comes back.
+Production runs 60/min as stage 1 of #405's staged raise; the stages and their gates are in [`provider-access.md`](provider-access.md).
 The jitter is adopted before any incident rather than after three; see [`provider-access.md`](provider-access.md) for the full access survey and for what has and has not been asked.
 
 **Collectable by hand, and scheduled since #335.**
@@ -516,7 +542,7 @@ So `collect.py` imports them ALIASED: a bare import would not be a clash the lin
 The first version of this paragraph claimed all four differed and quoted Mapillary's rate as 40, which is its PRODUCTION CONFIG value and not what the module exports; a three-reviewer pass caught it.
 **And "four" is the count of what THIS CALLER imports, never a property of the two modules**: they share 55 public names, 14 of which resolve to different objects (`TILE_ZOOM`, `TILE_URL_TEMPLATE`, `TileCheckpoint`, `fetch_city_images_async`, `build_image_rows`, `records_to_census`, `tiles_for_bbox`, `load_cached_census`, … — measured, not counted by hand).
 Stated as a module property it invites the next call site to import a fifth name unaliased on the grounds that the list was complete.
-And a **404 is an empty tile**, not a failure, so a tile genuinely holding no imagery never reaches `failed_tiles`; everything the walk's `unmeasured_mask` covers is ground the fetch really did not see.
+And an **empty tile answers 204**, an answer rather than a failure, so a tile genuinely holding no imagery never reaches `failed_tiles`; a 404 does, being an unread tile (#407), so everything the walk's `unmeasured_mask` covers is ground the fetch really did not see.
 
 **`panoramax_streets` is a budget channel with no credential behind it.**
 Its row in `config.CHANNEL_ENV_VARS` is an empty tuple exactly like `panoramax`'s, which is what puts it in `CREDENTIAL_FREE_CHANNELS`; drop the row and `load_config` falls through to its final `raise`, making the one walk that needs no key the one walk that cannot start.

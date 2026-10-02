@@ -51,11 +51,13 @@ layer; neither reimplements the other.
 
 PACING AND REFUSALS ARE THE COLLECTOR'S, IMPORTED. Same host, same absence of
 any documented limit, same per-IP exposure — so the screen paces at the same
-30/min with the same #292 jitter, takes the same machine-wide
+rate as the collection channel (`[providers.panoramax]`: the collector default
+30/min, production 60/min since #405 stage 1) with the same #292 jitter, takes
+the same machine-wide
 `host_lock(HOST_PANORAMAX)`, and reads HTTP status through the collector's
 `_fetch_tile`, which is the single place in the repo that says what a 403, a
-redirect, a 404 or an HTML body means on this host. 113 requests a week is a
-rounding error against a night of collection, and it still goes through the
+redirect, a 204, a 404 or an HTML body means on this host. 113 requests a week
+is a rounding error against a night of collection, and it still goes through the
 lock: the lock is not about volume, it is about two processes pacing
 independently into one volunteer-run meta-catalog.
 """
@@ -84,8 +86,9 @@ from .download_common import tiles_for_bbox as common_tiles_for_bbox
 # `_fetch_tile` is imported under its private name deliberately, rather than
 # copied. It is where this repo decides that a 403 or 429 is a per-IP refusal
 # (there is no credential, so it cannot be a rejected token), that a redirect is
-# a block or a moved endpoint, that a 404 is an EMPTY TILE rather than a failure,
-# and that an HTML body behind a 200 is an error page. Those readings are host
+# a block or a moved endpoint, that a 204 is an EMPTY TILE while a 404 is an
+# unrouted URL and so an unread tile, never an empty one (issue #407), and that
+# an HTML body behind a 200 is an error page. Those readings are host
 # properties, not collector properties: a second copy here would be a second
 # place to get them wrong, and the screen is the instrument whose wrong answer is
 # hardest to notice.
@@ -94,6 +97,7 @@ from .download_panoramax import (
     DEFAULT_TILE_JITTER,
     DEFAULT_TILE_REQUESTS_PER_MINUTE,
     USER_AGENT,
+    TileNotServedError,
     _fetch_tile,
 )
 from .host_lock import host_lock
@@ -733,7 +737,8 @@ async def _fetch_screen_tiles(
     Fetch and decode `tiles` SEQUENTIALLY, returning (by_tile, requests, empties).
 
     Sequential on purpose, and it costs nothing worth having: at 113 tiles and
-    30/min the pass takes under four minutes either way, while concurrency would
+    the default 30/min the pass takes under four minutes (under two at
+    production's 60/min since #405) either way, while concurrency would
     buy a burst shape against a volunteer-run host for no operational gain. The
     collector fans out because a leader city is thousands of tiles; this does not
     because the whole catalog is 113.
@@ -774,6 +779,21 @@ async def _fetch_screen_tiles(
                     tile_bytes = await _fetch_tile(
                         session, url, timeout, rate_limiter, count_request, count_empty
                     )
+                except TileNotServedError as exc:
+                    # A 404 is NOT an empty tile on this host (it answers an
+                    # empty one 204, issue #407): the URL is not a route it
+                    # serves, so the tile was never read. For a screen that is
+                    # the case directly below -- an unread tile is every city
+                    # under it -- and it ends the pass for the same reason.
+                    error = DownloadError(
+                        f"Panoramax screen tile z{zoom}/{x}/{y} answered HTTP 404. This "
+                        f"host answers an empty tile with 204 and never 404s a tile "
+                        f"route, so the screen endpoint ({SCREEN_URL_TEMPLATE}) has "
+                        f"moved or been renamed. Refusing to write a screen with an "
+                        f"unread tile."
+                    )
+                    error.api_requests = requests_spent
+                    raise error from exc
                 except DownloadError as exc:
                     # STAMP WHAT WAS SPENT ON THE WAY OUT, the same contract the
                     # collector's `interrupted` has: a pass refused halfway still
@@ -821,26 +841,41 @@ async def _fetch_screen_tiles(
     return by_tile, requests_spent, empty_tiles
 
 
-def _refuse_if_endpoint_moved(
+def _refuse_if_every_tile_empty(
     tiles: list[tuple[int, int]], empty_tiles: int, *, api_requests: int = 0
 ) -> None:
-    """Refuse a pass in which every tile answered 404 — a moved endpoint.
+    """Refuse a pass in which every tile answered 204 — the host's empty tile.
 
-    Same reading, and the same measured basis, as the collector's guard: on this
-    host an empty area answers 200 with no layer, and phase 1 saw zero 404s in
-    3,321 requests including 20 cities holding nothing. So an all-404 lattice is
-    a renamed endpoint, and finalizing it would stamp the whole catalog with a
-    zero on the day the URL changed.
+    A 204 is a true answer for ONE tile (issue #407), and the collector
+    publishes a city of them as empty, because 730 of 1,144 catalog cities
+    genuinely are. A SCREEN of them is not credible the same way: a z6 tile is
+    ~5.6 degrees of longitude, and 201 of 235 such tiles over the world held
+    imagery on 2026-10-01. So a whole pass answering 204 is a meta-catalog
+    serving nothing anywhere -- an emptied index, a broken deployment -- and
+    recording it would stamp every city with a zero on the day it happened.
 
-    Bounded at two tiles for the same reason the collector's is: one 404 is a
-    hole, two against a measured baseline of none is a moved endpoint.
+    It also keeps a refusal that existed before #407 by accident. A 204 used to
+    be counted as a tile that ANSWERED and decoded no hexagon, so an all-204
+    pass tripped `_refuse_if_layer_missing`. Counting 204 as empty moves those
+    tiles out of that guard's denominator, so this one has to take them, or an
+    all-204 pass would publish. The one-city screen (issue #374) inherits the
+    direction, which is the safe one there: a failed screen enrols nobody.
+
+    A 404 never reaches this: `_fetch_screen_tiles` ends the pass on the first
+    one, because a 404 is an unread tile rather than an empty one.
+
+    Bounded at two tiles: one empty tile is a tile, two with nothing in them
+    anywhere is a pass that measured nothing.
     """
     if len(tiles) >= 2 and empty_tiles == len(tiles):
         error = DownloadError(
-            f"Every one of the {len(tiles)} Panoramax screen tiles answered HTTP 404. "
-            f"An empty area answers 200 with no grid layer, so this means the screen "
-            f"endpoint ({SCREEN_URL_TEMPLATE}) has moved or been renamed — refusing to "
-            f"record a screen claiming the whole catalog holds no imagery."
+            f"Every one of the {len(tiles)} Panoramax screen tiles answered HTTP 204 "
+            f"(no content). An empty tile is ordinary, but {SCREEN_URL_TEMPLATE} served "
+            f"no imagery in ANY tile this screen asked for — not credible for the weekly "
+            f"pass, and for a one-city screen it may be a genuinely empty area, which "
+            f"this guard cannot tell from an emptied index. Refusing to record every "
+            f"city screened as conclusively empty; a one-city screen refused here "
+            f"enrols nobody."
         )
         # Carried for the same reason the fetch stamps it: this refusal comes
         # AFTER the whole lattice was requested, so it is the most expensive
@@ -854,11 +889,11 @@ def _refuse_if_layer_missing(
 ) -> None:
     """Refuse a pass in which tiles ANSWERED but not one hexagon decoded.
 
-    The quiet twin of the moved-endpoint guard, and the one that protects a
+    The quiet twin of the empty-tile guard, and the one that protects a
     catalog with no history. If the layer is renamed (`grid` -> `grid_v2`) or
     served under a changed schema, every tile comes back 200 with a body, so no
-    404 is seen -- and `hexes_from_tile` returns {} for all of them. Every city
-    then screens zero, the pass exits 0, and 1,144 rows are recorded as
+    204 or 404 is seen -- and `hexes_from_tile` returns {} for all of them. Every
+    city then screens zero, the pass exits 0, and 1,144 rows are recorded as
     conclusively empty and published; those zeros become the baseline, so
     `first_positive_date` for every city would date from whenever somebody
     noticed, permanently mis-dating the arrival signal this instrument exists to
@@ -872,9 +907,11 @@ def _refuse_if_layer_missing(
     COUNTER property produces hexagons whose counts are all zero, decodes fine,
     and is caught there.
 
-    Bounded at two answering tiles for the same reason the 404 guard is: over
-    the real catalog 113 tiles decode ~thousands of hexagons, and a single
-    genuinely empty tile proves nothing.
+    Bounded at two answering tiles for the same reason the empty-tile guard is:
+    over the real catalog 113 tiles decode ~thousands of hexagons, and a single
+    genuinely featureless tile proves nothing. A 204 is NOT an answering tile
+    here (it has no body to carry a layer); `_refuse_if_every_tile_empty` owns
+    it.
     """
     answered = len(tiles) - empty_tiles
     if answered >= 2 and hexagons == 0:
@@ -882,7 +919,7 @@ def _refuse_if_layer_missing(
             f"{answered} Panoramax screen tiles answered with a body and NOT ONE "
             f"hexagon decoded from any of them. That is what a renamed or restructured "
             f"'{SCREEN_LAYER}' layer looks like, not what an empty catalog looks like "
-            f"(an empty area still answers 200 and simply carries no features) — "
+            f"(an empty tile answers 204 with no body, and is not counted here) — "
             f"refusing to record every city as conclusively empty. Check the layer "
             f"served by {SCREEN_URL_TEMPLATE} before re-running."
         )
@@ -915,13 +952,13 @@ async def screen_targets_async(
 
     ``allow_collapse`` skips only :func:`_refuse_if_layer_missing`, for an
     operator who has checked the endpoint by hand and means to record a real
-    collapse. It does not skip the 404 guard, which has no honest reading.
+    collapse. It does not skip the empty-tile guard, which has no honest reading.
 
     Raises:
         HostBlockedError: the host refused this IP, or the endpoint moved.
-        DownloadError: a tile could not be read or decoded, every tile answered
-            404, no hexagon decoded from any answering tile, or some city
-            resolves to zero tiles.
+        DownloadError: a tile could not be read or decoded, a tile answered
+            404, every tile answered 204, no hexagon decoded from any answering
+            tile, or some city resolves to zero tiles.
         HostBusyError: another local process holds the Panoramax lock.
     """
     tiles, per_city = plan_screen(targets)
@@ -938,7 +975,7 @@ async def screen_targets_async(
             request_timeout=request_timeout,
             label=f"Screening Panoramax z{SCREEN_ZOOM} tiles",
         )
-    _refuse_if_endpoint_moved(tiles, empty_tiles, api_requests=api_requests)
+    _refuse_if_every_tile_empty(tiles, empty_tiles, api_requests=api_requests)
     hexagons = sum(len(h) for h in by_tile.values())
     if not allow_collapse:
         _refuse_if_layer_missing(tiles, empty_tiles, hexagons, api_requests=api_requests)
@@ -1022,7 +1059,15 @@ async def measure_targets_async(
             request_timeout=request_timeout,
             label=f"Measuring Panoramax z{MEASURE_ZOOM} tiles",
         )
-    _refuse_if_endpoint_moved(tile_list, empty_tiles, api_requests=api_requests)
+    # NO all-204 refusal here, unlike the screen (issue #407 review). A measure
+    # is a bounded follow-up over a few cities' z14 tiles, and a city that
+    # screened positive at z6 can genuinely hold nothing at z14 -- its upper
+    # bound came from a hexagon far larger than the city. So every tile
+    # answering 204 is a legitimate EXACT zero, and refusing it (with no
+    # override) would make the instrument unable to report the one answer it
+    # exists to sharpen. It prints rather than writes, so a wrong zero damages no
+    # series. A 404 still ends the pass in `_fetch_screen_tiles`, and tiles that
+    # answer with a body and decode nothing are still a renamed layer.
     _refuse_if_layer_missing(
         tile_list, empty_tiles, sum(len(h) for h in by_tile.values()), api_requests=api_requests
     )

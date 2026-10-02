@@ -265,3 +265,15 @@ def test_an_enrolled_pair_on_an_opt_in_channel_re_arms_normally(catalog, caplog)
 
     assert "clear schedule_state.last_success_at for kartaview" in caplog.text
     assert "re-arms nothing" not in caplog.text
+
+
+def test_purge_drops_the_purged_runs_early_refresh_mark_only(catalog):
+    """Issue #404: a purged run's mark goes with it; the clean run keeps its own."""
+    conn, data_dir, city_id, clean_run, tainted_run = catalog
+    for day in (date(2026, 7, 15), date(2026, 7, 16)):
+        db.record_early_refresh(
+            conn, city_id, "gsv", day, prior_success_at="2026-06-01", floor_days=30
+        )
+    [item] = find_runs_to_purge(conn, data_dir, "2026-07-16", "gsv")
+    purge_run(conn, data_dir, item["run"], item["reason"], execute=True)
+    assert db.get_early_refresh_keys(conn) == {(city_id, "gsv", "2026-07-15")}

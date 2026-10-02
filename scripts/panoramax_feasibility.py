@@ -16,6 +16,18 @@ largely-US catalog.** This script measures it and nothing else. There is no
 collector here, no scheduler channel, no credential, and no write of any kind
 to `data/`.
 
+KNOWN BLIND SPOT -- A RE-RUN REPEATS IT (issue #407). This script counts HTTP
+404 as the empty tile, and Panoramax's empty tile is actually 204 (measured
+2026-10-01; the meta-catalog never 404s a tile route). A 204 reaches
+`get_tile` as `.content == b""` and is tallied as a tile that ANSWERED, so
+`empty_tiles` here is a count of 404s and says nothing about how many tiles
+were empty. The logic is left as it was on purpose -- this is the instrument
+that produced docs/experiments/panoramax-feasibility.md, and changing it would
+make a re-run disagree with the record it is meant to reproduce. The decoded
+numbers are unaffected (an empty tile decodes to nothing whichever status
+carried it). For the classification production uses, see
+`download_panoramax._fetch_tile`.
+
 READ THIS BEFORE CHANGING THE INSTRUMENT. #316 proposed answering the question
 with the federated `/api/search` over a stratified sample. Probing it first (the
 standing rule) showed that cannot work, and the alternative is strictly better:
@@ -467,6 +479,11 @@ class Fetcher:
                     f"happened in docs/provider-access.md."
                 )
             if response.status_code == 404:
+                # PHASE-1 READING, KEPT FOR REPRODUCIBILITY AND WRONG (issue #407):
+                # the host's empty tile is 204, which falls through to
+                # raise_for_status below and is returned as an answering tile.
+                # See the module docstring's KNOWN BLIND SPOT.
+                #
                 # A tile the host has nothing for. Counted, never silent: a
                 # 404 that is really a URL mistake would otherwise read as a
                 # city with no imagery, which is exactly the wrong answer for a

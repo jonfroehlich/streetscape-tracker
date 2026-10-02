@@ -43,6 +43,8 @@ It is **local-only and never rsynced** — it lives in exactly one place, which 
 | `street_networks` | UNIQUE(city_id, network_type) | Frozen OSM networks (#103); GraphML lives unpublished under `data/osm_cache/` |
 | `street_walks` | UNIQUE(city_id, provider, network_type, run_date) | Road-walk collection runs (#99) — a second modality with its own unit of observation |
 | `street_walk_diffs` | UNIQUE(from_walk_id, to_walk_id) | Walk-to-walk street-coverage diffs (#101) |
+| `early_refreshes` | PK(city_id, channel, run_date) | Collections `run-due`'s fill phase took before the channel's cycle wall (#404, v18): `channel` is a SCHEDULER channel (`gsv_streets`, not `gsv`), `network_type` is set for a walk only, with the prior success and the floor admitted under |
+| `fill_attempts` | PK(city_id, run_date) | The nights the fill ATTEMPTED a city (#404, v18), written at admission: what finds an orphaned fill checkpoint whatever the city's channels then did |
 | `driving_plan_snapshots` | UNIQUE(fetch_date) | One row per fetch of Google's driving-plan feed (#176); the only family not city-keyed |
 | `driving_plan_entries` | FK → snapshot | The feed's rows, exploded per (record, district), stored verbatim |
 | `provider_screen` | PK(provider, city_id, screen_date) | Dated whole-catalog growth screen (#316) — **upper bounds**, never counts; a zero is conclusive, a positive number means "look closer" |
@@ -72,6 +74,11 @@ v17 added `runs.status_out_of_radius` and `runs.query_radius_m` (#367, see "GSV 
 The migration is named by content (`_migrate_add_query_radius_columns`) rather than by number and is idempotent per column.
 It runs on the v16 → v17 rung, so a v15 catalog takes #385's v16 backfill first and then this step, and it is also called unconditionally at the end of `init_schema`: both changes stamped v16 while in flight, so a catalog touched by either branch alone can read v16 or later without the columns and still gains them.
 
+v18 added the `early_refreshes` table (#404): one row per (city, channel, run date) that `run-due`'s fill phase collected before the channel's cycle wall, with the channel's prior success and the `fill_min_days` it was admitted under.
+Its column is `channel`, not `provider`, because it holds scheduler channel names — everywhere else in the catalog `provider` names an imagery provider — and it carries the walk's `network_type` (NULL for a grid channel), so a later join onto `street_walks` on (city, provider, network type, run date) needs no migration.
+It is purely additive (no migration function), so pre-#404 code reads a v18 catalog once `user_version` is set back to 17, ignoring the table.
+The aggregate surfaces it as `"early_refresh": true` on a GRID run's `runs[]` entry only, **present only when true**, so every other record is byte-identical and `cities.json.gz` stays schema v4; walk channels are recorded in the table but not yet published.
+`scripts/purge_tainted_runs.py` and `scripts/import_archival_scrapes.py` delete a run's mark with the run (`db.delete_early_refresh_for_run`).
 v19 added the `provider_screen_cells` table (#406; v18 is #411's `early_refreshes`): per screen date, how many distinct hexagons that pass read at each H3 resolution decoded from their ids, so the published screen describes its cells from a measurement rather than a constant.
 A NULL `cell_resolution` with a positive count is ids that are not H3 cells at all — counted, never dropped; a lone `(NULL, 0)` row is a pass that was measured and decoded no hexagon; and a screen date with no rows predates the table, meaning "not measured", never "no hexagons".
 Both v18 and v19 are `CREATE TABLE IF NOT EXISTS` with no migration function, and `init_schema` runs the whole `_SCHEMA` on every connect, so a catalog gains both tables whichever branch's build touched it first; the v19 rung is keyed on 17 and 18 so it is correct on a tree with or without the v18 rung.
@@ -155,7 +162,7 @@ The steps below are per (city, provider, run_date):
    It refuses a catalog of another schema version or one with no runs or walks, and it refuses `--execute` against a catalog that looks older than the disk, i.e. an unreferenced diff dated after its newest run or walk.
    An existing diff is re-derived under the current reader and definitions by `scripts/recompute_run_diffs.py` (#245), which updates the row in place so its `diff_id` — and with it which comparison the published change blocks treat as current — never moves; `recompute_run_stats.py` does not touch diffs.
 6. `json_summarizer.generate_city_metadata_summary_as_json()` — per-run JSON v2, ages pinned to `run_date` (deterministic); gsv runs include the `google_panos` block, other providers only `all_panos`.
-   Then `generate_aggregate_v2()` builds `cities.json.gz` (schema v3) from the DB: per city `{city_id, city, providers: {gsv: {latest, runs, change}, mapillary: {...}}}`, with per-provider global histograms.
+   Then `generate_aggregate_v2()` builds `cities.json.gz` (schema v4) from the DB: per city `{city_id, city, providers: {gsv: {latest, runs, change}, mapillary: {...}}}`, with per-provider global histograms.
 
 ## The filename contract
 
@@ -182,7 +189,7 @@ Every published JSON artifact carries a `schema_version`; the frontend's `adaptC
 | Artifact | File | Version |
 |---|---|---|
 | Per-run summary | `{base}.json.gz` | 2 |
-| Aggregate | `cities.json.gz` | 3 |
+| Aggregate | `cities.json.gz` | 4 |
 | Streetwalk manifest | `streetwalks.json.gz` | 1 |
 | Driving-plan summary | `driving_plan.json.gz` | 1 |
 | Provider screen | `provider_screen.json.gz` | 1 |

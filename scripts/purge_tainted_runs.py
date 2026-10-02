@@ -166,6 +166,9 @@ def purge_run(conn, data_dir: str, run, reason: str, execute: bool) -> None:
         conn.execute(
             "DELETE FROM run_diffs WHERE from_run_id = ? OR to_run_id = ?", (run_id, run_id)
         )
+        # Its early-refresh mark (issue #404) goes with it, or a re-collection on
+        # the same date would inherit a mark for a run that no longer exists.
+        db.delete_early_refresh_for_run(conn, run_id)
         conn.execute("DELETE FROM runs WHERE run_id = ?", (run_id,))
         # Re-arm scheduling: NULL last_success_at makes the city due again
         # (get_due_cities orders NULLS FIRST), so a missed re-collect can't
