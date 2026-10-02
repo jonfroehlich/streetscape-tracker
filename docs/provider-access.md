@@ -556,8 +556,9 @@ That is a materially better access position than KartaView's empty room, and it 
 
 **It has NOT been asked, and that is a decision rather than an oversight (2026-09-06).**
 Phase 2's collector shipped without a forum post, on the reading that CLAUDE.md's standing rule is to READ a provider's docs and community before changing how we call it — which phase 1's survey did, and which this section is the record of — while *posting* a question was #316's own addition rather than the rule's.
-What that leaves is a pace chosen from nothing the provider said, which is exactly why it is conservative: 30/min, half the Mapillary channels', against the one host here that publishes no number at all.
-Re-read both forums before any change that raises volume, rate or concurrency, and treat a reply there as outranking the number in `config/scheduler.toml`.
+What that left was a pace chosen from nothing the provider said, which is exactly why it started conservative: 30/min, three quarters of the Mapillary channels' 40, against the one host here that publishes no number at all.
+Production has since been raised to 60/min under a staged plan (#405, below); the collector's own default and the repo-default config stay at 30.
+Re-read both forums before any change that raises volume, rate or concurrency, and treat a reply there as outranking the number in `config/scheduler.makelab1.toml`.
 
 **Two questions still belong in a post, and the second is not a courtesy question.**
 What sustained rate the meta-catalog is comfortable with; and whether a picture's identity survives a sequence being migrated between instances.
@@ -568,7 +569,7 @@ Until that is answered it is a **known caveat on every Panoramax diff**, not a s
 Two things, both on the same IP and serialized against each other by one machine-wide `host_lock(HOST_PANORAMAX)`:
 
 - **Nightly collections** — a city's z15 tile census, p50 414 tiles for a leader city, max 3,132, on the two opt-in channels [#335](https://github.com/jonfroehlich/streetscape-tracker/issues/335) wired.
-  Both read ONE census per (city, bbox) and share it through the #290 cache, so an enrolled pair costs what the grid run alone costs, and the budget that bounds a night is the per-IP SUM of the two blocks (4,000 + 4,000 un-paired) rather than either figure alone.
+  Both read ONE census per (city, bbox) and share it through the #290 cache, so an enrolled pair costs what the grid run alone costs, and the budget that bounds a night is the per-IP SUM of the two blocks (8,000 + 8,000 un-paired in production since #405 stage 1; 4,000 + 4,000 before) rather than either figure alone.
   Enrolment is the rate this proceeds at: seed a handful of cities, not the ~20 leaders at once.
 - **The weekly screen** ([#316](https://github.com/jonfroehlich/streetscape-tracker/issues/316) phase 2) — **113 requests, once a week**, answering all 1,144 enabled cities off the v2 `grid` layer at z6.
   It is small enough that the interesting number is not its volume but its regularity: it fires on a fixed weekday at a fixed hour, so it is the one traffic shape here that a scorer could learn.
@@ -580,7 +581,9 @@ Two things, both on the same IP and serialized against each other by one machine
 Its requests land in the same `(date, provider)` ledger row a collection writes, so a budget gate reading `api_usage` sees the real total rather than the collection's share of it.
 
 **What the phase-1 study paced at, and why.** 30 requests/minute with jittered gaps at CV 0.6 — the same shifted-exponential shape [#292](https://github.com/jonfroehlich/streetscape-tracker/issues/292) put on the Mapillary channels, imported from `download_common.spaced_gap_seconds` rather than re-derived, so the two cannot drift into different distributions.
-That is roughly half the Mapillary channels' configured rate against a host with strictly less published guidance, which is the intended direction of the asymmetry.
+That was below the Mapillary channels' configured rate against a host with strictly less published guidance, which was the intended direction of the asymmetry for the probe and remains it for the collector's DEFAULT.
+Production reverses it since #405 stage 1 (60/min against Mapillary's 40).
+That is acceptable because the two are separate hosts with separate limits, and the #405 evidence below is about this host alone: no limiter in its source, and complaints only about bursts two orders of magnitude faster.
 The probe calls `refuse_on_collection_host()`, so it can only run from a laptop: a per-IP limit found from makelab2 takes out the nightly batch, and both prior bans landed exactly that way.
 It treats **403 and 429 as stop, never as retry** — a refusal ends the run with what it has measured, since finding this host's limit is emphatically not the study's question.
 
@@ -595,11 +598,81 @@ And **`filter=field_of_view=360` returns none of the EXIF-less pictures** (17 of
 The tile layers are the answer to all three: they carry a `type` field with no absent state, and they are the instrument [`experiments/panoramax-feasibility.md`](experiments/panoramax-feasibility.md) actually uses.
 
 **What the COLLECTOR does, as shipped (#316 phase 2).**
-Same 30/min and the same CV-0.6 jitter as the probe, from `download_common.spaced_gap_seconds` rather than re-derived, and behind `host_lock(HOST_PANORAMAX)` — the fourth locked host, exit codes **84 blocked / 85 busy**.
+Same 30/min default (production: 60/min since #405 stage 1, below) and the same CV-0.6 jitter as the probe, from `download_common.spaced_gap_seconds` rather than re-derived, and behind `host_lock(HOST_PANORAMAX)` — the fourth locked host, exit codes **84 blocked / 85 busy**.
 **403 and 429 are `HostBlockedError` at the first request**, which is a stronger reading than the other two providers get and follows from there being no credential: on Mapillary and KartaView a 403 is a rejected token and is deliberately scoped to the key, while here it can only be the IP.
 **A 404 is an empty tile rather than a failure** — measured, not assumed: 0 empty tiles across 3,321 phase-1 requests including 20 cities holding nothing, because an empty area answers 200 with no layer.
 The guard that reading needs is that **a lattice where EVERY tile 404s is refused**, since that is what a moved endpoint looks like and the alternative is publishing a city as having lost all its imagery.
 Unlike the probe there is no `refuse_on_collection_host()`: a collector's whole purpose is to run on the collection host, so what protects the nightly batch is the pace, the host lock and the fact that the channel is not scheduled yet.
+
+**The staged raise (issue #405; stage 1 configured 2026-10-01, live from its deploy).**
+On 2026-10-01 Panoramax was the one budget-bound channel: the grid channel spent its whole 4,000 and the walk 2,651, three cities were deferred for budget, and Salt Lake City launched capped at 409 and paused (exit 83), with only 20 cities enrolled and 41 more tracked cities screening positive at ≥1,000 360° pictures.
+What a second read of docs, source and forums found that day:
+
+- **Documented: still nothing** — no limit, no 429 contract, no `Retry-After` and no fair-use text in the OpenAPI spec, docs.panoramax.fr, the API landing page or the OSM wiki.
+- **Measured: tile caching** — tiles carry `Cache-Control: public, max-age=86400` at z6 and `max-age=3600` at z15, so a tile is never worth re-fetching inside its window.
+- **Reported by the maintainer, and about BURSTS** — forum.geocommuns.fr thread 3298 (2026-07-02) calls several thousand requests at once "très violent" and says rate-limiting has not been needed yet but will come because of bots.
+  forum.openstreetmap.fr thread 44813 (2026-07-18) describes a 150–200 req/s job of 80,000+ requests as ~25% of the meta-catalog's traffic, calls a one-off ~900-request query fine, and offers the weekly GeoParquet dumps at `https://api.panoramax.xyz/data/` as the bulk path.
+  **"~320k requests/day" is our inference, not a reported figure**: it reads 80,000 / 0.25 as one day, and the post names no window.
+- **Source** — `api.panoramax.xyz` is `gitlab.com/panoramax/server/meta-catalog`, a Rust/actix-web service whose `main.rs` wires no rate-limit, concurrency or timeout middleware; whatever limit exists lives in an unpublished nginx in front of it.
+
+Against that assumed 320k/day, the per-IP sum of both channels' budgets is at most ~2.5% at stage 0 (8,000), ~5% at stage 1 (16,000) and ~7.5% at stage 2 (24,000), beside the 25% the maintainer complained about.
+Only the 150–200 req/s incident has a rate, and stage 1's 1 req/s is 150–200× below it; the "several thousand at once" report is a burst with no stated rate, and jittered pacing under one host lock never bursts.
+So the raise proceeds in stages, both channels together, with the forum deliberately not asked:
+
+| Stage | `max_requests_per_minute` | `daily_request_budget` (each channel) | First UTC night (`--since`) | Gate to the next stage |
+|---|---|---|---|---|
+| 0 | 30 | 4,000 | — | |
+| **1 (current)** | **60** | **8,000** | *the first night after the deploy — fill in when it goes live* | **7 consecutive clean qualifying nights** under the gate rule below |
+| 2 | 90 | 12,000 | | another 7, same rule |
+
+The fourth column is a DEPLOY fact, not a merge fact, so the repo cannot derive it: whoever deploys a stage writes its first UTC night here, and it is the `--since` the gate check below is run with.
+
+- **Each stage is its own PR** to `config/scheduler.makelab1.toml`, with its date and evidence in the comment block, and the pinning test in `tests/test_scheduler.py` moves with it.
+- **The trip wire is the existing latch**: 403/429/redirect is a `HostBlockedError` (exit 84) at the first request.
+  A trip **reverts to the previous stage** and the night is recorded in this section.
+- **The gate rule** (decided 2026-10-02; #405 said only "no 5xx cluster", so this is what that phrase means here).
+  A **night** is one UTC date, and its **requests** are the `api_usage` rows for `panoramax` + `panoramax_streets` on that date (both channels share one per-IP host, and the weekly screen writes into the grid row too).
+  Its **retried 5xx** are the `Panoramax tile retry: HTTP 5xx on try …` lines, one per retried request; its **5xx give-ups** are `Panoramax tile retry gave up: HTTP 5xx` lines; timeouts, connection errors and retried 4xx (retries and give-ups alike) are counted and printed but do not gate.
+  - **REVERT** to the previous stage, at once, on any per-IP refusal (an `exited 84` child, or a Panoramax 403/429/redirect/error-page message) — #405's original trip wire.
+    Also REVERT when retried 5xx exceed **10%** of the night's requests (and 10 in absolute terms), or on a **second HOLD within 7 nights** of the first.
+  - **HOLD** — the stage stays, and the clean streak resets to 0 — on any **5xx give-up**, or when retried 5xx exceed **max(10, 1% of requests)**.
+  - **UNKNOWN** when the ledger shows a qualifying night (≥ 1,000 requests) but no `collect_*_panoramax*` child log exists for it: the night cannot be judged, so it resets the streak and is flagged rather than read as clean.
+  - **PROVISIONAL** for the current UTC date, whose batch may still be running: shown, never judged clean or held (a refusal still reverts).
+  - Otherwise the night is **CLEAN**; but it **qualifies** toward the seven only at **≥ 1,000 requests**, and a quieter night neither advances nor resets the streak.
+  - **ADVANCE** after **7 consecutive clean qualifying nights**.
+- **Why those numbers.**
+  - *Our own baseline* — the only measured Panoramax error data in the repo is phase 1 of #316 ([`experiments/panoramax-feasibility.md`](experiments/panoramax-feasibility.md), from a laptop IP at 30/min, September 2026), whose fetcher counted every attempt: the `screen` stage spent exactly its 113 tiles and the `detail` stage exactly its 3,001, so **0 retries in 3,114 requests** (the 3,321-request `measure` stage cannot be split, having reused rows).
+    By the rule of three (Hanley & Lippman-Hand, *JAMA* 1983) that bounds a healthy retry rate at **≈ 0.1%** (95% upper bound, 3 / 3,114).
+    **There is no production baseline**: before this gate's log line, prod retries were invisible, and nobody has compared prod's `runs.api_requests` with tile counts; stage 1's first nights are the first production measurement, and they should be read as such.
+  - *1% to HOLD* is ten times that bound, so ordinary noise does not hold a stage, and an order of magnitude below the **10% per-client retry budget** in Google's SRE book ("a request will only be retried as long as this ratio is below 10%", [Handling Overload](https://sre.google/sre-book/handling-overload/)) — so we stop *advancing* long before our retries reach what that guidance treats as load amplification.
+    This is **our adaptation**, not the book's mechanism: there the 10% is a budget a client ENFORCES at request time, paired with a per-request budget of three attempts ("If a request has already failed three times, we let the failure bubble up"), whereas we measure the ratio after the fact as a gate and `_fetch_tile` allows **five** attempts (`TILE_MAX_TRIES`), not three.
+    Five is deliberately not changed here; it means one failing tile can cost up to four retries rather than two, which is part of why the HOLD line sits a decade below the book's number.
+  - *10% to REVERT* is that budget's number used as a ceiling: past it our retries add ≥ 10% to the load of a server that is already failing, and the maintainer measures clients by their share of the catalog's load (#405's 25% complaint).
+  - *The floor of 10, and 1,000 requests to qualify*, are the same number seen twice: at 1,000 requests 1% is 10, and below that a ratio says nothing. At the baseline bound a 1,000-request night expects ~1 retried 5xx, and P(more than 10) under Poisson(1) is ~10⁻⁸.
+    **That figure is optimistic**: Poisson assumes independent failures, and 5xx come in bursts (one bad minute fails every tile in flight, each then retried up to four times), so the real chance of a healthy-but-unlucky night crossing 10 is higher — still small, and a burst that big is worth a HOLD anyway.
+  - *Any 5xx give-up holds*: a give-up is `TILE_MAX_TRIES` (5) consecutive failures of one tile across up to `_TILE_MAX_TIME_S` (120 s) of exponential backoff, which is sustained server trouble rather than a blip — and it leaves a hole the resume must re-probe.
+    The per-request cap is the SRE book's "Limit retries per request" ([Addressing Cascading Failures](https://sre.google/sre-book/addressing-cascading-failures/)) in spirit, at five attempts rather than the three its other chapter uses.
+  - *A second HOLD within 7 nights reverts*: a hold that recurs inside one gate window is a trend, not a blip, and stage 0 is the pace with no complaint on record.
+- **How an operator checks it — one command, read-only, no network, run on the production host:**
+  `python scripts/panoramax_gate_check.py --config config/scheduler.makelab1.toml --since <first UTC night of this stage>` prints every night from `--since` to yesterday (UTC; `--end` moves it, and today is shown only as PROVISIONAL), each night's requests, retried and given-up 5xx, other retries and give-ups, refusals and child-log count, a per-night verdict and the stage verdict.
+  It exits **1 if ANY night since `--since` reverts** (a revert is acted on by a config change and a new `--since`, so it never needs to be "outgrown"), **3** if none reverts but a night is UNKNOWN, and 0 otherwise.
+  `--since` is required so a previous stage's clean nights can never advance this one.
+  It reads the per-attempt child logs `logs/collect_*_panoramax*_<date>.log` (named for the UTC run date, so every line counts) and the scheduler log's OWN records — never the copy of a failed child's last 25 lines that `_run_collection_subprocess` appends to its error, which would count those retries twice.
+  The scheduler log's timestamps are host-LOCAL and it rotates at local midnight, while the ledger (`_record_screen_spend` included — the screen fires Monday 18:00 Pacific, which is Tuesday in UTC) is keyed by UTC date, so each record is converted to its UTC date in the host's zone (`--log-tz` overrides it) and both local rotations a UTC night spans are read.
+  By hand, the 5xx count is `grep -h 'Panoramax tile retry: HTTP 5' logs/collect_*_panoramax*_<date>.log | wc -l`.
+  That log line (`download_panoramax.TILE_RETRY_LOG_PHRASE`, a backoff `on_backoff`/`on_giveup` handler on `_fetch_tile`) exists for this gate: before it a 5xx that recovered on its next try left no trace anywhere.
+  A cross-check that needs no log: for a crawl that completed in one uncapped night, `runs.api_requests` counts every attempt, so its excess over the lattice's tile count is the number of retries.
+- **Jitter stays 0.6 and the host lock stays.**
+- **The `User-Agent` names a contact address since #405** (Jon's choice): `StreetscapeTracker/<version> (+https://github.com/jonfroehlich/streetscape-tracker; sidewalk@cs.uw.edu) aiohttp/<version>`.
+  The shape is RFC 9110's product token (no spaces, hence `StreetscapeTracker`) plus a comment, laid out the way the [Wikimedia User-Agent policy](https://foundation.wikimedia.org/wiki/Policy:Wikimedia_Foundation_User-Agent_Policy) asks — `<client>/<version> (<contact>) <library>/<version>` — and OSM's own [Nominatim policy](https://operations.osmfoundation.org/policies/nominatim/) refuses stock library agents.
+  It is the Panoramax collector's and screen's alone; the Nominatim and Overpass agents are separate constants and were not changed.
+- **What it changes downstream.**
+  `_tile_census_timeout_seconds` divides by the configured rate, so at 60/min the richest enrollable city (3,132 tiles) derives ~108 min, under the 180-minute floor that now times every city of 5,440 tiles or fewer.
+  That floor affords 8,160 requests at this pace, just above the 8,000 budget, so a capped launch is sized by the budget rather than the clock — **but only when the child's timeout is the unclamped floor**: `_sweep_launch_plan` prices the cap from the deadline-clamped timeout, and the Panoramax pair ranks last, so late in a long night the clock sizes the cap instead.
+  The per-IP sum is 16,000 un-paired, ~5.6 h of the host lock at the 0.8 achieved fraction.
+  The weekly growth screen paces from the same block, so it runs twice as fast too.
+- **Enrolment of the 41 screen-positive tracked cities proceeds in tranches only after stage 1 holds.**
+- Whole-catalog screening should move to the weekly parquet dump for 0 API requests; that is a separate ticket.
 
 **One host, not twenty-five.** `api.panoramax.xyz` is a meta-catalog that harvests metadata from every registered instance (23 on 2026-09-04), so a collector would query one host regardless of how many instances join — one `host_lock.py` entry, no per-instance fan-out, and no per-instance rate question.
 The corollary is that all of our load lands on one volunteer-run endpoint rather than being spread across the federation, which argues for the conservative end of any pacing range rather than against it.

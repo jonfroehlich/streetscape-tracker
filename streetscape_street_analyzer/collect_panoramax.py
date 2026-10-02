@@ -29,7 +29,9 @@ wrongly:
     parameter, and ``config.load_config("panoramax_streets")`` returns
     ``access_token=None`` rather than raising. A missing key cannot be the
     reason this walk fails.
-  * **Pacing is the lowest tile rate in the repo** (30/min). Panoramax documents
+  * **The DEFAULT pace is the lowest tile rate in the repo** (30/min; production
+    runs 60/min since #405 stage 1, faster than Mapillary's 40 -- separate hosts,
+    and #405's evidence is about this one). Panoramax documents
     no rate limit and returns no ``X-RateLimit-*``/``Retry-After`` header, so the
     figure is a conservative default rather than a measured ceiling — see
     CLAUDE.md's provider-access rule before changing it. It is half the

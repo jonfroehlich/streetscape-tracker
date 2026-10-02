@@ -118,6 +118,7 @@ Since the groups derive from the screen, a corrected screen meant a corrected dr
 
 30 requests/minute with jittered gaps at CV 0.6, using [#292](https://github.com/jonfroehlich/streetscape-tracker/issues/292)'s shifted-exponential formula imported from `download_common.spaced_gap_seconds` rather than re-derived.
 That is roughly half the Mapillary channels' configured rate, against a host with strictly less published guidance — the intended direction of the asymmetry.
+(Production later reversed it, 60/min against Mapillary's 40, under #405's staged raise; see [`../provider-access.md`](../provider-access.md).)
 `refuse_on_collection_host()` keeps it off makelab\*, and a 403 or 429 ends the run rather than being retried into; neither occurred.
 No rate limit is documented anywhere found and no rate-limit headers come back; see [`provider-access.md`](../provider-access.md) for the full access survey.
 The whole study spent 113 + 3,321 + 60 + 79 + 3,001 requests over two afternoons, plus a 60-request re-run of the `access` stage on 2026-09-06 once its `datetime` probe was corrected (finding 5).

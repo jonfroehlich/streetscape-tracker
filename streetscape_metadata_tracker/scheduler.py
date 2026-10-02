@@ -701,7 +701,10 @@ CHANNEL_RESUMABLE: dict[str, bool] = {
     # fraction (0.8) and the headroom (1.5) on top, so that city derives
     # 3,132 / (30 x 0.8) x 60 = 7,830 s, x 1.5 + 600 = 12,345 s ~ 206 min, which
     # is ABOVE the floor. The derivation binds TODAY for any city over ~2,720
-    # tiles, not only after a grid is re-registered larger.
+    # tiles, not only after a grid is re-registered larger. (That is at the
+    # collector's default 30/min. Production runs 60/min since #405 stage 1,
+    # where the threshold is ~5,440 tiles -- and a clamped launch still needs
+    # the cap whatever the rate, per the next paragraph.)
     #
     # And the floor is not what a real night hands a child anyway: the batch
     # deadline CLAMPS the timeout, and these channels rank last, so they are the
@@ -742,8 +745,9 @@ def is_resumable_channel(name: str) -> bool:
 # so being cut short costs a night rather than the crawl. Within the exception
 # the rule applies again -- kartaview's sweep runs to hours on a metro
 # (Singapore ~9,974 requests at 16/min) where the richest Panoramax city
-# measures ~3,132 tiles, ~104 min at 30/min (both RAW PACE, which is the right
-# basis for comparing two channels' expense; the derived timeouts are longer)
+# measures ~3,132 tiles, ~104 min at the default 30/min, ~52 min at prod's 60
+# since #405 (all RAW PACE, which is the right basis for comparing two
+# channels' expense; the derived timeouts are longer)
 # -- so kartaview is the one that would starve everything behind it and keeps
 # the later slot. Their adjacency
 # to each other is the same #290 pairing argument as KartaView's.
@@ -2256,6 +2260,12 @@ def _tile_census_timeout_seconds(
     this docstring and four comments did -- compares a raw pace against a
     derived ceiling and gets the live/latent question backwards.
 
+    All of that is at the collector's DEFAULT 30/min. Production runs 60/min
+    since #405 stage 1, and the derivation halves with the configured rate:
+    the max city derives ~108 min there, the floor times every enrolled city,
+    and the threshold moves to ~5,440 tiles (pinned by
+    ``test_production_panoramax_stage_one_derived_figures``).
+
     That it would ALSO be needed after a re-registration is the weaker half of
     the argument, kept because it is the reason ``city_timeout_seconds`` gives
     about Anchorage: a frozen grid can be re-registered larger at any time, and
@@ -2684,8 +2694,12 @@ def city_timeout_estimate_seconds(
     # so the same bbox is up to ~4x the tiles at half the rate. The richest
     # enrollable city measures ~3,132 tiles, and its DERIVED timeout is ~206 min
     # (~104 min of raw pacing, then / 0.8 and x 1.5 plus 600 s) against the
-    # 180-minute floor — so this arm is LIVE today rather than latent against a
-    # future re-registration. Falling through to the flat floor instead — which is what an
+    # 180-minute floor — so this arm is LIVE at the default pace rather than
+    # latent against a future re-registration. (Production's 60/min since #405
+    # stage 1 halves that to ~108 min, under the floor, so there it is latent
+    # until a city passes ~5,440 tiles -- the arm stays for the same reason the
+    # Mapillary one does, and because the configured rate can move again.)
+    # Falling through to the flat floor instead — which is what an
     # unlisted channel does, and what this arm's absence meant while
     # `panoramax` sat in UNWIRED_CHANNELS — is the failure `_kartaview_timeout_
     # seconds` was written for, reached by the other route: a SIGKILLed child
@@ -3970,8 +3984,9 @@ def _enrolment_cost_note(conn, cfg: SchedulerConfig, city: db.CityRow, channel: 
     third and fourth opt-in channels would have enrolled in silence — the
     operator reading this line is the gate #248's risk 1 names, and a silent
     enrolment removes it exactly where the estimate is largest (the richest
-    Panoramax city measures ~3,132 z15 tiles, ~104 min of raw pacing at 30/min
-    and a ~206-minute derived timeout).
+    Panoramax city measures ~3,132 z15 tiles, ~104 min of raw pacing at the
+    default 30/min and a ~206-minute derived timeout; at production's 60/min
+    since #405 stage 1, ~52 min and ~108 min).
 
     Empty unless the channel is BOTH opt-in and priced as one crawl. Opt-in
     because this is a note about a decision an operator is making — a

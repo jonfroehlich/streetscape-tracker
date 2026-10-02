@@ -490,7 +490,8 @@ The rest of the run schema is deliberately thin — `account_id`, `sequence_id`,
 An MVT feature id is numbered per tile, so the fallback mints id `0` in every tile of the city, and `dedupe_census` factorizes on `id`: those collisions would silently collapse distinct pictures into one across the whole city.
 A picture the layer does not name is dropped instead.
 
-**Pacing is 30/min with jitter 0.6**, half the Mapillary channels' configured rate against a host with strictly less published guidance — nothing documents a limit anywhere found, and no `X-RateLimit-*` or `Retry-After` header comes back.
+**Pacing defaults to 30/min with jitter 0.6** against a host with strictly less published guidance than Mapillary — nothing documents a limit anywhere found, and no `X-RateLimit-*` or `Retry-After` header comes back.
+Production runs 60/min as stage 1 of #405's staged raise; the stages and their gates are in [`provider-access.md`](provider-access.md).
 The jitter is adopted before any incident rather than after three; see [`provider-access.md`](provider-access.md) for the full access survey and for what has and has not been asked.
 
 **Collectable by hand, and scheduled since #335.**
