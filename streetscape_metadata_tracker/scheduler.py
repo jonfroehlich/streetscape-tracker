@@ -4671,9 +4671,9 @@ def _screen_one_city(
     * the catalog-collapse check ("zero everywhere, but cities have screened
       positive before") is a whole-catalog signal — one city screening zero is
       the ordinary answer for 64% of the catalog (#316), so it is not applied;
-    * the renamed-layer guard stays on, so a genuinely empty city spanning two
-      or more tiles that answer with no hexagon at all reads as a FAILED screen
-      rather than a zero. That enrols nobody, which is where every doubt about
+    * the empty-tile and renamed-layer guards stay on, so a genuinely empty
+      city spanning two or more tiles that answer 204 (or 200 with no hexagon
+      at all) reads as a FAILED screen rather than a zero (issue #407). That enrols nobody, which is where every doubt about
       this instrument must land: never enrol on "unknown".
 
     A busy host lock is reported, not retried (the lock is taken with
@@ -5197,7 +5197,9 @@ def cmd_screen_provider(
     if not positive and not allow_collapse:
         # THE THIRD AND LAST COLLAPSE CHECK, and the only one that can see a
         # renamed COUNTER. Two structural guards already ran inside the screen
-        # and neither needs any history: every tile answering 404 is a moved
+        # and neither needs any history: a pass in which every tile answered 204
+        # (or one that met a 404, which ends the pass outright, issue #407) is a
+        # meta-catalog serving nothing or a moved
         # endpoint, and tiles answering with a body from which not one hexagon
         # decodes is a renamed LAYER. What neither can see is a schema change
         # that keeps the layer and the features while renaming or re-typing the

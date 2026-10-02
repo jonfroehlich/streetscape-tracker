@@ -316,6 +316,16 @@ def parse_args():
              consumers behind it get the fresher census.""",
     )
     run_group.add_argument(
+        "--allow-panoramax-collapse",
+        action="store_true",
+        help="""Publish a Panoramax census that holds NO imagery even though
+             this city's previous Panoramax run held some (issue #407). Without
+             it such a run is refused (exit 1), because a meta-catalog that
+             answers 204 for every tile looks exactly like a city that lost
+             every picture. Pass it only after checking the endpoint by hand;
+             the accepted empty run then becomes the series' new baseline.""",
+    )
+    run_group.add_argument(
         "--min-days-since-last-run",
         type=int,
         default=80,
@@ -995,6 +1005,15 @@ async def _collect_one_run(conn, args, city_row, run_date, provider, config, vis
             # unauthenticated, so `config` here is the credential-free arm's
             # {"access_token": None} and the downloader takes no such parameter
             # (issue #316).
+            #
+            # THE COLLAPSE GUARD'S HISTORY (issue #407 review) is read here,
+            # because only the caller has a catalog: an empty census is refused
+            # when the previous run of THIS series held imagery. Strictly before
+            # run_date, so a --force re-run of the same date compares against
+            # the run before it rather than against the row it is replacing.
+            refuse_empty_census = not args.allow_panoramax_collapse and db.run_held_imagery(
+                db.get_previous_run(conn, city_row.city_id, run_date, provider="panoramax")
+            )
             dict_results = await download_panoramax_metadata_async(
                 city_name=city_row.display_name,
                 center_lat=city_row.center_lat,
@@ -1015,6 +1034,7 @@ async def _collect_one_run(conn, args, city_row, run_date, provider, config, vis
                 # spend belongs to and refuses to resume another's.
                 checkpoint_channel=provider,
                 census_cache=census_cache,
+                refuse_empty_census=refuse_empty_census,
             )
         elif provider == "gsv":
             logging.info(

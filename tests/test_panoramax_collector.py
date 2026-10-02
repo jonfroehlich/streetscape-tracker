@@ -567,7 +567,7 @@ def test_the_crawl_store_paths_are_channel_keyed_date_free_and_outside_data(tmp_
 # Panoramax's crawl is Mapillary's, so the cap is the same code reached through
 # a different module -- which is exactly why it is tested here rather than
 # assumed from the Mapillary suite. The two censuses have diverged before (the
-# zoom, the 404-is-empty rule, `type` being two-state), and a cap that raised
+# zoom, the empty-tile status rule, `type` being two-state), and a cap that raised
 # the wrong exception or promoted a partial entry would be silent in both.
 #
 # Nothing SCHEDULES Panoramax yet -- CHANNEL_RESUMABLE keeps it False because no

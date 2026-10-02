@@ -286,6 +286,12 @@ Per the standing rule that question gets *asked* on the Panoramax forum before a
 That is the Unix epoch, not a capture date, and the tile `ts` carries it verbatim; a collector reads capture dates through `analysis.dated_unique_panos`' provider floor like every other provider's, and this is Panoramax's first known sentinel.
 The other 1,345,141 pictures seen carry plausible dates.
 
+**This study's instrument could not see an empty tile, because it counted the wrong status** ([#407](https://github.com/jonfroehlich/streetscape-tracker/issues/407)).
+`scripts/panoramax_feasibility.py` counts a 404 as an empty tile, and an empty tile actually answers **204**: on 2026-10-01 a z15 tile over the open Pacific answered 204 with 0 bytes while one over downtown Des Moines answered 200 with 2,123,633 bytes, the meta-catalog's source returns 204 for an empty tile and never 404, and all 235 z6 tiles of a world screen that day answered 201 × 200, 34 × 204, 0 × 404.
+So "0 empty tiles across 3,321 requests" is a count of **404s**, not of empty tiles — a 204 went through `requests`' `.content` as `b""` and was tallied as a tile that answered — and how many 204s this study received is not recorded in its committed metrics.
+Those figures come from the laptop probe recorded in #407; no committed JSON in this repo backs them, so they are quoted as that issue's measurement rather than as this study's.
+No number above moves: an empty tile decodes to no pictures and no hexagons whichever status carried it, which is why the collector got it right by accident.
+
 **Coverage is a moving target on a growing platform.**
 Panoramax gained instances and pictures throughout 2026 — the newest hex date in Paris, Boise and Denver is within days of the run — so these numbers date quickly in the upward direction.
 A re-run is 113 requests for the screen; that is the number to re-check before treating any verdict here as still current.

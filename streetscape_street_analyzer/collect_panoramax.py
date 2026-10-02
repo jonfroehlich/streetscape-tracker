@@ -155,6 +155,7 @@ async def collect_panoramax_street_samples_async(
     checkpoint_channel: str | None = None,
     checkpoint_variant: str | None = None,
     census_cache: CensusCache | None = None,
+    refuse_empty_census: bool = False,
 ) -> dict[str, Any]:
     """
     Collect Panoramax street samples for a city and write the snapshot csv.gz.
@@ -229,6 +230,10 @@ async def collect_panoramax_street_samples_async(
         checkpoint_channel=checkpoint_channel,
         checkpoint_variant=checkpoint_variant,
         census_cache=census_cache,
+        # The walk series' own history decides this (collect.py), and it is
+        # forwarded to the shared census untouched: the walk reaches the same
+        # fetch, so it gets the same collapse guard (issue #407 review).
+        refuse_empty_census=refuse_empty_census,
     )
     # A reused census is stamped with when the provider was observed, a fresh
     # one with this process's clock; see checkpointing.observation_timestamp.
@@ -263,7 +268,8 @@ async def collect_panoramax_street_samples_async(
             census,
             match_dist_m,
             query_timestamp,
-            # A tile nothing came back for leaves its samples UNKNOWN rather
+            # A tile nothing came back for leaves its samples REQUEST_FAILED
+            # (census_walk's unmeasured status) rather
             # than empty, exactly as this provider's GRID run does and as the
             # Mapillary (#259) and KartaView (#258) walks do; a clean fetch
             # passes None and pays nothing. Publishing an unswept sample as
@@ -271,10 +277,14 @@ async def collect_panoramax_street_samples_async(
             # dated snapshot, and no later reader can tell it from a measured
             # one.
             #
-            # Panoramax makes the distinction sharper than either sibling: a 404
-            # is an EMPTY TILE here, not a failure, so a tile that is genuinely
-            # missing imagery never reaches this list — everything in it is
-            # ground the fetch really did not see.
+            # Panoramax makes the distinction sharper than either sibling: an
+            # empty tile answers 204 here (issue #407), a settled answer rather
+            # than a failure, so a tile that is genuinely missing imagery never
+            # reaches this list — everything in it is ground the fetch really
+            # did not see. A 404 is the opposite case: not an empty tile but an
+            # unrouted URL, so it IS in this list and its samples publish
+            # REQUEST_FAILED; a whole lattice of them is refused by the shared census
+            # before any row is built.
             unmeasured_mask=(
                 (lambda lats, lons: _points_in_tiles(lats, lons, failed_tiles))
                 if failed_tiles

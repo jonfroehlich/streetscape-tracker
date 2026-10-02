@@ -109,7 +109,7 @@ GSV emits no FLAT_ONLY, so its any-value equals its 360° value by construction;
 Publishing an unswept sample as `ZERO_RESULTS` records an absence nobody observed into an immutable dated snapshot, and no later reader can tell it from a measured one.
 What this buys is a **legible row**, and deliberately nothing more — see the two consequences below before reading it as a coverage fix.
 The seam is `census_walk.build_streetwalk_rows`' `unmeasured_mask` hook, and each provider passes the SAME helper its own grid run masks with — KartaView's `_points_in_cells` over `failed_cells` (#258), Mapillary's `_points_in_tiles` over `failed_tiles` (#259), Panoramax's `_points_in_tiles` over its own `failed_tiles` (#331) — so a city's walk and its grid run cannot disagree about the same unswept ground.
-Panoramax makes the distinction sharper than either sibling: **a 404 there is an EMPTY TILE, not a failure** (an empty area answers 200 with no layer), so a tile genuinely holding no imagery never enters `failed_tiles` — everything in that list is ground the fetch really did not see.
+Panoramax makes the distinction sharper than either sibling: **an empty tile there answers 204, an answer and not a failure**, so a tile genuinely holding no imagery never enters `failed_tiles`, while a 404 — an unrouted URL on a host that never 404s a tile route — does (#407); everything in that list is ground the fetch really did not see.
 The mask applies only to samples that matched **nothing**: one that found imagery within `--match-dist` was measured by construction, whatever cell it sits in, so a matched sample inside a failed tile stays matched.
 GSV needs no hook at all, because it queries each sample directly and a failed sample already carries its own `REQUEST_FAILED`.
 
