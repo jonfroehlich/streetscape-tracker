@@ -11,7 +11,7 @@ An edit that changes a rule belongs in both files; anything written since the sp
 **Added after the 2026-08-22 split** (#304, PR #399 review, #412).
 
 Claude runs essentially every hand run and catch-up on prod (makelab2), so this checklist is the mitigation for the one overlap nothing in the code refuses.
-Since #304 each GSV process actually reaches its configured 48,000/min, so a hand run on the **same GSV key** as a nightly lane that is collecting presents ~96,000/min against that project's 60,000/min quota.
+Since #304 each GSV process actually reaches its configured pace, so a hand run on the **same GSV key** as a nightly lane that is collecting presents more than that project's 60,000/min quota: ~72,000/min for a direct-CLI run at its 24,000 default beside the lane's 48,000, and ~96,000/min for a scheduler-path run, which paces at the lane's own 48,000.
 The nightly `gsv` and `gsv_streets` lanes never collide with each other: they use different keys in separate Cloud projects.
 The decision taken is **no lock and no shared pacer**: hand runs follow this checklist, and #412 tracks making `run-due` refuse to start beside another `run-due`.
 The mechanism, the realistic pairs and the rejected options are in [`provider-access.md`](provider-access.md) (the #304 section); this section is only the procedure.
@@ -45,7 +45,8 @@ echo "== collection children in flight (empty = none)"
 ps -eo pid=,etime=,args= | awk '/streetscape_tracker[.]py|streetscape_street_analyzer[.]collect/'
 
 echo "== deploys, repair scripts, other scripts (empty = none)"
-ps -eo pid=,etime=,args= | awk '/scripts[/][A-Za-z0-9_]+[.]py|git[ ](pull|fetch|merge|checkout|rebase|reset)|uv[ ]pip[ ]sync/'
+ps -eo pid=,etime=,args= \
+  | awk '/scripts\/[A-Za-z0-9_]+[.]py|deploy_makelab1[.]sh|git[ ]([-]C[ ][^ ]+[ ])?(pull|fetch|merge|checkout|rebase|reset)|uv[ ]pip[ ]sync/'
 
 echo "== scheduler log: latest launches, then the tail"
 grep -E 'Collecting ' "$LOG" | tail -n 8
@@ -53,7 +54,7 @@ tail -n 5 "$LOG"
 
 echo "== budgets (per UTC date) and per-IP host windows"
 "$PY" -m streetscape_metadata_tracker.scheduler --config "$CFG" status 2>&1 \
-  | grep -E 'budget today:|rolling 24 h:|due today'
+  | grep -E 'budget today:|rolling 24 h:|due today|Error|Traceback'
 
 echo "== GSV paces and the batch deadline, from the deployed config"
 "$PY" - "$CFG" <<'PYEOF'
@@ -66,9 +67,13 @@ PYEOF
 EOF
 ```
 
-The `awk` patterns spell `.`, `/` and spaces as `[.]`, `[/]` and `[ ]` so they cannot match awk's own command line, which a plain `ps | grep` does.
-The run-due test is the same `ps -eo pid=,args=` match `scheduler._run_due_in_flight()` applies for `import-bundle`, the prefreeze and the two repair scripts.
-**Do not use `pgrep -f "scheduler run-due"`**: the unit's command line is `-m streetscape_metadata_tracker.scheduler --config … run-due`, so that pattern never matches it and reports idle mid-batch (`deploy/README.md`'s `pgrep -af 'scheduler .*run-due'` does match).
+The `awk` patterns spell `.`, `/`, `-` and spaces as `[.]`, `\/`, `[-]` and `[ ]` so they cannot match awk's own command line, which a plain `ps | grep` does.
+The slash is escaped rather than bracketed because `[/]` inside an awk regex literal is a syntax error in BSD awk ("nonterminated character class"), though mawk and gawk accept it.
+The git alternative allows `-C <dir>` because `deploy_makelab1.sh` runs `git -C "$REPO_DIR" pull --ff-only`, which a bare `git pull` pattern misses; the script's own name covers its later `rsync` of `www/`.
+The run-due test is the same two-substring test (`streetscape_metadata_tracker.scheduler` and `run-due`) over `ps -eo pid=,args=` that `scheduler._run_due_in_flight()` applies for `import-bundle`, the prefreeze and the two repair scripts.
+The status call keeps `Error` and `Traceback` lines, because a filter for the budget lines alone turns a crashed `status` into empty output.
+**Do not use `pgrep -f "scheduler run-due"`**: the unit's command line is `-m streetscape_metadata_tracker.scheduler --config … run-due`, so that pattern never matches it and reports idle mid-batch.
+`deploy/README.md` uses `pgrep -af '[s]cheduler .*run-due'`, which does match; the bracket matters, because on Linux `pgrep` excludes only itself, so inside a compound remote command (`ssh host 'pgrep … || echo idle'`) a bare `scheduler .*run-due` matches the parent `bash -c` and never prints idle.
 
 ### 2. Read what the batch is doing
 
@@ -102,7 +107,9 @@ The snippet prints both paces from the deployed config, so use its numbers, not 
 - **Same GSV key, through the scheduler** (`run-due --provider gsv` or `gsv_streets`, or `assess-city`, whose set includes `gsv_streets`): these take **no** rate override, so wait until the batch can no longer collect that channel (its budget is spent, or the in-flight run is a filtered `run-due` that does not name it), or until the batch has ended.
   The nightly batch is city-major and its GSV budgets do not bind, so against the nightly unit that means waiting for it to end.
 - **Different key, or a non-GSV channel:** proceed — for example a hand `gsv` run beside a `run-due --provider gsv_streets` catch-up, or any GSV run beside a `run-due --provider mapillary`.
-  Re-run step 1 if the hand run could still be going at 02:00 Pacific, when the timer starts a full unfiltered night on both keys.
+- **No `run-due` in flight now is not the whole check: the 02:00 Pacific timer starts an unfiltered night on both keys**, and after a reboot the 08:30 watchdog re-arm can start a `Persistent` catch-up night at once ([`scheduler.md`](scheduler.md)).
+  Step 1 cannot see a batch that has not started, so decide before launching: a direct-CLI GSV run that could still be going at 02:00 takes the same quota-minus-pace cap from the start.
+  A scheduler-path GSV run has no cap, so size it with `--limit` to end well before 02:00; `kill -TERM <run-due pid>` stops further launches but does not signal the in-flight child (only a unit's control-group stop reaches it), so that city still runs to its end.
 - **Per-IP providers (Mapillary, KartaView, Panoramax, Overpass):** `host_lock` already serializes them across processes, so a second process fails fast instead of doubling the rate; if the batch's child is the one that loses, its city skips that channel tonight and the night alerts ([`deploy/README.md`](../deploy/README.md), "Running anything by hand alongside the scheduler").
   They still respect their budgets: catch up through `run-due --provider … --limit N` or `--city`, which draw on the daily and rolling-24h ledgers, never a detached script; the staging rules are in [`provider-access.md`](provider-access.md).
 - **Never start a catch-up while a deploy or a repair script is running.** A deploy changes the code the next child runs and a repair script rewrites the catalog a run writes into, so the snippet's "deploys, repair scripts" list must be empty; if another session might be deploying, ask the operator first.
@@ -112,12 +119,13 @@ The snippet prints both paces from the deployed config, so use its numbers, not 
 Drive the hand run into a file (`>> logs/<name>.log 2>&1`), never a pipe, and read it when it ends:
 
 ```bash
-grep -cE 'OVER_QUERY_LIMIT|REQUEST_FAILED' logs/<name>.log
-grep -E 'Retry attempt .*quota window reset|points after all retries' logs/<name>.log
+grep -E 'Retry attempt .*quota window reset|points after all retries|refusing to finalize|run rejected' logs/<name>.log
 ```
 
-A `quota window reset` retry means the engine saw OVER_QUERY_LIMIT or UNKNOWN_ERROR answers, i.e. the key was oversubscribed.
-Points still failing after the retry passes are written with their status to the run's `*_failed_points.csv`, and past 1% of points the run aborts with its checkpoint kept rather than finalizing.
+**Do not count `OVER_QUERY_LIMIT` in the log**: the engine routes each throttled answer to its retry queue without logging it, so the string appears only in a run rejected as ≥95% denied, and a count of 0 says nothing about a throttled run.
+A `quota window reset` retry means a pass saw OVER_QUERY_LIMIT or UNKNOWN_ERROR answers, the first of which is the oversubscription signature (`download_gsv.collect_points_async`).
+`points after all retries` means points were still failing after every pass; their statuses are in the run's `*_failed_points.csv` beside its output, and under 1% they are also written into the run's CSV as failure rows.
+`refusing to finalize` is the >1% abort (its checkpoint is kept), and `run rejected` is the ≥95% denial that renames the file `*.rejected`.
 For a scheduler-launched catch-up, read its `logs/collect_<city_id>_<channel>_<UTC date>.log` instead.
 If a nightly lane collected the same key during the hand run, read that night's child logs for the same strings too, because the nightly run is the series whose data matters.
 Any hit is a finding: record it in the #304 section of [`provider-access.md`](provider-access.md) with the hand run's rate and the overlap window, rather than lowering a configured pace on one sample.

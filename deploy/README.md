@@ -4,10 +4,9 @@ The scheduler runs as a **user-level systemd timer** on
 `makelab2.cs.washington.edu`; it ran on makelab1 until the cutover described in
 [Host = makelab2](#host--makelab2-and-the-shared-home-cutover-model), and the
 production config keeps its historical name `config/scheduler.makelab1.toml`.
-A oneshot service fires
-nightly, collects the cities due that day (staggered quarterly cycle,
-bounded by a daily API-request budget), diffs each against its previous
-run, regenerates the aggregate JSON, and publishes `data/` to the public
+A oneshot service fires nightly, collects the cities due that day (staggered
+quarterly cycle, bounded by a daily API-request budget), diffs each against its
+previous run, regenerates the aggregate JSON, and publishes `data/` to the public
 web docroot. All state lives in `data/streetscape_tracker.db`, so crashes and
 missed days self-heal.
 
@@ -235,7 +234,7 @@ To fail back to makelab1: flip `ConditionHost` and move linger the other way.
 systemctl --user list-timers streetscape-tracker.timer      # next scheduled run
 journalctl --user -u streetscape-tracker.service -f          # live logs
 systemctl --user start streetscape-tracker.service           # trigger a run now
-.venv/bin/python -m streetscape_metadata_tracker.scheduler --config config/scheduler.makelab1.toml status
+.venv-makelab2/bin/python -m streetscape_metadata_tracker.scheduler --config config/scheduler.makelab1.toml status
 .venv-makelab2/bin/python -m streetscape_metadata_tracker.scheduler --config config/scheduler.makelab1.toml timer-status   # are all timers armed? (#369)
 ```
 
@@ -391,6 +390,12 @@ median 9, p90 81, max 870), so a Mapillary catch-up starts small and widens only
 after a night lands where you expected — see the staging rule in
 `docs/provider-access.md`. The old `--limit 40` exemplar here predates that rule.
 
+A `gsv` or `gsv_streets` catch-up takes no rate override, so it paces at the
+nightly 48,000/min on the same key as the nightly lane. Run the pre-run
+checklist in `docs/operations.md` ("Before any hand run or catch-up") first: a
+GSV catch-up waits for the batch to end, and is sized with `--limit` to finish
+before the 02:00 timer starts the next one.
+
 `--provider` takes enabled channel names (repeatable, or comma-separated) and
 `--limit N` overrides `[schedule].max_cities_per_day` for that invocation only
 (the nightly unit passes no `--limit` and is unaffected). Both refuse a bad value
@@ -425,6 +430,8 @@ python -m streetscape_metadata_tracker.scheduler --config <prod.toml> \
 It runs the **GSV road walk**, the **Mapillary road walk** and the cheap
 **Mapillary grid run**, regenerates the published JSON, publishes, and prints the
 street-km figures plus a city-page link.
+The GSV walk uses the nightly `gsv_streets` key with no rate override, so run the
+pre-run checklist in `docs/operations.md` before `--yes`.
 
 **Answer from street coverage, not grid coverage.** Grid points land on river,
 rail, parkland and rooftops, so grid percentages understate street availability
@@ -552,7 +559,7 @@ Properties worth knowing before an incident:
 
 ```bash
 # Health of the backups plus an inventory of what exists in only one place
-.venv/bin/python -m streetscape_metadata_tracker.scheduler --config config/scheduler.makelab1.toml backup-status
+.venv-makelab2/bin/python -m streetscape_metadata_tracker.scheduler --config config/scheduler.makelab1.toml backup-status
 ```
 
 Exits nonzero when the newest backup is missing, **older than 48 h**, or the
@@ -622,7 +629,7 @@ Install on **makelab2 only**, never mid-batch.
 the file's marker line:
 
 ```bash
-pgrep -af 'scheduler .*run-due' || echo idle
+pgrep -af '[s]cheduler .*run-due' || echo idle
 crontab -l                                  # look first; "not allowed to use this program" means ask CSE IT
 crontab -l 2>/dev/null | grep -q 'streetscape-tracker timer watchdog' \
   || (crontab -l 2>/dev/null; cat deploy/cron/streetscape-tracker.crontab) | crontab -
@@ -686,7 +693,7 @@ and `backup-status` inventories both:
 
 ```bash
 # Verifies the backup, then restores it. Refuses if anything is already there.
-.venv/bin/python -m streetscape_metadata_tracker.scheduler --config config/scheduler.makelab1.toml \
+.venv-makelab2/bin/python -m streetscape_metadata_tracker.scheduler --config config/scheduler.makelab1.toml \
     restore-backup backups/streetscape_tracker.db.2026-08-07.backup --to /tmp/recovered.db
 ```
 
@@ -791,7 +798,7 @@ Enabled in `config/scheduler.makelab1.toml`. Test end-to-end without waiting
 for a failure:
 
 ```bash
-.venv/bin/python -m streetscape_metadata_tracker.scheduler --config config/scheduler.makelab1.toml notify-failure
+.venv-makelab2/bin/python -m streetscape_metadata_tracker.scheduler --config config/scheduler.makelab1.toml notify-failure
 ```
 
 **Transport under the sandbox (issue #144).** `transport = "mail"` delivers via
@@ -934,7 +941,7 @@ Enrolment rows survive that and cost nothing while the channel is unconfigured, 
 **Never deploy mid-batch.** The scheduler launches a fresh `streetscape_tracker.py` per city out of the deployed tree, so an rsync while `run-due` is in flight changes the code the *next* city runs — and a schema migration would be applied by a child while the parent is still executing the previously-loaded module. Check for a live batch first:
 
 ```bash
-pgrep -af 'scheduler .*run-due'
+pgrep -af '[s]cheduler .*run-due'   # [s]: never matches a parent `bash -c` holding this line
 ```
 
 A city that fails `max_consecutive_failures` nights in a row is skipped

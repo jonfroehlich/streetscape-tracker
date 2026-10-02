@@ -713,7 +713,7 @@ The two keys belong to two Cloud projects, both on the UW account: `gsv` (`GMAPS
 **The two nightly lanes therefore cannot oversubscribe each other**: they use different keys in separate Cloud projects with independent quotas, so the hazard is only a hand run on the same key as its concurrently running nightly twin, or two hand runs.
 Each project's per-minute quota is 60,000; for `gsv-streets-tracker` that figure is the grant Google approved on 2026-09-21 (raised from 30,000), not a live limit anyone has read back independently.
 Nothing serializes GSV across processes (the host lock above deliberately skips it), and before #304 that was harmless in practice: two engines each achieving ~30,000/min sat near the quota rather than over it.
-Now each can reach 48,000/min, so any two concurrent processes on one key present ~96,000/min against that project's 60,000/min.
+Now each reaches its configured pace, so two concurrent processes on one key present ~96,000/min against that project's 60,000/min when both pace at the scheduler's 48,000, and ~72,000/min when one is a direct CLI run at its 24,000 default — still over the quota.
 The realistic pairs:
 
 - a hand-run `streetscape_tracker.py` (gsv) while the nightly `gsv` lane is collecting (both `GMAPS_API_KEY`);
