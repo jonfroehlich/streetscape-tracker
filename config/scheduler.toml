@@ -581,7 +581,10 @@ daily_request_budget = 4000
 # derives every per-city timeout from it, so lowering it here without
 # re-reading that function silently shortens those timeouts too.
 #
-# It is the LOWEST tile pace in the repo on purpose. Panoramax documents no
+# It is the LOWEST tile pace in the repo on purpose -- in THIS file. Production
+# (scheduler.makelab1.toml) runs 60/min and 8,000/day per channel as stage 1 of
+# #405's staged raise; this repo default and laptop runs stay at the collector's
+# conservative 30 / 4,000. Panoramax documents no
 # rate limit and returns no X-RateLimit-*/Retry-After header, so there is no
 # ceiling to pace against and the conservative number is the honest one; it is
 # volunteer-run infrastructure and we carry no credential identifying us. Half

@@ -1727,3 +1727,79 @@ def test_every_clock_flag_refuses_zero_at_parse_time(monkeypatch, entry, provide
         parse("0")
     assert excinfo.value.code == 2
     assert getattr(parse("1"), f"{provider}_max_seconds") == 1
+
+
+# ── The Panoramax collapse guard's history (#407 review) ───────────────────
+
+
+def _panoramax_capture(monkeypatch, calls):
+    """Record what the CLI hands the Panoramax downloader, then stop."""
+
+    class Reached(Exception):
+        pass
+
+    async def capture(**kwargs):
+        calls.append(kwargs)
+        raise Reached
+
+    monkeypatch.setattr(cli, "download_panoramax_metadata_async", capture)
+
+
+def _prior_panoramax_run(conn, city_id, **stats):
+    prior = date(2026, 1, 1)
+    db.register_run(
+        conn,
+        city_id=city_id,
+        run_date=prior,
+        csv_filename=run_filename(city_id, "panoramax", prior),
+        provider="panoramax",
+        **stats,
+    )
+
+
+@pytest.mark.parametrize(
+    ("prior", "extra", "refuse"),
+    [
+        ({"unique_panos": 12, "status_ok": 30}, (), True),
+        ({"num_flat_images": 4, "status_flat_only": 3}, (), True),
+        ({"unique_panos": 12, "status_ok": 30}, ("--allow-panoramax-collapse",), False),
+        ({"unique_panos": 0, "status_ok": 0, "status_zero_results": 25}, (), False),
+        (None, (), False),
+    ],
+    ids=["prior-360", "prior-flat-only", "override", "prior-zero", "no-prior"],
+)
+def test_the_collapse_guard_is_armed_exactly_when_the_previous_run_held_imagery(
+    monkeypatch, catalog, prior, extra, refuse
+):
+    """The downloader has no catalog, so the CLI decides: refuse an empty
+    census only when the previous run of this (city, panoramax) series held
+    imagery of either kind and the operator has not overridden it."""
+    conn, city_id, data_dir = catalog
+    if prior is not None:
+        _prior_panoramax_run(conn, city_id, **prior)
+    calls = []
+    _panoramax_capture(monkeypatch, calls)
+    run_cli(monkeypatch, city_id, data_dir, *extra, provider="panoramax")
+    assert calls, "the Panoramax downloader was never reached"
+    assert calls[0]["refuse_empty_census"] is refuse
+
+
+def test_a_collapse_after_a_positive_run_exits_1_and_catalogs_nothing(monkeypatch, catalog):
+    """
+    End to end through the REAL downloader: every tile answers 204 and the
+    previous run held imagery, so the run is refused -- exit 1, the ordinary
+    failure family, because this is neither a per-IP refusal (that would trip
+    the night's breaker for every other Panoramax city) nor a resumable pause
+    (amnesty would hide a real collapse forever). Nothing is cataloged, and the
+    spend still reaches the ledger.
+    """
+    from tests.test_panoramax_grid_run import _TileResponse, _TileSession
+
+    conn, city_id, data_dir = catalog
+    _prior_panoramax_run(conn, city_id, unique_panos=12, status_ok=30)
+    monkeypatch.setattr(
+        "aiohttp.ClientSession", lambda **kw: _TileSession(lambda url: _TileResponse(204))
+    )
+    assert run_cli(monkeypatch, city_id, data_dir, provider="panoramax") == 1
+    assert db.get_latest_run(conn, city_id, "panoramax").run_date == "2026-01-01"
+    assert db.get_api_usage(conn, RUN_DATE, provider="panoramax") > 0

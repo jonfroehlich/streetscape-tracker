@@ -1020,6 +1020,47 @@ def test_a_declared_kartaview_channel_still_collects_nothing_until_a_city_is_enr
     assert sched.db.count_channel_members(conn, "kartaview", False) == 0
 
 
+def test_production_panoramax_stage_one_derived_figures(conn, monkeypatch):
+    """What #405 stage 1's 60/min and 8,000/day DERIVE to under prod's config.
+
+    Pinned beside the raw values because the raise is two numbers that must
+    move together: _sweep_requests_within_timeout prices a capped launch from
+    the RATE, so a budget raised without its rate is a cap the child cannot
+    reach inside the 180-minute floor (at 30/min that floor affords 4,080, about
+    half of 8,000). And the derived timeout of the richest enrollable city
+    (3,132 z15 tiles) falls UNDER that floor at 60/min -- ~108 min -- where at
+    30/min it derived ~206 min, so the floor is what times every enrolled city
+    today; a city over 5,440 tiles is where the derivation binds again
+    (5,440 derives exactly the floor, 5,441 one second past it -- both pinned,
+    so the threshold the comments quote is exact rather than approximate).
+    """
+    cfg = load_scheduler_config(os.path.join(_PROJECT_ROOT, "config", "scheduler.makelab1.toml"))
+    floor_s = cfg.city_timeout_minutes * 60
+    assert floor_s == 180 * 60
+    city = db.resolve_city(conn, _register(conn, "Richest Panoramax"))
+    for channel in ("panoramax", "panoramax_streets"):
+        pc = cfg.providers[channel]
+        affordable = _sched._sweep_requests_within_timeout(floor_s, channel, pc)
+        # (10,800 - 600) s / 60 x 60/min x 0.8 achieved
+        assert affordable == 8_160
+        assert affordable >= pc.daily_request_budget, (
+            f"{channel}: the floor timeout affords {affordable} requests at "
+            f"{pc.max_requests_per_minute}/min, under the {pc.daily_request_budget} "
+            f"budget -- the rate and the budget were not raised together"
+        )
+        for tiles, expected in (
+            (3_132, floor_s),
+            (5_440, floor_s),
+            (5_441, floor_s + 1),
+            (6_000, 11_850),
+        ):
+            monkeypatch.setattr(_sched, "estimate_requests", lambda *a, _t=tiles, **k: _t)
+            assert _sched.city_timeout_seconds(cfg, city, channel, conn) == expected, (
+                channel,
+                tiles,
+            )
+
+
 def test_makelab1_production_config_is_wired():
     # Guard the checked-in production config the systemd unit points at.
     #
@@ -1099,17 +1140,21 @@ def test_makelab1_production_config_is_wired():
     # not a floor a city must clear, so raising it widens what a night may spend
     # against a host that documents no rate limit at all.
     #
-    # 4,000 is ~the richest city measured (3,132 z15 tiles) plus room for a
-    # second. The rate is pinned because two things read it: the child paces at
-    # it, and _tile_census_timeout_seconds derives every per-city timeout from
-    # it. The jitter is pinned because a metronomic pattern is the shape three
-    # Mapillary per-IP blocks put under suspicion (#292), and here there is no
-    # documented limit to say we are inside.
+    # Stage 1 of #405's staged raise (2026-10-01): 30 -> 60/min and 4,000 ->
+    # 8,000/day, both channels together. Stage 2 (90/min, 12,000/day) is gated
+    # on seven clean nights here, so moving these figures has to be a
+    # deliberate edit to this test and that config together -- and a trip
+    # reverts them to 30 / 4,000. The rate is pinned because two things read
+    # it: the child paces at it, and _tile_census_timeout_seconds derives every
+    # per-city timeout from it (see the derived-figure test below). The jitter
+    # is pinned because a metronomic pattern is the shape three Mapillary
+    # per-IP blocks put under suspicion (#292), and here there is no documented
+    # limit to say we are inside.
     for channel in ("panoramax", "panoramax_streets"):
         pc = cfg.providers[channel]
         assert pc.enabled, f"{channel} declared in production"
-        assert pc.daily_request_budget == 4_000
-        assert pc.max_requests_per_minute == 30
+        assert pc.daily_request_budget == 8_000
+        assert pc.max_requests_per_minute == 60
         assert pc.jitter == pytest.approx(0.6)
         assert _sched.is_opt_in_channel(channel), "declaring it must not enrol the catalog"
     # And the walk walks the same sample points on the same network as the other
@@ -14046,6 +14091,27 @@ def test_a_panoramax_walk_reads_its_grid_siblings_cached_census_for_nothing(conn
     # And the reverse direction, which production does too: a walk that paid
     # first hands the grid run a free census.
     assert _channel_estimate(cfg, city, "panoramax", conn) == 0
+
+
+@pytest.mark.parametrize("channel", ["panoramax", "panoramax_streets"])
+def test_the_enrolment_note_prices_at_the_CONFIGURED_panoramax_rate(conn, channel):
+    """The printed pace is the channel's configured one, never the collector's.
+
+    The test above configures 30/min, which IS the collector default, so a
+    `_enrolment_cost_note` that ignored the configured rate passed it. Since
+    #405 stage 1 production runs 60/min, so that mutation would print twice the
+    real wall clock to the operator deciding whether to enrol. Asserted at a
+    value that is neither the default nor prod's, and through prod's own config.
+    """
+    city = db.resolve_city(conn, _register(conn, "Krabi", width=10000, height=10000, step=20))
+    tiles = estimate_requests(city, channel, conn=conn)
+    assert tiles > 0
+    (line, *_rest) = _sched._enrolment_cost_note(conn, _px_cfg(rate=45), city, channel)
+    assert f"~{tiles:,} requests" in line
+    assert line.endswith(f"(~{tiles / 45:.0f} min paced at 45/min)"), line
+    prod = load_scheduler_config(os.path.join(_PROJECT_ROOT, "config", "scheduler.makelab1.toml"))
+    (prod_line, *_rest) = _sched._enrolment_cost_note(conn, prod, city, channel)
+    assert "paced at 60/min" in prod_line, prod_line
 
 
 def test_enroll_city_prices_a_panoramax_enrolment(conn, monkeypatch, tmp_path, capsys):
