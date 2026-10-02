@@ -619,10 +619,18 @@ Cutting `cycle_days` was rejected in the issue: at 45 days 578 cities fall due a
 The fill composes with the two reservations by construction rather than by argument: they reorder the due slate inside `_collect_due`, and the fill never touches that slate — it runs in `_run_fill` after `_run_city_loop` returns, so the due phase's launch order is identical with the fill on or off (`test_the_fill_composes_with_the_hoist_and_the_refresh_reserve` pins it, with the opening line's `hoisted=`/`promoted` counts).
 It runs only when the due loop **ended on its own** — no cap, deadline, SIGTERM or error stop — which is what "fill never outranks a due city" means mechanically.
 
-**Eligibility** (`db.get_fill_candidates`): an enabled city whose every default-membership channel it is a member of has succeeded before, at least `[schedule].fill_min_days` ago, under `cycle_days - grace_days` ago (so it is not due), and with fewer than `max_consecutive_failures` failures.
-One channel under the floor, or quarantined, disqualifies the city: the fill never collects a subset.
-Candidates are ordered by the city's **oldest** channel success, then `city_id` — stalest-first, read on the channel that has waited longest.
-Opt-in channels neither qualify nor disqualify a city and are never run (#248, #374); KartaView and Panoramax volume stays explicit (#405).
+**The fill ALIGNS a city across every provider it is a member of (Jon, 2026-10-02: "every night we should try to get the same exact cities across all providers").**
+A fill city runs **every** channel it is a member of — its enrolled opt-in channels (`kartaview`, `kartaview_streets`, `panoramax`, `panoramax_streets`) included — on tonight's UTC date.
+A channel that already succeeded tonight in the due phase is already on that date and is left out, so a city the due phase collected on only some channels is finished by the fill: a late KartaView enrolment, due and hoisted on `kartaview` alone, then gets its gsv and mapillary the same night, and a city due only on mapillary gets its gsv.
+The fill never ENROLS anybody (a city not enrolled on KartaView is never run there), and the opt-in channels' own nightly dueness and hoist are untouched.
+
+**Eligibility** (`db.get_fill_candidates`): an enabled city, every member channel of which that did not run tonight qualifies, or the city is skipped whole:
+a **default** channel must have succeeded, at least `[schedule].fill_min_days` ago and under `cycle_days - grace_days` ago (a due one belongs to the due slate);
+an **opt-in** channel must be at least the floor old, or **never collected, or overdue** — a city enrolled late is realigned by the fill rather than excluded ("we will need to play catch up for these providers since we added them late"), while a FRESH opt-in channel holds the city back until the whole set can move together;
+and no channel to run may have a consecutive failure since its last success.
+Candidates are ordered by the day of the oldest last success among the channels to run (a city whose every channel to run is a never-collected opt-in first), then **misaligned before aligned** among equally stale cities — member channels on different days, or with a never — then `city_id`, so the fill actively re-aligns the catalog; the `Done:` line counts the cities it `realigned`.
+Only an EARLY success is recorded in `early_refreshes` (`_is_early`): a never-collected or overdue opt-in channel the fill collects is a first or late collection, not an early one.
+Opt-in channels are priced by their own estimators — KartaView's `max(prior observed, swept-lattice geometry × 1.80)`, Panoramax's z15 tile census — against their own daily budgets and hosts, and they are resumable, so the launch-plan test below applies to them too; KartaView has run up to 3.0× its estimate (Yogyakarta), and a crawl that outruns it pauses and is resumed by the next fill, below.
 
 **Admission is whole-city** (`_fill_judge`, shared by the live path and the dry run): every channel's `_channel_estimate` must fit that channel's daily remainder; per metered host, the **sum** of its channels' prices must fit both the `[hosts.*]` rolling-24h room and the fill's own `fill_host_ceilings` room; the summed `city_timeout_estimate_seconds` must fit the deadline; and every resumable channel must be one `_sweep_launch_plan` would launch with no skip and a cap at least its price.
 That last test exists because `est <= room` is not what the launch path asks: a 1-tile Mapillary census against a 4-request remainder fits the room but sits under the launch floor, so the launch skipped Mapillary after GSV had run — the GSV-only refresh the fill exists to prevent.
@@ -633,18 +641,27 @@ Two refusals come before the budget rule, both because the launch path would oth
 A declined city is skipped and the next one asked, as the due loop does for a budget skip; the ledgers are re-read per admission, so earlier fill cities' spend counts.
 The motivating case is in the issue: today a due city whose Mapillary run does not fit still gets its GSV run, which un-pairs its snapshots and strands it behind the hoist (#301, #341); a fill city never does.
 
-**The fill ceiling is lower than the budget on purpose.**
-Prod sets `fill_host_ceilings = { mapillary_tiles = 2260 }` under the 3,000 `[hosts.mapillary_tiles]` budget: 2,260 is the highest combined night the #292 window measured clean (`docs/provider-access.md`), which #404 says to start at.
-The due slate keeps the whole 3,000, and the fill takes only what is left under 2,260 — so the fill fills unused capacity and never raises any ceiling; raising the ceiling toward the budget is a separate, staged decision.
+**The fill ceiling is lower than the budget on purpose, and it is fixed.**
+Prod sets `fill_host_ceilings = { mapillary_tiles = 2260 }` under the 3,000 `[hosts.mapillary_tiles]` budget, every night with no ramp (Jon, 2026-10-02): 2,260 is the highest combined night the #292 window measured clean (`docs/provider-access.md`).
+The due slate keeps the whole 3,000, and the fill takes only what is left under 2,260 — so the fill fills unused capacity and never raises any ceiling.
 GSV metadata has no per-IP host and no charge, so on gsv only the daily budget and the deadline bound it.
 
-**A backlog holds the whole fill** (`_fill_backlog`): any (city, channel) pair the due slate held on a default channel whose `last_attempt_at` predates the batch start was deferred — for budget, a host budget, the deadline, the breaker — or paused, and while one exists the fill does not run, so it stops by itself the night a backlog forms.
-A failure records an attempt and is not a backlog, and an opt-in channel's deferral (Panoramax is budget-bound on its own) does not hold it.
+**The fill never borrows tomorrow's due room** (Jon, 2026-10-02).
+A rolling 24 h window does not reset at midnight: tonight's fill runs after tonight's due work, so its spend is still inside the window when tomorrow's due slate starts ~24 h after tonight's (tonight's due spend ages out in step with tomorrow's).
+So on every metered host with a rolling bound the fill's room has a third term beside the budget's and the ceiling's: the host's cap (its fill ceiling, else its budget) less **tomorrow's projected due demand** there, less what tonight's fill has already spent there (`_fill_host_room`) — the fill may spend at most `cap - reserve` in total.
+The reserve (`_tomorrow_due_reserve`) is sized once, as the fill starts: each channel's due list for TOMORROW from the same `get_due_cities` query (its julianday rule, membership and quarantine) — read after tonight's due phase, so what succeeded tonight has left it and what was deferred is still in it — priced with the same `_channel_estimate`, and SUMMED per host (the grid and the walk on the tile CDN are one pool).
+It is an approximation, conservative wherever it is not exact: each channel's list is cut at `max_cities_per_day` but not at the shared cap or the opt-in reservation, each channel's demand is cut at its daily budget (all tomorrow can spend), a paired walk is priced at its full census, and a resumable crawl is priced whole.
+A host with no rolling bound (KartaView and Panoramax on prod) has no figure to subtract a reserve from, and its daily budgets reset at midnight, so tonight cannot borrow them.
+The log, the `Done:` line and the dry run say what was reserved: `reserved 812 on mapillary_tiles for tomorrow's due (23 cities)`; the dry run assumes tonight's due slate succeeds.
+
+**A backlog holds its channel** (`_fill_backlog`): any due (city, channel) pair whose `last_attempt_at` predates the batch start was deferred — for budget, a host budget, the deadline, the breaker — or paused, and no fill city that would run that channel is admitted tonight (declined whole as `backlog`), so the fill stops by itself wherever a backlog forms.
+Per channel rather than the whole fill, now that the fill runs opt-in channels too: Panoramax is budget-bound on its own most nights, and a Panoramax deferral says nothing about a city with no Panoramax enrolment.
+A failure records an attempt and is not a backlog.
 Nor does a pair no night like this one could run (`_never_fits_tonight`), each logged as such: a non-resumable channel priced over its whole daily budget, one whose need exceeds the whole `max_batch_hours` window (#373), and a walk waiting behind its grid sibling's in-flight checkpoint (the sibling's own pair is the backlog there). Held on those, one oversized city would switch the fill off for good.
 
 **A fill crawl that pauses is resumed by the next fill, first.**
 Admission prices a crawl from its estimate, and a crawl can still outrun it and pause (exit 83). A fill city is not due on that channel, so nothing on the due path resumes it, and its checkpoint is discarded at `CHECKPOINT_MAX_AGE_S` (7 days) with the spend thrown away — while the paused channel's pair is already broken.
-So each fill begins with `_fill_resumers`: every city the fill touched inside that age, not due tonight, with a live checkpoint on a default resumable channel, nearest the age wall first, admitted on its paused channels only, and **not held by a backlog** (nothing else will ever resume it).
+So each fill begins with `_fill_resumers`: every city the fill touched inside that age, not due tonight, with a live checkpoint on a resumable channel it is a member of, nearest the age wall first, admitted on its paused channels only, and **not held by a backlog** (nothing else will ever resume it).
 A resume that lands is marked an early refresh against the success the channel still had; the pause line in the log says the channel is not due and the next fill resumes it, rather than "stays due".
 
 **A failing city leaves the fill.** A candidate needs no consecutive failure since its last success on any channel, so the fill can add at most one failure per channel between successes and can never be what quarantines a city that was never due.
@@ -657,8 +674,8 @@ A resume that lands is marked an early refresh against the success the channel s
 
 **What a night says about it.**
 The opening line carries `fill_min_days=N` when set.
-The `Done:` line counts the cities apart — `across 23 cities (15 due, 8 fill)` — and adds `fill (early refresh, >= 30 d): 8 cities, 24/24 runs, 24 early refresh(es) recorded; declined 3 for mapillary_tiles; ended by budget (mapillary_tiles)`.
-`ended by` is one of `city cap (N)`, `deadline (N h)`, `budget (<channel or host>)` (the candidates ran out with the last ones declined for it), `candidates exhausted`, `unfrozen street network`, `host refused tonight`, `held: backlog (...)`, `received SIGTERM`, or `unexpected error in the fill phase`; a night that never reached it says `fill not reached`, and a narrowed run says `fill off for --limit`.
+The `Done:` line counts the cities apart — `across 23 cities (15 due, 8 fill)` — and adds `fill (early refresh, >= 30 d): 8 cities, 3 realigned, 24/24 runs, 24 early refresh(es) recorded; declined 3 for mapillary_tiles; reserved 812 on mapillary_tiles for tomorrow's due (23 cities); ended by budget (mapillary_tiles)`.
+`ended by` is one of `city cap (N)`, `deadline (N h)`, `budget (<channel or host>)` (the candidates ran out with the last ones declined for it), `candidates exhausted`, `unfrozen street network`, `host refused tonight`, `held: backlog (...)` (the last ones were declined for a held channel), `received SIGTERM`, or `unexpected error in the fill phase`; a night that never reached it says `fill not reached`, and a narrowed run says `fill off for --limit`.
 An error inside the fill is logged under its own wording (not the city loop's), ends the fill, and makes the night unhealthy, but the tail still publishes (#167).
 `scripts/night_length_analyze.py` parses the `(D due, F fill)` split and counts a night that ran fill cities as its own `filled` population, never pooled into `full`: its length is set by the fill's end, not by the due work.
 `run-due --dry-run` previews it through the same `_fill_verdict` against its simulated ledgers, listing what the budgets admit up to the cap; the deadline is the one term a preview cannot price, so it says the deadline decides how many run.
@@ -668,8 +685,7 @@ Each fill channel that succeeds is written to `early_refreshes` (catalog v18, ke
 Success is read off `schedule_state.last_success_at` having moved since admission, so a skipped or failed channel is never marked.
 
 Not done here: an operator-facing `status` view of fill eligibility, publishing the mark for walks, and any change to Panoramax pacing (#405).
-Open for a decision rather than code: the prod `fill_host_ceilings` value and any ramp of it; sizing the fill's room against TOMORROW's projected due demand on the rolling-24h window (tonight's fill spend is still in the window when tomorrow's due slate starts); and how an opt-in-enrolled city's grid and opt-in dates should align when the fill refreshes only its default channels.
-The provider forums were not re-read for this change: it raises no rate, no budget and no ceiling, and its one new per-IP number (2,260) is a figure this project already measured clean.
+The provider forums were not re-read for this change: it raises no rate, no budget and no ceiling, and its one new per-IP number (2,260) is a figure this project already measured clean — but it DOES call KartaView and Panoramax more often for their enrolled cities (inside their unchanged daily budgets), which CLAUDE.md's READ THIS FIRST rule asks to be checked against those providers' forums before deploying.
 
 ## The subcommand roster, and the production config (added 2026-08-25)
 
