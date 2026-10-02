@@ -1559,7 +1559,13 @@ def test_a_paused_fill_grid_resumes_with_the_walk_it_held_back(conn, monkeypatch
         return True
 
     ran2, _ = _run_night(
-        monkeypatch, conn, _pair_cfg(data_dir), outcome=n2, today=TODAY + timedelta(days=1)
+        monkeypatch,
+        conn,
+        # A one-city night: the walk must come back WITH the resume, not from a
+        # later refresh of the same city (which a cap of 1 never reaches).
+        _pair_cfg(data_dir, max_cities_per_day=1),
+        outcome=n2,
+        today=TODAY + timedelta(days=1),
     )
     assert ran2 == [(cid, "gsv"), (cid, "mapillary"), (cid, "mapillary_streets")]
     days = {
@@ -1819,3 +1825,45 @@ def test_a_walk_the_fill_did_not_hold_behind_a_sibling_checkpoint(
     ran, _ = _run_night(monkeypatch, conn, _pair_cfg(data_dir), outcome=outcome)
     assert (due, "mapillary_streets") not in ran
     assert (fill, "mapillary_streets") in ran
+
+
+def test_the_dry_run_counts_tonights_due_spend_against_the_host_budget(conn, monkeypatch, capsys):
+    """The preview's host room reads its own simulated due spend: with a host
+    budget the due city's mapillary leaves the fill city one tile short.
+    Killed by leaving the preview's spend out of the host room's `used`."""
+    due = _register(conn, "Due")
+    fill = _city(conn, "Fill", {"gsv": 60, "mapillary": 60})
+    d = sched.estimate_requests(db.resolve_city(conn, due), "mapillary")
+    f = sched.estimate_requests(db.resolve_city(conn, fill), "mapillary")
+    cfg = _grid_cfg(host_budgets={"mapillary_tiles": d + f - 1})
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+    sched.cmd_run_due(cfg, dry_run=True, today=TODAY)
+    out = capsys.readouterr().out
+    assert "Fill: 0 cities admitted; declined 1 for mapillary_tiles." in out
+
+
+def test_the_dry_runs_reserve_assumes_tonights_due_slate_succeeds(conn, monkeypatch, capsys):
+    """A city due tonight is not tomorrow's demand in the preview (it is
+    assumed to run tonight). Killed by not handing the preview's reserve
+    tonight's slate."""
+    _register(conn, "Due")
+    _city(conn, "Fill", {"gsv": 60, "mapillary": 60})
+    cfg = _grid_cfg(fill_host_ceilings={"mapillary_tiles": 2_260})
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+    sched.cmd_run_due(cfg, dry_run=True, today=TODAY)
+    assert "Fill: reserved 0 on mapillary_tiles for tomorrow's due (0 cities)" in (
+        capsys.readouterr().out
+    )
+
+
+def test_the_reserve_is_cut_at_the_city_cap(conn):
+    """Tomorrow cannot run more than max_cities_per_day cities on a channel:
+    two due tomorrow at a cap of one reserve the stalest one only. Killed by
+    not cutting the list."""
+    older = _city(conn, "Older", {"gsv": 10, "mapillary": 82.5})
+    _tomorrow_city(conn, "Newer")
+    cfg = _grid_cfg(max_cities_per_day=1, fill_host_ceilings={"mapillary_tiles": 2_260})
+    want = sched.estimate_requests(db.resolve_city(conn, older), "mapillary")
+    assert sched._tomorrow_due_reserve(cfg, conn, TODAY, ["gsv", "mapillary"]) == {
+        "mapillary_tiles": (want, 1)
+    }
