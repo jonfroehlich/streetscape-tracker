@@ -924,6 +924,18 @@ Every property is a way the study could publish a confident wrong number:
 - The committed record (skipped until it exists): each summary recomputes from its own raw block — `access` included, or the recompute KeyErrors the night that stage joins the record — an unrun stage is an explicit null, no measured in-bbox count exceeds its city's screen upper bound, and **every control measured zero**, which is the one test that turns "a zero screen is conclusive" from an assumption into a measurement.
   The two tile instruments agree within the larger of 5% and **2 pictures**, with a second test asserting the absolute half is still needed: a ratio band alone silently demands EXACT agreement on any city where one picture exceeds 5%, and three of the eight cross-check cities are that small (Aberdeen 3, Pierre 7, Ridgeley 28).
 
+## The Panoramax candidate-city screen (issue #406)
+
+`tests/test_panoramax_world_screen.py` pins `scripts/panoramax_world_screen_{collect,analyze}.py`, offline; the raw outputs are gitignored, so nothing here reads them (one check that the old evidence dir would be refused skips when it is absent).
+Every distance and threshold is asserted at a LITERAL value placed on both sides of it — the tests compute offsets on their own sphere and never read the module's constant back — and each was checked by mutating the constant and watching the test fail.
+
+- The sampling invariant: the region plan is the **235 tiles** the 2026-10-01 log records, split by region exactly as it was, a tile two regions share belongs to the first, and the dry run sends nothing.
+- The collector cannot destroy a record: the default output is a fresh dated dir under the repo root, and a `panoramax/` dir that already holds files is refused by both `main` (dry run included) and `collect`, with the file left untouched.
+- The pass, over an injected `get` and pacer: `s` is the request's latency and excludes the pacer's sleep; a 429 stops after one attempt; an exhausted 5xx or transport error ends in a `stop` record, never an uncaught exception; the 250 cap counts retries; a plan over the cap is refused unsent.
+- The analyzer refuses a request log that is not one complete pass: a missing, repeated (two runs) or out-of-plan tile, a failed status, or a `stop` record.
+- The derivation: the 10 km place radius at 9.5 and 10.5 km; the 2,000 floor at 2,000 and 1,999; descending rank order; the 20 km cluster radius at 19.5 and 20.5 km, measured from the ANCHOR (a chain 15 + 15 km splits); a cluster taking its bound and max hex from the anchor, its name and point from the most populous member, and its newest date from any member; the candidate thresholds at 5,000/4,999 and, for both the US and Canada, 2,000/1,999 (Mexico stays at 5,000); the 25 km catalog radius at 24.9 and 25.1 km; a match found at 70°N and across the antimeridian; tracked-by-name vs tracked-by-anchor reported separately; the H3 resolution read from an id.
+- The committed record: its `parameters` equal both the literal values the writeup quotes and the module's constants, its hexagons are all resolution 7, request counts add to 239 with no refusal, the cluster CSV regenerates every cluster count and the `tracked_split` list, the ranked lists are the CSV's rows in order, each cluster's bound is its anchor place's row in the places CSV, and no GeoNames population is published.
+
 ## Frontend node tests
 
 Frontend node tests cover the streetwalk render seam (manifest lookup + fetch-failure fallback, artifact-URL selection, key normalization, the fractional ramp, and initial view mode) by stubbing Leaflet and the panel's DOM, and `panoDateOrNull`'s reduced-precision shapes (issue #226), asserted on the LOCAL getters rather than `toISOString()`

@@ -17,10 +17,14 @@ the entire catalog costs 113 requests — against 64,650 tiles for an exact z14
 measure and 236,808 for the z15 census the collector runs. Cities share tiles;
 that sharing is the saving.
 
-A ZERO IS CONCLUSIVE AND A POSITIVE ONE IS NOT. A res-6 hexagon is roughly
-36 km2 and the median catalog city is 19.5 km2, so a city's screen sums
-hexagons LARGER than the city inside them: every number here is an UPPER
-BOUND. That asymmetry is the point and it is the only reason 113 requests can
+A ZERO IS CONCLUSIVE AND A POSITIVE ONE IS NOT. A city's screen sums every
+hexagon that OVERLAPS its bbox, whole, so every number here is an UPPER BOUND.
+(Correction, 2026-10-01, #406: the z6 hexagons are H3 RES 7, ~5.2 km2 -- every
+one of 261,913 ids decoded that day carries resolution 7 -- not the res 6,
+~36 km2, this comment first said. Against a 19.5 km2 median city the bound is
+therefore tighter than first described, but it is still a bound: a hexagon
+straddling the bbox edge is counted whole. Whether the layer changed or the
+earlier figure was never measured is unknown; no phase-1 hex id was kept.) That asymmetry is the point and it is the only reason 113 requests can
 answer anything — an upper bound of zero means the city holds no imagery, full
 stop, while a positive one means only "look closer", which is what the
 collector (or `scripts/panoramax_feasibility.py --stage measure`) is for. Every
@@ -120,8 +124,9 @@ MEASURE_ZOOM = 14
 # A hexagon is returned CLIPPED to the tile that carries it, and `merge_hexes`
 # reconstructs the whole hexagon by unioning those pieces — so a hexagon
 # overlapping the city but straddling a z6 tile seam is only correctly extended,
-# and correctly counted, if BOTH tiles were fetched. A res-6 hexagon is about
-# 7 km across, comfortably inside this margin. 108 of 1,144 catalog cities sit
+# and correctly counted, if BOTH tiles were fetched. A z6 hexagon is H3 res 7
+# (measured 2026-10-01, #406; first written here as res 6, about 7 km across),
+# about 2.8 km across -- comfortably inside this margin either way. 108 of 1,144 catalog cities sit
 # within one margin of a seam, 49 of them screening zero, so without this the
 # "a zero is conclusive" claim would rest at those cities on tiles nobody read.
 #
@@ -373,9 +378,11 @@ def hexes_overlapping_bbox(
 
     The screen and the measure stage select hexes differently on purpose.
     :func:`hexes_in_bbox` assigns a res-11 hexagon by its centre because at 25 m
-    across the difference is noise. A screen hexagon is res 6 -- about 36 km2 --
-    and a city bbox is often smaller than one, so centre-based selection would
-    miss the very hex the city sits inside. Overlap is the only selection that
+    across the difference is noise. A screen hexagon is H3 res 7 -- about
+    5.2 km2, measured from the ids on 2026-10-01 (#406); this docstring first
+    said res 6 and 36 km2 -- and a small city bbox can still be smaller than
+    one, or miss every hex centre, so centre-based selection could miss the
+    very hex the city sits inside. Overlap is the only selection that
     keeps the screen an upper bound.
     """
     min_lon, min_lat, max_lon, max_lat = bbox
