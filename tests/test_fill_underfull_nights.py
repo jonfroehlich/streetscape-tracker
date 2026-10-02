@@ -803,7 +803,7 @@ def test_a_v17_catalog_gains_the_early_refreshes_table(tmp_path):
     conn.close()
 
     conn = db.connect(path)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 18
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 19
     cid = _register(conn, "Bend")
     db.record_early_refresh(
         conn, cid, "gsv", TODAY, prior_success_at="2026-08-01T00:00:00+00:00", floor_days=30

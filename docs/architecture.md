@@ -27,7 +27,7 @@ Legacy pre-2026 undated files are registered as `is_baseline=1` runs by `scripts
 
 ## The catalog
 
-The SQLite catalog `data/streetscape_tracker.db` (`streetscape_metadata_tracker/db.py`, stdlib sqlite3/WAL, no ORM; schema v18, auto-migrated on connect) is the operational source of truth.
+The SQLite catalog `data/streetscape_tracker.db` (`streetscape_metadata_tracker/db.py`, stdlib sqlite3/WAL, no ORM; schema v19, auto-migrated on connect) is the operational source of truth.
 It is **local-only and never rsynced** — it lives in exactly one place, which is why the dated backups in [`catalog-backups.md`](catalog-backups.md) exist.
 
 | Table | Key / uniqueness | Holds |
@@ -48,6 +48,7 @@ It is **local-only and never rsynced** — it lives in exactly one place, which 
 | `driving_plan_snapshots` | UNIQUE(fetch_date) | One row per fetch of Google's driving-plan feed (#176); the only family not city-keyed |
 | `driving_plan_entries` | FK → snapshot | The feed's rows, exploded per (record, district), stored verbatim |
 | `provider_screen` | PK(provider, city_id, screen_date) | Dated whole-catalog growth screen (#316) — **upper bounds**, never counts; a zero is conclusive, a positive number means "look closer" |
+| `provider_screen_cells` | index(provider, screen_date) | The H3 resolution of every hexagon id one screen pass read, as a histogram (#406, v19); NULL resolution counts ids that are not H3 cells, a lone (NULL, 0) row means measured with no hexagons decoded, and a date with no rows predates the measurement |
 
 Schema-version history that still matters when reading old rows:
 v11 added `street_walks.coverage_by_highway` (#101, backfilled by `scripts/backfill_streetwalk_coverage.py`);
@@ -78,6 +79,10 @@ Its column is `channel`, not `provider`, because it holds scheduler channel name
 It is purely additive (no migration function), so pre-#404 code reads a v18 catalog once `user_version` is set back to 17, ignoring the table.
 The aggregate surfaces it as `"early_refresh": true` on a GRID run's `runs[]` entry only, **present only when true**, so every other record is byte-identical and `cities.json.gz` stays schema v4; walk channels are recorded in the table but not yet published.
 `scripts/purge_tainted_runs.py` and `scripts/import_archival_scrapes.py` delete a run's mark with the run (`db.delete_early_refresh_for_run`).
+v19 added the `provider_screen_cells` table (#406; v18 is #411's `early_refreshes`): per screen date, how many distinct hexagons that pass read at each H3 resolution decoded from their ids, so the published screen describes its cells from a measurement rather than a constant.
+A NULL `cell_resolution` with a positive count is ids that are not H3 cells at all — counted, never dropped; a lone `(NULL, 0)` row is a pass that was measured and decoded no hexagon; and a screen date with no rows predates the table, meaning "not measured", never "no hexagons".
+Both v18 and v19 are `CREATE TABLE IF NOT EXISTS` with no migration function, and `init_schema` runs the whole `_SCHEMA` on every connect, so a catalog gains both tables whichever branch's build touched it first; the v19 rung is keyed on 17 and 18 so it is correct on a tree with or without the v18 rung.
+It is purely additive (no migration function, the `CREATE TABLE IF NOT EXISTS` builds it on any catalog), and `record_provider_screen` replaces a date's rows wholesale on a same-day re-run, which is why it has no primary key.
 
 ## Provider model
 
@@ -191,6 +196,10 @@ Every published JSON artifact carries a `schema_version`; the frontend's `adaptC
 
 The per-run summary stays at 2 across #367's additions to its `coverage` block (`num_points_out_of_radius`, and `query_radius_m`, which is null for census providers): both are additive, and no existing key changed shape.
 A summary written before #367 simply lacks them, and its coverage figures are the old definition until the run's JSON is rebuilt.
+
+The provider screen stays at 1 across #406's measured cell (v19's `provider_screen_cells`).
+`instrument.cell` is still a string — its value is now derived from the latest pass's decoded hexagon ids instead of the literal "H3 resolution 6 (~36 km²)", which the ids contradicted (resolution 7) — and every other change is a new key: `instrument.cell_resolutions` (null for a screen that predates the measurement), `instrument.cell_area_source`, the absent-unless-unexpected `instrument.cell_warning`, and a per-date `cell_resolutions` on each `series` point.
+The `caveat` text changed meaning but not shape; no `www/` page reads this artifact.
 
 The streetwalk manifest's version deliberately stayed 1 across the v12 catalog additions: every one of them is additive, and no existing key changed shape or meaning.
 The four scalar v12 keys (`length_km`, `length_km_covered`, `length_km_covered_any`, `median_covered_age_years`) are written unconditionally, so on a walk cataloged before v12 they are **present carrying `null`**, not absent; only the optional `coverage_by_highway` and `change` blocks are omitted when they have nothing to say.

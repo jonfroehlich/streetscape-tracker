@@ -6,8 +6,8 @@ What these pin, in the order the instrument is built:
 1. **The decoders**, moved here from the phase-1 study — hexagon counters are
    whole-hexagon figures repeated on every tile they touch, so they merge by MAX
    and never by SUM, while the geometry is clipped and merges by UNION.
-2. **The selection rule** — a screen hexagon is bigger than most cities, so
-   cities are matched by OVERLAP and the result is an UPPER BOUND. Centre
+2. **The selection rule** — a screen hexagon can be bigger than a small city,
+   so cities are matched by OVERLAP and the result is an UPPER BOUND. Centre
    selection would miss the very hexagon a city sits inside.
 3. **The economy** — the whole catalog dedupes to a handful of z6 tiles, which
    is the only reason this can run weekly.
@@ -226,10 +226,10 @@ def test_an_empty_tile_and_a_tile_without_the_layer_are_both_answers():
 
 def test_a_city_INSIDE_one_big_hexagon_is_selected_by_overlap_but_not_by_centre():
     """
-    A res-6 hexagon is ~36 km² and the median tracked city is 19.5 km², so the
-    normal case is a city sitting wholly INSIDE one hexagon whose centre is
-    nowhere near it. Centre selection returns nothing there — which would call
-    every such city empty, conclusively and wrongly.
+    A screen hexagon is H3 res 7, ~5.2 km² (measured from the ids, #406; this
+    first said res 6, ~36 km²), so a small city can still sit wholly INSIDE one
+    hexagon whose centre is nowhere near it. Centre selection returns nothing
+    there — which would call such a city empty, conclusively and wrongly.
     """
     big = {
         "h1": {

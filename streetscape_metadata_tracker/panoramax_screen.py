@@ -24,7 +24,8 @@ one of 261,913 ids decoded that day carries resolution 7 -- not the res 6,
 ~36 km2, this comment first said. Against a 19.5 km2 median city the bound is
 therefore tighter than first described, but it is still a bound: a hexagon
 straddling the bbox edge is counted whole. Whether the layer changed or the
-earlier figure was never measured is unknown; no phase-1 hex id was kept.) That asymmetry is the point and it is the only reason 113 requests can
+earlier figure was never measured is unknown; no phase-1 hex id was kept.)
+That asymmetry is the point and it is the only reason 113 requests can
 answer anything — an upper bound of zero means the city holds no imagery, full
 stop, while a positive one means only "look closer", which is what the
 collector (or `scripts/panoramax_feasibility.py --stage measure`) is for. Every
@@ -128,8 +129,8 @@ MEASURE_ZOOM = 14
 # overlapping the city but straddling a z6 tile seam is only correctly extended,
 # and correctly counted, if BOTH tiles were fetched. A z6 hexagon is H3 res 7
 # (measured 2026-10-01, #406; first written here as res 6, about 7 km across),
-# about 2.8 km across -- comfortably inside this margin either way. 108 of 1,144 catalog cities sit
-# within one margin of a seam, 49 of them screening zero, so without this the
+# about 2.8 km across -- comfortably inside this margin either way. 108 of
+# 1,144 catalog cities sit within one margin of a seam, 49 of them screening zero, so without this the
 # "a zero is conclusive" claim would rest at those cities on tiles nobody read.
 #
 # Numerically equal to the feasibility script's v1 lattice cell size, and that
@@ -345,6 +346,211 @@ def merge_hexes(
         seen["min_lat"] = min(seen["min_lat"], hexagon["min_lat"])
         seen["max_lat"] = max(seen["max_lat"], hexagon["max_lat"])
     return accumulated
+
+
+# ── The cell resolution, read off the ids rather than written down ──────────
+#
+# What a screen hexagon IS was first recorded as a constant -- "H3 resolution 6
+# (~36 km²)" -- and published in every provider_screen.json.gz. On 2026-10-01
+# every one of the 261,913 ids the z6 layer served decoded to resolution 7
+# (docs/experiments/panoramax-world-screen.md, #406), and whether the layer
+# changed or the 6 was never read from an id is unknown. A description of the
+# instrument that can be wrong without anything failing is the shape of that
+# mistake, so the screen now decodes every id it reads and records what it
+# found per pass; the artifact describes the MEASURED resolution.
+#
+# Within the range a z6 tile can draw, the resolution does not decide whether
+# the screen is sound: a hexagon is selected by overlap and counted whole, so
+# every figure is an upper bound and a zero is still conclusive. What it decides
+# there is how LOOSE the bound is, and whether `cells` is comparable between two
+# screen dates (one res-6 hexagon covers about seven res-7 ones). So a coarser,
+# mixed or unrecognised layer is warned about and published, not refused.
+#
+# FINER is different, and is refused (`MAX_SCREEN_H3_RESOLUTION`): a hexagon
+# much smaller than one tile unit can quantize to a degenerate feature that
+# `hexes_from_tile` cannot place, and a dense tile of small hexagons is where an
+# undocumented per-tile feature cap would bite. Either drops a hexagon without
+# an error, and a dropped hexagon is a FALSE zero -- the one failure the design
+# cannot tolerate.
+
+# The resolution the z6 `grid` layer served when it was last measured
+# (2026-10-01, #406). A pass that sees anything else still records, and says so.
+EXPECTED_SCREEN_H3_RESOLUTION = 7
+
+# The FINEST resolution a z6 screen pass may record without an override.
+#
+# Derived, not tuned: an MVT tile is 4,096 units across (the decoder's default
+# extent), and a z6 tile spans 40,075,017 m / 64 of equator, so one unit is
+# ~152.9 m there -- the coarsest a unit gets, so a bound safe at the equator is
+# safe at every catalog latitude (a unit shrinks with cos(latitude)). H3's
+# published AVERAGE EDGE length is 200.8 m at res 9 and 75.9 m at res 10
+# (https://h3geo.org/docs/core-library/restable): a res-9 edge still spans more
+# than one unit, while a res-10 edge is under half of one, so its six vertices
+# can snap onto one or two points and the feature decode to nothing. Res 10 and
+# finer is refused; res 8 and 9 are only warned about, like any other change.
+MAX_SCREEN_H3_RESOLUTION = 9
+
+# H3's published AVERAGE hexagon area per resolution, in km², verbatim from
+# https://h3geo.org/docs/core-library/restable (and `h3.average_hexagon_area`,
+# which agrees to the printed precision). An average: a real cell's area varies
+# with its position on the icosahedron, so this describes the layer, never one
+# hexagon.
+H3_AVERAGE_HEX_AREA_KM2: dict[int, float] = {
+    0: 4357449.416078381,
+    1: 609788.441794133,
+    2: 86801.780398997,
+    3: 12393.434655088,
+    4: 1770.347654491,
+    5: 252.903858182,
+    6: 36.129062164,
+    7: 5.161293360,
+    8: 0.737327598,
+    9: 0.105332513,
+    10: 0.015047502,
+    11: 0.002149643,
+    12: 0.000307092,
+    13: 0.000043870,
+    14: 0.000006267,
+    15: 0.000000895,
+}
+
+# The H3 index bit layout, from `src/h3lib/include/h3Index.h` (H3_MODE_OFFSET,
+# H3_RESERVED_OFFSET, H3_RES_OFFSET, H3_BC_OFFSET, H3_PER_DIGIT_OFFSET) and
+# `constants.h` (H3_CELL_MODE = 1, NUM_BASE_CELLS = 122) in uber/h3:
+#
+#   bit 63      reserved, 0
+#   bits 59-62  mode: 1 for a cell (2 is a directed edge, 4 a vertex)
+#   bits 56-58  mode-dependent, 0 for a cell
+#   bits 52-55  resolution, 0-15
+#   bits 45-51  base cell, 0-121
+#   bits 0-44   fifteen 3-bit digits for resolutions 1-15; a digit past the
+#               cell's resolution is 7, and a digit at or before it never is
+_H3_MODE_OFFSET = 59
+_H3_RESERVED_OFFSET = 56
+_H3_RES_OFFSET = 52
+_H3_BC_OFFSET = 45
+_H3_CELL_MODE = 1
+_H3_NUM_BASE_CELLS = 122
+_H3_MAX_RES = 15
+_H3_UNUSED_DIGIT = 7
+
+
+def h3_cell_resolution(hex_id: str) -> int | None:
+    """
+    The H3 resolution of a cell id, or None when the id is not an H3 cell.
+
+    Pure bit arithmetic on the 64-bit index -- no `h3` dependency for one
+    shift and a mask. The resolution alone is ``(int(hex_id, 16) >> 52) & 0xF``,
+    but four bits read off ANY hex string always come out 0-15, so a layer that
+    switched to some other id scheme would still "measure" a resolution. The
+    rest of the layout is checked for that reason: the mode must say cell, the
+    reserved bits must be clear, the base cell must exist, and the digits must
+    end exactly at the resolution. It is not a full ``h3.is_valid_cell`` (no
+    pentagon deleted-subsequence check); it only has to tell an H3 cell from an
+    id that is not one.
+
+    Example::
+
+        >>> h3_cell_resolution("872830828ffffff")  # San Francisco, res 7
+        7
+        >>> h3_cell_resolution("86283082fffffff")  # its res-6 parent
+        6
+        >>> h3_cell_resolution("11928308280fffff") is None  # a directed EDGE
+        True
+    """
+    try:
+        index = int(str(hex_id), 16)
+    except ValueError:
+        return None
+    if index < 0 or index >> 63:
+        return None
+    if (index >> _H3_MODE_OFFSET) & 0xF != _H3_CELL_MODE:
+        return None
+    if (index >> _H3_RESERVED_OFFSET) & 0x7:
+        return None
+    resolution = (index >> _H3_RES_OFFSET) & 0xF
+    if (index >> _H3_BC_OFFSET) & 0x7F >= _H3_NUM_BASE_CELLS:
+        return None
+    for digit_res in range(1, _H3_MAX_RES + 1):
+        digit = (index >> ((_H3_MAX_RES - digit_res) * 3)) & 0x7
+        if (digit == _H3_UNUSED_DIGIT) != (digit_res > resolution):
+            return None
+    return resolution
+
+
+def cell_resolution_counts(hex_ids) -> dict[int | None, int]:
+    """
+    How many DISTINCT hexagon ids decode to each H3 resolution.
+
+    ``None`` keys the ids that are not H3 cells at all, so an unrecognised id
+    is counted rather than dropped -- a histogram that hid them would describe
+    the layer as cleaner than it is. Distinct, because a hexagon on a tile seam
+    arrives once per tile and is still one hexagon.
+
+    Example::
+
+        >>> counts = cell_resolution_counts(["872830828ffffff", "872830828ffffff", "zz"])
+        >>> counts == {7: 1, None: 1}
+        True
+    """
+    counts: dict[int | None, int] = {}
+    for hex_id in set(hex_ids):
+        resolution = h3_cell_resolution(hex_id)
+        counts[resolution] = counts.get(resolution, 0) + 1
+    return counts
+
+
+def unexpected_cell_resolutions(counts: dict[int | None, int]) -> str | None:
+    """
+    Why a pass's resolution histogram is not the single expected resolution,
+    or None when it is (or when no hexagon decoded at all, which the layer guard
+    owns).
+
+    Example::
+
+        >>> unexpected_cell_resolutions({7: 10}) is None
+        True
+        >>> unexpected_cell_resolutions({6: 3, 7: 10})
+        'mixed H3 resolutions (6: 3 hexagons, 7: 10 hexagons); expected only H3 resolution 7'
+    """
+    if not counts or set(counts) == {EXPECTED_SCREEN_H3_RESOLUTION}:
+        return None
+    expected = f"expected only H3 resolution {EXPECTED_SCREEN_H3_RESOLUTION}"
+    if len(counts) == 1:
+        ((res, n),) = counts.items()
+        what = "not H3 cells at all" if res is None else f"H3 resolution {res}"
+        return f"{what} ({_hexagons(n)}); {expected}"
+    parts = [
+        f"{'not an H3 cell' if res is None else res}: {_hexagons(n)}"
+        for res, n in sorted(counts.items(), key=lambda kv: (kv[0] is None, kv[0] or 0))
+    ]
+    return f"mixed H3 resolutions ({', '.join(parts)}); {expected}"
+
+
+def _hexagons(n: int) -> str:
+    return f"{n:,} hexagon{'s' if n != 1 else ''}"
+
+
+def too_fine_cell_resolutions(counts: dict[int | None, int]) -> str | None:
+    """
+    Why a pass's hexagons are too fine for a z6 tile to carry faithfully, or
+    None when none is finer than :data:`MAX_SCREEN_H3_RESOLUTION`.
+
+    Example::
+
+        >>> too_fine_cell_resolutions({7: 10}) is None
+        True
+        >>> too_fine_cell_resolutions({7: 10, 10: 2})
+        'H3 resolution 10 (2 hexagons) is finer than resolution 9, ...'
+    """
+    fine = sorted(r for r in counts if r is not None and r > MAX_SCREEN_H3_RESOLUTION)
+    if not fine:
+        return None
+    named = ", ".join(f"{r} ({_hexagons(counts[r])})" for r in fine)
+    return (
+        f"H3 resolution {named} is finer than resolution {MAX_SCREEN_H3_RESOLUTION}, "
+        f"the finest whose hexagons a z{SCREEN_ZOOM} tile unit can still resolve"
+    )
 
 
 def hexes_in_bbox(
@@ -728,6 +934,7 @@ async def screen_targets_async(
     jitter: float = DEFAULT_TILE_JITTER,
     request_timeout: float = SCREEN_REQUEST_TIMEOUT_S,
     allow_collapse: bool = False,
+    allow_fine_cells: bool = False,
 ) -> dict[str, Any]:
     """
     One whole-catalog screen pass, serialized against every other Panoramax
@@ -737,7 +944,11 @@ async def screen_targets_async(
     ``tiles``, ``api_requests`` (ATTEMPTS, not planned tiles — a retried 5xx
     sends traffic the plan did not price), ``empty_tiles`` and ``hexagons``
     (how many distinct hexagons decoded in total, the structural evidence the
-    layer is still the layer we think it is).
+    layer is still the layer we think it is), and ``cell_resolutions``, the
+    :func:`cell_resolution_counts` histogram of every distinct hexagon id the
+    pass decoded -- the measured answer to "what is a screen cell?".
+    ``allow_fine_cells`` records a pass whose hexagons are finer than
+    :data:`MAX_SCREEN_H3_RESOLUTION`, otherwise refused with a DownloadError.
 
     ``allow_collapse`` skips only :func:`_refuse_if_layer_missing`, for an
     operator who has checked the endpoint by hand and means to record a real
@@ -769,12 +980,43 @@ async def screen_targets_async(
     if not allow_collapse:
         _refuse_if_layer_missing(tiles, empty_tiles, hexagons, api_requests=api_requests)
     rows = [screen_row(target, by_tile, per_city[target.city_id]) for target in targets]
+    # A resolution other than the one last measured changes how loose every
+    # bound is and breaks `cells` comparability across dates, but not soundness
+    # -- as long as a z6 tile can still DRAW the hexagons. Overlap selection plus
+    # whole-hexagon counting keeps each figure an upper bound and each zero
+    # conclusive at res 9 and coarser, so there it is WARNED AND RECORDED:
+    # refusing would turn a still-valid week into a permanent hole in a series
+    # that cannot be backfilled, to protect a number the artifact can describe.
+    # Finer than that, a hexagon can vanish in quantization and a zero can be
+    # false, so the pass is REFUSED unless the operator overrides it.
+    cell_resolutions = cell_resolution_counts(
+        hex_id for tile_hexes in by_tile.values() for hex_id in tile_hexes
+    )
+    too_fine = too_fine_cell_resolutions(cell_resolutions)
+    if too_fine and not allow_fine_cells:
+        error = DownloadError(
+            f"Panoramax screen hexagons: {too_fine}. Such a hexagon can quantize to "
+            f"nothing in a z{SCREEN_ZOOM} tile, so a city could record a zero it was "
+            f"never measured at — refusing to record the pass. Check the layer served "
+            f"by {SCREEN_URL_TEMPLATE}, then re-run with --allow-fine-cells if its "
+            f"hexagons are known to survive at this zoom."
+        )
+        error.api_requests = api_requests
+        raise error
+    unexpected = unexpected_cell_resolutions(cell_resolutions)
+    if unexpected:
+        logger.warning(
+            f"Panoramax screen hexagons: {unexpected}. Recorded and published as "
+            f"measured; the figures are still upper bounds, but `cells` is not "
+            f"comparable with a screen read at another resolution."
+        )
     return {
         "rows": rows,
         "tiles": len(tiles),
         "api_requests": api_requests,
         "empty_tiles": empty_tiles,
         "hexagons": hexagons,
+        "cell_resolutions": cell_resolutions,
     }
 
 
