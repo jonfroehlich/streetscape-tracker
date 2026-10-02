@@ -550,6 +550,13 @@ and `hosts_unavailable` is anchored to the blocked-host note's own `; `-delimite
   — the columns are added one ALTER at a time, so a guard checking only the first would strand the rest; the collector and salvage paths persisting the lengths,
   salvage tolerating a pre-v12 artifact rather than raising and forcing a full-cost re-crawl; the manifest publishing the lengths,
   trimming and order-preserving the per-class block, and surviving an unparseable one; and the backfill script's dry run, idempotency, rounding tolerance, wrong-artifact refusal, and the null-tolerant cases that must not become permanent candidates)
+- **The walk recompute** (#262, `tests/test_recompute_streetwalk_stats.py`), on walks collected by the REAL `collect.run_collect` from a real GraphML in the frozen-network cache (a cache hit, so no network), with a stale walk produced by the collector itself under `street_coverage.PRESENT_STATUSES` narrowed to `("OK",)` — the one thing #257 changed.
+  A walk holding `NO_DATE` samples recomputes to higher coverage, and its row and artifact are asserted EQUAL to a `--force` re-collection of the same responses under the current code, so the tool cannot drift from the collector; the CSV is asserted byte-identical, and a second pass changes nothing.
+  A sample frame mismatch (one CSV row dropped, which the `sample_points` pre-check cannot see) refuses the WHOLE series, leaving the other walk — which would move — untouched; a refreshed network is refused by the count pre-check.
+  A missing GraphML refuses with `fetch_graph`, `fetch_street_edges`, `_download_graph`, `_overpass_refusing` and `ox.graph_from_bbox` all replaced by recorders that must stay uncalled.
+  The dry run leaves the data dir byte-identical, catalog included.
+  The phantom pair is an old-definition walk then a new-definition one over identical imagery: the collector's diff records a positive delta and a detail file (asserted, so the premise is real), a catalog-only pass leaves the diff and says so, and `--regenerate-artifacts` leaves a no-changes row equal to `compute_walk_diff` over the two artifacts now on disk, a NULL pointer, no file, the name listed for the web server, and a manifest `change` block of 0.0.
+  A walk with no diff row is not given one.
 
 ## The census seam
 
