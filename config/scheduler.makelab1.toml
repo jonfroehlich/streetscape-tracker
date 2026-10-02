@@ -654,8 +654,12 @@ network_type = "drive"
 #   HOLD   (streak -> 0) on any 5xx give-up, or retried 5xx > max(10, 1%).
 #   CLEAN  otherwise; it QUALIFIES only at >= 1,000 requests, and a quieter
 #          night neither advances nor resets the streak.
-# Check it with ONE read-only command:
-#   python scripts/panoramax_gate_check.py --config config/scheduler.makelab1.toml
+#   UNKNOWN a qualifying ledger night with no child log: resets the streak.
+# Check it with ONE read-only command on this host, where --since is the
+# stage's first UTC night (recorded in the provider-access.md stage table):
+#   python scripts/panoramax_gate_check.py \
+#     --config config/scheduler.makelab1.toml --since <YYYY-MM-DD>
+# It exits 1 if ANY night since --since reverts, 3 if one is UNKNOWN.
 # or by hand: grep -h 'Panoramax tile retry: HTTP 5' \
 #               logs/collect_*_panoramax*_<date>.log | wc -l
 # (download_panoramax.TILE_RETRY_LOG_PHRASE: one WARNING per RETRIED request,

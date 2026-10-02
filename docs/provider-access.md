@@ -618,36 +618,46 @@ Against that assumed 320k/day, the per-IP sum of both channels' budgets is at mo
 Only the 150–200 req/s incident has a rate, and stage 1's 1 req/s is 150–200× below it; the "several thousand at once" report is a burst with no stated rate, and jittered pacing under one host lock never bursts.
 So the raise proceeds in stages, both channels together, with the forum deliberately not asked:
 
-| Stage | `max_requests_per_minute` | `daily_request_budget` (each channel) | Gate to the next stage |
-|---|---|---|---|
-| 0 (until 2026-10-01) | 30 | 4,000 | |
-| **1 (current)** | **60** | **8,000** | **7 consecutive clean qualifying nights** under the gate rule below |
-| 2 | 90 | 12,000 | another 7, same rule |
+| Stage | `max_requests_per_minute` | `daily_request_budget` (each channel) | First UTC night (`--since`) | Gate to the next stage |
+|---|---|---|---|---|
+| 0 | 30 | 4,000 | — | |
+| **1 (current)** | **60** | **8,000** | *the first night after the deploy — fill in when it goes live* | **7 consecutive clean qualifying nights** under the gate rule below |
+| 2 | 90 | 12,000 | | another 7, same rule |
+
+The fourth column is a DEPLOY fact, not a merge fact, so the repo cannot derive it: whoever deploys a stage writes its first UTC night here, and it is the `--since` the gate check below is run with.
 
 - **Each stage is its own PR** to `config/scheduler.makelab1.toml`, with its date and evidence in the comment block, and the pinning test in `tests/test_scheduler.py` moves with it.
 - **The trip wire is the existing latch**: 403/429/redirect is a `HostBlockedError` (exit 84) at the first request.
   A trip **reverts to the previous stage** and the night is recorded in this section.
 - **The gate rule** (decided 2026-10-02; #405 said only "no 5xx cluster", so this is what that phrase means here).
   A **night** is one UTC date, and its **requests** are the `api_usage` rows for `panoramax` + `panoramax_streets` on that date (both channels share one per-IP host, and the weekly screen writes into the grid row too).
-  Its **retried 5xx** are the `Panoramax tile retry: HTTP 5xx on try …` lines, one per retried request; its **5xx give-ups** are `Panoramax tile retry gave up: HTTP 5xx` lines; timeouts and connection errors are counted and printed but do not gate.
+  Its **retried 5xx** are the `Panoramax tile retry: HTTP 5xx on try …` lines, one per retried request; its **5xx give-ups** are `Panoramax tile retry gave up: HTTP 5xx` lines; timeouts, connection errors and retried 4xx (retries and give-ups alike) are counted and printed but do not gate.
   - **REVERT** to the previous stage, at once, on any per-IP refusal (an `exited 84` child, or a Panoramax 403/429/redirect/error-page message) — #405's original trip wire.
     Also REVERT when retried 5xx exceed **10%** of the night's requests (and 10 in absolute terms), or on a **second HOLD within 7 nights** of the first.
   - **HOLD** — the stage stays, and the clean streak resets to 0 — on any **5xx give-up**, or when retried 5xx exceed **max(10, 1% of requests)**.
+  - **UNKNOWN** when the ledger shows a qualifying night (≥ 1,000 requests) but no `collect_*_panoramax*` child log exists for it: the night cannot be judged, so it resets the streak and is flagged rather than read as clean.
+  - **PROVISIONAL** for the current UTC date, whose batch may still be running: shown, never judged clean or held (a refusal still reverts).
   - Otherwise the night is **CLEAN**; but it **qualifies** toward the seven only at **≥ 1,000 requests**, and a quieter night neither advances nor resets the streak.
   - **ADVANCE** after **7 consecutive clean qualifying nights**.
 - **Why those numbers.**
   - *Our own baseline* — the only measured Panoramax error data in the repo is phase 1 of #316 ([`experiments/panoramax-feasibility.md`](experiments/panoramax-feasibility.md), from a laptop IP at 30/min, September 2026), whose fetcher counted every attempt: the `screen` stage spent exactly its 113 tiles and the `detail` stage exactly its 3,001, so **0 retries in 3,114 requests** (the 3,321-request `measure` stage cannot be split, having reused rows).
     By the rule of three (Hanley & Lippman-Hand, *JAMA* 1983) that bounds a healthy retry rate at **≈ 0.1%** (95% upper bound, 3 / 3,114).
     **There is no production baseline**: before this gate's log line, prod retries were invisible, and nobody has compared prod's `runs.api_requests` with tile counts; stage 1's first nights are the first production measurement, and they should be read as such.
-  - *1% to HOLD* is ten times that bound, so ordinary noise does not hold a stage, and an order of magnitude below the per-client **retry budget of 10%** in Google's SRE book ("a request will only be retried as long as this ratio is below 10%", [Handling Overload](https://sre.google/sre-book/handling-overload/)) — so we stop *advancing* long before our retries reach what that guidance treats as load amplification.
-  - *10% to REVERT* is that budget itself: past it our retries are adding ≥ 10% to the load of a server that is already failing, and the maintainer measures clients by their share of the catalog's load (#405's 25% complaint).
-  - *The floor of 10, and 1,000 requests to qualify*, are the same number seen twice: at 1,000 requests 1% is 10, and below that a ratio says nothing. At the baseline bound a 1,000-request night expects ~1 retried 5xx, and P(more than 10) under Poisson(1) is ~10⁻⁸, so the floor cannot hold a healthy night by chance.
+  - *1% to HOLD* is ten times that bound, so ordinary noise does not hold a stage, and an order of magnitude below the **10% per-client retry budget** in Google's SRE book ("a request will only be retried as long as this ratio is below 10%", [Handling Overload](https://sre.google/sre-book/handling-overload/)) — so we stop *advancing* long before our retries reach what that guidance treats as load amplification.
+    This is **our adaptation**, not the book's mechanism: there the 10% is a budget a client ENFORCES at request time, paired with a per-request budget of three attempts ("If a request has already failed three times, we let the failure bubble up"), whereas we measure the ratio after the fact as a gate and `_fetch_tile` allows **five** attempts (`TILE_MAX_TRIES`), not three.
+    Five is deliberately not changed here; it means one failing tile can cost up to four retries rather than two, which is part of why the HOLD line sits a decade below the book's number.
+  - *10% to REVERT* is that budget's number used as a ceiling: past it our retries add ≥ 10% to the load of a server that is already failing, and the maintainer measures clients by their share of the catalog's load (#405's 25% complaint).
+  - *The floor of 10, and 1,000 requests to qualify*, are the same number seen twice: at 1,000 requests 1% is 10, and below that a ratio says nothing. At the baseline bound a 1,000-request night expects ~1 retried 5xx, and P(more than 10) under Poisson(1) is ~10⁻⁸.
+    **That figure is optimistic**: Poisson assumes independent failures, and 5xx come in bursts (one bad minute fails every tile in flight, each then retried up to four times), so the real chance of a healthy-but-unlucky night crossing 10 is higher — still small, and a burst that big is worth a HOLD anyway.
   - *Any 5xx give-up holds*: a give-up is `TILE_MAX_TRIES` (5) consecutive failures of one tile across up to `_TILE_MAX_TIME_S` (120 s) of exponential backoff, which is sustained server trouble rather than a blip — and it leaves a hole the resume must re-probe.
-    That backoff, capped per request, is the other half of the SRE book's retry guidance ("Limit retries per request", [Addressing Cascading Failures](https://sre.google/sre-book/addressing-cascading-failures/)), and it is already how `_fetch_tile` retries.
+    The per-request cap is the SRE book's "Limit retries per request" ([Addressing Cascading Failures](https://sre.google/sre-book/addressing-cascading-failures/)) in spirit, at five attempts rather than the three its other chapter uses.
   - *A second HOLD within 7 nights reverts*: a hold that recurs inside one gate window is a trend, not a blip, and stage 0 is the pace with no complaint on record.
-- **How an operator checks it — one command, read-only, no network:**
-  `python scripts/panoramax_gate_check.py --config config/scheduler.makelab1.toml` prints the last 14 nights (`--end`, `--nights` to move the window), each night's requests, retried and given-up 5xx, other retries and refusals, a per-night verdict and the stage verdict; it exits 1 when the window ends in REVERT.
-  It reads the per-attempt child logs `logs/collect_*_panoramax*_<date>.log` and the night's own lines of `streetscape_scheduler.log` (the screen's retries, and every `exited 84`), plus the `api_usage` ledger opened read-only.
+- **How an operator checks it — one command, read-only, no network, run on the production host:**
+  `python scripts/panoramax_gate_check.py --config config/scheduler.makelab1.toml --since <first UTC night of this stage>` prints every night from `--since` to yesterday (UTC; `--end` moves it, and today is shown only as PROVISIONAL), each night's requests, retried and given-up 5xx, other retries and give-ups, refusals and child-log count, a per-night verdict and the stage verdict.
+  It exits **1 if ANY night since `--since` reverts** (a revert is acted on by a config change and a new `--since`, so it never needs to be "outgrown"), **3** if none reverts but a night is UNKNOWN, and 0 otherwise.
+  `--since` is required so a previous stage's clean nights can never advance this one.
+  It reads the per-attempt child logs `logs/collect_*_panoramax*_<date>.log` (named for the UTC run date, so every line counts) and the scheduler log's OWN records — never the copy of a failed child's last 25 lines that `_run_collection_subprocess` appends to its error, which would count those retries twice.
+  The scheduler log's timestamps are host-LOCAL and it rotates at local midnight, while the ledger (`_record_screen_spend` included — the screen fires Monday 18:00 Pacific, which is Tuesday in UTC) is keyed by UTC date, so each record is converted to its UTC date in the host's zone (`--log-tz` overrides it) and both local rotations a UTC night spans are read.
   By hand, the 5xx count is `grep -h 'Panoramax tile retry: HTTP 5' logs/collect_*_panoramax*_<date>.log | wc -l`.
   That log line (`download_panoramax.TILE_RETRY_LOG_PHRASE`, a backoff `on_backoff`/`on_giveup` handler on `_fetch_tile`) exists for this gate: before it a 5xx that recovered on its next try left no trace anywhere.
   A cross-check that needs no log: for a crawl that completed in one uncapped night, `runs.api_requests` counts every attempt, so its excess over the lattice's tile count is the number of retries.
