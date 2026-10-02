@@ -420,7 +420,7 @@ Incidental coverage of a deprecated spelling trains readers to ignore the notice
 Seeded successes sit at midnight, so a channel's age is a whole number of days, read the way `get_due_cities` reads it.
 A test that builds a second catalog keeps the unpatched `db.connect`, since `_run_night` replaces it for the night; a lane test writes no ledger, since a lane worker has no catalog handle.
 A live checkpoint is faked by replacing `_sweep_checkpoint_progress`, which both the resumer scan and `_sweep_launch_plan` read.
-Every "killed by" below was run against the committed code, one mutation at a time with the file restored after (95 mutants in the fourth review round of PR #411, run with the socket guard on — every earlier round's, the reviewers', and Jon's 2026-10-02 decisions — all killed but one EQUIVALENT mutant, named below):
+Every "killed by" below was run against the committed code, one mutation at a time with the file restored after (106 mutants in the fifth review round of PR #411, run with the socket guard on — every earlier round's, the reviewers', and Jon's 2026-10-02 decisions — all killed but one EQUIVALENT mutant, named below):
 
 - `test_a_backlog_holds_the_whole_fill` — a never-collected due city's mapillary deferred for budget holds the fill, and no fill gsv runs either; killed by ignoring the backlog.
 - `test_a_backlog_on_an_opt_in_channel_does_not_hold_the_fill` — a KartaView deferral does not stop a gsv/mapillary fill; killed by filling every provider instead of the default-membership ones.
