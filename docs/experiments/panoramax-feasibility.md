@@ -6,6 +6,13 @@
 **Issue:** [#316](https://github.com/jonfroehlich/streetscape-tracker/issues/316), phase 1.
 Provider context: [`imagery-providers.md`](../imagery-providers.md).
 
+> **Correction, 2026-10-01 ([#406](https://github.com/jonfroehlich/streetscape-tracker/issues/406)).**
+> This writeup says the v2 z6 screen hexagons are H3 resolution 6, ~36 km² (the "Read this before" section, the instrument table, and the screen's caveat).
+> On 2026-10-01 every one of the 261,913 hexagon ids the same layer served at z6 carried **resolution 7** (~5.2 km²), and the hex counts inside a 10 km disc agree (at most 74, ~4.3 km² each) — see [`panoramax-world-screen.md`](panoramax-world-screen.md).
+> Whether the layer changed after this study or resolution 6 was stated without being read from an id is **unknown**: no phase-1 hexagon id was kept.
+> The screen's logic is unaffected (it selects by overlap and counts whole hexagons, so it is still an upper bound and a zero is still conclusive), but every "a screen hex is larger than the city" sentence below is wrong for the median city at resolution 7.
+> The text below is left as written.
+
 ## Verdict
 
 **The gate as [#316](https://github.com/jonfroehlich/streetscape-tracker/issues/316) phrases it fails: the median tracked city has no Panoramax imagery at all.**
@@ -118,6 +125,7 @@ Since the groups derive from the screen, a corrected screen meant a corrected dr
 
 30 requests/minute with jittered gaps at CV 0.6, using [#292](https://github.com/jonfroehlich/streetscape-tracker/issues/292)'s shifted-exponential formula imported from `download_common.spaced_gap_seconds` rather than re-derived.
 That is roughly half the Mapillary channels' configured rate, against a host with strictly less published guidance — the intended direction of the asymmetry.
+(Production later reversed it, 60/min against Mapillary's 40, under #405's staged raise; see [`../provider-access.md`](../provider-access.md).)
 `refuse_on_collection_host()` keeps it off makelab\*, and a 403 or 429 ends the run rather than being retried into; neither occurred.
 No rate limit is documented anywhere found and no rate-limit headers come back; see [`provider-access.md`](../provider-access.md) for the full access survey.
 The whole study spent 113 + 3,321 + 60 + 79 + 3,001 requests over two afternoons, plus a 60-request re-run of the `access` stage on 2026-09-06 once its `datetime` probe was corrected (finding 5).

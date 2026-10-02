@@ -477,9 +477,12 @@ def parse_args():
              — not in its API docs, not in its OpenAPI spec, and no
              X-RateLimit-*/Retry-After header comes back — so there is no
              published number to pace to and this one is chosen, not measured.
-             It is deliberately half the Mapillary cap against a host with
-             strictly less published guidance, and one that is a single
-             volunteer-run meta-catalog taking all of our load. Default
+             The DEFAULT is deliberately below the Mapillary cap against a
+             host with strictly less published guidance, and one that is a
+             single volunteer-run meta-catalog taking all of our load.
+             Production reverses that (60/min since #405 stage 1, against
+             Mapillary's 40): separate hosts, separate limits, and #405's
+             evidence is about this host alone. Default
              {DEFAULT_PANORAMAX_REQUESTS_PER_MINUTE}; 0 disables pacing.""",
     )
 

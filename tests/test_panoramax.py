@@ -25,6 +25,7 @@ is modelled on, because those are the differences a reader coming from
 """
 
 import asyncio
+import re
 from datetime import UTC, datetime, timedelta
 
 import aiohttp
@@ -566,6 +567,98 @@ def test_a_5xx_is_retried_and_every_attempt_is_paced_and_counted():
         _fetch(session, rate_limiter=limiter, on_request=lambda: counted.append(1))
     assert session.calls == dp.TILE_MAX_TRIES
     assert len(counted) == session.calls == limiter.acquired
+
+
+@pytest.fixture
+def _instant_backoff(monkeypatch):
+    """backoff's real expo waits make an exhausted tile take ~8 s; the wait is
+    not under test here, only what gets logged around it."""
+    import backoff._async as backoff_async
+
+    real_sleep = asyncio.sleep
+
+    async def no_wait(_seconds, *args, **kwargs):
+        await real_sleep(0)
+
+    monkeypatch.setattr(backoff_async.asyncio, "sleep", no_wait)
+
+
+class _SequenceTileSession(_FakeTileSession):
+    """Answers each .get() with the next response in a list."""
+
+    def __init__(self, responses):
+        super().__init__(None)
+        self._responses = list(responses)
+
+    def get(self, url, **kwargs):
+        self._response = self._responses[min(self.calls, len(self._responses) - 1)]
+        return super().get(url, **kwargs)
+
+
+def test_a_RECOVERED_5xx_is_logged_so_the_405_gate_can_see_it(caplog, _instant_backoff):
+    """
+    #405's stage gate is "no 5xx cluster", and before this a 5xx that succeeded
+    on its next try left no trace anywhere: backoff retried silently, the tile
+    committed, and the night read as clean. Each retry now logs the fixed
+    phrase the gate check greps for, naming the status.
+    """
+    body = mapbox_vector_tile.encode([])
+    ok = _FakeTileResponse(200, {"Content-Type": "application/x-protobuf"}, body)
+    session = _SequenceTileSession([_FakeTileResponse(503), _FakeTileResponse(502), ok])
+    with caplog.at_level("WARNING", logger=dp.logger.name):
+        assert _fetch(session) == body
+    retries = [r.getMessage() for r in caplog.records if dp.TILE_RETRY_LOG_PHRASE in r.getMessage()]
+    assert len(retries) == 2
+    assert retries[0].startswith(
+        f"{dp.TILE_RETRY_LOG_PHRASE}: HTTP 503 on try 1 of {dp.TILE_MAX_TRIES}"
+    )
+    assert retries[1].startswith(
+        f"{dp.TILE_RETRY_LOG_PHRASE}: HTTP 502 on try 2 of {dp.TILE_MAX_TRIES}"
+    )
+    assert dp.TILE_RETRY_LOG_PHRASE == "Panoramax tile retry", "the documented grep string"
+
+
+def test_an_EXHAUSTED_5xx_logs_each_retry_and_the_give_up(caplog, _instant_backoff):
+    session = _FakeTileSession(_FakeTileResponse(503))
+    with caplog.at_level("WARNING", logger=dp.logger.name):
+        with pytest.raises(aiohttp.ClientResponseError):
+            _fetch(session)
+    messages = [r.getMessage() for r in caplog.records]
+    assert sum(m.startswith(f"{dp.TILE_RETRY_LOG_PHRASE}: HTTP 503") for m in messages) == (
+        dp.TILE_MAX_TRIES - 1
+    )
+    assert f"{dp.TILE_RETRY_LOG_PHRASE} gave up: HTTP 503 after {dp.TILE_MAX_TRIES} tries" in (
+        messages
+    )
+
+
+# RFC 9110 sec. 10.1.5: User-Agent = product *( RWS ( product / comment ) ),
+# product = token ["/" product-version]; tchar excludes spaces and delimiters.
+_TCHAR = r"[!#$%&'*+\-.^_`|~0-9A-Za-z]"
+_PRODUCT = rf"{_TCHAR}+(?:/{_TCHAR}+)?"
+_COMMENT = r"\([^()]*\)"
+_RFC9110_USER_AGENT = re.compile(rf"^{_PRODUCT}(?: (?:{_PRODUCT}|{_COMMENT}))*$")
+
+
+def test_the_user_agent_names_the_product_and_a_contact_address():
+    """
+    Panoramax carries no credential, so the User-Agent is the only way its
+    operator can tell who we are -- and since #405 doubled our pace against a
+    maintainer who has said rate-limiting "will come", it names a person to
+    write to. Jon chose the contact address; the shape follows RFC 9110 and the
+    Wikimedia `<client>/<version> (<contact>) <library>/<version>` convention.
+    """
+    ua = dp.USER_AGENT
+    assert _RFC9110_USER_AGENT.match(ua), ua
+    assert ua.startswith("StreetscapeTracker/1.0 "), "a product token has no spaces"
+    assert dp.USER_AGENT_CONTACT == "sidewalk@cs.uw.edu"
+    assert "; sidewalk@cs.uw.edu)" in ua, "the contact belongs inside the comment"
+    assert "(+https://github.com/jonfroehlich/streetscape-tracker;" in ua
+    assert ua.endswith(f" aiohttp/{aiohttp.__version__}")
+    # The weekly screen hits the same host and must identify itself the same way.
+    from streetscape_metadata_tracker import panoramax_screen
+
+    assert panoramax_screen.USER_AGENT is dp.USER_AGENT
 
 
 def test_a_healthy_tile_returns_its_body():
