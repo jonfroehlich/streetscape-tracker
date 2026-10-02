@@ -18,6 +18,10 @@ import pytest
 
 from streetscape_metadata_tracker import catalog_backup, db
 
+# The real write_backup is this file's unit under test; tests/conftest.py's
+# `_no_nightly_side_effects` stubs it for every test without this marker.
+pytestmark = pytest.mark.real_catalog_backup
+
 
 def _populate(conn, n_cities=3, offset=0):
     """A catalog with rows in the tables a restore has to bring back.

@@ -47,4 +47,5 @@ testpaths = ["tests"]
 addopts = "-q -m 'not e2e'"
 markers = [
   "e2e: end-to-end tests that need the network - the browser smoke suite (pytest-playwright + chromium) and live third-party checks",
+  "real_catalog_backup: keeps the real catalog_backup.write_backup (tests/conftest.py stubs it for every other test)",
 ]

@@ -10296,12 +10296,17 @@ def _retry_stranded_walks(
     sigterm_seen: threading.Event,
     tally: Counter[str],
     only: set[tuple[str, str]] | None = None,
+    fill: bool = False,
+    fill_cap: Callable[[str, str], int | None] | None = None,
 ) -> str | None:
     """The end-of-night retry of tonight's stranded walks (issue #380).
 
     ``only`` narrows the pass to those (city, walk) pairs: the fill phase
     (issue #404) retries the walks IT stranded, after the due phase's own pass
     already retried the due ones, which a second pass must not re-ask about.
+    ``fill`` and ``fill_cap`` (``(city_id, channel) -> room``) are the fill's
+    launch settings, handed through so a retried fill walk is sized to the
+    fill's room and logged as a fill run, like its first launch.
 
     Once the city loop has passed a city nothing asks the breaker on its
     behalf again, yet a night finishes in ~2-3 h of its 12 h window and an
@@ -10465,6 +10470,12 @@ def _retry_stranded_walks(
                     deadline_deferred=deadline_deferred,
                     batch_deadline=batch_deadline,
                     stop_requested=sigterm_seen,
+                    fill=fill,
+                    fill_cap=(
+                        None
+                        if fill_cap is None
+                        else (lambda channel, cid=cid: fill_cap(cid, channel))
+                    ),
                 )
             finally:
                 # A breaker skip HERE re-asks about a walk the loop already
@@ -11018,25 +11029,27 @@ def _tomorrow_due_demand(
     providers: Sequence[str],
     *,
     running_tonight: dict[str, list[str]] | None = None,
-) -> dict[tuple[str, str], tuple[str, int]]:
+) -> dict[tuple[str, str], tuple[str, int, int]]:
     """Tomorrow night's due work on rolling-24h hosts, per (city, channel) (issue #404).
 
-    ``{(city_id, channel): (host, requests)}`` for every channel on a metered
-    host with a rolling bound (a ``[hosts.*]`` budget or a fill ceiling). Each
-    channel's due list for ``today + 1`` comes from the SAME dueness query the
-    due path uses (``get_due_cities``: its julianday rule, membership and
-    quarantine), cut at ``max_cities_per_day`` (tomorrow cannot run more), and
-    is priced with the SAME estimator the launch gate uses
-    (``_channel_estimate``) -- except a paired WALK, priced at 0 when its grid
-    sibling is due the same night: the grid's census lands in the cache and
-    the walk reuses it (#290). Read after tonight's due phase, so a city that
-    succeeded tonight has already left the lists and one deferred is still in
-    them. ``running_tonight`` is the dry run's correction: a preview has run
-    nothing, so each city's due channels in tonight's slate are assumed to
-    succeed and are left out.
+    ``{(city_id, channel): (host, requests, rank)}`` for every channel on a
+    metered host with a rolling bound (a ``[hosts.*]`` budget or a fill
+    ceiling). Each channel's due list for ``today + 1`` comes from the SAME
+    dueness query the due path uses (``get_due_cities``: its julianday rule,
+    membership and quarantine), priced with the SAME estimator the launch gate
+    uses (``_channel_estimate``, which is already 0 for a census in tonight's
+    cache), and ``rank`` is the city's place in that stalest-first list.
+
+    The FULL list, uncut: the city cap and the paired-walk pricing are applied
+    by :func:`_tomorrow_due_reserve` AFTER the fill's credits, because a pair
+    the fill pulls forward tonight lets the next city into tomorrow's window --
+    cut first, that city would be unreserved (review 411e #4). Read after
+    tonight's due phase, so a city that succeeded tonight has already left the
+    lists; ``running_tonight`` is the dry run's correction (each city's due
+    channels in tonight's slate are assumed to succeed).
     """
     tomorrow = today + timedelta(days=1)
-    lists: dict[str, list[db.CityRow]] = {}
+    demand: dict[tuple[str, str], tuple[str, int, int]] = {}
     for channel in providers:
         host = CHANNEL_METERED_HOST.get(channel)
         if host is None or _fill_host_cap(cfg, host) is None:
@@ -11052,19 +11065,12 @@ def _tomorrow_due_demand(
         )
         if running_tonight:
             due = [c for c in due if channel not in running_tonight.get(c.city_id, ())]
-        lists[channel] = due[: cfg.max_cities_per_day]
-    demand: dict[tuple[str, str], tuple[str, int]] = {}
-    for channel, due in lists.items():
-        host = CHANNEL_METERED_HOST[channel]
-        sibling = STREET_CHANNELS.get(channel)
-        paired = (
-            {c.city_id for c in lists.get(sibling, ())}
-            if sibling is not None and sibling in CENSUS_PROVIDERS
-            else set()
-        )
-        for city in due:
-            req = 0 if city.city_id in paired else _channel_estimate(cfg, city, channel, conn)
-            demand[(city.city_id, channel)] = (host, req)
+        for rank, city in enumerate(due):
+            demand[(city.city_id, channel)] = (
+                host,
+                _channel_estimate(cfg, city, channel, conn),
+                rank,
+            )
     return demand
 
 
@@ -11075,47 +11081,72 @@ def _tomorrow_due_reserve(
     providers: Sequence[str],
     *,
     running_tonight: dict[str, list[str]] | None = None,
-    demand: dict[tuple[str, str], tuple[str, int]] | None = None,
+    demand: dict[tuple[str, str], tuple[str, int, int]] | None = None,
     credit: Collection[tuple[str, str]] = (),
 ) -> dict[str, tuple[int, int]]:
     """Tomorrow night's projected DUE demand per rolling-24h host (issue #404).
 
     ``{host: (requests, cities)}`` for every metered host with a rolling bound
-    and a channel in ``providers``, summed from :func:`_tomorrow_due_demand`
-    (the grid and the walk on the tile CDN are one pool), with each channel cut
-    at its daily budget and each host at its cap (the fill ceiling, else the
-    budget) -- all tomorrow could spend there.
+    and a channel in ``providers``, from :func:`_tomorrow_due_demand`, in this
+    order:
 
-    ``credit`` is the (city, channel) pairs the fill pulls FORWARD tonight:
-    once the fill has collected them they are not due tomorrow, so they leave
-    the demand -- and a city being judged is credited its own pairs, since
-    running it is exactly what removes them (an 82-day city fits a ceiling of
-    1.5x its price; reserving its own tomorrow against it would decline it).
+    1. drop ``credit`` -- the (city, channel) pairs the fill pulls FORWARD
+       tonight (collected, so not due tomorrow), plus the city being judged,
+       whose own pairs running it removes (an 82-day city fits a ceiling of
+       1.5x its price);
+    2. cut each channel's list at ``max_cities_per_day``, in its
+       stalest-first order -- AFTER the credits, so the cities that move up
+       into tomorrow's window are reserved;
+    3. find, per GRID channel, the cities its daily budget lets tomorrow
+       actually run (the stalest-first prefix that fits);
+    4. price a paired WALK at 0 only when its grid sibling is one of those
+       (the grid's census is then cached for it, #290); a walk whose grid
+       sibling will not run tomorrow pays its census;
+    5. cut each channel at its daily budget and each host at its cap -- all
+       tomorrow could spend there -- and sum per host (the grid and the walk
+       on the tile CDN are one pool).
 
-    Conservative where it is not exact: the lists are cut at the city cap per
-    channel but not at the shared cap or the opt-in reservation, and a
-    resumable crawl is priced whole. ``demand`` lets the fill compute the
-    pairs once and re-sum them per admission.
+    Conservative where it is not exact: each channel is cut at the city cap
+    but not at the shared cap or the opt-in reservation, and a resumable crawl
+    is priced whole.
     """
     if demand is None:
         demand = _tomorrow_due_demand(cfg, conn, today, providers, running_tonight=running_tonight)
     credited = set(credit)
-    per_channel: Counter[str] = Counter()
+    lists: dict[str, list[tuple[int, str, int]]] = {}
+    for (city_id, channel), (_host, req, rank) in demand.items():
+        if (city_id, channel) not in credited:
+            lists.setdefault(channel, []).append((rank, city_id, req))
+    for channel in lists:
+        lists[channel] = sorted(lists[channel])[: cfg.max_cities_per_day]
+    runs_tomorrow: dict[str, set[str]] = {}
+    for channel, entries in lists.items():
+        if is_street_channel(channel):
+            continue
+        budget, spent, ran = cfg.providers[channel].daily_request_budget, 0, set()
+        for _rank, city_id, req in entries:
+            if spent + req > budget:
+                break
+            spent += req
+            ran.add(city_id)
+        runs_tomorrow[channel] = ran
+    host_total: Counter[str] = Counter()
     cities: dict[str, set[str]] = {}
     for channel in providers:
         host = CHANNEL_METERED_HOST.get(channel)
         if host is not None and _fill_host_cap(cfg, host) is not None:
             cities.setdefault(host, set())
-    for (city_id, channel), (host, req) in demand.items():
-        if (city_id, channel) in credited:
-            continue
-        per_channel[channel] += req
-        cities.setdefault(host, set()).add(city_id)
-    host_total: Counter[str] = Counter()
-    for channel, req in per_channel.items():
-        host_total[CHANNEL_METERED_HOST[channel]] += min(
-            req, cfg.providers[channel].daily_request_budget
+    for channel, entries in lists.items():
+        host = CHANNEL_METERED_HOST[channel]
+        sibling = STREET_CHANNELS.get(channel)
+        paired = (
+            runs_tomorrow.get(sibling, set())
+            if sibling is not None and sibling in CENSUS_PROVIDERS
+            else set()
         )
+        total = sum(0 if city_id in paired else req for _rank, city_id, req in entries)
+        host_total[host] += min(total, cfg.providers[channel].daily_request_budget)
+        cities.setdefault(host, set()).update(city_id for _rank, city_id, _req in entries)
     out = {}
     for host, ids in cities.items():
         cap = _fill_host_cap(cfg, host)
@@ -12036,7 +12067,9 @@ def _run_fill(
             report.cities += 1
             if label == "fill resume":
                 report.resumed += 1
-            elif _misaligned(conn, city.city_id, channels, prior):
+            elif _misaligned(conn, city.city_id, channels, prior) and _aligned_tonight(
+                conn, city.city_id, channels, today
+            ):
                 report.realigned += 1
         if sigterm_seen.is_set():
             report.stop_reason = _STOP_REASON_SIGTERM
@@ -12127,6 +12160,8 @@ def _run_fill(
                 sigterm_seen=sigterm_seen,
                 tally=tally,
                 only=set(walk_prior),
+                fill=True,
+                fill_cap=lambda cid, channel: fill_room(cid, [channel], channel),
             )
             report.attempted += tally["attempted"]
             report.succeeded += tally["succeeded"]
@@ -12155,6 +12190,26 @@ def _run_fill(
                 blocked_hosts.fill_stranded[(cid, walk)] = due_on
     logger.info("Fill: " + report.summary_clause(cfg.fill_min_days))
     return report
+
+
+def _aligned_tonight(conn, city_id: str, channels: Sequence[str], today: date) -> bool:
+    """Does EVERY member channel of this city now carry tonight's date? (#404)
+
+    What the Done line's ``realigned`` means: a city counts only when the run
+    actually brought every member channel onto one date -- not when a channel
+    failed, or a failing opt-in channel was left out ("realign blocked").
+    """
+    for channel in channels:
+        row = conn.execute(
+            "SELECT last_success_at, member FROM schedule_state WHERE city_id = ? AND provider = ?",
+            (city_id, channel),
+        ).fetchone()
+        member = None if row is None else row["member"]
+        if (CHANNEL_DEFAULT_MEMBERSHIP[channel] if member is None else member) != 1:
+            continue
+        if row is None or not (row["last_success_at"] or "").startswith(today.isoformat()):
+            return False
+    return True
 
 
 def _misaligned(conn, city_id: str, channels: Sequence[str], prior: dict[str, str | None]) -> bool:

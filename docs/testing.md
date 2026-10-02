@@ -9,10 +9,14 @@ An edit that changes a rule belongs in both files; anything written since the sp
 `tests/`, pytest. No real network; the downloader tests substitute an in-memory fetch primitive rather than mocking HTTP.
 
 **"No real network" is enforced, not a convention (since the PR #411 review).**
-`tests/conftest.py`'s autouse `_no_real_network` makes every non-loopback AF_INET/AF_INET6 `connect` raise `RealNetworkBlocked` (an `OSError`, so the code under test sees an ordinary transport failure) and then FAILS the test at teardown, because code that swallows an `OSError` would otherwise turn the attempt into a pass; loopback and AF_UNIX stay open.
-It was added after `tests/test_fill_underfull_nights.py` drove `run-due` without `tests/test_scheduler.py`'s local stubs and made 168 real GETs of Google's driving-plan feed; with the guard on, nothing else in the suite tried to connect.
+`tests/conftest.py`'s autouse `_no_real_network` makes every non-loopback AF_INET/AF_INET6 `connect`/`connect_ex` raise `RealNetworkBlocked` (an `OSError`, so the code under test sees an ordinary transport failure), every `getaddrinfo` of a non-loopback NAME raise `RealDNSBlocked` (a `socket.gaierror`, so no DNS query leaves the machine; an IP literal resolves locally and meets the connect check), and then FAILS the test at teardown, because code that swallows the error would otherwise turn the attempt into a pass.
+Loopback means 127.0.0.0/8, `::1`, IPv4-mapped loopback (`::ffff:127.0.0.1`) and `localhost`; AF_UNIX stays open; a test that fakes DNS (`tests/_dns_fakes.py`) patches `getaddrinfo` after the guard and so wins.
+**Not covered, by where it hooks:** a UDP `sendto` (no connect), and anything a SUBPROCESS does — a child imports none of this, so a test that spawns one stubs its network itself.
+**The e2e tests are exempt** — the `e2e` marker, or a file under `tests/e2e/` — because they talk to the network by design: `tests/e2e/test_basemap_key.py` fetches a real CARTO tile (the only detector of a missing basemap key), and CI runs that job as `pytest tests/e2e -m e2e`; guarded, it would skip and error every run.
+It was added after `tests/test_fill_underfull_nights.py` drove `run-due` without `tests/test_scheduler.py`'s local stubs and made 168 real GETs of Google's driving-plan feed; with the guard on, nothing else in the DEFAULT (non-e2e) suite tried to connect or resolve a name.
 Two more suite-wide autouse fixtures close the same hole for files on disk:
-`_no_nightly_side_effects` (moved from `tests/test_scheduler.py`) stubs the driving-plan fetch, the catalog backup and the driving-plan summary for every test — `tests/test_catalog_backup.py` keeps the real `write_backup`, its unit under test — and `_scheduler_config_defaults_in_tmp` puts a `SchedulerConfig`'s DEFAULT `data_dir`, `backup_dir` and `log_dir` under `tmp_path`.
+`_no_nightly_side_effects` (moved from `tests/test_scheduler.py`) stubs the driving-plan fetch, the catalog backup and the driving-plan summary for every test — a test marked `real_catalog_backup` keeps the real `write_backup` (`tests/test_catalog_backup.py` marks itself) — and `_scheduler_config_defaults_in_tmp` puts a `SchedulerConfig`'s DEFAULT `data_dir`, `backup_dir` and `log_dir` under `tmp_path`.
+`tests/test_hermetic_guard.py` pins all of it: loopback open across the range, a swallowed connect and a swallowed lookup still erroring the test (nested pytest runs), the e2e exemption by marker (identity of the real `connect`/`getaddrinfo`, so no packet leaves) and by path, the marker-based backup exemption, and the real default dirs of `SchedulerConfig` beside their redirection.
 The second was needed beyond the fill tests: the `regenerate-aggregate` tests built default configs and left `data/provider_screen.json.gz` in the working tree — from the production checkout, the published data directory.
 A test passing its own path, and `load_scheduler_config` (which always passes one), are untouched.
 
@@ -501,6 +505,13 @@ Added in the fourth review round:
 - `test_the_dry_run_previews_finishing_a_partly_due_city`; killed by excluding due cities from the preview again.
 - `test_the_fills_own_spend_excludes_what_was_already_in_the_window`; killed by ignoring the baseline (the reviewers' M15).
 - `tests/test_hermetic_guard.py` — loopback stays open, and a swallowed non-loopback connect still errors the test at teardown (run in a nested pytest); killed by not failing at teardown.
+
+Added in the fifth review round:
+
+- `test_a_failed_run_is_not_counted_realigned` and `test_realigned_counts_only_a_city_that_ended_aligned` — `realigned` means every member channel now carries tonight's date; killed by counting misaligned-before alone.
+- `test_a_paired_walk_pays_when_its_grid_will_not_run_tomorrow`; killed by pricing every paired walk at 0.
+- `test_a_retried_fill_walk_is_capped_at_the_fill_room` and `test_the_fills_walk_retry_is_a_fill_launch`; killed by not threading `fill`/`fill_cap` through the fill's retry pass.
+- `test_credits_let_the_next_city_into_tomorrows_window_and_reserve_it`; killed by cutting tomorrow's lists before the credits.
 
 **The equivalent mutant**: dropping `CHANNEL_METERED_HOST.get(channel) is None` from the resume's free extras (the reviewers' M21) changes nothing, because the coverage gate admits extras only when every usable metered member channel is already in the resume — so no metered channel is left for the extras loop to add. The check stays as the statement of intent.
 

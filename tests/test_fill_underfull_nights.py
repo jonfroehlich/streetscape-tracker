@@ -2110,3 +2110,121 @@ def test_the_dry_run_credits_a_city_its_own_tomorrow(conn, monkeypatch, capsys):
         _grid_cfg(fill_host_ceilings={"mapillary_tiles": t + t // 2}), dry_run=True, today=TODAY
     )
     assert "Fill: 1 cities admitted." in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# Review round 5 (PR #411, 411e)
+# ---------------------------------------------------------------------------
+
+
+def test_the_fills_walk_retry_is_a_fill_launch(conn, monkeypatch, data_dir):
+    """Review 411e #2: the fill's stranded-walk retry launches through
+    `_run_city_channels` with `fill=True` and the fill's `fill_cap`, so a
+    retried mapillary walk is sized to the fill room, not the due budget.
+    Killed by not threading either through."""
+    from streetscape_metadata_tracker.download_common import HOST_EXIT_CODES, HOST_OVERPASS
+
+    cid = _city(conn, "Pair", {"gsv": 60, "mapillary": 60, "mapillary_streets": 60})
+    _freeze_network(data_dir, cid)
+    calls = []
+    real = sched._run_city_channels
+
+    def spy(*a, **k):
+        calls.append((a[4], k.get("fill"), k.get("fill_cap")))
+        return real(*a, **k)
+
+    monkeypatch.setattr(sched, "_run_city_channels", spy)
+
+    def outcome(city, p):
+        return _outcome(HOST_EXIT_CODES[HOST_OVERPASS]) if p == "mapillary_streets" else True
+
+    cfg = _pair_cfg(data_dir, fill_host_ceilings={"mapillary_tiles": 400})
+    _run_night(monkeypatch, conn, cfg, outcome=outcome)
+    retries = [c for c in calls if c[0] == ["mapillary_streets"]]
+    assert retries, "the fill retried its stranded walk"
+    assert all(fill is True and cap is not None for _ch, fill, cap in retries)
+
+
+def test_a_retried_fill_walk_is_capped_at_the_fill_room(conn, monkeypatch, data_dir):
+    """The cap the retried walk's child receives is within the fill ceiling."""
+    from streetscape_metadata_tracker.download_common import HOST_EXIT_CODES, HOST_OVERPASS
+
+    cid = _city(conn, "Pair", {"gsv": 60, "mapillary": 60, "mapillary_streets": 60})
+    _freeze_network(data_dir, cid)
+    caps = []
+
+    def fake_run(cfg, city, run_today, provider="gsv", request_cap=None, **_):
+        if provider == "mapillary_streets":
+            caps.append(request_cap)
+            return _outcome(HOST_EXIT_CODES[HOST_OVERPASS])
+        return True
+
+    monkeypatch.setattr(sched, "_run_one_city", fake_run)
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+    monkeypatch.setattr(sched.time, "sleep", lambda s: None)
+    monkeypatch.setattr(sched, "generate_aggregate_v2", lambda c, d: None)
+    monkeypatch.setattr(sched, "generate_streetwalk_manifest", lambda c, d: {"walks": []})
+    monkeypatch.setattr(sched, "send_alert", lambda *a, **k: None)
+    sched.cmd_run_due(_pair_cfg(data_dir, fill_host_ceilings={"mapillary_tiles": 400}), today=TODAY)
+    assert len(caps) >= 2, "first launch plus the retry"
+    assert all(c is not None and c <= 400 for c in caps), caps
+
+
+def test_realigned_counts_only_a_city_that_ended_aligned(conn, monkeypatch, caplog):
+    """Review 411e #3 (probe): gsv 60, mapillary 60, kartaview 40 FAILING --
+    kartaview is dropped, the city ends on two dates, and the Done line must
+    not call it realigned. Killed by counting misaligned-before alone."""
+    caplog.set_level("INFO")
+    cid = _city(conn, "Karta", {"gsv": 60, "mapillary": 60, "kartaview": 40})
+    db.set_channel_membership(conn, cid, "kartaview", True, cycle_days=90)
+    _seed(conn, cid, "kartaview", 40, failures=1)
+
+    ran, _ = _run_night(monkeypatch, conn, _opt_in_cfg())
+
+    assert ran == [(cid, "gsv"), (cid, "mapillary")]
+    done = _done_line(caplog)
+    assert "realign blocked: kartaview failing (1)" in done
+    assert "realigned" not in done
+
+
+def test_a_failed_run_is_not_counted_realigned(conn, monkeypatch, caplog):
+    caplog.set_level("INFO")
+    _city(conn, "Mis", {"gsv": 70, "mapillary": 40})
+    _run_night(monkeypatch, conn, _grid_cfg(), outcome=lambda city, p: p == "gsv")
+    assert "realigned" not in _done_line(caplog)
+
+
+def test_credits_let_the_next_city_into_tomorrows_window_and_reserve_it(conn):
+    """Review 411e #4: the city cap is applied AFTER credits. At a cap of 1 with
+    the stalest tomorrow city credited (the fill ran it), the NEXT one moves
+    into tomorrow's window and must be reserved. Killed by cutting first."""
+    a = _city(conn, "Aaa", {"gsv": 10, "mapillary": 82.5})
+    b = _tomorrow_city(conn, "Bbb")
+    cfg = _grid_cfg(max_cities_per_day=1, fill_host_ceilings={"mapillary_tiles": 2_260})
+    want = sched.estimate_requests(db.resolve_city(conn, b), "mapillary")
+    assert sched._tomorrow_due_reserve(
+        cfg, conn, TODAY, ["gsv", "mapillary"], credit={(a, "mapillary")}
+    ) == {"mapillary_tiles": (want, 1)}
+
+
+def test_a_paired_walk_pays_when_its_grid_will_not_run_tomorrow(conn):
+    """Review 411e #5: the walk is free only when its grid sibling survives
+    tomorrow's grid budget cut. Two cities due tomorrow on both channels, a
+    grid budget for the stalest one only: that one's walk is 0, the other's
+    walk pays its census. Killed by pricing every paired walk at 0."""
+    a = _city(conn, "Aaa", {"gsv": 10, "mapillary": 82.5, "mapillary_streets": 82.5})
+    b = _city(conn, "Bbb", {"gsv": 10, "mapillary": 82, "mapillary_streets": 82})
+    city_a, city_b = db.resolve_city(conn, a), db.resolve_city(conn, b)
+    grid_a = sched.estimate_requests(city_a, "mapillary")
+    cfg = _grid_cfg(
+        fill_host_ceilings={"mapillary_tiles": 100_000},
+        providers={
+            "gsv": ProviderConfig(daily_request_budget=10_000_000),
+            "mapillary": ProviderConfig(daily_request_budget=grid_a),
+            "mapillary_streets": ProviderConfig(daily_request_budget=100_000),
+        },
+    )
+    walk_b = sched._channel_estimate(cfg, city_b, "mapillary_streets", conn)
+    assert walk_b > 0
+    got = sched._tomorrow_due_reserve(cfg, conn, TODAY, ["gsv", "mapillary", "mapillary_streets"])
+    assert got == {"mapillary_tiles": (grid_a + walk_b, 2)}
