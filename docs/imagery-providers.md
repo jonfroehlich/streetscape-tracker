@@ -226,7 +226,7 @@ The consequence for a collector is that Panoramax must report **both** coverage 
 
 **Rate limits are not documented** anywhere found, including the OpenAPI spec, and a single read-only probe returned no rate-limit headers.
 Unlike KartaView, though, **a staffed community exists** — [forum.geocommuns.fr](https://forum.geocommuns.fr) and the [OSM community forum](https://community.openstreetmap.org/), with core developers answering within days — so the standing rule's "read the forum first" has an object here.
-It was read and not asked: the collector paces at 30/min, half the Mapillary channels', chosen rather than measured. [`provider-access.md`](provider-access.md) carries that decision and the two questions still worth posting.
+It was read and not asked: the collector defaults to 30/min, chosen rather than measured, and production runs 60/min as stage 1 of #405's staged raise. [`provider-access.md`](provider-access.md) carries those decisions and the two questions still worth posting.
 
 **One open risk, still open.** Coverage against the catalog is now measured (above) and the collector is written.
 But there is active work on migrating sequences between instances, so picture identity across instance moves is unanswered — if an image can change instance and identity, "removed" in a run-to-run diff could mean "migrated", which would corrupt the one statistic this project exists to produce.

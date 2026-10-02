@@ -148,6 +148,7 @@ def _setup(
         calls["jitter"] = kwargs.get("jitter")
         calls["max_requests"] = kwargs.get("max_requests")
         calls["deadline_monotonic"] = kwargs.get("deadline_monotonic")
+        calls["refuse_empty_census"] = kwargs.get("refuse_empty_census")
         policy = kwargs.get("census_cache")
         calls["cache_path"] = policy.path if policy else None
         calls["reuse_census"] = policy.reuse if policy else None
@@ -167,9 +168,10 @@ def _setup(
             "checkpoint_path": kwargs.get("checkpoint_path"),
             "tiles": 5,
             "raw_feature_count": len(pictures),
-            # Tiles the fetch never got back. A 404 is an EMPTY tile here and
-            # never lands in this list, so everything in it is genuinely
-            # unmeasured ground.
+            # Tiles the fetch never got back. An empty tile answers 204 here
+            # and never lands in this list, while a 404 is an unread tile and
+            # does (issue #407), so everything in it is genuinely unmeasured
+            # ground.
             "failed_tiles": list(failed_tiles or []),
             # Census provenance (#290). Defaults mimic an ordinary fresh fetch:
             # this channel paid, and nothing was reused.
@@ -876,7 +878,7 @@ def _seam_edges():
 
 def test_a_failed_tile_publishes_request_failed_not_zero_results(tmp_path, monkeypatch):
     """
-    A tile the fetch never got back leaves its samples UNKNOWN.
+    A tile the fetch never got back leaves its samples REQUEST_FAILED.
 
     Street coverage is a share of samples, so recording an unswept sample as
     ZERO_RESULTS publishes an absence we never observed -- into an immutable
@@ -884,9 +886,9 @@ def test_a_failed_tile_publishes_request_failed_not_zero_results(tmp_path, monke
     always done this; the walk must too, or the two disagree about the same
     unswept ground.
 
-    Panoramax sharpens the distinction: a 404 is an EMPTY TILE here, not a
-    failure, so a tile genuinely holding no imagery never reaches failed_tiles
-    at all. Everything this mask covers is ground the fetch really did not see.
+    Panoramax sharpens the distinction: an empty tile answers 204 here, an
+    answer and not a failure, so a tile genuinely holding no imagery never
+    reaches failed_tiles at all (a 404 does, being an unread tile; issue #407). Everything this mask covers is ground the fetch really did not see.
 
     The split must follow the TILE boundary rather than some other accident, so
     the unknown rows are asserted to be exactly the samples north of the seam.
@@ -1000,3 +1002,45 @@ def test_the_wall_clock_budget_reaches_the_crawl_as_a_deadline_from_process_star
     data_dir3, calls3 = _setup(tmp_path / "c", monkeypatch, [_picture("px1", 44.05, -121.30)])
     assert collect.run_collect(_args(data_dir3, **{"mapillary-max-seconds": 30})) == 0
     assert calls3["deadline_monotonic"] is None
+
+
+# ── The collapse guard's history, for the walk series (#407 review) ────────
+
+
+def _prior_walk(data_dir, *, network_type="drive", covered=42.0):
+    conn = db.connect(db.get_default_db_path(data_dir))
+    conn.execute(
+        """INSERT INTO street_walks
+               (city_id, provider, run_date, csv_filename, network_type,
+                coverage_pct_by_length, coverage_pct_by_length_any)
+           VALUES (?, 'panoramax', '2026-01-01', ?, ?, ?, ?)""",
+        (CITY_ID, f"prior-{network_type}.csv.gz", network_type, covered, covered),
+    )
+    conn.commit()
+    conn.close()
+
+
+@pytest.mark.parametrize(
+    ("prior", "extra", "refuse"),
+    [
+        ({"covered": 42.0}, {}, True),
+        ({"covered": 42.0}, {"allow-panoramax-collapse": True}, False),
+        ({"covered": 0.0}, {}, False),
+        ({"covered": 42.0, "network_type": "all_public"}, {}, False),
+        (None, {}, False),
+    ],
+    ids=["prior-positive", "override", "prior-zero", "other-network", "no-prior"],
+)
+def test_the_walks_collapse_guard_reads_its_OWN_series(tmp_path, monkeypatch, prior, extra, refuse):
+    """
+    The walk forwards `refuse_empty_census` to the shared census, decided from
+    the previous walk of THIS series -- same city, same --network-type -- so a
+    positive all_public walk does not arm the drive walk, and an override
+    disarms it.
+    """
+    data_dir, calls = _setup(tmp_path, monkeypatch, [])
+    if prior is not None:
+        _prior_walk(data_dir, **prior)
+    collect.run_collect(_args(data_dir, **extra))
+    assert calls["n"] == 1
+    assert calls["refuse_empty_census"] is refuse
