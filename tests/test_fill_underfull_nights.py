@@ -472,7 +472,9 @@ def test_a_due_city_always_runs_before_any_fill_city(conn, monkeypatch):
 
     ran, _ = _run_night(monkeypatch, conn, _grid_cfg())
 
-    assert ran == [(due, "gsv"), (fill, "gsv"), (fill, "mapillary"), (due, "mapillary")]
+    # The due city, partly collected tonight, is FINISHED first (its fresh gsv
+    # would be under the floor tomorrow); then the staler fill city.
+    assert ran == [(due, "gsv"), (due, "mapillary"), (fill, "gsv"), (fill, "mapillary")]
 
 
 def test_a_backlog_holds_the_whole_fill(conn, monkeypatch, caplog):
@@ -795,6 +797,7 @@ def test_a_v17_catalog_gains_the_early_refreshes_table(tmp_path):
     path = str(tmp_path / "v17.db")
     conn = db.connect(path)
     conn.execute("DROP TABLE early_refreshes")
+    conn.execute("DROP TABLE fill_attempts")
     conn.execute("PRAGMA user_version = 17")
     conn.commit()
     conn.close()
@@ -808,6 +811,10 @@ def test_a_v17_catalog_gains_the_early_refreshes_table(tmp_path):
     db.record_early_refresh(
         conn, cid, "gsv", TODAY, prior_success_at="2026-08-01T00:00:00+00:00", floor_days=30
     )
+    assert {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")} >= {
+        "early_refreshes",
+        "fill_attempts",
+    }
     # COUNT, not the key set: a set cannot see a duplicate row, so it stays
     # green with the PRIMARY KEY dropped.
     assert conn.execute("SELECT COUNT(*) FROM early_refreshes").fetchone()[0] == 1
@@ -1327,12 +1334,16 @@ def test_an_empty_tomorrow_leaves_the_ceiling(conn, monkeypatch, caplog):
 
 
 def test_the_reserve_sums_grid_and_walk_on_one_host_key(conn):
-    """One pool per HOST: the grid and the walk on the tile CDN are summed
-    under `mapillary_tiles`, a channel with no rolling host (gsv) is not
-    reserved at all, and tonight's preview correction drops a city's due
-    channels. Killed by keying the reserve on the channel."""
+    """One pool per HOST: a grid and a walk on the tile CDN are summed under
+    `mapillary_tiles`; a walk whose grid sibling is due the same night is
+    priced 0 (the grid's census is cached for it, #290) while an unpaired one
+    pays its census; gsv (no rolling host) is not reserved at all; tonight's
+    preview correction drops a city's due channels. Killed by keying the
+    reserve on the channel, and by pricing a paired walk in full."""
     cid = _city(conn, "Tomorrow", {"gsv": 82, "mapillary": 82, "mapillary_streets": 82})
     city = db.resolve_city(conn, cid)
+    lone = _city(conn, "Lone", {"gsv": 10, "mapillary": 10, "mapillary_streets": 82})
+    lone_city = db.resolve_city(conn, lone)
     cfg = _grid_cfg(
         fill_host_ceilings={"mapillary_tiles": 2_260},
         providers={
@@ -1342,14 +1353,21 @@ def test_the_reserve_sums_grid_and_walk_on_one_host_key(conn):
         },
     )
     want = sched._channel_estimate(cfg, city, "mapillary", conn) + sched._channel_estimate(
-        cfg, city, "mapillary_streets", conn
+        cfg, lone_city, "mapillary_streets", conn
     )
     providers = ["gsv", "mapillary", "mapillary_streets"]
     assert sched._tomorrow_due_reserve(cfg, conn, TODAY, providers) == {
-        "mapillary_tiles": (want, 1)
+        "mapillary_tiles": (want, 2)
     }
     assert sched._tomorrow_due_reserve(
-        cfg, conn, TODAY, providers, running_tonight={cid: ["mapillary", "mapillary_streets"]}
+        cfg,
+        conn,
+        TODAY,
+        providers,
+        running_tonight={
+            cid: ["mapillary", "mapillary_streets"],
+            lone: ["mapillary_streets"],
+        },
     ) == {"mapillary_tiles": (0, 0)}
     # A day further out, nothing is due tomorrow either.
     assert sched._tomorrow_due_reserve(cfg, conn, TODAY - timedelta(days=1), providers) == {
@@ -1467,25 +1485,6 @@ def test_a_city_the_due_phase_ran_on_an_opt_in_channel_is_realigned(conn, monkey
     }
     assert dates == {"2026-10-01"}
     assert "1 realigned" in _done_line(caplog)
-
-
-def test_a_never_collected_or_overdue_opt_in_channel_is_admissible(conn):
-    """The catch-up Jon asked for: an opt-in channel never collected, or past
-    its wall, does not exclude the city (outside tonight's slate, as the dry run
-    reads it) -- but a FRESH opt-in channel does, until the set can move together."""
-    never = _city(conn, "Never", {"gsv": 60, "mapillary": 60})
-    db.set_channel_membership(conn, never, "panoramax", True, cycle_days=90)
-    overdue = _city(conn, "Overdue", {"gsv": 60, "mapillary": 60, "kartaview": 120})
-    db.set_channel_membership(conn, overdue, "kartaview", True, cycle_days=90)
-    fresh = _city(conn, "Fresh", {"gsv": 60, "mapillary": 60, "kartaview": 10})
-    db.set_channel_membership(conn, fresh, "kartaview", True, cycle_days=90)
-
-    channels = ("gsv", "mapillary", "kartaview", "panoramax")
-    got = {c.city_id: p for c, p in _candidates(conn, channels=channels)}
-
-    assert set(got) == {never, overdue}
-    assert got[never]["panoramax"] is None
-    assert set(got[overdue]) == {"gsv", "mapillary", "kartaview"}
 
 
 def test_misaligned_cities_go_first_among_equally_stale(conn):
@@ -1871,3 +1870,230 @@ def test_the_reserve_is_cut_at_the_city_cap(conn):
     assert sched._tomorrow_due_reserve(cfg, conn, TODAY, ["gsv", "mapillary"]) == {
         "mapillary_tiles": (want, 1)
     }
+
+
+# ---------------------------------------------------------------------------
+# Review round 4 (PR #411, 3118ac5..686ebff)
+# ---------------------------------------------------------------------------
+
+
+def _capture_caps(monkeypatch):
+    """Record each launch's request cap: {(city_id, channel): request_cap}."""
+    caps = {}
+    real = sched._run_one_city
+
+    def spy(cfg, city, run_today, provider="gsv", request_cap=None, **kw):
+        caps[(city.city_id, provider)] = request_cap
+        return real(cfg, city, run_today, provider=provider, request_cap=request_cap, **kw)
+
+    return caps, spy
+
+
+def test_a_partly_collected_city_is_finished_before_a_staler_one(conn, monkeypatch):
+    """Review 411d #2 (P1): A is due on gsv+mapillary (85 d) and enrolled on
+    KartaView at 40 d; B is aligned at 80 d. One fill slot: A's kartaview, so A
+    ends the night aligned -- tomorrow its fresh gsv is under the floor and A
+    is not a candidate again for a month. Killed by ranking staleness first."""
+    a = _city(conn, "Aaa", {"gsv": 85, "mapillary": 85, "kartaview": 40})
+    db.set_channel_membership(conn, a, "kartaview", True, cycle_days=90)
+    b = _city(conn, "Bbb", {"gsv": 80, "mapillary": 80})
+    cfg = _opt_in_cfg()
+    cfg.max_cities_per_day = 2
+
+    ran, _ = _run_night(monkeypatch, conn, cfg)
+
+    assert (a, "kartaview") in ran
+    assert all(c != b for c, _ in ran)
+
+
+def test_the_dry_run_previews_finishing_a_partly_due_city(conn, monkeypatch, capsys):
+    """Review 411d #8: the preview assumes tonight's due slate succeeds and so
+    shows the fill finishing a due city on its other channels. Killed by
+    excluding due cities from the preview again."""
+    a = _city(conn, "Aaa", {"gsv": 85, "mapillary": 85, "kartaview": 40})
+    db.set_channel_membership(conn, a, "kartaview", True, cycle_days=90)
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+    sched.cmd_run_due(_opt_in_cfg(), dry_run=True, today=TODAY)
+    fill = capsys.readouterr().out.split("Would FILL", 1)[1]
+    assert a in fill and "kartaview" in fill
+    assert "Fill: 1 cities admitted." in fill
+
+
+def test_a_fill_launch_cap_reaches_the_child(conn, monkeypatch):
+    """Review 411d #3 (P6): the cap the child receives is the FILL's room -- a
+    12-tile ceiling caps mapillary at <= 12, not at the 3,500 daily (or 3,000
+    rolling) remainder the due slate keeps; KartaView likewise at its fill
+    ceiling, not its 10,000 budget. Killed by not handing the launch `fill_cap`."""
+    cid = _city(
+        conn, "Small", {"gsv": 60, "mapillary": 60, "kartaview": 60}, width=2_000, height=2_000
+    )
+    db.set_channel_membership(conn, cid, "kartaview", True, cycle_days=90)
+    city = db.resolve_city(conn, cid)
+    tiles = sched.estimate_requests(city, "mapillary")
+    cfg = _opt_in_cfg()
+    karta = sched._channel_estimate(cfg, city, "kartaview", conn)
+    # Above KartaView's 34-request launch floor, far below its 10,000 budget.
+    ceiling = max(karta, 34) + 10
+    cfg.fill_host_ceilings = {"mapillary_tiles": 12, "kartaview": ceiling}
+    assert tiles <= 12
+    caps = {}
+
+    def fake_run(cfg, city, run_today, provider="gsv", request_cap=None, **_):
+        caps[provider] = request_cap
+        return True
+
+    monkeypatch.setattr(sched, "_run_one_city", fake_run)
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+    monkeypatch.setattr(sched.time, "sleep", lambda s: None)
+    monkeypatch.setattr(sched, "generate_aggregate_v2", lambda c, d: None)
+    monkeypatch.setattr(sched, "generate_streetwalk_manifest", lambda c, d: {"walks": []})
+    monkeypatch.setattr(sched, "send_alert", lambda *a, **k: None)
+    sched.cmd_run_due(cfg, today=TODAY)
+
+    assert caps["mapillary"] is not None and caps["mapillary"] <= 12
+    assert caps["kartaview"] is not None and caps["kartaview"] <= ceiling
+
+
+def test_a_paused_walk_alone_is_resumed_alone(conn, monkeypatch, data_dir):
+    """Review 411d #4 (P7): only the WALK paused, so the resume does not re-run
+    gsv beside it -- that would leave mapillary on the old date and split the
+    pair. Killed by realigning whenever anything is paused."""
+    cid = _city(conn, "Walk", {"gsv": 2, "mapillary": 2, "mapillary_streets": 60})
+    _freeze_network(data_dir, cid)
+    db.record_fill_attempt(conn, cid, TODAY - timedelta(days=2))
+    _live_checkpoints(monkeypatch, {(cid, "mapillary_streets")})
+    ran, _ = _run_night(monkeypatch, conn, _pair_cfg(data_dir))
+    assert ran == [(cid, "mapillary_streets")]
+
+
+def test_a_free_walk_extra_needs_a_frozen_network(conn, monkeypatch, data_dir):
+    """The free realignment skips a walk whose network is not frozen (the fill
+    sends Overpass nothing): gsv is re-run beside the resumed mapillary, the
+    unfrozen gsv_streets is not. Killed by dropping the frozen check."""
+    cid = _city(conn, "Grid", {"gsv": 2, "gsv_streets": 2, "mapillary": 60})
+    db.record_fill_attempt(conn, cid, TODAY - timedelta(days=2))
+    _live_checkpoints(monkeypatch, {(cid, "mapillary")})
+    cfg = _grid_cfg(
+        data_dir=data_dir,
+        providers={
+            "gsv": ProviderConfig(daily_request_budget=10_000_000),
+            "gsv_streets": ProviderConfig(daily_request_budget=10_000_000),
+            "mapillary": ProviderConfig(daily_request_budget=3_500),
+        },
+    )
+    ran, _ = _run_night(monkeypatch, conn, cfg)
+    assert ran == [(cid, "gsv"), (cid, "mapillary")]
+
+
+def test_a_city_due_tomorrow_is_credited_its_own_reserve(conn, monkeypatch, caplog):
+    """Review 411d #5 (P2): an 82-day city is due tomorrow; refreshing it
+    tonight REMOVES its own tomorrow demand, so it fits a ceiling of 1.5x its
+    tiles. Killed by not crediting the judged city."""
+    caplog.set_level("INFO")
+    cid = _city(conn, "Eighty", {"gsv": 82, "mapillary": 82})
+    t = sched.estimate_requests(db.resolve_city(conn, cid), "mapillary")
+    ran, _ = _run_night(
+        monkeypatch, conn, _grid_cfg(fill_host_ceilings={"mapillary_tiles": t + t // 2})
+    )
+    assert _cities_in(ran) == [cid]
+
+
+def test_a_city_the_fill_pulled_forward_leaves_tomorrows_demand(conn, monkeypatch):
+    """After an 82-day city is collected tonight its tomorrow demand is gone,
+    which makes room for a second fill city. Killed by not crediting what the
+    fill pulled forward."""
+    x = _city(conn, "Xxx", {"gsv": 82, "mapillary": 82})
+    y = _city(conn, "Yyy", {"gsv": 60, "mapillary": 60})
+    z = _tomorrow_city(conn, "Zzz")
+    t = sched.estimate_requests(db.resolve_city(conn, x), "mapillary")
+    zt = sched.estimate_requests(db.resolve_city(conn, z), "mapillary")
+    ran, _ = _run_night(
+        monkeypatch, conn, _grid_cfg(fill_host_ceilings={"mapillary_tiles": 2 * t + zt})
+    )
+    assert _cities_in(ran) == [x, y]
+
+
+def test_a_hosts_reserve_is_cut_at_its_cap(conn):
+    """Tomorrow cannot spend more on a host than its cap."""
+    _tomorrow_city(conn, "Big", width=40_000, height=40_000)
+    cfg = _grid_cfg(fill_host_ceilings={"mapillary_tiles": 7})
+    assert sched._tomorrow_due_reserve(cfg, conn, TODAY, ["gsv", "mapillary"]) == {
+        "mapillary_tiles": (7, 1)
+    }
+
+
+def test_a_failing_opt_in_channel_does_not_freeze_the_city_out(conn, monkeypatch, caplog):
+    """Review 411d #6: a failing KartaView is dropped from the run, the city is
+    still refreshed on its other channels, and the night says why it is not
+    aligned. A failing DEFAULT channel still keeps the city out (the
+    candidates test). Killed by skipping the whole city again."""
+    caplog.set_level("INFO")
+    cid = _city(conn, "Karta", {"gsv": 60, "mapillary": 60, "kartaview": 60})
+    db.set_channel_membership(conn, cid, "kartaview", True, cycle_days=90)
+    _seed(conn, cid, "kartaview", 60, failures=2)
+
+    ran, _ = _run_night(monkeypatch, conn, _opt_in_cfg())
+
+    assert ran == [(cid, "gsv"), (cid, "mapillary")]
+    assert "realign blocked: kartaview failing (1)" in _done_line(caplog)
+
+
+def test_a_never_collected_opt_in_channel_is_the_due_phases_not_the_fills(conn):
+    """Review 411d #7: an opt-in channel never collected (or overdue) is DUE --
+    the due phase and its bounded hoist catch it up, and the fill finishes the
+    city's other channels the same night. As a candidate on its own it is not
+    admissible."""
+    never = _city(conn, "Never", {"gsv": 60, "mapillary": 60})
+    db.set_channel_membership(conn, never, "panoramax", True, cycle_days=90)
+    fresh = _city(conn, "Fresh", {"gsv": 60, "mapillary": 60, "kartaview": 10})
+    db.set_channel_membership(conn, fresh, "kartaview", True, cycle_days=90)
+    assert _candidates(conn, channels=("gsv", "mapillary", "kartaview", "panoramax")) == []
+
+
+def test_a_paused_kartaview_due_sweep_holds_kartaview_visibly(conn, monkeypatch, caplog):
+    """Review 411d #9: a due KartaView sweep that pauses holds the kartaview
+    channel -- an enrolled city is declined -- while a city without KartaView
+    is filled, and the Done line names the hold. Killed by dropping the
+    held count from the report."""
+    from streetscape_metadata_tracker.download_common import SWEEP_INCOMPLETE_EXIT_CODE
+
+    caplog.set_level("INFO")
+    due = _city(conn, "Due", {"gsv": 10, "mapillary": 10})
+    db.set_channel_membership(conn, due, "kartaview", True, cycle_days=90)
+    enrolled = _city(conn, "Enrolled", {"gsv": 60, "mapillary": 60, "kartaview": 60})
+    db.set_channel_membership(conn, enrolled, "kartaview", True, cycle_days=90)
+    plain = _city(conn, "Plain", {"gsv": 50, "mapillary": 50})
+
+    def outcome(city, p):
+        if city.city_id == due and p == "kartaview":
+            return _outcome(SWEEP_INCOMPLETE_EXIT_CODE)
+        return True
+
+    ran, _ = _run_night(monkeypatch, conn, _opt_in_cfg(), outcome=outcome)
+    assert all(c != enrolled for c, _ in ran)
+    assert (plain, "gsv") in ran
+    assert "holding kartaview (1 due not attempted)" in _done_line(caplog)
+
+
+def test_the_fills_own_spend_excludes_what_was_already_in_the_window(conn, monkeypatch):
+    """The fill's spend is measured from its BASELINE: spend already in the
+    window when the fill began (yesterday, or tonight's due work) is not the
+    fill's, and charging it against tomorrow's term declines a city that fits.
+    Killed by ignoring the baseline (M15)."""
+    x = _city(conn, "Xxx", {"gsv": 60, "mapillary": 60})
+    z = _tomorrow_city(conn, "Zzz")
+    t = sched.estimate_requests(db.resolve_city(conn, x), "mapillary")
+    r = sched.estimate_requests(db.resolve_city(conn, z), "mapillary")
+    db.add_api_usage(conn, TODAY - timedelta(days=1), r, "mapillary")  # in the window
+    ran, _ = _run_night(monkeypatch, conn, _grid_cfg(fill_host_ceilings={"mapillary_tiles": r + t}))
+    assert _cities_in(ran) == [x]
+
+
+def test_old_fill_attempts_are_pruned(conn, monkeypatch):
+    """`fill_attempts` keeps only what can still hold a live checkpoint."""
+    cid = _city(conn, "Old", {"gsv": 10, "mapillary": 10})
+    db.record_fill_attempt(conn, cid, TODAY - timedelta(days=30))
+    db.record_fill_attempt(conn, cid, TODAY - timedelta(days=2))
+    _run_night(monkeypatch, conn, _grid_cfg())
+    days = [r[0] for r in conn.execute("SELECT run_date FROM fill_attempts")]
+    assert days == [(TODAY - timedelta(days=2)).isoformat()]

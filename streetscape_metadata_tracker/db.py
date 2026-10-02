@@ -839,8 +839,8 @@ def init_schema(conn: sqlite3.Connection) -> None:
     if user_version == 16:
         _migrate_add_query_radius_columns(conn)
         user_version = 17
-    # v17 -> v18 (issue #404): the early_refreshes table. Purely additive, so
-    # like v2 -> v3 it needs no migration function.
+    # v17 -> v18 (issue #404): the early_refreshes and fill_attempts tables.
+    # Purely additive, so like v2 -> v3 it needs no migration function.
     if user_version == 17:
         user_version = 18
     conn.executescript(_SCHEMA)
@@ -2296,6 +2296,17 @@ def record_fill_attempt(conn: sqlite3.Connection, city_id: str, run_date: date) 
     conn.commit()
 
 
+def prune_fill_attempts(conn: sqlite3.Connection, before: date) -> int:
+    """Delete fill attempts dated before ``before``; return the count (issue #404).
+
+    An attempt only matters while a checkpoint it could have left is alive, so
+    the fill prunes everything older than CHECKPOINT_MAX_AGE_S as it starts.
+    """
+    cur = conn.execute("DELETE FROM fill_attempts WHERE run_date < ?", (before.isoformat(),))
+    conn.commit()
+    return cur.rowcount
+
+
 def get_recent_fill_attempt_city_ids(conn: sqlite3.Connection, since: date) -> set[str]:
     """Cities the fill attempted on or after ``since`` (issue #404).
 
@@ -2341,35 +2352,37 @@ def get_fill_candidates(
     fill_min_days: int,
     due_threshold_days: int,
     ran_since: str | None = None,
-    exclude: Collection[str] = (),
-) -> list[tuple[CityRow, dict[str, str | None]]]:
+    ran_tonight: dict[str, Collection[str]] | None = None,
+) -> list[tuple[CityRow, dict[str, str]]]:
     """Cities ``run-due``'s fill phase may refresh early, and the channels it would run (#404).
 
     The fill ALIGNS a city: it runs every channel the city is a member of
     (``channels`` is every enabled channel, opt-in ones included) on one UTC
-    date. A channel that already succeeded at or after ``ran_since`` (tonight,
-    in the due phase) is already on that date, so it is left out of the run;
-    every OTHER member channel must qualify, or the city is skipped whole:
+    date. A channel that already ran tonight is on that date already and is
+    left out of the run: live, one that succeeded at or after ``ran_since``
+    (the batch start); in the dry run, the city's channels in ``ran_tonight``
+    (tonight's due slate, assumed to succeed). Every OTHER member channel must
+    have succeeded before, at least ``fill_min_days`` ago (the floor) and
+    under ``due_threshold_days`` (``cycle_days - grace_days``) ago -- a due
+    or never-collected channel belongs to the due phase (a late opt-in
+    enrolment is caught up there, through the bounded hoist, and the fill then
+    finishes the city's other channels the same night). One channel short of
+    the floor skips the city whole.
 
-    * a DEFAULT-membership channel must have succeeded before, at least
-      ``fill_min_days`` ago (the floor) and under ``due_threshold_days``
-      (``cycle_days - grace_days``) ago -- a due one belongs to the due slate;
-    * an OPT-IN channel must be at least ``fill_min_days`` old, OR never
-      collected, OR overdue: a city enrolled late on KartaView or Panoramax is
-      realigned by the fill rather than excluded from it (Jon, 2026-10-02: "we
-      will need to play catch up for these providers since we added them
-      late"). A fresh one (under the floor) disqualifies the city, which then
-      waits until the whole set can move together;
-    * NO consecutive failure since its last success, on any channel the fill
-      would run, so the fill adds at most one failure per channel between
-      successes and can never be what quarantines a city.
+    No consecutive failure since its last success: on a DEFAULT channel that
+    skips the city, so the fill adds at most one failure per channel between
+    successes and can never quarantine it. On an OPT-IN channel it drops only
+    that channel from the run -- a failing KartaView must not freeze the city
+    out of the fill for good -- and the scheduler reports it as a blocked
+    realignment.
 
-    Returns ``(city, {channel to run: last_success_at or None})``, ordered by
-    the day of the oldest last success among the channels to run (a city with
-    none dated -- every channel to run is a never-collected opt-in -- first),
-    then MISALIGNED before aligned among equally stale cities (member channels
-    whose last successes fall on different days, or include a never), then
-    ``city_id``. So the fill actively re-aligns the catalog.
+    Returns ``(city, {channel to run: last_success_at})``, ordered:
+
+    1. a city PARTLY collected tonight first: its fresh channel will be under
+       the floor tomorrow, so tonight is its one chance to be aligned;
+    2. then by the day of the oldest last success among the channels to run;
+    3. then MISALIGNED before aligned (member channels on different days);
+    4. then ``city_id``.
     """
     if not channels:
         return []
@@ -2382,14 +2395,13 @@ def get_fill_candidates(
         (today.isoformat(), *channels),
     ):
         states.setdefault(row["city_id"], {})[row["provider"]] = row
-    excluded = set(exclude)
     ranked = []
     for city in get_all_cities(conn, enabled_only=True):
-        if city.city_id in excluded:
-            continue
         rows = states.get(city.city_id, {})
+        assumed = set((ran_tonight or {}).get(city.city_id, ()))
         days: set[str | None] = set()
-        to_run: dict[str, str | None] = {}
+        to_run: dict[str, str] = {}
+        partial = False
         ok = True
         for channel in channels:
             row = rows.get(channel)
@@ -2397,27 +2409,30 @@ def get_fill_candidates(
             if (default_membership[channel] if member is None else member) != 1:
                 continue
             last = row["last_success_at"] if row is not None else None
-            days.add(last[:10] if last else None)
-            if last is not None and ran_since is not None and last >= ran_since:
+            if channel in assumed or (
+                last is not None and ran_since is not None and last >= ran_since
+            ):
+                days.add(today.isoformat())
+                partial = True
                 continue  # already collected tonight: on tonight's date
+            days.add(last[:10] if last else None)
             if row is not None and row["consecutive_failures"] > 0:
-                ok = False
-                break
-            if default_membership[channel]:
-                if last is None or not (fill_min_days <= row["age_days"] < due_threshold_days):
+                if default_membership[channel]:
                     ok = False
                     break
-            elif last is not None and row["age_days"] < fill_min_days:
+                continue  # a failing opt-in channel: dropped, reported by the caller
+            if last is None or not (fill_min_days <= row["age_days"] < due_threshold_days):
                 ok = False
                 break
             to_run[channel] = last
         if not ok or not to_run:
             continue
-        dated = [v[:10] for v in to_run.values() if v is not None]
-        stale = min(dated) if dated else ""
-        ranked.append((stale, 0 if len(days) > 1 else 1, city.city_id, city, to_run))
-    ranked.sort(key=lambda t: t[:3])
-    return [(city, to_run) for _s, _m, _id, city, to_run in ranked]
+        stale = min(v[:10] for v in to_run.values())
+        ranked.append(
+            (0 if partial else 1, stale, 0 if len(days) > 1 else 1, city.city_id, city, to_run)
+        )
+    ranked.sort(key=lambda t: t[:4])
+    return [(city, to_run) for *_k, city, to_run in ranked]
 
 
 def prune_host_usage(conn: sqlite3.Connection, before: datetime) -> int:
