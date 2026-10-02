@@ -83,6 +83,10 @@ def test_a_known_H3_cell_decodes_to_its_published_resolution(hex_id, resolution)
 NOT_CELLS = [
     ("11928308280fffff", "a directed EDGE (mode 2) -- its resolution bits still read 9"),
     ("229283082803ffff", "a VERTEX (mode 4)"),
+    # The edge and vertex above also set the mode-dependent bits, so these two
+    # break ONLY the mode -- without them a missing mode check goes unseen.
+    ("72830828ffffff", "mode 0, every other field a valid res-7 cell's"),
+    ("1072830828ffffff", "mode 2, every other field a valid res-7 cell's"),
     ("8872830828ffffff", "the reserved high bit set"),
     ("972830828ffffff", "a mode-dependent reserved bit set"),
     ("87f430828ffffff", "base cell 122, one past the last"),
