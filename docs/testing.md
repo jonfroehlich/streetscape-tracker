@@ -416,7 +416,7 @@ Incidental coverage of a deprecated spelling trains readers to ignore the notice
 Seeded successes sit at midnight, so a channel's age is a whole number of days, read the way `get_due_cities` reads it.
 A test that builds a second catalog keeps the unpatched `db.connect`, since `_run_night` replaces it for the night; a lane test writes no ledger, since a lane worker has no catalog handle.
 A live checkpoint is faked by replacing `_sweep_checkpoint_progress`, which both the resumer scan and `_sweep_launch_plan` read.
-Every "killed by" below was run against the committed code, one mutation at a time with the file restored after (73 mutants in the third review round of PR #411 — every earlier round's, the reviewers' M1–M16, and Jon's 2026-10-02 decisions — all killed):
+Every "killed by" below was run against the committed code, one mutation at a time with the file restored after (95 mutants in the fourth review round of PR #411, run with the socket guard on — every earlier round's, the reviewers', and Jon's 2026-10-02 decisions — all killed but one EQUIVALENT mutant, named below):
 
 - `test_a_backlog_holds_the_whole_fill` — a never-collected due city's mapillary deferred for budget holds the fill, and no fill gsv runs either; killed by ignoring the backlog.
 - `test_a_backlog_on_an_opt_in_channel_does_not_hold_the_fill` — a KartaView deferral does not stop a gsv/mapillary fill; killed by filling every provider instead of the default-membership ones.
@@ -471,7 +471,6 @@ Added for Jon's decisions (2026-10-02) and the third review round:
 - `test_a_due_city_whose_grid_needs_more_than_the_window_does_not_hold_the_fill` — the #373 cascade (probe P1); killed by dropping the window arm and by dropping the first-grid cascade.
 - `test_a_fill_crash_is_named_as_the_fills_in_the_subject`; killed by passing `LOOP`.
 - `test_a_heavy_tomorrow_shrinks_tonights_fill` and `test_an_empty_tomorrow_leaves_the_ceiling`; the first killed by dropping the reserve term and by keying the reserve on the channel.
-- `test_a_never_collected_or_overdue_opt_in_channel_is_admissible` — and a fresh one is not; killed by excluding a never-collected opt-in channel.
 - `test_a_paused_fill_grid_resumes_with_the_walk_it_held_back` — probe P2, on a one-city resume night so only the resume can run the walk; killed by dropping the walk from the resume and by planning the walk as behind its earlier sibling.
 - `test_a_resumer_never_runs_a_failing_channel` (probe P3); killed by dropping the failure test in `_resumable_member`.
 - `test_a_walk_the_fill_did_not_hold_behind_a_sibling_checkpoint`; killed by dropping the never-fits sibling arm.
@@ -484,7 +483,26 @@ Added for Jon's decisions (2026-10-02) and the third review round:
 - `test_the_fills_own_spend_counts_against_tomorrows_room`; killed by dropping the fill's own spend from tomorrow's term.
 - `test_the_fills_retry_pass_leaves_the_due_phases_strandings_alone` — one due and one fill stranding; killed by dropping `only=` (M1) or its filter (M2), and by counting fill strandings in the subject.
 - `test_the_launch_check_draws_the_host_and_the_clock_down_in_launch_order`; killed by not drawing down either (M6, and the clock).
-- `test_the_reserve_is_cut_at_a_channels_daily_budget` and `test_the_reserve_is_cut_at_the_city_cap`, and `test_the_reserve_sums_grid_and_walk_on_one_host_key`.
+- `test_the_reserve_is_cut_at_a_channels_daily_budget` and `test_the_reserve_is_cut_at_the_city_cap`, and `test_the_reserve_sums_grid_and_walk_on_one_host_key` (now also: a paired walk is priced 0, an unpaired one in full; killed by pricing the paired walk in full).
+
+Added in the fourth review round:
+
+- `test_a_city_due_tomorrow_is_credited_its_own_reserve` (P2) and `test_the_dry_run_credits_a_city_its_own_tomorrow`; killed by not crediting the judged city, live and in the preview.
+- `test_a_city_the_fill_pulled_forward_leaves_tomorrows_demand`; killed by not crediting what the fill collected.
+- `test_a_failing_opt_in_channel_does_not_freeze_the_city_out` — dropped from the run, reported as `realign blocked`; killed by skipping the whole city again and by not reporting it.
+- `test_a_fill_launch_cap_reaches_the_child` (P6) — mapillary capped at <= 12 under a 12-tile ceiling, KartaView at its ceiling; killed by not handing the launch `fill_cap` and by ignoring it there.
+- `test_a_free_walk_extra_needs_a_frozen_network`; killed by dropping the frozen check (the reviewers' M12).
+- `test_a_hosts_reserve_is_cut_at_its_cap`.
+- `test_a_never_collected_opt_in_channel_is_the_due_phases_not_the_fills` — the branch that admitted one was unreachable and is removed (the reviewers' M23 is gone with it).
+- `test_a_partly_collected_city_is_finished_before_a_staler_one` (P1); killed by ranking staleness first.
+- `test_a_paused_kartaview_due_sweep_holds_kartaview_visibly`; killed by dropping the held count from the report.
+- `test_a_paused_walk_alone_is_resumed_alone` (P7); killed by realigning without the coverage gate.
+- `test_old_fill_attempts_are_pruned`.
+- `test_the_dry_run_previews_finishing_a_partly_due_city`; killed by excluding due cities from the preview again.
+- `test_the_fills_own_spend_excludes_what_was_already_in_the_window`; killed by ignoring the baseline (the reviewers' M15).
+- `tests/test_hermetic_guard.py` — loopback stays open, and a swallowed non-loopback connect still errors the test at teardown (run in a nested pytest); killed by not failing at teardown.
+
+**The equivalent mutant**: dropping `CHANNEL_METERED_HOST.get(channel) is None` from the resume's free extras (the reviewers' M21) changes nothing, because the coverage gate admits extras only when every usable metered member channel is already in the resume — so no metered channel is left for the extras loop to add. The check stays as the statement of intent.
 
 ## Concurrent channel lanes (issue #240)
 

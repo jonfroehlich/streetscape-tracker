@@ -2097,3 +2097,16 @@ def test_old_fill_attempts_are_pruned(conn, monkeypatch):
     _run_night(monkeypatch, conn, _grid_cfg())
     days = [r[0] for r in conn.execute("SELECT run_date FROM fill_attempts")]
     assert days == [(TODAY - timedelta(days=2)).isoformat()]
+
+
+def test_the_dry_run_credits_a_city_its_own_tomorrow(conn, monkeypatch, capsys):
+    """The preview credits the judged city its own tomorrow demand, as the
+    night does (P2): an 82-day city fits a 1.5x ceiling. Killed by not
+    crediting it in the preview."""
+    cid = _city(conn, "Eighty", {"gsv": 82, "mapillary": 82})
+    t = sched.estimate_requests(db.resolve_city(conn, cid), "mapillary")
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+    sched.cmd_run_due(
+        _grid_cfg(fill_host_ceilings={"mapillary_tiles": t + t // 2}), dry_run=True, today=TODAY
+    )
+    assert "Fill: 1 cities admitted." in capsys.readouterr().out
