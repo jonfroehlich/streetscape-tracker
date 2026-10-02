@@ -25,6 +25,7 @@ is modelled on, because those are the differences a reader coming from
 """
 
 import asyncio
+import re
 from datetime import UTC, datetime, timedelta
 
 import aiohttp
@@ -597,6 +598,35 @@ def test_an_EXHAUSTED_5xx_logs_each_retry_and_the_give_up(caplog, _instant_backo
     assert f"{dp.TILE_RETRY_LOG_PHRASE} gave up: HTTP 503 after {dp.TILE_MAX_TRIES} tries" in (
         messages
     )
+
+
+# RFC 9110 sec. 10.1.5: User-Agent = product *( RWS ( product / comment ) ),
+# product = token ["/" product-version]; tchar excludes spaces and delimiters.
+_TCHAR = r"[!#$%&'*+\-.^_`|~0-9A-Za-z]"
+_PRODUCT = rf"{_TCHAR}+(?:/{_TCHAR}+)?"
+_COMMENT = r"\([^()]*\)"
+_RFC9110_USER_AGENT = re.compile(rf"^{_PRODUCT}(?: (?:{_PRODUCT}|{_COMMENT}))*$")
+
+
+def test_the_user_agent_names_the_product_and_a_contact_address():
+    """
+    Panoramax carries no credential, so the User-Agent is the only way its
+    operator can tell who we are -- and since #405 doubled our pace against a
+    maintainer who has said rate-limiting "will come", it names a person to
+    write to. Jon chose the contact address; the shape follows RFC 9110 and the
+    Wikimedia `<client>/<version> (<contact>) <library>/<version>` convention.
+    """
+    ua = dp.USER_AGENT
+    assert _RFC9110_USER_AGENT.match(ua), ua
+    assert ua.startswith("StreetscapeTracker/1.0 "), "a product token has no spaces"
+    assert dp.USER_AGENT_CONTACT == "sidewalk@cs.uw.edu"
+    assert "; sidewalk@cs.uw.edu)" in ua, "the contact belongs inside the comment"
+    assert "(+https://github.com/jonfroehlich/streetscape-tracker;" in ua
+    assert ua.endswith(f" aiohttp/{aiohttp.__version__}")
+    # The weekly screen hits the same host and must identify itself the same way.
+    from streetscape_metadata_tracker import panoramax_screen
+
+    assert panoramax_screen.USER_AGENT is dp.USER_AGENT
 
 
 def test_a_healthy_tile_returns_its_body():

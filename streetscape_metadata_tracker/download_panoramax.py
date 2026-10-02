@@ -144,10 +144,27 @@ TYPE_360 = "equirectangular"
 # Sent on every request. Panoramax is volunteer-run infrastructure with no
 # credential to identify us, so the User-Agent is the ONLY way an operator there
 # can tell what this traffic is or who to contact about it — which matters more
-# here than on a metered commercial CDN, not less.
+# here than on a metered commercial CDN, not less. It now carries a CONTACT
+# ADDRESS (issue #405, chosen by Jon): the #405 raise doubles our pace against a
+# host whose maintainer has said rate-limiting "will come", and an operator who
+# sees our traffic should be able to write to a person rather than block an IP.
+#
+# Shape, per RFC 9110 sec. 10.1.5 (`product *( RWS ( product / comment ) )`,
+# where a product is `token ["/" version]` and a token has NO spaces -- hence
+# `StreetscapeTracker`, not "Streetscape Tracker") and per the Wikimedia
+# User-Agent policy's `<client name>/<version> (<contact information>)
+# <library>/<version>`, which is the convention OSM's own services (Nominatim:
+# "identifying the application ... stock User-Agents ... will not do") read.
+# The library token is the real aiohttp version, so it cannot drift.
+#
+# Panoramax ONLY. The screen imports this constant, so it sends the same
+# string; the Nominatim and Overpass agents are separate constants and are
+# deliberately not changed here.
+USER_AGENT_CONTACT = "sidewalk@cs.uw.edu"
 USER_AGENT = (
-    "streetscape-tracker/1.0 (+https://github.com/jonfroehlich/streetscape-tracker; "
-    "street-level imagery coverage research)"
+    "StreetscapeTracker/1.0 "
+    f"(+https://github.com/jonfroehlich/streetscape-tracker; {USER_AGENT_CONTACT}) "
+    f"aiohttp/{aiohttp.__version__}"
 )
 
 
