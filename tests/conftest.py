@@ -733,6 +733,26 @@ def _no_host_recheck_probe(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_run_due_in_flight(monkeypatch):
+    """
+    Report "no other run-due in flight" to the scheduler for the whole suite.
+
+    ``cmd_run_due`` refuses a GSV channel while another ``run-due`` shows in
+    ``ps`` (issue #412), and ``ps`` is the real process table. This suite is
+    meant to be runnable on the production host DURING a live nightly batch, and
+    there every GSV ``cmd_run_due`` test would read the nightly's command line
+    and exit 64 instead of testing what it names. Tests of the refusal override
+    this (``monkeypatch.setattr``), which runs after the fixture and so wins.
+
+    Only the scheduler module's binding is replaced: the repair scripts import
+    the function by name, keep their own binding, and stub it in their own tests.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    monkeypatch.setattr(sched, "_run_due_in_flight", lambda: None)
+
+
+@pytest.fixture(autouse=True)
 def _no_recheck_cooldown_wait(monkeypatch):
     """
     Make the stranded-walk retry's cooldown wait (issue #380) instant.

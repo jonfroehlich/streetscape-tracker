@@ -8377,6 +8377,53 @@ def _select_providers(cfg: SchedulerConfig, requested: list[str]) -> list[str]:
     return [p for p in enabled if p in set(names)]
 
 
+# The channels that spend a GSV key (issue #412). Each has its OWN key in its
+# own Cloud project, so the two never contend with each other -- the hazard is
+# a second process on the SAME key, which nothing serializes: GSV is metered
+# per project, not per IP, so CHANNEL_HOSTS gives 'gsv' no host lock at all.
+GSV_KEY_CHANNELS: frozenset[str] = frozenset({"gsv", "gsv_streets"})
+
+
+def _gsv_in_flight_refusal(providers: Sequence[str]) -> list[str] | None:
+    """
+    Why this ``run-due`` must not start, or None when it may (issue #412).
+
+    Since #304 each GSV process really reaches its configured pace (48,000/min
+    on prod), so a hand ``run-due`` on a GSV channel overlapping the nightly
+    batch presents ~96,000/min against a 60,000/min project quota. About a
+    third of each overlapping minute then answers OVER_QUERY_LIMIT, and a run
+    whose failed fraction stays above 1% after its retry passes aborts: no data
+    lost, but the wall clock spent for nothing. ``run-due`` takes its rate from
+    config and has no per-run override, so its one safe action is to wait.
+
+    Only GSV channels are checked. Every per-IP host is already serialized
+    across processes by the per-IP host lock, so refusing ``run-due --provider
+    mapillary --limit 5`` would block the supported catch-up path (#214) for
+    nothing. The check can only fire on a SECOND ``run-due``: the detector
+    excludes this process and its parent, so a ``run-due`` with no other batch
+    in flight -- the nightly unit, normally -- is never refused by it.
+
+    ``_run_due_in_flight`` is a ``ps`` heuristic that returns None when ``ps``
+    is unavailable, so this fails OPEN; ``--force`` overrides a match known not
+    to be collecting.
+    """
+    gsv = [p for p in providers if p in GSV_KEY_CHANNELS]
+    if not gsv:
+        return None
+    busy = _run_due_in_flight()
+    if busy is None:
+        return None
+    return [
+        f"REFUSED: another run-due appears to be in flight ({busy}).",
+        f"  This run would collect {', '.join(gsv)}, and a second process on the same GSV "
+        "key doubles the rate presented to that key's per-project quota: requests answer "
+        "OVER_QUERY_LIMIT and the run can abort having spent its wall clock (issue #412). "
+        "run-due has no rate override, so wait for the other batch to finish; a non-GSV "
+        "channel (e.g. --provider mapillary) is not affected and may run now. Pass "
+        "--force only if you are certain that line is not a collection run.",
+    ]
+
+
 def cmd_run_due(
     cfg: SchedulerConfig,
     dry_run: bool = False,
@@ -8384,6 +8431,7 @@ def cmd_run_due(
     today: date | None = None,
     requested_providers: list[str] | None = None,
     requested_cities: list[str] | None = None,
+    force: bool = False,
 ) -> int:
     """
     Collect all cities due today, within per-provider budgets, publish.
@@ -8412,6 +8460,10 @@ def cmd_run_due(
     It narrows the DUE list and never forces: a named city that is not due is
     reported and skipped. An unresolvable name exits ``USAGE_EXIT_CODE``
     before anything is collected or written.
+
+    A run that would collect a GSV channel while another ``run-due`` is in
+    flight is refused with ``USAGE_EXIT_CODE`` unless ``force`` or ``dry_run``
+    (issue #412); see ``_gsv_in_flight_refusal``.
     """
     # Validate BEFORE opening the catalog, so an operator typo costs nothing.
     # Returning rather than propagating is deliberate: main()'s run-due branch
@@ -8443,6 +8495,14 @@ def cmd_run_due(
             raise _UsageError(f"--limit must be at least 1 (got {limit})")
     except _UsageError as e:
         logger.error(str(e))
+        return USAGE_EXIT_CODE
+    # Before the catalog is opened, so a refused catch-up writes nothing -- not
+    # even the stagger assignments below. A dry run is exempt: it collects
+    # nothing, and it is how an operator previews a catch-up mid-batch.
+    refusal = None if (dry_run or force) else _gsv_in_flight_refusal(providers)
+    if refusal is not None:
+        for message in refusal:
+            logger.error(message)
         return USAGE_EXIT_CODE
 
     conn = db.connect(cfg.db_path)
@@ -11348,6 +11408,13 @@ def build_parser() -> argparse.ArgumentParser:
         "and never forces: a named city that is not due is reported and "
         f"skipped. An unknown name exits {USAGE_EXIT_CODE}.",
     )
+    p_run.add_argument(
+        "--force",
+        action="store_true",
+        help="Collect a GSV channel even though another run-due appears to be in "
+        f"flight (otherwise exits {USAGE_EXIT_CODE}, issue #412: a second process on "
+        "the same GSV key oversubscribes its quota). The check is a heuristic over `ps`.",
+    )
     p_assess = sub.add_parser(
         "assess-city",
         help="Register a new city, walk its streets on both providers, publish, "
@@ -11597,6 +11664,7 @@ def main() -> int:
                 limit=args.limit,
                 requested_providers=args.providers,
                 requested_cities=args.cities,
+                force=args.force,
             )
         except Exception as exc:
             # A DRY RUN whose stdout reader went away is the one crash here

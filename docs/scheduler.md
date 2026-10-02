@@ -27,6 +27,15 @@ The motivating case was 2026-09-24: Detroit's and Fresno's Mapillary walks had e
 The STRANDED alert (#341) prints this command with the ids filled in, one per exact set of lost walk channels: a city stranded on one walk because its OTHER grid run failed is still due on that other walk, and a single combined command would pay its census for an un-paired walk (#362).
 It used to print `run-due --provider <walk> --limit N`, which walks the stalest-due queue — on 2026-09-22 none of 8 stranded cities was in the first 10 of any walk channel, and Austin's ~640k-request walk led `gsv_streets`.
 
+**A `run-due` that would collect a GSV channel (`gsv` or `gsv_streets`, named or reached through the default channel set) exits 64 while another `run-due` is in flight** (issue #412).
+Since #304 each GSV process reaches its configured 48,000/min, so a hand catch-up on the same key as the nightly presents ~96,000/min against a 60,000/min project quota, and nothing serializes GSV across processes (Google meters per project, so `CHANNEL_HOSTS` gives it no host lock).
+`run-due` reads its rate from config and has no per-run override, so waiting is its only safe action; the direct CLIs can be slowed instead (the pre-run checklist in `docs/operations.md`).
+The check is `_gsv_in_flight_refusal` over `_run_due_in_flight()`, the same `ps` heuristic `import-bundle` and the prefreeze use: it excludes this process and its parent, so it can only fire on a SECOND `run-due` — a nightly with nothing else running is never refused — and it fails open when `ps` is unavailable.
+It runs before the catalog is opened, so a refusal writes nothing; it is a usage refusal, not a collection, so no `consecutive_failures` is charged.
+A non-GSV run (`--provider mapillary --limit 5`) is not checked at all, since `host_lock` already serializes every per-IP host, and `--dry-run` is exempt because a preview spends nothing.
+`--force` overrides a match known not to be collecting.
+The one case it gets backwards: a hand catch-up still running at 02:00 makes the NIGHTLY the second `run-due`, and the nightly is then the one refused — so start a long GSV catch-up early enough to finish before the timer fires.
+
 **Every channel is paced, so every channel's per-city timeout is DERIVED rather than flat, and `city_timeout_minutes` (180) is only the floor.**
 The shape is the same for all of them — `estimated_requests / (rate × achieved_rate_fraction) × _TIMEOUT_HEADROOM + _TIMEOUT_FIXED_SLACK_S`, never below the floor — and what differs is where the request count and the rate come from.
 `gsv` prices grid points against `[download].max_requests_per_minute`.

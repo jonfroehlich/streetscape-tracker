@@ -87,6 +87,7 @@ python scripts/register_frame.py --manifest mapillary_360_cities.csv --overlap-k
 | `notify-failure` | Email the recent log (the systemd `OnFailure=` hook) |
 
 `run-due` notes: `--limit` (≥1) overrides `[schedule].max_cities_per_day`; an unknown/disabled channel or a bad `--limit` exits 64, not 2; a filtered run advances only the named channels' clocks, **un-pairing those cities' snapshots**.
+A run that would collect `gsv` or `gsv_streets` exits 64 while another `run-due` is in flight (#412; `--force` overrides, `--dry-run` and non-GSV runs are exempt): a second process on one GSV key oversubscribes its per-project quota, and nothing else serializes GSV.
 `--city CITY` (repeatable) is the targeted retry: it narrows the DUE list and never forces, so a named city that is not due is warned about and skipped, and an unknown name exits 64.
 The named list is the run's city cap unless `--limit` is given, in which case the named cities past it are listed by name, and it is what the STRANDED alert prints (#362).
 `assess-city` notes: a bad `--provider` or an unpaired `--width`/`--height` exits 64; answer from **street coverage, never grid coverage** (see operations below).
