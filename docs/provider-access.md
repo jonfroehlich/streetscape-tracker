@@ -443,6 +443,7 @@ Chokepoints are the two places every such request in the repo passes through: `d
 — placed **after** its cache-hit return, so a warm city never contends, and **outside** `_download_graph` so one hold covers the whole retry stack.
 GSV metadata is deliberately **not** locked: Google meters the Street View Static API per *project*, so two processes share a quota the daily ledger already tracks and serializing them would cost throughput for nothing.
 **That reasoning predates #304 and no longer holds per minute**: each GSV process now actually reaches its 48,000/min, so two processes on the SAME key send ~96,000/min into one 60,000/min project quota — see the #304 section at the end of this file.
+GSV stays unlocked by decision even so: hand runs follow the pre-run checklist in [`operations.md`](operations.md) instead (the #304 section at the end of this file says why).
 **Only the child ever holds the lock** — `flock` is scoped to an open file description and is not inherited across `subprocess.run`, so a scheduler parent holding it would make every child's `timeout=0` acquire fail;
 a source-inspection test asserts `scheduler.py` never imports the module.
 A stale lock file cannot wedge a night, because the kernel releases `flock` when the fd closes (SIGKILL and OOM included)
@@ -720,8 +721,14 @@ The realistic pairs:
 - two hand runs of either.
 
 What it costs is OVER_QUERY_LIMIT answers: the engine retries them after a 20 s quota-reset wait, and a run with more than 1% of points still failing after its retry passes aborts with its checkpoint kept rather than finalizing.
-**No lock is added yet; that is an open decision**, the options being a per-key cross-process lock (which would serialize a hand run behind a multi-hour night), a shared cross-process pacer, or halving the per-process rate while two could overlap.
-Until it is decided: do not start a same-key GSV run while the nightly batch is collecting (check `pgrep -f "scheduler run-due"` or the unit status), or lower `--max-requests-per-minute` on the hand run so the two sum under the quota.
+**Decided (2026-10): no lock and no shared pacer; the mitigation is procedural.**
+Claude runs essentially every hand run and catch-up, so each one follows the pre-run checklist in [`operations.md`](operations.md) ("Before any hand run or catch-up"): check for an in-flight `run-due` and the channels it can still reach, then either wait for it or, on a direct-CLI run, pass `--max-requests-per-minute` at the quota minus the nightly pace (12,000 today).
+Three options were considered and rejected:
+a per-key cross-process lock, because it would serialize a hand run behind a multi-hour night (and a fail-fast `timeout=0` lock like `host_lock`'s could instead make the nightly child the loser, skipping that city's channel);
+a shared cross-process pacer, because it would put new cross-process state on the path of every GSV request to guard an overlap that only a hand run creates;
+and halving the per-process rate while two could overlap, because the two nightly lanes never share a key, so it would cost every night half its GSV rate for an occasional hand run.
+Nothing in code refuses a second `run-due` yet: `scheduler._run_due_in_flight()` exists, but only `import-bundle`, the prefreeze and two repair scripts call it; #412 tracks adding it to `run-due`.
+Note that `pgrep -f "scheduler run-due"`, which an earlier version of this paragraph recommended, never matches the unit (its command line is `-m streetscape_metadata_tracker.scheduler --config … run-due`); the checklist gives a test that does.
 
 **`api_requests` counts one per point per pass, not one per HTTP attempt** (PR #399 review).
 The engine adds a batch's points to `api_requests` when it schedules the batch, and the retry passes re-count only the points they re-request.

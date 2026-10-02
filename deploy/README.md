@@ -299,10 +299,12 @@ holds the lock:
 ```bash
 # Safe to START at any time — neither can double the rate any more. But see
 # below: whichever process loses the race gives up, and if that's the batch,
-# the city it was on skips that channel tonight. GSV grid collection is
-# unaffected either way (Google meters per project, not per IP).
+# the city it was on skips that channel tonight. GSV is NOT locked, and since
+# #304 a GSV hand run on the same key as a collecting nightly lane oversubscribes
+# its 60,000/min project quota: run the docs/operations.md pre-run checklist
+# ("Before any hand run or catch-up") before any GSV run.
 python streetscape_tracker.py "Bend, OR" --provider mapillary
-python -m streetscape_street_analyzer.collect "Bend, OR"
+python -m streetscape_street_analyzer.collect "Bend, OR" --provider mapillary
 ```
 
 **What it costs the batch.** The lock is not polite about who wins: whoever

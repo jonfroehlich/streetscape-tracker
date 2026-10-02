@@ -6,6 +6,122 @@ anything about how the site gets its files.
 Split out of `CLAUDE.md` (2026-08-22); the router keeps this topic's short rules and points here for the evidence and detail.
 An edit that changes a rule belongs in both files; anything written since the split is under its own heading and says so.
 
+## Before any hand run or catch-up (check the server and allocations)
+
+**Added after the 2026-08-22 split** (#304, PR #399 review, #412).
+
+Claude runs essentially every hand run and catch-up on prod (makelab2), so this checklist is the mitigation for the one overlap nothing in the code refuses.
+Since #304 each GSV process actually reaches its configured 48,000/min, so a hand run on the **same GSV key** as a nightly lane that is collecting presents ~96,000/min against that project's 60,000/min quota.
+The nightly `gsv` and `gsv_streets` lanes never collide with each other: they use different keys in separate Cloud projects.
+The decision taken is **no lock and no shared pacer**: hand runs follow this checklist, and #412 tracks making `run-due` refuse to start beside another `run-due`.
+The mechanism, the realistic pairs and the rejected options are in [`provider-access.md`](provider-access.md) (the #304 section); this section is only the procedure.
+
+### 1. Gather everything in one SSH call
+
+The makelab hosts ban an IP that opens connections too fast, so reuse ONE control master and batch the checks into one call.
+Before connecting, look for a live master (`ls ~/.ssh/cm-*`, then `ssh -O check makelab2`); open one with `ssh -fNM makelab2` only if none is live.
+**If a connection times out once, stop**: no retry, no longer timeout, no hop through makelab1, and tell the operator, since a ban and a hung host look the same from outside.
+The checkout is `/projects/makeabilitylab/streetscape-tracker` (`~/streetscape-tracker` is a symlink to it), and prod runs from `.venv-makelab2` with `config/scheduler.makelab1.toml` ([`deploy/README.md`](../deploy/README.md)).
+The snippet only reads: `ps`, `systemctl --user`, the scheduler log, `scheduler status` and the config.
+
+```bash
+ssh makelab2 'bash -s' <<'EOF'
+cd /projects/makeabilitylab/streetscape-tracker || exit 1
+PY=.venv-makelab2/bin/python
+CFG=config/scheduler.makelab1.toml
+LOG=logs/streetscape_scheduler.log
+echo "== $(hostname) at $(date -u '+%F %T') UTC ($(TZ=America/Los_Angeles date '+%T %Z'))"
+
+echo "== units (active = running now)"
+for u in streetscape-tracker streetscape-prefreeze streetscape-screen-provider streetscape-backup-check; do
+  printf '  %-36s %s\n' "$u.service" "$(systemctl --user is-active "$u.service" 2>&1)"
+done
+systemctl --user list-timers 'streetscape-*' --no-pager 2>&1 | head -n 7
+
+echo "== run-due in flight (empty = none)"
+ps -eo pid=,etime=,args= | awk '/streetscape_metadata_tracker[.]scheduler/ && /run-due/'
+
+echo "== collection children in flight (empty = none)"
+ps -eo pid=,etime=,args= | awk '/streetscape_tracker[.]py|streetscape_street_analyzer[.]collect/'
+
+echo "== deploys, repair scripts, other scripts (empty = none)"
+ps -eo pid=,etime=,args= | awk '/scripts[/][A-Za-z0-9_]+[.]py|git[ ](pull|fetch|merge|checkout|rebase|reset)|uv[ ]pip[ ]sync/'
+
+echo "== scheduler log: latest launches, then the tail"
+grep -E 'Collecting ' "$LOG" | tail -n 8
+tail -n 5 "$LOG"
+
+echo "== budgets (per UTC date) and per-IP host windows"
+"$PY" -m streetscape_metadata_tracker.scheduler --config "$CFG" status 2>&1 \
+  | grep -E 'budget today:|rolling 24 h:|due today'
+
+echo "== GSV paces and the batch deadline, from the deployed config"
+"$PY" - "$CFG" <<'PYEOF'
+import sys, tomllib
+c = tomllib.load(open(sys.argv[1], "rb"))
+print("  gsv         [download].max_requests_per_minute             =", c["download"]["max_requests_per_minute"])
+print("  gsv_streets [providers.gsv_streets].max_requests_per_minute =", c["providers"]["gsv_streets"].get("max_requests_per_minute", "unset: falls back to [download]"))
+print("  [schedule].max_batch_hours =", c["schedule"]["max_batch_hours"])
+PYEOF
+EOF
+```
+
+The `awk` patterns spell `.`, `/` and spaces as `[.]`, `[/]` and `[ ]` so they cannot match awk's own command line, which a plain `ps | grep` does.
+The run-due test is the same `ps -eo pid=,args=` match `scheduler._run_due_in_flight()` applies for `import-bundle`, the prefreeze and the two repair scripts.
+**Do not use `pgrep -f "scheduler run-due"`**: the unit's command line is `-m streetscape_metadata_tracker.scheduler --config … run-due`, so that pattern never matches it and reports idle mid-batch (`deploy/README.md`'s `pgrep -af 'scheduler .*run-due'` does match).
+
+### 2. Read what the batch is doing
+
+- **Is a `run-due` in flight?** Any line under "run-due in flight" means yes, whether it is the nightly unit (`streetscape-tracker.service` active) or a hand-started catch-up.
+  The timer fires at 02:00 Pacific and `max_batch_hours = 12` stops it launching cities at ~14:00; the bounded tail (aggregate, manifests, backup, publish) runs past that, so read `ps`, never the clock.
+- **Which channels can it still reach?** Read the in-flight `run-due`'s args.
+  The nightly unit passes no `--provider`, so it collects **every** enabled channel; a hand catch-up's `--provider` list is the whole of what it can touch.
+  The batch is **city-major**: it walks its due cities in order and runs each city's due channels (two at once, in host-disjoint lanes, on prod), so the channel that is live this minute says little about the next one, and an unfiltered night is back on `gsv` with the next city.
+- **Which channel is live right now?** The `collect_*` children say: `streetscape_tracker.py --provider gsv` is the `gsv` lane (`GMAPS_API_KEY`), and `streetscape_street_analyzer.collect --provider gsv` is the `gsv_streets` lane (`GMAPS_STREETS_API_KEY`).
+  The scheduler log's `Collecting <city> [<channel>]` and `Collecting streets for <city> [<channel>]` lines name the channel of each launch, and each child writes its full output to `logs/collect_<city_id>_<channel>_<UTC date>.log`.
+- **Can that GSV channel still spend tonight?** `scheduler status` prints `<channel> budget today: <used> / <budget> requests used.` per enabled channel, keyed by UTC date; a GSV channel at its budget launches nothing more tonight.
+  On prod both GSV budgets are 35,000,000, sized so that `max_batch_hours`, not the budget, ends the night, so in practice treat any in-flight unfiltered `run-due` as able to collect both GSV keys until it exits.
+- **Per-IP pools:** the same output prints `mapillary_tiles rolling 24 h: <used> / 3,000 requests used.` (`[hosts.mapillary_tiles]`, #385), the pool both Mapillary channels draw from on every scheduler path; read [`provider-access.md`](provider-access.md) before sizing a Mapillary step.
+
+### 3. The GSV keys
+
+| Channel | Env var | Cloud project (account) | Project quota | Nightly pace (config key) |
+|---|---|---|---|---|
+| `gsv` | `GMAPS_API_KEY` | `gsv-date-tracker`, 634289259936 (UW) | 60,000/min, read in the console 2026-09-15 | 48,000/min (`[download].max_requests_per_minute`) |
+| `gsv_streets` | `GMAPS_STREETS_API_KEY` | `gsv-streets-tracker`, 657654513495 (UW) | 60,000/min, the grant approved 2026-09-21, not read back independently | 48,000/min (`[providers.gsv_streets].max_requests_per_minute`) |
+
+Always name the project ID and the account: a decoy project with the same display name exists on another account (the `max_concurrent_channels` comment in `config/scheduler.makelab1.toml`).
+The snippet prints both paces from the deployed config, so use its numbers, not this table's, if they ever differ.
+
+### 4. The decision rule
+
+- **Same GSV key as a `run-due` that can still collect it, direct CLI** (`streetscape_tracker.py --provider gsv`, or `python -m streetscape_street_analyzer.collect --provider gsv`): pass `--max-requests-per-minute 12000`.
+  12,000 is the project quota minus that key's nightly pace (60,000 − 48,000), so it moves with the config: re-derive it from the pace the snippet printed rather than quoting it.
+  It is a ceiling with **no** margin (the two then sum to the quota, and each token bucket can run about a second ahead of its rate), so go lower when the hand run is not urgent.
+  Never rely on either CLI's default: both default to 24,000, and 24,000 + 48,000 is already over 60,000.
+- **Same GSV key, through the scheduler** (`run-due --provider gsv` or `gsv_streets`, or `assess-city`, whose set includes `gsv_streets`): these take **no** rate override, so wait until the batch can no longer collect that channel (its budget is spent, or the in-flight run is a filtered `run-due` that does not name it), or until the batch has ended.
+  The nightly batch is city-major and its GSV budgets do not bind, so against the nightly unit that means waiting for it to end.
+- **Different key, or a non-GSV channel:** proceed — for example a hand `gsv` run beside a `run-due --provider gsv_streets` catch-up, or any GSV run beside a `run-due --provider mapillary`.
+  Re-run step 1 if the hand run could still be going at 02:00 Pacific, when the timer starts a full unfiltered night on both keys.
+- **Per-IP providers (Mapillary, KartaView, Panoramax, Overpass):** `host_lock` already serializes them across processes, so a second process fails fast instead of doubling the rate; if the batch's child is the one that loses, its city skips that channel tonight and the night alerts ([`deploy/README.md`](../deploy/README.md), "Running anything by hand alongside the scheduler").
+  They still respect their budgets: catch up through `run-due --provider … --limit N` or `--city`, which draw on the daily and rolling-24h ledgers, never a detached script; the staging rules are in [`provider-access.md`](provider-access.md).
+- **Never start a catch-up while a deploy or a repair script is running.** A deploy changes the code the next child runs and a repair script rewrites the catalog a run writes into, so the snippet's "deploys, repair scripts" list must be empty; if another session might be deploying, ask the operator first.
+
+### 5. Afterwards
+
+Drive the hand run into a file (`>> logs/<name>.log 2>&1`), never a pipe, and read it when it ends:
+
+```bash
+grep -cE 'OVER_QUERY_LIMIT|REQUEST_FAILED' logs/<name>.log
+grep -E 'Retry attempt .*quota window reset|points after all retries' logs/<name>.log
+```
+
+A `quota window reset` retry means the engine saw OVER_QUERY_LIMIT or UNKNOWN_ERROR answers, i.e. the key was oversubscribed.
+Points still failing after the retry passes are written with their status to the run's `*_failed_points.csv`, and past 1% of points the run aborts with its checkpoint kept rather than finalizing.
+For a scheduler-launched catch-up, read its `logs/collect_<city_id>_<channel>_<UTC date>.log` instead.
+If a nightly lane collected the same key during the hand run, read that night's child logs for the same strings too, because the nightly run is the series whose data matters.
+Any hit is a finding: record it in the #304 section of [`provider-access.md`](provider-access.md) with the hand run's rate and the overlap window, rather than lowering a configured pace on one sample.
+
 ## Answering a partner inquiry the same day: `scheduler assess-city "City, Region"` (issue #215)
 
 **Answering a partner inquiry the same day: `scheduler assess-city "City, Region"` (issue #215).** A Project Sidewalk deployment inquiry arrives by email about a city we don't track, and the useful reply happens *that day*.
@@ -42,8 +158,8 @@ The realistic victim is not a dev laptop but prod with publishing switched off d
 Exit stays 0 there, on the same reasoning that makes `--no-publish` exit 0 — only an *attempted* publish that failed is a failure.
 **Do not run it while the nightly batch is collecting** (PR #399 review): its `gsv_streets` walk uses the same key as the nightly `gsv_streets` lane, nothing serializes GSV processes, and since #304 each engine actually reaches its 48,000/min, so the two would present ~96,000/min against that key's 60,000/min project quota.
 The same holds for any hand-run GSV collection (`streetscape_tracker.py`, `collect --provider gsv`) against its nightly twin.
-The failure is OVER_QUERY_LIMIT answers, retried after 20 s waits and, past 1% of points, an aborted run; the full account and the open decision are in [`provider-access.md`](provider-access.md) (the #304 section).
-Check `pgrep -f "scheduler run-due"` first, or pass a lower `--max-requests-per-minute` to a hand run so the two sum under the quota.
+The failure is OVER_QUERY_LIMIT answers, retried after 20 s waits and, past 1% of points, an aborted run; the full account and the decision taken (no lock, a pre-run checklist, #412 for a `run-due` guard) are in [`provider-access.md`](provider-access.md) (the #304 section).
+Run the checklist under "Before any hand run or catch-up" above first: `assess-city` has no rate override, so it waits for the batch to end, while a direct-CLI hand run can instead pass `--max-requests-per-minute` at the quota minus the nightly pace.
 Refusals mirror #214's: an unpaired `--width/--height`, a `--provider` naming the grid channel or an unknown/disabled one, and a config with no assess channel enabled all exit `USAGE_EXIT_CODE` **before the catalog is opened**.
 `--width/--height` without `--lat/--lng` is refused where `cli.py` accepts it.
 `cli.py` now centers such a grid on the geocoder's reported point rather than the OSM bbox midpoint (#186), but nobody has verified that point is downtown (#185), and an assessment freezes geometry for a partner answer — a guess there is the right size in possibly the wrong place, permanently.
