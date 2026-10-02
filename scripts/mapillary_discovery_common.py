@@ -5,7 +5,7 @@ fresh, systematic 360-degree capture whether or not they are in the catalog.
 The instrument is Mapillary's coverage vector tiles, ``sequence`` layer, at
 z6 -- one LineString per capture sequence carrying ``captured_at``,
 ``creator_id``, ``is_pano``, ``foot``, ``image_id``, ``quality_score`` and
-(on ~3% of sequences) ``organization_id``. About 100 z6 tiles cover North
+(on 20.8% of sequences in the 2026-10-02 scan) ``organization_id``. About 100 z6 tiles cover North
 America; one dense tile is 5-10 MB and up to ~190,000 sequences.
 
 Everything here is a SCREENING SIGNAL, never coverage. z6 geometry is
