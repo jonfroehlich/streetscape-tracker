@@ -621,20 +621,40 @@ So the raise proceeds in stages, both channels together, with the forum delibera
 | Stage | `max_requests_per_minute` | `daily_request_budget` (each channel) | Gate to the next stage |
 |---|---|---|---|
 | 0 (until 2026-10-01) | 30 | 4,000 | |
-| **1 (current)** | **60** | **8,000** | **7 clean nights**: no 403/429/redirect, no 5xx cluster |
-| 2 | 90 | 12,000 | another 7 clean nights |
+| **1 (current)** | **60** | **8,000** | **7 consecutive clean qualifying nights** under the gate rule below |
+| 2 | 90 | 12,000 | another 7, same rule |
 
 - **Each stage is its own PR** to `config/scheduler.makelab1.toml`, with its date and evidence in the comment block, and the pinning test in `tests/test_scheduler.py` moves with it.
 - **The trip wire is the existing latch**: 403/429/redirect is a `HostBlockedError` (exit 84) at the first request.
   A trip **reverts to the previous stage** and the night is recorded in this section.
-- **How an operator checks a night against the gate.**
-  Blocks: any exit 84 in that night's `streetscape_scheduler.log` or alert email fails it.
-  5xx: `grep -h 'Panoramax tile retry: HTTP 5' logs/collect_*_panoramax*_<date>.log | wc -l` counts every RETRIED 5xx request in that night's per-attempt child logs, and a `Panoramax tile retry gave up:` line marks a tile whose retries ran out.
-  That log line (`download_panoramax.TILE_RETRY_LOG_PHRASE`, a backoff `on_backoff`/`on_giveup` handler on `_fetch_tile`) was added for this gate: before it a 5xx that recovered on its next try was retried silently and left no trace anywhere, so "no 5xx cluster" was unobservable.
-  The weekly screen reads tiles through the same `_fetch_tile`, so its retries land in the scheduler log under the same phrase.
+- **The gate rule** (decided 2026-10-02; #405 said only "no 5xx cluster", so this is what that phrase means here).
+  A **night** is one UTC date, and its **requests** are the `api_usage` rows for `panoramax` + `panoramax_streets` on that date (both channels share one per-IP host, and the weekly screen writes into the grid row too).
+  Its **retried 5xx** are the `Panoramax tile retry: HTTP 5xx on try …` lines, one per retried request; its **5xx give-ups** are `Panoramax tile retry gave up: HTTP 5xx` lines; timeouts and connection errors are counted and printed but do not gate.
+  - **REVERT** to the previous stage, at once, on any per-IP refusal (an `exited 84` child, or a Panoramax 403/429/redirect/error-page message) — #405's original trip wire.
+    Also REVERT when retried 5xx exceed **10%** of the night's requests (and 10 in absolute terms), or on a **second HOLD within 7 nights** of the first.
+  - **HOLD** — the stage stays, and the clean streak resets to 0 — on any **5xx give-up**, or when retried 5xx exceed **max(10, 1% of requests)**.
+  - Otherwise the night is **CLEAN**; but it **qualifies** toward the seven only at **≥ 1,000 requests**, and a quieter night neither advances nor resets the streak.
+  - **ADVANCE** after **7 consecutive clean qualifying nights**.
+- **Why those numbers.**
+  - *Our own baseline* — the only measured Panoramax error data in the repo is phase 1 of #316 ([`experiments/panoramax-feasibility.md`](experiments/panoramax-feasibility.md), from a laptop IP at 30/min, September 2026), whose fetcher counted every attempt: the `screen` stage spent exactly its 113 tiles and the `detail` stage exactly its 3,001, so **0 retries in 3,114 requests** (the 3,321-request `measure` stage cannot be split, having reused rows).
+    By the rule of three (Hanley & Lippman-Hand, *JAMA* 1983) that bounds a healthy retry rate at **≈ 0.1%** (95% upper bound, 3 / 3,114).
+    **There is no production baseline**: before this gate's log line, prod retries were invisible, and nobody has compared prod's `runs.api_requests` with tile counts; stage 1's first nights are the first production measurement, and they should be read as such.
+  - *1% to HOLD* is ten times that bound, so ordinary noise does not hold a stage, and an order of magnitude below the per-client **retry budget of 10%** in Google's SRE book ("a request will only be retried as long as this ratio is below 10%", [Handling Overload](https://sre.google/sre-book/handling-overload/)) — so we stop *advancing* long before our retries reach what that guidance treats as load amplification.
+  - *10% to REVERT* is that budget itself: past it our retries are adding ≥ 10% to the load of a server that is already failing, and the maintainer measures clients by their share of the catalog's load (#405's 25% complaint).
+  - *The floor of 10, and 1,000 requests to qualify*, are the same number seen twice: at 1,000 requests 1% is 10, and below that a ratio says nothing. At the baseline bound a 1,000-request night expects ~1 retried 5xx, and P(more than 10) under Poisson(1) is ~10⁻⁸, so the floor cannot hold a healthy night by chance.
+  - *Any 5xx give-up holds*: a give-up is `TILE_MAX_TRIES` (5) consecutive failures of one tile across up to `_TILE_MAX_TIME_S` (120 s) of exponential backoff, which is sustained server trouble rather than a blip — and it leaves a hole the resume must re-probe.
+    That backoff, capped per request, is the other half of the SRE book's retry guidance ("Limit retries per request", [Addressing Cascading Failures](https://sre.google/sre-book/addressing-cascading-failures/)), and it is already how `_fetch_tile` retries.
+  - *A second HOLD within 7 nights reverts*: a hold that recurs inside one gate window is a trend, not a blip, and stage 0 is the pace with no complaint on record.
+- **How an operator checks it — one command, read-only, no network:**
+  `python scripts/panoramax_gate_check.py --config config/scheduler.makelab1.toml` prints the last 14 nights (`--end`, `--nights` to move the window), each night's requests, retried and given-up 5xx, other retries and refusals, a per-night verdict and the stage verdict; it exits 1 when the window ends in REVERT.
+  It reads the per-attempt child logs `logs/collect_*_panoramax*_<date>.log` and the night's own lines of `streetscape_scheduler.log` (the screen's retries, and every `exited 84`), plus the `api_usage` ledger opened read-only.
+  By hand, the 5xx count is `grep -h 'Panoramax tile retry: HTTP 5' logs/collect_*_panoramax*_<date>.log | wc -l`.
+  That log line (`download_panoramax.TILE_RETRY_LOG_PHRASE`, a backoff `on_backoff`/`on_giveup` handler on `_fetch_tile`) exists for this gate: before it a 5xx that recovered on its next try left no trace anywhere.
   A cross-check that needs no log: for a crawl that completed in one uncapped night, `runs.api_requests` counts every attempt, so its excess over the lattice's tile count is the number of retries.
-  #405 does not put a number on "cluster"; a proposed working reading is any `gave up` line, or retries on more than ~1% of a night's Panoramax requests, and either is a reason to hold the stage rather than advance.
-- **Jitter stays 0.6 and the host lock stays**; the collector already sends a `User-Agent` naming the project and its repository.
+- **Jitter stays 0.6 and the host lock stays.**
+- **The `User-Agent` names a contact address since #405** (Jon's choice): `StreetscapeTracker/<version> (+https://github.com/jonfroehlich/streetscape-tracker; sidewalk@cs.uw.edu) aiohttp/<version>`.
+  The shape is RFC 9110's product token (no spaces, hence `StreetscapeTracker`) plus a comment, laid out the way the [Wikimedia User-Agent policy](https://foundation.wikimedia.org/wiki/Policy:Wikimedia_Foundation_User-Agent_Policy) asks — `<client>/<version> (<contact>) <library>/<version>` — and OSM's own [Nominatim policy](https://operations.osmfoundation.org/policies/nominatim/) refuses stock library agents.
+  It is the Panoramax collector's and screen's alone; the Nominatim and Overpass agents are separate constants and were not changed.
 - **What it changes downstream.**
   `_tile_census_timeout_seconds` divides by the configured rate, so at 60/min the richest enrollable city (3,132 tiles) derives ~108 min, under the 180-minute floor that now times every city of 5,440 tiles or fewer.
   That floor affords 8,160 requests at this pace, just above the 8,000 budget, so a capped launch is sized by the budget rather than the clock — **but only when the child's timeout is the unclamped floor**: `_sweep_launch_plan` prices the cap from the deadline-clamped timeout, and the Panoramax pair ranks last, so late in a long night the clock sizes the cap instead.

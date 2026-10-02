@@ -643,19 +643,24 @@ network_type = "drive"
 #     burst with no stated rate, and our jittered, single-lock pacing never
 #     bursts.
 # The forum was deliberately NOT asked (#405). Jitter (0.6) and the host lock
-# are unchanged; the collector already sends a User-Agent naming the project.
+# are unchanged. The User-Agent now names a contact address (Jon's choice):
+# StreetscapeTracker/1.0 (+<repo URL>; sidewalk@cs.uw.edu) aiohttp/<version>.
 #
-# THE GATE TO STAGE 2 (90/min, 12,000/day each): seven clean nights at these
-# values -- no 403/429/redirect (a HostBlockedError, exit 84), no 5xx cluster.
-# How to CHECK it each morning (the full recipe is in docs/provider-access.md):
-#   blocks: any exit 84 in that night's scheduler log or alert email.
-#   5xx:    grep -h 'Panoramax tile retry: HTTP 5' \
-#             logs/collect_*_panoramax*_<date>.log | wc -l
-#           -- one WARNING per RETRIED request (download_panoramax.
-#           TILE_RETRY_LOG_PHRASE, added for this gate: before it a 5xx that
-#           recovered on its next try left no trace), plus a "... gave up"
-#           line when a tile's retries ran out.
-# A trip REVERTS to the previous stage (30 / 4,000) and is recorded in
+# THE GATE TO STAGE 2 (90/min, 12,000/day each): seven CONSECUTIVE clean
+# qualifying nights. Per UTC night, over both channels' api_usage requests
+# (the reasoning and sources are in docs/provider-access.md):
+#   REVERT on any per-IP refusal (exit 84 / 403 / 429 / redirect), on retried
+#          5xx > 10% of requests (and > 10), or on a 2nd HOLD within 7 nights.
+#   HOLD   (streak -> 0) on any 5xx give-up, or retried 5xx > max(10, 1%).
+#   CLEAN  otherwise; it QUALIFIES only at >= 1,000 requests, and a quieter
+#          night neither advances nor resets the streak.
+# Check it with ONE read-only command:
+#   python scripts/panoramax_gate_check.py --config config/scheduler.makelab1.toml
+# or by hand: grep -h 'Panoramax tile retry: HTTP 5' \
+#               logs/collect_*_panoramax*_<date>.log | wc -l
+# (download_panoramax.TILE_RETRY_LOG_PHRASE: one WARNING per RETRIED request,
+# added for this gate -- before it a recovered 5xx left no trace.)
+# A REVERT goes back to the previous stage (30 / 4,000) and is recorded in
 # docs/provider-access.md. Each stage is its own PR; enrolment of the 41
 # screen-positive tracked cities proceeds in tranches only after this holds.
 [providers.panoramax]
