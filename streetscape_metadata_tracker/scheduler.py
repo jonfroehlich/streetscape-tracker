@@ -5080,6 +5080,7 @@ def cmd_screen_provider(
     limit: int | None = None,
     publish: bool = True,
     allow_collapse: bool = False,
+    allow_fine_cells: bool = False,
 ) -> int:
     """
     Re-ask, over the WHOLE catalog, whether a provider has imagery in each city
@@ -5159,6 +5160,7 @@ def cmd_screen_provider(
             max_requests_per_minute=rate,
             jitter=jitter,
             allow_collapse=allow_collapse,
+            allow_fine_cells=allow_fine_cells,
         )
     except HostUnavailableError as e:
         # 84/85, the same codes a collection reports, so the weekly unit's
@@ -11456,6 +11458,14 @@ def build_parser() -> argparse.ArgumentParser:
         "screened positive before. Refused by default: that is what a moved grid "
         "layer looks like, not a platform losing its imagery.",
     )
+    p_screen.add_argument(
+        "--allow-fine-cells",
+        action="store_true",
+        help="Record a screen whose hexagons decode to an H3 resolution finer than "
+        "panoramax_screen.MAX_SCREEN_H3_RESOLUTION. Refused by default: such a "
+        "hexagon can quantize to nothing in a z6 tile, which would publish a false "
+        "zero.",
+    )
     _add_global_flags(
         sub.add_parser(
             "notify-failure", help="Email the recent log (for a systemd OnFailure= hook)"
@@ -11552,6 +11562,7 @@ def main() -> int:
             limit=args.limit,
             publish=not args.no_publish,
             allow_collapse=args.allow_collapse,
+            allow_fine_cells=args.allow_fine_cells,
         )
     if args.command == "backup-status":
         return cmd_backup_status(cfg, alert=args.alert)

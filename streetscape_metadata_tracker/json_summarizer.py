@@ -3,6 +3,7 @@ import hashlib
 import itertools
 import json
 import logging
+import math
 import os
 from dataclasses import asdict
 from datetime import date
@@ -1552,13 +1553,17 @@ _SCREEN_INSTRUMENTS: dict[str, dict[str, Any]] = {
 # them", which rested on the hardcoded resolution 6 (~36 km²) against a 19.5 km²
 # median city; at the measured resolution 7 (~5.2 km²) that is false for most
 # cities, while the bound itself never depended on it. Every clause below holds
-# at any resolution: selection is by overlap, a selected hexagon's counters are
-# for the WHOLE hexagon, and the bbox is a rectangle around the city.
+# at any resolution a z6 tile can still DRAW: selection is by overlap, a
+# selected hexagon's counters are for the WHOLE hexagon, and the bbox is a
+# rectangle around the city. Hexagons finer than that can vanish in
+# quantization, which is why such a pass is refused
+# (`panoramax_screen.MAX_SCREEN_H3_RESOLUTION`) rather than described here.
 #
 # "A zero is conclusive" survives for the same reason, and is stated for the
 # bbox rather than for "the city": no overlapping hexagon counting anything
 # means nothing the provider had indexed lies anywhere in the box -- and a pass
-# that could not read every tile is refused rather than written.
+# that could not read every tile is refused rather than written (which, for a
+# tile answering 404, holds once #407's reading of 404 as an UNREAD tile lands).
 _SCREEN_CAVEAT = (
     "Upper bounds, not counts. Each figure sums provider-published counters over "
     "every map cell that overlaps the city's bounding box, and counts each such "
@@ -1586,6 +1591,21 @@ def _screen_cell_list(counts: dict[int | None, int]) -> list[dict[str, Any]]:
     ]
 
 
+def _format_area_km2(area: float) -> str:
+    """
+    An average area to three significant figures, never in scientific notation.
+
+    Example::
+
+        >>> [_format_area_km2(a) for a in (4357449.416078381, 36.129062164, 0.000000895)]
+        ['4,357,449', '36.1', '0.000000895']
+    """
+    if area >= 100:
+        return f"{area:,.0f}"
+    decimals = max(0, 2 - math.floor(math.log10(area)))
+    return f"{area:.{decimals}f}"
+
+
 def _describe_screen_cells(counts: dict[int | None, int] | None, screen_date: str | None) -> str:
     """
     The `cell` sentence for a screen, from what that pass MEASURED.
@@ -1604,12 +1624,15 @@ def _describe_screen_cells(counts: dict[int | None, int] | None, screen_date: st
         return f"No hexagons decoded in the screen of {screen_date}"
     parts = []
     for row in _screen_cell_list(counts):
+        n = row["hexagons"]
+        hexagons = f"{n:,} hexagon{'s' if n != 1 else ''}"
         if row["resolution"] is None:
-            parts.append(f"{row['hexagons']:,} hexagons whose ids are not H3 cells")
+            ids = "ids are" if n != 1 else "id is"
+            parts.append(f"{hexagons} whose {ids} not H3 cells")
             continue
         area = row["average_area_km2"]
-        text = f"H3 resolution {row['resolution']} (~{area:.3g} km² average)"
-        parts.append(text if len(counts) == 1 else f"{text} for {row['hexagons']:,} hexagons")
+        text = f"H3 resolution {row['resolution']} (~{_format_area_km2(area)} km² average)"
+        parts.append(text if len(counts) == 1 else f"{text} for {hexagons}")
     return parts[0] if len(parts) == 1 else "Mixed: " + "; ".join(parts)
 
 
@@ -1630,9 +1653,21 @@ def _screen_cell_fields(
         "cell_resolutions": _screen_cell_list(counts) if counts is not None else None,
     }
     if counts is not None:
-        fields["cell_area_source"] = _H3_AREA_SOURCE
+        # Cited only when an area was actually quoted from it: a pass that
+        # decoded nothing, or only ids that are not H3 cells, sized nothing.
+        if any(res is not None for res in counts):
+            fields["cell_area_source"] = _H3_AREA_SOURCE
         unexpected = panoramax_screen.unexpected_cell_resolutions(counts)
-        if unexpected:
+        too_fine = panoramax_screen.too_fine_cell_resolutions(counts)
+        if too_fine:
+            # Only reachable through --allow-fine-cells, and the one case where
+            # "still upper bounds" cannot be promised.
+            fields["cell_warning"] = (
+                f"This screen's hexagons were {unexpected}, and {too_fine}. It was "
+                f"recorded by explicit override: a hexagon that small can vanish from "
+                f"the tile, so a zero in this screen is NOT conclusive."
+            )
+        elif unexpected:
             fields["cell_warning"] = (
                 f"This screen's hexagons were {unexpected}. The figures are still "
                 f"upper bounds, but `cells` is not comparable with a screen read at "

@@ -30,7 +30,7 @@ from .naming import sanitize_city_query_str
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
 
 # The v16 per-host ledger (issue #385). One constant, spliced into _SCHEMA
 # below AND executed by _migrate_v15_to_v16, which runs before _SCHEMA and needs
@@ -418,7 +418,7 @@ CREATE TABLE IF NOT EXISTS provider_screen (
 CREATE INDEX IF NOT EXISTS idx_provider_screen_date
     ON provider_screen(provider, screen_date);
 
--- v18: what the CELLS of one dated screen were, MEASURED -- one row per H3
+-- v19: what the CELLS of one dated screen were, MEASURED -- one row per H3
 -- resolution decoded from the hexagon ids that pass read, with how many
 -- distinct hexagons carried it. The published description of a screen cell
 -- used to be a constant ("H3 resolution 6"), and the ids said 7 (#406); this
@@ -430,7 +430,14 @@ CREATE INDEX IF NOT EXISTS idx_provider_screen_date
 -- that reason (NULLs are distinct in a UNIQUE); `record_provider_screen`
 -- replaces a date's rows wholesale instead, which an upsert could not do -- a
 -- same-day re-run that no longer sees some resolution must not keep its row.
--- A screen date with NO rows here predates v18: "not measured", never "none".
+--
+-- Three states per screen date, and they must stay distinguishable:
+--   no rows at all             -> screened before v19: resolution NOT MEASURED;
+--   one row (NULL, 0)          -> measured, and the pass decoded NO hexagons
+--                                 (only an --allow-collapse pass can record it);
+--   rows with hexagons > 0     -> the measured histogram.
+-- The (NULL, 0) sentinel cannot collide with the non-H3 bucket, which only
+-- ever holds a positive count.
 --
 -- Purely additive (the v2 -> v3 pattern): no migration function.
 CREATE TABLE IF NOT EXISTS provider_screen_cells (
@@ -815,11 +822,15 @@ def init_schema(conn: sqlite3.Connection) -> None:
     if user_version == 16:
         _migrate_add_query_radius_columns(conn)
         user_version = 17
-    # v17 -> v18: the provider_screen_cells table (the screen's measured H3
-    # resolution). Purely additive, so like v2 -> v3 it needs no migration
-    # function -- the CREATE TABLE IF NOT EXISTS in _SCHEMA builds it.
-    if user_version == 17:
-        user_version = 18
+    # v18 -> v19: the provider_screen_cells table (the screen's measured H3
+    # resolution, #406). v18 is #411's early_refreshes table. Both are purely
+    # additive, so like v2 -> v3 neither needs a migration function: the CREATE
+    # TABLE IF NOT EXISTS in _SCHEMA builds every missing table on every
+    # connect, whichever order the two branches landed in. Keyed on 17 as well
+    # so a v17 catalog is correct on a tree that does not yet carry the v18 rung;
+    # once it does, that rung runs first and this one sees 18.
+    if user_version in (17, 18):
+        user_version = 19
     conn.executescript(_SCHEMA)
     # The GSV query-radius pair (issue #367) is ALSO added on every connect, not
     # only on its rung: while in flight it and PR #388 both stamped v16, so a
@@ -2890,13 +2901,14 @@ def record_provider_screen(
             "DELETE FROM provider_screen_cells WHERE provider = ? AND screen_date = ?",
             (provider, screen_date.isoformat()),
         )
+        # An EMPTY histogram is a measurement ("no hexagons decoded"), not the
+        # absence of one, so it is stored as the (NULL, 0) sentinel -- writing
+        # nothing would read back as "not measured".
+        histogram = cell_resolutions or {None: 0}
         conn.executemany(
             """INSERT INTO provider_screen_cells
                (provider, screen_date, cell_resolution, hexagons) VALUES (?, ?, ?, ?)""",
-            [
-                (provider, screen_date.isoformat(), res, int(n))
-                for res, n in cell_resolutions.items()
-            ],
+            [(provider, screen_date.isoformat(), res, int(n)) for res, n in histogram.items()],
         )
     conn.commit()
     return len(rows)
@@ -2908,8 +2920,10 @@ def get_provider_screen_cells(
     """
     Per screen date, the measured resolution histogram of that pass's hexagons.
 
-    A date absent from the result was screened before v18 recorded cells: its
-    resolution was never measured, which is not the same as "no hexagons".
+    A date absent from the result was screened before v19 recorded cells: its
+    resolution was never measured. A date mapping to ``{}`` was measured and
+    decoded no hexagon at all (the stored (NULL, 0) sentinel). The two are not
+    the same and are never folded together.
     """
     out: dict[str, dict[int | None, int]] = {}
     for row in conn.execute(
@@ -2917,7 +2931,9 @@ def get_provider_screen_cells(
             WHERE provider = ? ORDER BY screen_date, cell_resolution""",
         (provider,),
     ).fetchall():
-        out.setdefault(row["screen_date"], {})[row["cell_resolution"]] = int(row["hexagons"])
+        histogram = out.setdefault(row["screen_date"], {})
+        if row["hexagons"]:
+            histogram[row["cell_resolution"]] = int(row["hexagons"])
     return out
 
 

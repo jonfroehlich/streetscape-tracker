@@ -36,6 +36,7 @@ import pytest
 
 from streetscape_metadata_tracker import db, scheduler
 from streetscape_metadata_tracker import panoramax_screen as ps
+from streetscape_metadata_tracker.download_common import DownloadError
 from streetscape_metadata_tracker.json_summarizer import (
     _SCREEN_CAVEAT,
     generate_provider_screen_summary,
@@ -90,8 +91,11 @@ NOT_CELLS = [
     ("8872830828ffffff", "the reserved high bit set"),
     ("972830828ffffff", "a mode-dependent reserved bit set"),
     ("87f430828ffffff", "base cell 122, one past the last"),
-    ("8728308287fffff", "an unused digit (7) INSIDE the resolution"),
-    ("8728308280fffff", "a used digit PAST the resolution"),
+    ("87283082fffffff", "an unused digit (7) INSIDE the resolution: digit 7 of a res-7 id"),
+    ("8728308287fffff", "a used digit (3) PAST the resolution, at digit 8"),
+    ("8728308280fffff", "a used digit (0) PAST the resolution, at digit 8"),
+    # Only the LAST digit is wrong, so a digit loop that stops at 14 never sees it.
+    ("872830828fffff8", "a used digit (0) at digit 15, the last"),
     ("h1", "not hexadecimal at all"),
     ("", "empty"),
     ("-872830828ffffff", "negative"),
@@ -105,12 +109,31 @@ def test_an_id_that_is_not_an_H3_cell_decodes_to_None_not_to_a_resolution(hex_id
     assert ps.h3_cell_resolution(hex_id) is None, why
 
 
+# https://h3geo.org/docs/core-library/restable, "Average area in km2", copied
+# independently of the module so a typo in either is caught.
+PUBLISHED_AVERAGE_AREA_KM2 = {
+    0: 4357449.416078381,
+    1: 609788.441794133,
+    2: 86801.780398997,
+    3: 12393.434655088,
+    4: 1770.347654491,
+    5: 252.903858182,
+    6: 36.129062164,
+    7: 5.161293360,
+    8: 0.737327598,
+    9: 0.105332513,
+    10: 0.015047502,
+    11: 0.002149643,
+    12: 0.000307092,
+    13: 0.000043870,
+    14: 0.000006267,
+    15: 0.000000895,
+}
+
+
 def test_the_area_table_is_the_published_H3_one():
-    """Pinned to https://h3geo.org/docs/core-library/restable, the source the
-    artifact cites: resolution 6 is ~36.13 km² and 7 is ~5.16 km²."""
-    assert ps.H3_AVERAGE_HEX_AREA_KM2[6] == 36.129062164
-    assert ps.H3_AVERAGE_HEX_AREA_KM2[7] == 5.161293360
-    assert sorted(ps.H3_AVERAGE_HEX_AREA_KM2) == list(range(16))
+    """Pinned at EVERY resolution to the source the artifact cites."""
+    assert ps.H3_AVERAGE_HEX_AREA_KM2 == PUBLISHED_AVERAGE_AREA_KM2
     areas = [ps.H3_AVERAGE_HEX_AREA_KM2[r] for r in range(16)]
     # Each resolution is ~1/7 the area of the one above (aperture 7; res 0->1 is 7.15).
     assert all(6.9 < a / b < 7.2 for a, b in zip(areas, areas[1:], strict=False))
@@ -127,15 +150,35 @@ def test_only_the_single_expected_resolution_is_unremarkable():
     assert ps.EXPECTED_SCREEN_H3_RESOLUTION == 7
     assert ps.unexpected_cell_resolutions({7: 261_913}) is None
     assert ps.unexpected_cell_resolutions({}) is None  # the layer guard owns "nothing"
-    assert (
-        ps.unexpected_cell_resolutions({6: 3, 7: 10})
-        == "mixed H3 resolutions (6: 3 hexagons, 7: 10 hexagons); expected only 7"
+    assert ps.unexpected_cell_resolutions({6: 3, 7: 10}) == (
+        "mixed H3 resolutions (6: 3 hexagons, 7: 10 hexagons); expected only H3 resolution 7"
     )
     assert ps.unexpected_cell_resolutions({6: 1}) == (
-        "H3 resolution (6: 1 hexagon); expected only 7"
+        "H3 resolution 6 (1 hexagon); expected only H3 resolution 7"
     )
     assert "not an H3 cell: 2 hexagons" in ps.unexpected_cell_resolutions({7: 5, None: 2})
-    assert ps.unexpected_cell_resolutions({None: 4}).startswith("no H3 cell ids")
+    # Reads as a sentence after "hexagons were", where the old wording read
+    # "hexagons were no H3 cell ids".
+    assert ps.unexpected_cell_resolutions({None: 4}) == (
+        "not H3 cells at all (4 hexagons); expected only H3 resolution 7"
+    )
+
+
+def test_the_fine_resolution_bound_is_derived_and_sits_at_9():
+    """Res 9's average edge (200.8 m) spans more than one z6 tile unit at the
+    equator, res 10's (75.9 m) under half of one; the equator is where a unit is
+    largest, so the bound holds at every latitude. Edge lengths from
+    https://h3geo.org/docs/core-library/restable."""
+    unit_m = 40_075_016.686 / 2**ps.SCREEN_ZOOM / 4096
+    assert 152 < unit_m < 154
+    assert 200.786148 > unit_m > 75.863783
+    assert ps.MAX_SCREEN_H3_RESOLUTION == 9
+    assert ps.too_fine_cell_resolutions({7: 5, 9: 1}) is None
+    assert ps.too_fine_cell_resolutions({None: 3}) is None
+    assert ps.too_fine_cell_resolutions({7: 5, 10: 2, 11: 1}) == (
+        "H3 resolution 10 (2 hexagons), 11 (1 hexagon) is finer than resolution 9, "
+        "the finest whose hexagons a z6 tile unit can still resolve"
+    )
 
 
 # ── 2. The pass ────────────────────────────────────────────────────────────
@@ -168,9 +211,9 @@ def test_a_pass_returns_the_resolution_of_every_hexagon_it_READ(monkeypatch, cap
 
 def test_a_MIXED_pass_is_warned_about_and_still_screens(monkeypatch, caplog):
     """Warned, never refused: overlap selection and whole-hexagon counting keep
-    every figure an upper bound at any resolution, so refusing would cost a
-    week of an un-backfillable series to protect a number the artifact can
-    simply describe."""
+    every figure an upper bound at any resolution a z6 tile can draw, so
+    refusing would cost a week of an un-backfillable series to protect a number
+    the artifact can simply describe."""
     with caplog.at_level(logging.WARNING, logger=ps.__name__):
         result = _pass(
             monkeypatch,
@@ -183,6 +226,39 @@ def test_a_MIXED_pass_is_warned_about_and_still_screens(monkeypatch, caplog):
     assert result["rows"][0]["pictures_upper_bound"] == 14
     warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     assert any("mixed H3 resolutions (6: 1 hexagon, 7: 1 hexagon)" in m for m in warnings)
+
+
+# Verified with h3 4.5.0: Des Moines at (41.59, -93.62), res 9 and res 10.
+DES_MOINES_RES9 = "89260d87627ffff"
+DES_MOINES_RES10 = "8a260d876267fff"
+
+
+def test_a_pass_FINER_than_the_bound_is_REFUSED_with_its_spend(monkeypatch):
+    """A res-10 hexagon can quantize to nothing in a z6 tile, so a zero beside
+    it could be false: the pass is refused before anything is written, and the
+    request it sent is still stamped for the ledger."""
+    hexes = [(DES_MOINES_RES10, (-93.70, 41.55, -93.60, 41.62), counters(5, 5, 0))]
+    with pytest.raises(DownloadError, match="finer than resolution 9") as excinfo:
+        _pass(monkeypatch, hexes)
+    assert "--allow-fine-cells" in str(excinfo.value)
+    assert excinfo.value.api_requests == 1
+
+
+def test_res_9_is_at_the_bound_and_records(monkeypatch):
+    result = _pass(
+        monkeypatch, [(DES_MOINES_RES9, (-93.70, 41.55, -93.60, 41.62), counters(5, 5, 0))]
+    )
+    assert result["cell_resolutions"] == {9: 1}
+
+
+def test_the_fine_cell_override_records_the_pass(monkeypatch):
+    target = ps.ScreenTarget("dm", "Des Moines", "United States", (-93.70, 41.55, -93.60, 41.62))
+    (x, y) = ps.screen_tiles_for_city(target.bbox)[0]
+    hexes = [(DES_MOINES_RES10, (-93.70, 41.55, -93.60, 41.62), counters(5, 5, 0))]
+    session = _FakeSession({tile_url(x, y): _FakeResponse(200, encode_grid_tile(hexes, x, y))})
+    monkeypatch.setattr(aiohttp, "ClientSession", lambda **kw: _AsyncCM(session))
+    result = asyncio.run(ps.screen_targets_async([target], allow_fine_cells=True))
+    assert result["cell_resolutions"] == {10: 1}
 
 
 # ── 3. The catalog and the artifact ────────────────────────────────────────
@@ -271,6 +347,80 @@ def test_a_screen_from_BEFORE_the_measurement_says_not_recorded_rather_than_gues
     assert "cell_area_source" not in instrument
     assert "cell_warning" not in instrument
     assert doc["providers"]["panoramax"]["series"][0]["cell_resolutions"] is None
+
+
+def test_a_pass_MEASURED_with_no_hexagons_is_not_mistaken_for_an_unmeasured_one(conn, data_dir):
+    """An empty histogram is a measurement. Stored as nothing, it would read
+    back as "predates per-pass measurement" -- the wrong one of two different
+    answers. The sentinel keeps them apart, and no area source is cited for a
+    pass that sized nothing."""
+    register(conn, "Des Moines", lat=DES_MOINES[0], lon=DES_MOINES[1])
+    city_id = db.get_all_cities(conn)[0].city_id
+    db.record_provider_screen(
+        conn,
+        provider="panoramax",
+        screen_date=date(2026, 10, 8),
+        rows=[_row(city_id, upper=0)],
+        cell_resolutions={},
+    )
+    assert db.get_provider_screen_cells(conn, "panoramax") == {"2026-10-08": {}}
+    instrument, doc = _instrument(conn, data_dir)
+    assert instrument["cell"] == "No hexagons decoded in the screen of 2026-10-08"
+    assert instrument["cell_resolutions"] == []
+    assert "cell_area_source" not in instrument
+    assert "cell_warning" not in instrument
+    assert doc["providers"]["panoramax"]["series"][0]["cell_resolutions"] == []
+
+
+def test_only_non_H3_ids_cite_no_area_source(conn, data_dir):
+    register(conn, "Des Moines", lat=DES_MOINES[0], lon=DES_MOINES[1])
+    city_id = db.get_all_cities(conn)[0].city_id
+    db.record_provider_screen(
+        conn,
+        provider="panoramax",
+        screen_date=date(2026, 10, 8),
+        rows=[_row(city_id)],
+        cell_resolutions={None: 4},
+    )
+    instrument, _ = _instrument(conn, data_dir)
+    assert instrument["cell"] == "4 hexagons whose ids are not H3 cells"
+    assert "cell_area_source" not in instrument
+    assert instrument["cell_warning"].startswith(
+        "This screen's hexagons were not H3 cells at all (4 hexagons)"
+    )
+
+
+def test_an_OVERRIDDEN_fine_screen_says_its_zeros_are_not_conclusive(conn, data_dir):
+    register(conn, "Des Moines", lat=DES_MOINES[0], lon=DES_MOINES[1])
+    city_id = db.get_all_cities(conn)[0].city_id
+    db.record_provider_screen(
+        conn,
+        provider="panoramax",
+        screen_date=date(2026, 10, 8),
+        rows=[_row(city_id)],
+        cell_resolutions={10: 40},
+    )
+    instrument, _ = _instrument(conn, data_dir)
+    assert instrument["cell"] == "H3 resolution 10 (~0.0150 km² average)"
+    assert "a zero in this screen is NOT conclusive" in instrument["cell_warning"]
+    assert "still upper bounds" not in instrument["cell_warning"]
+
+
+def test_areas_are_never_printed_in_scientific_notation(conn, data_dir):
+    register(conn, "Des Moines", lat=DES_MOINES[0], lon=DES_MOINES[1])
+    city_id = db.get_all_cities(conn)[0].city_id
+    db.record_provider_screen(
+        conn,
+        provider="panoramax",
+        screen_date=date(2026, 10, 8),
+        rows=[_row(city_id)],
+        cell_resolutions={0: 1, 15: 1},
+    )
+    instrument, _ = _instrument(conn, data_dir)
+    assert instrument["cell"] == (
+        "Mixed: H3 resolution 0 (~4,357,449 km² average) for 1 hexagon; "
+        "H3 resolution 15 (~0.000000895 km² average) for 1 hexagon"
+    )
 
 
 def test_the_instrument_describes_the_LATEST_screen_and_the_series_each_date(conn, data_dir):
@@ -400,3 +550,40 @@ def test_the_caveat_states_the_MECHANISM_not_a_size_comparison():
     assert "never under-count the box" in text
     assert "A zero is conclusive" in text
     assert "LARGER" not in text and "larger than" not in text.lower()
+
+
+# ── The override's wiring ──────────────────────────────────────────────────
+
+
+def test_allow_fine_cells_reaches_the_screen_from_the_command_line(data_dir, monkeypatch):
+    """The override is only an override if the flag gets through: argv ->
+    `main` -> `cmd_screen_provider` -> `screen_targets`. Off unless given."""
+    import sys
+
+    seen = []
+    monkeypatch.setattr(scheduler, "load_scheduler_config", lambda path=None: _cfg(data_dir))
+    monkeypatch.setattr(scheduler, "setup_logging", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        scheduler, "cmd_screen_provider", lambda cfg, provider, **kw: seen.append(kw) or 0
+    )
+    for argv, expected in (([], False), (["--allow-fine-cells"], True)):
+        monkeypatch.setattr(sys, "argv", ["scheduler", "screen-provider", "panoramax", *argv])
+        assert scheduler.main() == 0
+        assert seen[-1]["allow_fine_cells"] is expected
+
+
+def test_cmd_screen_provider_forwards_allow_fine_cells(data_dir, conn, monkeypatch):
+    register(conn, "Des Moines", lat=DES_MOINES[0], lon=DES_MOINES[1])
+    conn.commit()
+    seen = []
+
+    def fake(targets, **kw):
+        seen.append(kw.get("allow_fine_cells"))
+        raise DownloadError("stop here")
+
+    monkeypatch.setattr(ps, "screen_targets", fake)
+    for flag in (False, True):
+        scheduler.cmd_screen_provider(
+            _cfg(data_dir), "panoramax", publish=False, allow_fine_cells=flag
+        )
+    assert seen == [False, True]

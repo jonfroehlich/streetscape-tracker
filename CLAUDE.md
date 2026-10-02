@@ -158,7 +158,7 @@ Each area below states its rules here and keeps its evidence in a `docs/` file.
 
 **Data model, pipeline and naming → [`docs/architecture.md`](docs/architecture.md).**
 Every run is an immutable dated snapshot on the city's **frozen grid geometry** (never re-geocoded, shared by all providers, so diffs are meaningful); **no filename provider token means gsv**, so all pre-provider names and published URLs are unchanged.
-The SQLite catalog `data/streetscape_tracker.db` (schema v18, auto-migrated on connect) is the operational source of truth and is **local-only, never rsynced**.
+The SQLite catalog `data/streetscape_tracker.db` (schema v19, auto-migrated on connect) is the operational source of truth and is **local-only, never rsynced**.
 `schedule_state.member` (v13, #248) is the one column where **NULL does not mean "not measured"** — it means "use `scheduler.CHANNEL_DEFAULT_MEMBERSHIP[channel]`", which is code-side so a new provider token cannot silently enrol the catalog (a missing entry is a `KeyError`, never a permissive default).
 Each provider is an independent run series on the same grid: GSV is a *sample* (nearest pano per grid point), Mapillary and KartaView are *censuses* — so coverage rates are cross-provider comparable and raw pano counts are not.
 **GSV "covered" means a present pano within `analysis.GSV_QUERY_RADIUS_M` (50 m — Google's `radius` is a hint, not a bound, #367)**, applied at the loader seam (`fileutils.load_city_csv_file`) and mirrored in `city.js`; the CSV keeps the far pano, and `scripts/recompute_run_stats.py` is the repair handle.
