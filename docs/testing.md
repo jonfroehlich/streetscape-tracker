@@ -1198,3 +1198,15 @@ the solar day keeping an American afternoon and evening on its own date, cells a
 the catalog match inside / outside / disabled / never-collected, the SMALLEST of two overlapping bboxes winning with the other in `also_in`, the latest Mapillary run (not a newer gsv one) read, and `after_last_run` and `newer_than_seen` each shown true without the other (the 2026-08-26 Spokane case) — including a NULL newest capture — against a catalog opened read-only;
 a missing catalog reported and never created, a catalog at schema 0 or newer than `db.SCHEMA_VERSION` exiting 64, the GeoJSON's properties, exits 64 / 75 / 83, a block on page 2 still reporting page 1, the default `--since` derived from `--until`, catalog paths committed without a home directory, the metrics upsert replacing a window rather than appending it, and a `makelab*` host refused.
 Every mutation of the script listed in the PR (#368) was run after commit and fails at least one test.
+
+## The Mapillary discovery screen (issue #383)
+
+**Added after the 2026-08-22 split.**
+
+`tests/test_mapillary_discovery.py`, offline: tiles are built with `mapbox_vector_tile.encode`, never fetched.
+It pins the sampling frame (the 2026-10-02 regions are exactly 97 z6 tiles, no duplicates), so a change to `REGIONS` or the tile math cannot silently change the population the committed numbers describe;
+the y-up tile-local mapping (a tile's (0, 4096) is its NORTH-west corner — a flipped y moves a town's sweep a tile south) and an empty or layerless tile decoding to nothing;
+`split_samples` conserving a polyline's length exactly, bounding each piece at `SAMPLE_KM`, and spreading a long segment along its length;
+`place_scores` counting a sample 1.9 km away and not one 2.1 km away, the score as km / (pi r^2), the top uploader's length share, the on-foot share, and the LENGTH-weighted median capture date, with empty and below-`min_km` discs skipped;
+`thin_by_distance` keeping the first of a cluster; `inside_grid` as rectangle membership (15 km off-centre inside a 40 km-wide grid, 12 km off-centre outside a 20 km-tall one), never centre distance;
+the manifest dropping apostrophes and applying `GEOCODE_OVERRIDES`; and the jittered pacer's mean and floor.
