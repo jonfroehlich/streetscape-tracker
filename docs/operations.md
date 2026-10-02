@@ -86,9 +86,26 @@ Step 2 is a whole-series pass over every GSV CSV, so budget hours rather than mi
 If it cannot finish before 02:00, disable the timer for the night (`systemctl --user disable --now streetscape-tracker.timer`, and `enable --now` after step 3; never `stop`, which the #369 watchdog re-arms) rather than let a night catalog runs beside a half-repaired series.
 
 **What the repair does NOT move.**
-Historical `run_diffs` rows and the published diff detail CSVs stay under the old definition: `recompute_run_stats.py` re-derives run stats, never diffs, and nothing re-diffs a GSV series yet.
-So after #367 a city's "Changes since" panel for an old pair can still count a far pano as added or removed, until a GSV re-diff pass exists (a follow-up).
+Historical `run_diffs` rows and the published diff detail CSVs stay under the old definition: `recompute_run_stats.py` re-derives run stats, never diffs.
+So after #367 a city's "Changes since" panel for an old pair can still count a far pano as added or removed, until the GSV series is re-diffed.
 Diffs computed from the deploy on are correct, because both of their sides load through the new rule.
+
+**Re-diffing a GSV series (issue #394) is a pending deploy step, not done and not scheduled.**
+The handle exists: `scripts/recompute_run_diffs.py` (#245) loads both CSVs of every existing row through the default `fileutils.load_city_csv_file`, so it inherits the 50 m rule (pinned by `test_a_gsv_rediff_applies_the_query_radius_rule`).
+Whether and when to run it on prod is Jon's call; until it runs, the paragraph above describes prod.
+The same shape as the stats repair — dry run first, then apply, then publish, in the daytime (`--execute` is refused while a `run-due` is in flight):
+
+```bash
+.venv-makelab2/bin/python scripts/recompute_run_diffs.py \
+    --data-dir /projects/makeabilitylab/streetscape-tracker/data --provider gsv
+.venv-makelab2/bin/python scripts/recompute_run_diffs.py \
+    --data-dir /projects/makeabilitylab/streetscape-tracker/data --provider gsv \
+    --execute --regenerate-json >> logs/rediff_394.log 2>&1
+.venv-makelab2/bin/python -m streetscape_metadata_tracker.scheduler \
+    --config config/scheduler.makelab1.toml regenerate-aggregate --publish
+```
+
+`--provider gsv` matters for the same memory reason as above, and the publish never passes rsync `--delete`, so a detail file the pass REMOVES stays on the web server until removed there; the pass lists those names.
 
 ## Landing a laptop investigation in this catalog: `scheduler import-bundle` (issue #330)
 
