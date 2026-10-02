@@ -1539,19 +1539,106 @@ _SCREEN_INSTRUMENTS: dict[str, dict[str, Any]] = {
         "endpoint": panoramax_screen.SCREEN_URL_TEMPLATE,
         "layer": panoramax_screen.SCREEN_LAYER,
         "zoom": panoramax_screen.SCREEN_ZOOM,
-        "cell": "H3 resolution 6 (~36 km²)",
-        "selection": "hexagons overlapping the city's frozen grid bbox",
+        # No "cell" here: it is MEASURED per screen pass and filled in by
+        # `_screen_cell_fields`. It was a literal ("H3 resolution 6 (~36 km²)")
+        # until the ids were read and said 7 (#406).
+        "selection": "hexagons overlapping the city's frozen grid bbox, each counted whole",
         "attribution": "© Panoramax contributors",
     },
 }
 
+# Why the figures are upper bounds, stated as the MECHANISM rather than as a
+# size comparison. It used to say the cells were "LARGER than the city inside
+# them", which rested on the hardcoded resolution 6 (~36 km²) against a 19.5 km²
+# median city; at the measured resolution 7 (~5.2 km²) that is false for most
+# cities, while the bound itself never depended on it. Every clause below holds
+# at any resolution: selection is by overlap, a selected hexagon's counters are
+# for the WHOLE hexagon, and the bbox is a rectangle around the city.
+#
+# "A zero is conclusive" survives for the same reason, and is stated for the
+# bbox rather than for "the city": no overlapping hexagon counting anything
+# means nothing the provider had indexed lies anywhere in the box -- and a pass
+# that could not read every tile is refused rather than written.
 _SCREEN_CAVEAT = (
-    "Upper bounds, not counts. Each figure sums provider-published counters for "
-    "map cells LARGER than the city inside them, so it over-counts by including "
-    "imagery outside the city's bounding box. A zero is conclusive — the city "
-    "holds no imagery — while a positive number means only that a closer look is "
-    "worth taking. Only a collection run measures coverage."
+    "Upper bounds, not counts. Each figure sums provider-published counters over "
+    "every map cell that overlaps the city's bounding box, and counts each such "
+    "cell whole — so a cell straddling the box's edge contributes the imagery "
+    "outside it too, and the box is itself a rectangle around the city, not its "
+    "boundary. A figure can therefore over-count the city but never under-count "
+    "the box. A zero is conclusive — the provider had indexed no imagery anywhere "
+    "in the box — while a positive number means only that a closer look is worth "
+    "taking. Only a collection run measures coverage."
 )
+
+# The published H3 average-area table the `cell` description is sized from.
+_H3_AREA_SOURCE = "https://h3geo.org/docs/core-library/restable"
+
+
+def _screen_cell_list(counts: dict[int | None, int]) -> list[dict[str, Any]]:
+    """A measured resolution histogram as published rows, commonest first."""
+    return [
+        {
+            "resolution": res,
+            "hexagons": n,
+            "average_area_km2": panoramax_screen.H3_AVERAGE_HEX_AREA_KM2.get(res),
+        }
+        for res, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0] is None, kv[0] or 0))
+    ]
+
+
+def _describe_screen_cells(counts: dict[int | None, int] | None, screen_date: str | None) -> str:
+    """
+    The `cell` sentence for a screen, from what that pass MEASURED.
+
+    Example::
+
+        >>> _describe_screen_cells({7: 261913}, "2026-10-08")
+        'H3 resolution 7 (~5.16 km² average)'
+    """
+    if counts is None:
+        return (
+            f"H3 hexagons; resolution not recorded for the screen of {screen_date} "
+            f"(it predates per-pass measurement)"
+        )
+    if not counts:
+        return f"No hexagons decoded in the screen of {screen_date}"
+    parts = []
+    for row in _screen_cell_list(counts):
+        if row["resolution"] is None:
+            parts.append(f"{row['hexagons']:,} hexagons whose ids are not H3 cells")
+            continue
+        area = row["average_area_km2"]
+        text = f"H3 resolution {row['resolution']} (~{area:.3g} km² average)"
+        parts.append(text if len(counts) == 1 else f"{text} for {row['hexagons']:,} hexagons")
+    return parts[0] if len(parts) == 1 else "Mixed: " + "; ".join(parts)
+
+
+def _screen_cell_fields(
+    cells_by_date: dict[str, dict[int | None, int]], latest_screen_date: str | None
+) -> dict[str, Any]:
+    """
+    The instrument's measured-cell keys, describing the LATEST screen.
+
+    ``cell`` stays a string, as it was in v1; ``cell_resolutions`` is the
+    histogram behind it (null when that screen predates the measurement), and
+    ``cell_warning`` is present only when the pass saw anything but the one
+    expected resolution — absent-not-null, like ``first_positive_date``.
+    """
+    counts = cells_by_date.get(latest_screen_date) if latest_screen_date else None
+    fields: dict[str, Any] = {
+        "cell": _describe_screen_cells(counts, latest_screen_date),
+        "cell_resolutions": _screen_cell_list(counts) if counts is not None else None,
+    }
+    if counts is not None:
+        fields["cell_area_source"] = _H3_AREA_SOURCE
+        unexpected = panoramax_screen.unexpected_cell_resolutions(counts)
+        if unexpected:
+            fields["cell_warning"] = (
+                f"This screen's hexagons were {unexpected}. The figures are still "
+                f"upper bounds, but `cells` is not comparable with a screen read at "
+                f"another resolution."
+            )
+    return fields
 
 
 def generate_provider_screen_summary(conn, data_dir: str) -> dict[str, Any]:
@@ -1588,7 +1675,13 @@ def generate_provider_screen_summary(conn, data_dir: str) -> dict[str, Any]:
     providers: dict[str, Any] = {}
     for provider in db.get_screened_providers(conn):
         firsts = db.get_provider_screen_firsts(conn, provider)
+        cells_by_date = db.get_provider_screen_cells(conn, provider)
         series = [dict(row) for row in db.get_provider_screen_series(conn, provider)]
+        for point in series:
+            # Per date, because `cells` is only comparable between two dates read
+            # at one resolution. Null for a screen that predates the measurement.
+            counts = cells_by_date.get(point["screen_date"])
+            point["cell_resolutions"] = _screen_cell_list(counts) if counts is not None else None
         rows = []
         for row in db.get_latest_provider_screen(conn, provider):
             city = cities.get(row["city_id"])
@@ -1616,11 +1709,15 @@ def generate_provider_screen_summary(conn, data_dir: str) -> dict[str, Any]:
                 record["first_positive_date"] = firsts[row["city_id"]]
             rows.append(record)
 
+        latest_screen_date = series[-1]["screen_date"] if series else None
         providers[provider] = {
-            "instrument": _SCREEN_INSTRUMENTS.get(provider, {}),
+            "instrument": {
+                **_SCREEN_INSTRUMENTS.get(provider, {}),
+                **_screen_cell_fields(cells_by_date, latest_screen_date),
+            },
             "caveat": _SCREEN_CAVEAT,
             "first_screen_date": series[0]["screen_date"] if series else None,
-            "latest_screen_date": series[-1]["screen_date"] if series else None,
+            "latest_screen_date": latest_screen_date,
             "cities": rows,
             "series": series,
         }

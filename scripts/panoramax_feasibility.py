@@ -61,7 +61,11 @@ standing rule) showed that cannot work, and the alternative is strictly better:
      out of EXIF in the SEARCH response, not of the imagery. Stage `instances`
      measures both against the same bbox so the writeup can say which.
 
-WHY A ZERO SCREEN IS CONCLUSIVE AND A NON-ZERO ONE IS NOT. A res-6 H3 hexagon
+WHY A ZERO SCREEN IS CONCLUSIVE AND A NON-ZERO ONE IS NOT. (Correction,
+#406: the z6 hexagon ids decode to H3 RESOLUTION 7, ~5.2 km2, not the res 6
+below -- docs/experiments/panoramax-world-screen.md. The argument survives
+because hexes are selected by overlap and counted whole, not because they
+are larger than a city; the study is left as it ran.) A res-6 H3 hexagon
 is roughly 36 km2 and the median catalog city is 19.5 km2, so the screen sums
 hexes far larger than the city inside them: it is an UPPER BOUND. That asymmetry is
 the point. An upper bound of zero means the city has no imagery, full stop; a
@@ -217,6 +221,8 @@ ACCESS_PROBE_LIMIT = 300
 ACCESS_PROBE_FALLBACK_DATETIME = "2026-01-01T00:00:00Z/.."
 DEFAULT_TIMEOUT_S = 60
 
+# Left verbatim because it is the record this study wrote; its "res-6 hexagons
+# (~36 km2 each)" is corrected by #406 -- the ids decode to res 7, ~5.2 km2.
 DOCS_RECORD_NOTE = (
     "Phase 1 of #316: read-only, no credential, no collector. Three instruments, and they are "
     "not interchangeable. `screen` sums the v2 z6 H3 grid layer's res-6 hexagons (~36 km2 each) "

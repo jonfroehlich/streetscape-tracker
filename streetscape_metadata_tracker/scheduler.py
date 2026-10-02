@@ -5203,7 +5203,14 @@ def cmd_screen_provider(
             )
             return 1
 
-    written = db.record_provider_screen(conn, provider=provider, screen_date=today, rows=rows)
+    cell_resolutions = result.get("cell_resolutions")
+    written = db.record_provider_screen(
+        conn,
+        provider=provider,
+        screen_date=today,
+        rows=rows,
+        cell_resolutions=cell_resolutions,
+    )
     summary = (
         f"Screened {written} cities against {provider} on {today.isoformat()}: "
         f"{len(positive)} hold imagery ({len(positive) / len(rows):.1%}), "
@@ -5212,6 +5219,13 @@ def cmd_screen_provider(
     )
     logger.info(summary)
     _emit(summary)
+    # Echoed to the operator as well as logged by the screen: a resolution
+    # change is recorded and published rather than refused (see
+    # `panoramax_screen.screen_targets_async`), so this line and the artifact's
+    # `cell_warning` are where anyone will see it.
+    unexpected = panoramax_screen.unexpected_cell_resolutions(cell_resolutions or {})
+    if unexpected:
+        _emit(f"WARNING: screen hexagons were {unexpected}; recorded and published as measured.")
 
     # Rebuilt HERE rather than in the nightly tail: this command is the only
     # thing that changes the artifact's inputs, so rebuilding it nightly would

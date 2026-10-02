@@ -30,7 +30,7 @@ from .naming import sanitize_city_query_str
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 
 # The v16 per-host ledger (issue #385). One constant, spliced into _SCHEMA
 # below AND executed by _migrate_v15_to_v16, which runs before _SCHEMA and needs
@@ -380,10 +380,12 @@ CREATE INDEX IF NOT EXISTS idx_swd_to_walk ON street_walk_diffs(to_walk_id);
 
 -- One dated whole-catalog SCREEN of a provider (v15, issue #316): is there any
 -- imagery in this city yet? Not a run and never a substitute for one -- every
--- count here is an UPPER BOUND read off hexagons larger than the city they
--- contain, which is what makes a whole-catalog pass cost 113 requests. A zero
--- is conclusive ("this city holds nothing"); a positive number means only
--- "look closer", and only a real collection settles how much.
+-- count here is an UPPER BOUND: it sums every hexagon OVERLAPPING the city's
+-- bbox, whole, so a hexagon straddling the edge brings in imagery from outside
+-- it (and the bbox is a rectangle, not the city). Coarse hexagons in coarse
+-- tiles are what make a whole-catalog pass cost 113 requests. A zero is
+-- conclusive ("nothing in this bbox"); a positive number means only "look
+-- closer", and only a real collection settles how much.
 --
 -- Keyed by `provider` because the instrument is not Panoramax-specific: any
 -- provider serving a coarse count layer screens into these same columns. The
@@ -415,6 +417,30 @@ CREATE TABLE IF NOT EXISTS provider_screen (
 -- with city_id and cannot serve that.
 CREATE INDEX IF NOT EXISTS idx_provider_screen_date
     ON provider_screen(provider, screen_date);
+
+-- v18: what the CELLS of one dated screen were, MEASURED -- one row per H3
+-- resolution decoded from the hexagon ids that pass read, with how many
+-- distinct hexagons carried it. The published description of a screen cell
+-- used to be a constant ("H3 resolution 6"), and the ids said 7 (#406); this
+-- is what lets the artifact say what each pass actually read, and what makes
+-- `cells` interpretable across dates if the provider ever changes resolution.
+--
+-- `cell_resolution` is NULL for ids that are NOT H3 cells at all: counted, not
+-- dropped, so a layer that changed id scheme shows up here. No primary key for
+-- that reason (NULLs are distinct in a UNIQUE); `record_provider_screen`
+-- replaces a date's rows wholesale instead, which an upsert could not do -- a
+-- same-day re-run that no longer sees some resolution must not keep its row.
+-- A screen date with NO rows here predates v18: "not measured", never "none".
+--
+-- Purely additive (the v2 -> v3 pattern): no migration function.
+CREATE TABLE IF NOT EXISTS provider_screen_cells (
+    provider        TEXT NOT NULL,
+    screen_date     TEXT NOT NULL,
+    cell_resolution INTEGER,
+    hexagons        INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_provider_screen_cells_date
+    ON provider_screen_cells(provider, screen_date);
 
 -- v16 (issue #385): a TIMESTAMPED per-host spend ledger beside api_usage.
 -- api_usage is keyed by (usage_date, provider), so it cannot answer "how much
@@ -789,6 +815,11 @@ def init_schema(conn: sqlite3.Connection) -> None:
     if user_version == 16:
         _migrate_add_query_radius_columns(conn)
         user_version = 17
+    # v17 -> v18: the provider_screen_cells table (the screen's measured H3
+    # resolution). Purely additive, so like v2 -> v3 it needs no migration
+    # function -- the CREATE TABLE IF NOT EXISTS in _SCHEMA builds it.
+    if user_version == 17:
+        user_version = 18
     conn.executescript(_SCHEMA)
     # The GSV query-radius pair (issue #367) is ALSO added on every connect, not
     # only on its rung: while in flight it and PR #388 both stamped v16, so a
@@ -2801,6 +2832,7 @@ def record_provider_screen(
     provider: str,
     screen_date: date,
     rows: list[dict[str, Any]],
+    cell_resolutions: dict[int | None, int] | None = None,
 ) -> int:
     """
     Write one dated whole-catalog screen (issue #316).
@@ -2812,6 +2844,13 @@ def record_provider_screen(
 
     Each row needs ``city_id``, ``cells``, ``pictures_upper_bound``,
     ``pictures_360_upper_bound`` and ``pictures_flat_upper_bound``.
+
+    ``cell_resolutions`` is the pass's measured histogram (resolution -> distinct
+    hexagons, ``None`` for ids that are not H3 cells; see
+    ``panoramax_screen.cell_resolution_counts``). When given it REPLACES the
+    date's `provider_screen_cells` rows in the same transaction; when omitted
+    the date's cells are left untouched, so a caller that measured nothing
+    never erases a measurement.
 
     Written in ONE transaction. A screen is only interpretable whole: half a
     catalog's cities carrying today's date and half carrying last week's would
@@ -2846,8 +2885,40 @@ def record_provider_screen(
             for row in rows
         ],
     )
+    if cell_resolutions is not None:
+        conn.execute(
+            "DELETE FROM provider_screen_cells WHERE provider = ? AND screen_date = ?",
+            (provider, screen_date.isoformat()),
+        )
+        conn.executemany(
+            """INSERT INTO provider_screen_cells
+               (provider, screen_date, cell_resolution, hexagons) VALUES (?, ?, ?, ?)""",
+            [
+                (provider, screen_date.isoformat(), res, int(n))
+                for res, n in cell_resolutions.items()
+            ],
+        )
     conn.commit()
     return len(rows)
+
+
+def get_provider_screen_cells(
+    conn: sqlite3.Connection, provider: str
+) -> dict[str, dict[int | None, int]]:
+    """
+    Per screen date, the measured resolution histogram of that pass's hexagons.
+
+    A date absent from the result was screened before v18 recorded cells: its
+    resolution was never measured, which is not the same as "no hexagons".
+    """
+    out: dict[str, dict[int | None, int]] = {}
+    for row in conn.execute(
+        """SELECT screen_date, cell_resolution, hexagons FROM provider_screen_cells
+            WHERE provider = ? ORDER BY screen_date, cell_resolution""",
+        (provider,),
+    ).fetchall():
+        out.setdefault(row["screen_date"], {})[row["cell_resolution"]] = int(row["hexagons"])
+    return out
 
 
 def get_latest_provider_screen(conn: sqlite3.Connection, provider: str) -> list[sqlite3.Row]:

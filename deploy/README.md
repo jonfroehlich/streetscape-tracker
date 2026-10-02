@@ -866,7 +866,8 @@ systemctl --user start streetscape-screen-provider.service   # run once now
 ```
 
 - Fires **Mondays at 18:00 Pacific** (up to 30 min late), after the 02:00 batch's latest end (~14:45; it was 12:00 until 2026-09-25, which a full 12 h night overlapped): both take the same machine-wide Panoramax host lock, so an overlap is not a race but a screen that exits **85** (host busy) and records nothing that week.
-- Every number it writes is an **upper bound** — the hexagons it sums are larger than the cities inside them. A zero is conclusive ("this city holds nothing"); a positive number means only "look closer". Never quote one as a coverage figure.
+- Every number it writes is an **upper bound** — it sums every hexagon that overlaps the city's bbox, counted whole, so a hexagon straddling the edge brings in imagery from outside it. A zero is conclusive ("nothing in this bbox"); a positive number means only "look closer". Never quote one as a coverage figure.
+- The hexagons' H3 resolution is **read off their ids on every pass** and published as the artifact's `cell` (resolution 7, ~5.16 km², when last measured). A pass that sees another or a mixed resolution still records, and prints a `WARNING:` line — it is a looser bound and a `cells` count not comparable with earlier weeks, not a broken screen.
 - Price a pass without spending anything: `scheduler screen-provider panoramax --dry-run`.
 - A city crossing zero → non-zero is an **enrolment candidate**, answerable any afternoon: `scheduler screen-provider panoramax --measure --limit 5` measures the richest screened cities exactly, prints, and writes nothing.
 - It publishes `data/provider_screen.json.gz` itself. The nightly batch deliberately does **not** rebuild that file — nothing else changes its inputs — so a stale one means this timer stopped, not that the batch did.

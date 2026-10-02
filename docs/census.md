@@ -465,6 +465,7 @@ That last figure is RAW PACE and is not the per-city timeout: `scheduler._tile_c
 `estimate_tile_count` counts that lattice exactly, offline and free, so unlike KartaView's sweep there is no observed-versus-geometric correction to carry.
 
 The v2 endpoint's H3 `grid` layer — aggregated counters rather than rows — is the *screen* instrument phase 1 used to price the whole catalog for 113 requests, and it is not read by the collector at all.
+At z6 its hexagons measured H3 resolution 7 (~5.2 km²), not the resolution 6 phase 1 recorded (#406), so the screen now reads the resolution off every id it decodes rather than trusting either figure ([`scheduler.md`](scheduler.md)).
 
 ### 2. A 403 or 429 is a per-IP refusal, and a 404 is an empty tile
 
