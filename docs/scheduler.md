@@ -27,6 +27,26 @@ The motivating case was 2026-09-24: Detroit's and Fresno's Mapillary walks had e
 The STRANDED alert (#341) prints this command with the ids filled in, one per exact set of lost walk channels: a city stranded on one walk because its OTHER grid run failed is still due on that other walk, and a single combined command would pay its census for an un-paired walk (#362).
 It used to print `run-due --provider <walk> --limit N`, which walks the stalest-due queue — on 2026-09-22 none of 8 stranded cities was in the first 10 of any walk channel, and Austin's ~640k-request walk led `gsv_streets`.
 
+**A hand `run-due` that would collect a GSV key another `run-due` on this host is collecting exits 64; the nightly unit is never refused, and alerts instead** (issue #412).
+Since #304 each GSV process reaches its configured 48,000/min, so a hand catch-up on the same key as the nightly presents ~96,000/min against a 60,000/min project quota, and nothing serializes GSV across processes (Google meters per project, so `CHANNEL_HOSTS` gives it no host lock).
+`run-due` reads its rate from config and has no per-run override, so waiting is a hand run's only safe action; the direct CLIs can be slowed instead (the pre-run checklist in `docs/operations.md`).
+`assess-city` spends the `gsv_streets` key the same way and is refused the same way (not under `--estimate`).
+
+- **What counts as an overlap** (`_gsv_key_overlaps`): `_scan_run_due_processes` reads `ps -ww -e -o pid=,ppid=,args=` and keeps a line only when its argv is a python executable, then `-m streetscape_metadata_tracker.scheduler`, then a `run-due` token — so a `pgrep -f` loop, a `tail -f logs/run-due.log`, `timer-status`, a shell or `timeout` wrapper and a pytest `-k run-due` never match.
+  This process and its whole ancestor chain are excluded.
+  The other process's channels are read from its argv (`--provider X`, `--provider=X`, repeated or comma-separated; none means this config's enabled set; `--dry-run` means none), and only a shared GSV key refuses — `gsv` and `gsv_streets` are separate keys, so a `gsv_streets` walk beside a `gsv`-only catch-up is no overlap.
+- **The nightly is identified exactly**, from `/proc/self/cgroup` ending in `/streetscape-tracker.service` (`_is_nightly_unit`); `INVOCATION_ID` would not do, since every unit and any `systemd-run --user` sets it.
+  On an overlap the nightly logs a warning, sends one `[alerts]` email naming the other pid and command line, and proceeds on every channel — refusing it would lose all eight channels' night to protect one key.
+  No `/proc` (macOS) reads as "not nightly".
+- **A refused hand run reports only to its terminal**, which is enough because its operator is the one watching it: `deploy/systemd/streetscape-tracker.service` ships with `OnFailure=` commented out, and the notify unit is not installed on makelab2, so no email follows an exit 64.
+- **Exempt:** `--dry-run` (a preview spends nothing) and any run holding no GSV key (`--provider mapillary --limit 5` never reads `ps`, since `host_lock` already serializes every per-IP host).
+  `--force` overrides a match known not to be collecting, with a warning naming it.
+- **Blind spots.** It is per-HOST: a same-key run on another machine (a laptop with the prod key) is invisible.
+  It sees `run-due` only: a direct `streetscape_tracker.py` or `collect --provider gsv` run, or an `assess-city`, is invisible to a later `run-due`, and is not itself guarded — the checklist covers those.
+  It assumes the other `run-due` reads the same config when it names no `--provider`.
+  It fails OPEN when `ps` is unavailable, and it is a check at start only: a hand run started before the 02:00 timer is not stopped, the nightly just alerts.
+
+
 **Every channel is paced, so every channel's per-city timeout is DERIVED rather than flat, and `city_timeout_minutes` (180) is only the floor.**
 The shape is the same for all of them — `estimated_requests / (rate × achieved_rate_fraction) × _TIMEOUT_HEADROOM + _TIMEOUT_FIXED_SLACK_S`, never below the floor — and what differs is where the request count and the rate come from.
 `gsv` prices grid points against `[download].max_requests_per_minute`.
