@@ -699,6 +699,40 @@ Success is read off `schedule_state.last_success_at` having moved since admissio
 Not done here: an operator-facing `status` view of fill eligibility, publishing the mark for walks, and any change to Panoramax pacing (#405).
 The provider forums were not re-read for this change: it raises no rate, no budget and no ceiling, and its one new per-IP number (2,260) is a figure this project already measured clean — but it DOES call KartaView and Panoramax more often for their enrolled cities (inside their unchanged daily budgets), which CLAUDE.md's READ THIS FIRST rule asks to be checked against those providers' forums before deploying.
 
+## The failure quarantine, made visible (issue #421, added 2026-10-02)
+
+**A (city, channel) at `[schedule].max_consecutive_failures` (5 on prod) is dropped from `get_due_cities`, and nothing but a success lifts it.**
+A dropped pair is never attempted, so it never fails, so it never alerts: prod alerts on every failed collection (`failure_threshold = 1`), so nights 1–5 each sent an email and night 6 onward was silence, which reads as the problem having gone away.
+The fill (#404) made that sharper: it drops a failing opt-in channel and refreshes the rest of the city, logging "realign blocked", so a city can sit indefinitely with one provider on an old date and the quarantine is the only durable signal.
+
+**The set is `db.get_quarantined`**: an enabled city, a member of the channel (`COALESCE(member, default)`, as dueness reads it), and `consecutive_failures >= max_consecutive_failures`.
+Staleness is deliberately not part of it, so the count tracks the set an operator has to clear rather than flickering with the cycle; a disabled city or a non-member is left out, because neither can be due whatever its counter says.
+
+**The transition alerts ONCE, inside the night email.**
+`cmd_run_due` reads the set after the dry-run return and again after the fill, and the set difference is what entered quarantine tonight.
+It is never `count >= max`, which would re-alert every night forever, and a pair some other path pushes from 5 to 6 is in both snapshots and stays silent.
+It reaches `_finish_batch` as `newly_quarantined`: an `N QUARANTINED` subject part (the subject is what gets read at 03:00) and a paragraph naming each pair's count, `last_error` and its pasteable `reset-failures ... --execute` command, `--config` included.
+It is part of `unhealthy`, so it alerts regardless of `failure_threshold` — it is that pair's last email.
+It cannot change a night's exit status in practice: the failure that tripped it already made `attempted > succeeded`.
+A separate email was rejected (the night email already carries every other condition), as was a per-night "realign blocked" email, which would duplicate the per-failure alert.
+
+**The standing set is counted on every `Done:` line while it is nonempty** — `; quarantined: 3 (kartaview 2, panoramax 1; 1 new tonight)` — over every enabled channel, not a filtered night's, so a `--provider mapillary` catch-up never reports a KartaView quarantine as gone.
+`status` marks each quarantined pair `QUARANTINED` in its failing-pairs list, from the same query, and prints the count with the clear command.
+
+**What it does not catch**, named rather than argued away:
+a pair quarantined OUTSIDE `run-due` (an `assess-city` failure, say) is already in the next night's first snapshot, so it never alerts and appears only in the count; so does every pair a LOWERED `max_consecutive_failures` sweeps in at once.
+Two `run-due` processes overlapping could each see the same transition, and both would alert — once each.
+
+**The amnestied exit-code families can never reach it.**
+Blocked (75/76/81/84), busy (79/80/82/85), crawl-incomplete (83) and argv-rejected (2) record no `consecutive_failure`, so a host block never quarantines the city it stopped; `test_an_amnestied_outcome_never_quarantines_a_pair_one_failure_from_the_cap` pins each against a plain failure that does.
+
+**`reset-failures CITY --channel C [--execute]`** is the way out, so the alert's fix is a command rather than SQL against the live catalog.
+It is DRY-RUN until `--execute`, and the preview prints the count, whether the pair is quarantined, and its `last_error`, so the cause is read before it is cleared.
+It moves only the counter: `last_success_at` stays (a reset is not a success, and stamping one would push the next attempt a whole cycle away), and so does `last_error` (the only record of why, overwritten by the next attempt anyway).
+An unknown channel, an unresolvable city and a pair with nothing to reset all exit 64 writing nothing — the last because a reset that changes nothing and exits 0 is the silent no-op `enroll-city --clear` refuses for the same reason.
+A disabled city or a non-member is allowed and noted, since the counter still gates the pair the moment it is enabled or enrolled.
+Fix the cause first: a cleared pair that still fails is quarantined again after five more nights, and alerts again then.
+
 ## The subcommand roster, and the production config (added 2026-08-25)
 
 Written 2026-08-25, when the CLAUDE.md rewrite turned its command cheatsheet into a table and two subcommands turned out to be documented nowhere.

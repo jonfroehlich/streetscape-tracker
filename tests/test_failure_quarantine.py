@@ -271,10 +271,9 @@ def test_the_done_line_says_nothing_about_quarantine_when_there_is_none(conn, mo
     assert "quarantined" not in done
 
 
-def test_a_pair_already_over_the_cap_that_fails_again_is_not_a_new_transition(conn, monkeypatch):
+def test_a_pair_already_over_the_cap_that_fails_again_is_not_a_new_transition():
     """The transition is a set difference, never a count, so a pair that some
-    other path pushed from 5 to 6 (it is not due, but `assess-city` or a fill
-    can still attempt it) does not alert a second time."""
+    path outside the due list pushed from 5 to 6 does not alert a second time."""
     before = [{"city_id": "a", "provider": "gsv"}, {"city_id": "b", "provider": "mapillary"}]
     after = [
         {"city_id": "a", "provider": "gsv"},
@@ -405,24 +404,32 @@ def test_reset_failures_execute_clears_the_quarantine_and_the_pair_is_due_again(
 
 
 @pytest.mark.parametrize(
-    ("city", "channel", "failures"),
+    ("city", "channel", "failures", "says"),
     [
-        pytest.param("bend", "no-such-channel", CAP, id="unknown-channel"),
-        pytest.param("no-such-city", "mapillary", CAP, id="unknown-city"),
-        pytest.param(None, "mapillary", CAP, id="no-city"),
-        pytest.param("bend", "mapillary", 0, id="nothing-to-reset"),
-        pytest.param("bend", "gsv", CAP, id="no-row-on-that-channel"),
+        pytest.param("bend", "no-such-channel", CAP, "unknown channel", id="unknown-channel"),
+        pytest.param("no-such-city", "mapillary", CAP, "no such city", id="unknown-city"),
+        pytest.param(None, "mapillary", CAP, "CITY is required", id="no-city"),
+        pytest.param("bend", "mapillary", 0, "nothing to reset", id="nothing-to-reset"),
+        pytest.param("bend", "gsv", CAP, "nothing to reset", id="no-row-on-that-channel"),
     ],
 )
 def test_reset_failures_bad_input_exits_64_and_writes_nothing(
-    conn, monkeypatch, city, channel, failures
+    conn, monkeypatch, caplog, city, channel, failures, says
 ):
+    """Each refusal names its own cause.
+
+    The message is asserted, not just the status: an unknown channel would
+    otherwise ALSO exit 64 as "nothing to reset" (no row matches it), telling
+    an operator who typo'd the channel that the pair is healthy.
+    """
     cid = _register(conn, "Bend")
     _set_failures(conn, cid, "mapillary", failures)
     query = cid if city == "bend" else city
 
-    assert _reset(monkeypatch, conn, query, channel, execute=True) == USAGE_EXIT_CODE
+    with caplog.at_level(logging.ERROR, logger="streetscape_scheduler"):
+        assert _reset(monkeypatch, conn, query, channel, execute=True) == USAGE_EXIT_CODE
     assert _failures(conn, cid, "mapillary") == failures
+    assert says in caplog.text
 
 
 def test_reset_failures_is_wired_into_the_cli(monkeypatch):
