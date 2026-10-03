@@ -10,10 +10,11 @@ An edit that changes a rule belongs in both files; anything written since the sp
 
 **Added after the 2026-08-22 split** (#304, PR #399 review, #412).
 
-Claude runs essentially every hand run and catch-up on prod (makelab2), so this checklist is the mitigation for the one overlap nothing in the code refuses.
+Claude runs essentially every hand run and catch-up on prod (makelab2), so this checklist is the mitigation for the overlaps the code does not refuse.
 Since #304 each GSV process actually reaches its configured pace, so a hand run on the **same GSV key** as a nightly lane that is collecting presents more than that project's 60,000/min quota: ~72,000/min for a direct-CLI run at its 24,000 default beside the lane's 48,000, and ~96,000/min for a scheduler-path run, which paces at the lane's own 48,000.
 The nightly `gsv` and `gsv_streets` lanes never collide with each other: they use different keys in separate Cloud projects.
-The decision taken is **no lock and no shared pacer**: hand runs follow this checklist, and #412 tracks making `run-due` refuse to start beside another `run-due`.
+The decision taken is **no lock and no shared pacer**: hand runs follow this checklist.
+Since #412 a hand `run-due` or `assess-city` on a GSV key another `run-due` on this host is collecting exits 64 (`--force` overrides), and the nightly is never refused but alerts; that guard is per-host, sees only `run-due` processes and checks only at start, so a direct-CLI run and a run on another machine still rely on this checklist (blind spots in `docs/scheduler.md`).
 The mechanism, the realistic pairs and the rejected options are in [`provider-access.md`](provider-access.md) (the #304 section); this section is only the procedure.
 
 ### 1. Gather everything in one SSH call
@@ -70,7 +71,7 @@ EOF
 The `awk` patterns spell `.`, `/`, `-` and spaces as `[.]`, `\/`, `[-]` and `[ ]` so they cannot match awk's own command line, which a plain `ps | grep` does.
 The slash is escaped rather than bracketed because `[/]` inside an awk regex literal is a syntax error in BSD awk ("nonterminated character class"), though mawk and gawk accept it.
 The git alternative allows `-C <dir>` because `deploy_makelab1.sh` runs `git -C "$REPO_DIR" pull --ff-only`, which a bare `git pull` pattern misses; the script's own name covers its later `rsync` of `www/`.
-The run-due test is the same two-substring test (`streetscape_metadata_tracker.scheduler` and `run-due`) over `ps -eo pid=,args=` that `scheduler._run_due_in_flight()` applies for `import-bundle`, the prefreeze and the two repair scripts.
+The run-due line here is a looser two-substring test than the code's: since #412 `scheduler._run_due_in_flight()` (for `import-bundle`, the prefreeze and the two repair scripts) and the `run-due` guard match argv tokens instead, so read any line this prints, and treat one the code would not match (a wrapper's) as the batch it wraps.
 The status call keeps `Error` and `Traceback` lines, because a filter for the budget lines alone turns a crashed `status` into empty output.
 **Do not use `pgrep -f "scheduler run-due"`**: the unit's command line is `-m streetscape_metadata_tracker.scheduler --config … run-due`, so that pattern never matches it and reports idle mid-batch.
 `deploy/README.md` uses `pgrep -af '[s]cheduler .*run-due'`, which does match; the bracket matters, because on Linux `pgrep` excludes only itself, so inside a compound remote command (`ssh host 'pgrep … || echo idle'`) a bare `scheduler .*run-due` matches the parent `bash -c` and never prints idle.
@@ -166,8 +167,8 @@ The realistic victim is not a dev laptop but prod with publishing switched off d
 Exit stays 0 there, on the same reasoning that makes `--no-publish` exit 0 — only an *attempted* publish that failed is a failure.
 **Do not run it while the nightly batch is collecting** (PR #399 review): its `gsv_streets` walk uses the same key as the nightly `gsv_streets` lane, nothing serializes GSV processes, and since #304 each engine actually reaches its 48,000/min, so the two would present ~96,000/min against that key's 60,000/min project quota.
 The same holds for any hand-run GSV collection (`streetscape_tracker.py`, `collect --provider gsv`) against its nightly twin.
-The failure is OVER_QUERY_LIMIT answers, retried after 20 s waits and, past 1% of points, an aborted run; the full account and the decision taken (no lock, a pre-run checklist, #412 for a `run-due` guard) are in [`provider-access.md`](provider-access.md) (the #304 section).
-Run the checklist under "Before any hand run or catch-up" above first: `assess-city` has no rate override, so it waits for the batch to end, while a direct-CLI hand run can instead pass `--max-requests-per-minute` at the quota minus the nightly pace.
+The failure is OVER_QUERY_LIMIT answers, retried after 20 s waits and, past 1% of points, an aborted run; the full account and the decision taken (no lock, a pre-run checklist, and since #412 a start-time guard that refuses this command beside a `run-due` on the same key) are in [`provider-access.md`](provider-access.md) (the #304 section).
+Run the checklist under "Before any hand run or catch-up" above first: `assess-city` has no rate override, so it waits for the batch to end (and exits 64 if started beside a `run-due` collecting `gsv_streets`), while a direct-CLI hand run can instead pass `--max-requests-per-minute` at the quota minus the nightly pace.
 Refusals mirror #214's: an unpaired `--width/--height`, a `--provider` naming the grid channel or an unknown/disabled one, and a config with no assess channel enabled all exit `USAGE_EXIT_CODE` **before the catalog is opened**.
 `--width/--height` without `--lat/--lng` is refused where `cli.py` accepts it.
 `cli.py` now centers such a grid on the geocoder's reported point rather than the OSM bbox midpoint (#186), but nobody has verified that point is downtown (#185), and an assessment freezes geometry for a partner answer — a guess there is the right size in possibly the wrong place, permanently.
