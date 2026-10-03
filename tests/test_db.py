@@ -1897,7 +1897,7 @@ def test_a_catalog_already_stamped_v16_without_the_columns_gains_them(tmp_path):
 def test_a_v15_catalog_takes_both_rungs_backfill_and_columns(tmp_path, frozen_utc_clock):
     """Prod is at v15 and takes v16 (#385) and v17 (#367) in one connect: the
     host_usage backfill must seed AND the query-radius columns must land, in
-    that order, ending at v17. Killed by a v17 rung keyed on 15 and placed
+    that order, ending at v19 (v18 and v19 are additive). Killed by a v17 rung keyed on 15 and placed
     ahead of the v16 rung: it consumes the v15 stamp and the backfill never
     runs, while the columns (also added unconditionally) still land."""
     frozen_utc_clock(_HOST_NOW)
@@ -1911,7 +1911,7 @@ def test_a_v15_catalog_takes_both_rungs_backfill_and_columns(tmp_path, frozen_ut
     raw.close()
 
     conn = db.connect(db_path)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 17
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 19
     cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
     assert set(db._QUERY_RADIUS_RUN_COLUMNS) <= cols
     assert _host_rows(conn) == [("2026-09-28T06:00:00+00:00", "mapillary_tiles", "mapillary", 194)]
@@ -2097,7 +2097,7 @@ def test_migrate_v15_to_v16_backfills_two_utc_dates_of_metered_channels(tmp_path
     raw.close()
 
     conn = db.connect(db_path)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 17
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 19
     assert _host_rows(conn) == [
         ("2026-09-27T23:59:59+00:00", "kartaview", "kartaview", 16),
         ("2026-09-27T23:59:59+00:00", "mapillary_tiles", "mapillary", 1198),
@@ -2244,7 +2244,7 @@ def test_concurrent_first_connects_seed_the_v16_backfill_exactly_once(tmp_path):
     """Issue #385 review: ``BEGIN IMMEDIATE`` makes the backfill race-safe.
 
     Four processes first-connect the same v15 catalog at once (a barrier lines
-    them up), over several fresh catalogs. Each must end at v17 with exactly the
+    them up), over several fresh catalogs. Each must end at v19 with exactly the
     two backfill rows -- never four, six or eight -- and no process may fail.
     Without the transaction, two processes can both find ``host_usage`` empty
     and both seed it; the worker pauses inside that window (see
@@ -2296,4 +2296,4 @@ def test_concurrent_first_connects_seed_the_v16_backfill_exactly_once(tmp_path):
         rows = raw.execute("SELECT provider, requests FROM host_usage ORDER BY provider").fetchall()
         version = raw.execute("PRAGMA user_version").fetchone()[0]
         raw.close()
-        assert (version, rows) == (17, [("mapillary", 1198), ("mapillary_streets", 5)]), path
+        assert (version, rows) == (19, [("mapillary", 1198), ("mapillary_streets", 5)]), path

@@ -43,7 +43,8 @@ Environment=STREETSCAPE_PUBLISH_LOCAL=1
 Environment=STREETSCAPE_LOCK_DIR=/projects/makeabilitylab/streetscape-tracker/locks
 # NB: --config is a global arg and MUST precede the subcommand (argparse).
 ExecStart=%h/streetscape-tracker/.venv-makelab2/bin/python -m streetscape_metadata_tracker.scheduler --config %h/streetscape-tracker/config/scheduler.makelab1.toml screen-provider panoramax
-# 113 requests at 30/min is under four minutes; the publish rsync that follows is
+# 113 requests at the collector default 30/min is under four minutes (under two
+# at production's 60/min since #405 stage 1); the publish rsync that follows is
 # hard-bounded at PUBLISH_TIMEOUT_S (10 min). 45 min is generous against both and
 # still bounded, so a screen that hangs on a stalled socket cannot sit until the
 # night's batch wants the same host lock.

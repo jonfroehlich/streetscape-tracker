@@ -94,6 +94,7 @@ def test_filtered_and_truncated_nights_are_counted_but_never_compared():
         "full": 4,
         "filtered": 1,
         "truncated": 1,
+        "filled": 0,
         "knob_unknown": 1,
         "comparable": 3,
     }
@@ -243,3 +244,38 @@ def test_a_start_line_with_trailing_clauses_still_parses():
     assert nights[0]["knob"] == 2, "the lane count is still read past the new clauses"
     assert nights[0]["due"] == 871
     assert nights[0]["hours"] == 8.0
+
+
+def test_a_filled_night_parses_and_is_never_pooled_into_full():
+    """Issue #404's `Done:` line splits the city count, `(D due, F fill)`.
+
+    The line below is the format cmd_run_due writes (pinned against the live
+    code in tests/test_fill_underfull_nights.py). Before the optional group the
+    whole line failed to match, so every filled night vanished from the
+    analysis; and a night whose length the fill set must not be compared as a
+    `full` one. A fill phase that admitted nothing ("0 fill") is a full night.
+    """
+    log = (
+        "2026-10-01 09:00:00,000 - streetscape_scheduler - INFO - 15 cities due on 2026-10-01; "
+        "processing up to 15 within daily budgets of 35,000,000 gsv requests; "
+        "max_concurrent_channels=2; refresh_slots=10 (0 promoted); fill_min_days=30\n"
+        "2026-10-01 18:00:00,000 - streetscape_scheduler - INFO - Done: run-due 2026-10-01: "
+        "160/160 runs succeeded across 80 cities (15 due, 65 fill) in 9.00 h; fill (early "
+        "refresh, >= 30 d): 65 cities, 130/130 runs, 130 early refresh(es) recorded; ended by "
+        "city cap (80)\n"
+        "2026-10-02 09:00:00,000 - streetscape_scheduler - INFO - 7 cities due on 2026-10-02; "
+        "processing up to 7 within daily budgets of 35,000,000 gsv requests; "
+        "max_concurrent_channels=2\n"
+        "2026-10-02 11:00:00,000 - streetscape_scheduler - INFO - Done: run-due 2026-10-02: "
+        "14/14 runs succeeded across 7 cities (7 due, 0 fill) in 2.00 h; fill (early refresh, "
+        ">= 30 d): 0 cities, 0/0 runs, 0 early refresh(es) recorded; ended by held: backlog "
+        "(mapillary 1 due not attempted)\n"
+    )
+    nights = nla.parse_log(log)
+    assert [(n["date"], n["population"], n["cities"], n["fill_cities"]) for n in nights] == [
+        ("2026-10-01", "filled", 80, 65),
+        ("2026-10-02", "full", 7, 0),
+    ]
+    summary = nla.summarize(nights, usage={})
+    assert summary["population_counts"]["filled"] == 1
+    assert summary["by_knob"]["2"]["dates"] == ["2026-10-02"]

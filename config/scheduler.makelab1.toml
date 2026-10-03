@@ -98,6 +98,17 @@ max_batch_hours = 12
 # slate after the hoist, so these 10 run whether the cap or the deadline ends
 # the night.
 refresh_slots = 10
+# The FILL (issue #404): once the due slate is worked through, refresh cities
+# EARLY, stalest-first, whose every default channel last succeeded at least
+# this many days ago -- admitted whole (every channel fits its budget, the
+# Mapillary pair fits the ceiling below, the time fits the deadline) or not at
+# all. cycle_days stays the guarantee. Counted against max_cities_per_day.
+# Delete these two lines to switch it off; nothing else depends on them.
+fill_min_days = 30
+# The fill's own rolling-24h ceiling on the tile CDN, BELOW the 3,000 budget the
+# due slate keeps: 2,260 is the highest combined (grid + walk) night the #292
+# window measured clean, which #404 says to start the fill at.
+fill_host_ceilings = { mapillary_tiles = 2260 }
 # The cron timer-watchdog (issue #369) writes logs/timer_watchdog_status.json on
 # every run; backup-status goes unhealthy (and its noon timer alerts) when that
 # heartbeat is missing or older than this. The two watchdogs cover each other:
@@ -620,16 +631,74 @@ network_type = "drive"
 # added since #258 brings one more Overpass user, and Overpass admits exactly
 # one talker. gsv_streets is the representative because it is the only Overpass
 # channel with no SECOND host. Moot at the knob's current value of 1.
+#
+# STAGE 1 OF A STAGED RAISE (issue #405, 2026-10-01): 30 -> 60/min and
+# 4,000 -> 8,000/day on BOTH channels together. Why it is safe to try:
+#   - documented: still nothing. The OpenAPI spec, docs.panoramax.fr, the API
+#     landing page and the OSM wiki carry no limit, no 429 contract, no
+#     Retry-After and no fair-use text.
+#   - source: api.panoramax.xyz is gitlab.com/panoramax/server/meta-catalog, a
+#     Rust/actix-web service whose main.rs wires no rate-limit, concurrency or
+#     timeout middleware; whatever limit exists is in an unpublished nginx.
+#   - reported by the maintainer, and it is about BURSTS: "several thousand
+#     requests at once" (forum.geocommuns.fr 3298, 2026-07-02) and a 150-200
+#     req/s job making 80,000+ requests, ~25% of the catalog's traffic
+#     (forum.openstreetmap.fr 44813, 2026-07-18). A one-off ~900-request query
+#     was called fine. "~320k requests/day" is OUR inference (80,000 / 0.25,
+#     read as a day): the post names no window, so treat it as an assumption.
+#   - ours, against that assumed 320k/day: stage 0 (30/min, 4,000 x 2) was at
+#     most ~2.5%; stage 1 (60/min, 8,000 x 2 = 16,000) is at most ~5%; stage 2
+#     (12,000 x 2 = 24,000) would be ~7.5% -- beside the 25% the maintainer
+#     complained about. Only the 150-200 req/s incident has a RATE; stage 1's
+#     1 req/s is 150-200x below it. The "several thousand at once" report is a
+#     burst with no stated rate, and our jittered, single-lock pacing never
+#     bursts.
+# The forum was deliberately NOT asked (#405). Jitter (0.6) and the host lock
+# are unchanged. The User-Agent now names a contact address (Jon's choice):
+# StreetscapeTracker/1.0 (+<repo URL>; sidewalk@cs.uw.edu) aiohttp/<version>.
+#
+# THE GATE TO STAGE 2 (90/min, 12,000/day each): seven CONSECUTIVE clean
+# qualifying nights. Per UTC night, over both channels' api_usage requests
+# (the reasoning and sources are in docs/provider-access.md):
+#   REVERT on any per-IP refusal (exit 84 / 403 / 429 / redirect), on retried
+#          5xx > 10% of requests (and > 10), or on a 2nd HOLD within 7 nights.
+#   HOLD   (streak -> 0) on any 5xx give-up, or retried 5xx > max(10, 1%).
+#   CLEAN  otherwise; it QUALIFIES only at >= 1,000 requests, and a quieter
+#          night neither advances nor resets the streak.
+#   UNKNOWN a qualifying ledger night with no child log: resets the streak.
+# Check it with ONE read-only command on this host, where --since is the
+# stage's first UTC night (recorded in the provider-access.md stage table):
+#   python scripts/panoramax_gate_check.py \
+#     --config config/scheduler.makelab1.toml --since <YYYY-MM-DD>
+# It exits 1 if ANY night since --since reverts, 3 if one is UNKNOWN.
+# or by hand: grep -h 'Panoramax tile retry: HTTP 5' \
+#               logs/collect_*_panoramax*_<date>.log | wc -l
+# (download_panoramax.TILE_RETRY_LOG_PHRASE: one WARNING per RETRIED request,
+# added for this gate -- before it a recovered 5xx left no trace.)
+# A REVERT goes back to the previous stage (30 / 4,000) and is recorded in
+# docs/provider-access.md. Each stage is its own PR; enrolment of the 41
+# screen-positive tracked cities proceeds in tranches only after this holds.
 [providers.panoramax]
 enabled = true
-# ~ the richest city measured (3,132 z15 tiles) with room for a second, so one
-# night can finish any single enrolled city. Also a real per-night ceiling, not
-# only a gate: `_run_one_city` hands the child --panoramax-max-requests.
-daily_request_budget = 4000
-# The collector's own DEFAULT_TILE_REQUESTS_PER_MINUTE, restated because
-# _tile_census_timeout_seconds derives every per-city timeout from THIS value —
-# lowering it here without re-reading that function shortens the timeouts too.
-max_requests_per_minute = 30
+# Was ~the richest city measured (3,132 z15 tiles) with room for a second; at
+# 8,000 a night can finish the richest city AND its unpaired walk, or two more.
+# A real per-night ceiling, not only a gate: `_run_one_city` hands the child
+# --panoramax-max-requests. The per-IP SUM over both channels is now 16,000
+# un-paired, ~5.6 h of this host's lock at 60/min x 0.8 achieved.
+daily_request_budget = 8000
+# Twice the collector's own DEFAULT_TILE_REQUESTS_PER_MINUTE (30, unchanged:
+# laptop runs and the repo default stay conservative). _tile_census_timeout_
+# seconds derives every per-city timeout from THIS value, so doubling it halves
+# the derivation: the richest city (3,132 tiles) now derives ~108 min, under
+# the 180-minute city_timeout_minutes floor, which therefore binds again for
+# any city of 5,440 tiles or fewer. That floor affords 8,160 requests at this
+# pace (_sweep_requests_within_timeout), just above the 8,000 budget, so a
+# capped launch is sized by the budget rather than the clock -- BUT ONLY when
+# the child's timeout is the unclamped 180-minute floor. _sweep_launch_plan
+# prices the cap from the DEADLINE-CLAMPED timeout, and the Panoramax pair
+# ranks last, so late in a long night the batch deadline shortens the timeout
+# and the clock, not this budget, sizes the cap.
+max_requests_per_minute = 60
 # Non-metronomic gaps, the #292 shifted exponential, at the collector's own CV.
 jitter = 0.6
 
@@ -638,11 +707,13 @@ jitter = 0.6
 # grid coverage. Nearly free WHEN PAIRED — both channels read one z15 census of
 # one bbox, the grid run promotes it into the shared cache (#290) and this one
 # prices at 0, which is why it ranks immediately after panoramax. Un-paired it
-# pays a full census, and that is what this budget covers.
+# pays a full census, and that is what this budget covers. Raised in lockstep
+# with the grid channel (#405 stage 1): one host lock serializes the two, so
+# 60/min is their COMBINED ceiling, never each one's.
 [providers.panoramax_streets]
 enabled = true
-daily_request_budget = 4000
-max_requests_per_minute = 30
+daily_request_budget = 8000
+max_requests_per_minute = 60
 jitter = 0.6
 spacing_m = 15
 network_type = "drive"

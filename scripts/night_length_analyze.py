@@ -99,11 +99,16 @@ _START_RE = re.compile(
     r"(?P<filter>\s\[--provider [^\]]*\])?;"
     r"(?:.*?max_concurrent_channels=(?P<knob>\d+))?.*$"
 )
+# `(D due, F fill)` is optional: since #404 a night with a fill phase splits its
+# city count, and without the group the line does not match at all -- every
+# filled night would silently vanish, the failure _START_RE's comment records.
 _DONE_RE = re.compile(
     rf"^{_TS} - .* - INFO - Done: run-due (?P<date>\d{{4}}-\d{{2}}-\d{{2}})"
     r"(?P<filter>\s\[--provider [^\]]*\])?: "
     r"(?P<succeeded>\d+)/(?P<attempted>\d+) runs succeeded across "
-    r"(?P<cities>\d+) cities in (?P<hours>[\d.]+) h(?P<rest>.*)$"
+    r"(?P<cities>\d+) cities"
+    r"(?: \((?P<due_cities>\d+) due, (?P<fill_cities>\d+) fill\))?"
+    r" in (?P<hours>[\d.]+) h(?P<rest>.*)$"
 )
 _DEFERRED_RE = re.compile(r"(\d+) deferred for budget")
 _BUSY_RE = re.compile(r"(\d+) channel\(s\) skipped")
@@ -189,11 +194,25 @@ def parse_log(text: str, source: str = "") -> list[dict]:
         pending = None
         stopped = "stopped early" in rest
         filtered = bool(done.group("filter"))
+        # A night that ran fill cities (#404) is a DIFFERENT population: its
+        # length is set by the fill's own end (the cap, a budget, the deadline),
+        # not by how long the due work took, so pooling it into `full` would
+        # move the comparison for a reason that has nothing to do with lanes.
+        fill_cities = int(done.group("fill_cities")) if done.group("fill_cities") else 0
         nights.append(
             {
                 "date": done.group("date"),
                 "knob": knob,
-                "population": "filtered" if filtered else "truncated" if stopped else "full",
+                "population": (
+                    "filtered"
+                    if filtered
+                    else "truncated"
+                    if stopped
+                    else "filled"
+                    if fill_cities
+                    else "full"
+                ),
+                "fill_cities": fill_cities,
                 "hours": round(hours, 4),
                 # Reported alongside `hours`, never instead of it: hours is what
                 # an operator feels, this is what survives a night of unusually
@@ -289,6 +308,7 @@ def summarize(nights: list[dict], usage: dict) -> dict:
             "full": sum(1 for n in nights if n["population"] == "full"),
             "filtered": sum(1 for n in nights if n["population"] == "filtered"),
             "truncated": sum(1 for n in nights if n["population"] == "truncated"),
+            "filled": sum(1 for n in nights if n["population"] == "filled"),
             "knob_unknown": sum(1 for n in nights if n["knob"] is None),
             "comparable": len(full),
         },

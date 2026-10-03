@@ -509,6 +509,9 @@ def delete_run(conn, data_dir: str, run_row, execute: bool) -> list[str]:
             path = os.path.join(data_dir, name)
             if os.path.exists(path):
                 os.remove(path)
+        # Its early-refresh mark (issue #404) goes with it, or a re-collection on
+        # the same date would inherit a mark for a run that no longer exists.
+        db.delete_early_refresh_for_run(conn, run_id)
         conn.execute("DELETE FROM runs WHERE run_id = ?", (run_id,))
         conn.commit()
     return basenames
