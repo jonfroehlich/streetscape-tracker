@@ -6,7 +6,7 @@ Re-run whenever a stats definition changes: because the stored numbers cannot
 be recovered with pure SQL, every run's CSV is reloaded and re-summarized with
 analysis.calculate_run_stats, the same function the live pipeline uses.
 
-Three definitions have moved so far:
+Four definitions have moved so far, and one column was added:
 
   * schema v3 changed what "present imagery" means — a pano the provider
     returned but whose capture date we couldn't read (status NO_DATE) now
@@ -33,8 +33,31 @@ Three definitions have moved so far:
     a 60-city archived sample, that is 10.4% of covered points -- a large move
     for a published coverage number, so this one too belongs to the WHOLE gsv
     series in one pass.
+  * issue #289 (schema v20) ADDED runs.total_grid_points, the distinct
+    (query_lat, query_lon) count, because total_points and the status_*
+    buckets are ROW counts and a census run (mapillary, kartaview, panoramax)
+    writes one row per image. No existing value moves; the column arrives NULL
+    ("not measured") on every pre-v20 row, and this script is its backfill.
+    It is a property of the CSV, so it is filled for every provider.
+    Backfill it with `--only total_grid_points`, NOT a plain `--execute`:
 
-Columns refreshed per run: total_points, status_ok, status_no_date,
+      - The plain pass loads every CSV through the full loader. A census run is
+        millions of rows (the PR #422 review put a 16.5M-row Mapillary run at
+        ~15 GiB resident), on the host that runs the 02:00 batch. `--only`
+        reads just the two coordinate columns (pandas `usecols`), which is the
+        whole input the count needs.
+      - The plain pass also applies every OTHER definition change the catalog
+        has not yet taken. If that moves a capture-date column and
+        --regenerate-json was not given, the catalog is repaired but the
+        published per-run JSON is not -- and a later --regenerate-json pass can
+        no longer find that run, because its date columns no longer move. That
+        rebuild is lost for good. `--only` writes one column and nothing else,
+        so no other repair is consumed by the backfill.
+
+    Run it in the daytime, one --provider at a time, never overlapping the
+    02:00 run-due (see docs/operations.md).
+
+Columns refreshed per run: total_points, total_grid_points, status_ok, status_no_date,
 status_zero_results, status_flat_only, status_out_of_radius, status_other,
 unique_panos, unique_google_panos, coverage_rate_pct,
 any_imagery_coverage_rate_pct, oldest/newest_capture_date,
@@ -80,6 +103,9 @@ Usage:
     python scripts/recompute_run_stats.py --execute              # apply
     python scripts/recompute_run_stats.py --provider gsv \\
         --regenerate-json --execute        # issue #213's and #226's repair on prod
+    python scripts/recompute_run_stats.py --only total_grid_points   # #289 preview
+    python scripts/recompute_run_stats.py --only total_grid_points \\
+        --provider mapillary --execute     # issue #289's backfill, one provider at a time
 
 --provider gsv is not just a filter there: --regenerate-json re-reads every
 rebuilt run's CSV, and a Mapillary census run is millions of rows.
@@ -100,8 +126,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from streetscape_metadata_tracker import db  # noqa: E402
 from streetscape_metadata_tracker.analysis import (  # noqa: E402
+    GRID_POINT_COLUMNS,
     GSV_QUERY_RADIUS_M,
     calculate_run_stats,
+    count_grid_points,
     implausible_capture_date_count,
     out_of_radius_count,
 )
@@ -120,6 +148,10 @@ logger = logging.getLogger(__name__)
 # Stat columns owned by calculate_run_stats that this script refreshes.
 STAT_COLUMNS = (
     "total_points",
+    # Issue #289: the grid size, where total_points is a row count. NULL on
+    # every row cataloged before v20, so the first pass after the migration
+    # "changes" every run -- which is the backfill, not a regression.
+    "total_grid_points",
     "status_ok",
     "status_no_date",
     "status_zero_results",
@@ -171,6 +203,68 @@ if not set(DATE_COLUMNS) <= set(STAT_COLUMNS):
         f"DATE_COLUMNS must be a subset of STAT_COLUMNS; "
         f"unknown: {sorted(set(DATE_COLUMNS) - set(STAT_COLUMNS))}"
     )
+
+
+# Columns `--only` can refresh by themselves, each with the narrowest CSV read
+# that derives it. Only columns whose value needs no other stat belong here: a
+# column computed from the full frame would need the full loader, which is the
+# cost --only exists to avoid.
+ONLY_COLUMNS = ("total_grid_points",)
+
+
+def _only_total_grid_points(csv_path: str) -> int:
+    """runs.total_grid_points from the two coordinate columns alone (issue #289).
+
+    The same count calculate_run_stats stores (analysis.count_grid_points),
+    read with ``usecols`` so a census CSV of millions of rows costs two float
+    columns rather than the full frame. Equivalent to the full loader's answer
+    because that loader never adds or drops a row: the query-radius rule
+    reclassifies a status, and the date parse coerces a value.
+    """
+    return count_grid_points(pd.read_csv(csv_path, usecols=GRID_POINT_COLUMNS))
+
+
+def _backfill_only(conn, args) -> int:
+    """The `--only total_grid_points` pass: one column, nothing else touched.
+
+    Writes no other stat, rebuilds no JSON and republishes nothing -- no
+    published artifact reads total_grid_points -- so it cannot consume a
+    pending date or radius repair the way a plain `--execute` can (see the
+    module docstring). Idempotent like the full pass.
+    """
+    column = args.only
+    where = "WHERE provider = ?" if args.provider else ""
+    params = (args.provider,) if args.provider else ()
+    rows = conn.execute(
+        f"""SELECT run_id, city_id, provider, run_date, csv_filename, {column}
+            FROM runs {where} ORDER BY city_id, provider, run_date""",
+        params,
+    ).fetchall()
+    updates, missing = [], 0
+    for r in rows:
+        csv_path = os.path.join(args.data_dir, r["csv_filename"])
+        if not os.path.exists(csv_path):
+            logger.warning(f"CSV missing, skipping: {r['csv_filename']}")
+            missing += 1
+            continue
+        new = _only_total_grid_points(csv_path)
+        if not _equalish(r[column], new):
+            updates.append((r["run_id"], new))
+            old = "NULL" if r[column] is None else r[column]
+            print(f"  {r['city_id']} [{r['provider']}] {r['run_date']}: {column} {old} -> {new}")
+    print(
+        f"\n{len(rows)} runs scanned, {missing} skipped (missing CSV), "
+        f"{len(updates)} would change (--only {column}: no other column is read or written)"
+    )
+    if not args.execute:
+        print("\nDry run complete. Re-run with --execute to apply.")
+        return 0
+    with conn:
+        conn.executemany(
+            f"UPDATE runs SET {column} = ? WHERE run_id = ?", [(v, i) for i, v in updates]
+        )
+    print(f"\nUpdated {len(updates)} runs.")
+    return 0
 
 
 def _equalish(a, b) -> bool:
@@ -269,15 +363,31 @@ def main() -> int:
         "kind is a second full pass per CSV, so it runs only under this flag; "
         "combine with --provider gsv and no --execute for a preview",
     )
+    parser.add_argument(
+        "--only",
+        choices=ONLY_COLUMNS,
+        help="Refresh ONLY this column, reading only the CSV columns it needs. "
+        "The backfill path for runs.total_grid_points (issue #289): it reads "
+        "two coordinate columns instead of the whole CSV and writes nothing "
+        "else, so it applies no pending definition change and rebuilds no "
+        "JSON. Not combinable with --regenerate-json",
+    )
     args = parser.parse_args()
+    if args.only and args.regenerate_json:
+        parser.error(
+            "--only writes one catalog column and rebuilds no JSON; drop --regenerate-json"
+        )
 
     conn = db.connect(db.get_default_db_path(args.data_dir))
+    if args.only:
+        return _backfill_only(conn, args)
 
     where = "WHERE provider = ?" if args.provider else ""
     params = (args.provider,) if args.provider else ()
     rows = conn.execute(
         f"""SELECT run_id, city_id, provider, run_date, csv_filename, json_filename,
-                   total_points, status_ok, status_no_date, status_zero_results,
+                   total_points, total_grid_points, status_ok, status_no_date,
+                   status_zero_results,
                    status_flat_only, status_out_of_radius, status_other,
                    unique_panos, unique_google_panos, coverage_rate_pct,
                    any_imagery_coverage_rate_pct, oldest_capture_date,
@@ -290,6 +400,10 @@ def main() -> int:
     json_repairs = []  # (run_id, csv_filename, implausible pano count)
     n_date_moved = 0  # of those repairs, how many were triggered by a moved date
     n_radius = 0  # of those repairs, how many hold a pano beyond the query radius
+    # Runs whose capture-date columns this pass moves while --regenerate-json is
+    # off: applying them repairs the catalog but not the published JSON, and
+    # leaves no trace a later --regenerate-json pass could find (see the warning).
+    n_dates_unrebuilt = 0
     missing = 0
     for r in rows:
         csv_path = os.path.join(args.data_dir, r["csv_filename"])
@@ -357,6 +471,8 @@ def main() -> int:
                     n_date_moved += 1
                 if radius_stale:
                     n_radius += 1
+        if not args.regenerate_json and any(c in changed for c in DATE_COLUMNS):
+            n_dates_unrebuilt += 1
         if changed:
             updates.append((r["run_id"], changed))
             nd = stats["status_no_date"]
@@ -367,7 +483,9 @@ def main() -> int:
                 f"coverage {('NULL' if cov_old is None else f'{cov_old:.1f}%')}"
                 f" -> {cov_new:.1f}%, unique_panos "
                 f"{r['unique_panos']} -> {stats['unique_panos']}, "
-                f"status_no_date -> {nd}"
+                f"status_no_date -> {nd}, total_grid_points "
+                f"{('NULL' if r['total_grid_points'] is None else r['total_grid_points'])}"
+                f" -> {stats['total_grid_points']}"
                 f"{_age_delta_note(r, stats, n_implausible, n_out_of_radius)}"
             )
 
@@ -380,6 +498,18 @@ def main() -> int:
             "rebuild the ones holding an impossible capture date, a pano beyond "
             "the query radius, or capture-date columns this pass would move"
         )
+        if n_dates_unrebuilt:
+            # The trap the PR #422 review found: the JSON trigger keys on a date
+            # column MOVING, so once this pass has written the new dates, no later
+            # --regenerate-json pass can see these runs' JSON is stale.
+            print(
+                f"WARNING: {n_dates_unrebuilt} runs' capture-date columns "
+                f"{'were' if args.execute else 'would be'} moved without "
+                "--regenerate-json. Their published per-run JSONs keep the old "
+                "dates, and a later --regenerate-json pass will NOT find them "
+                "(nothing moves any more). Re-run with --regenerate-json"
+                + (" instead." if not args.execute else "; those runs need a manual rebuild.")
+            )
     elif json_repairs:
         total_bad = sum(n for _, _, n in json_repairs)
         n_bad_dates = sum(1 for _, _, n in json_repairs if n)

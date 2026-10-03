@@ -484,6 +484,36 @@ def calculate_age_stats(df: pd.DataFrame, now: pd.Timestamp) -> AgeStats:
     )
 
 
+# The two columns that identify a grid point within one run. Coordinates within
+# a run come from a single grid-generation pass, so exact equality is safe.
+GRID_POINT_COLUMNS = ["query_lat", "query_lon"]
+
+
+def count_grid_points(df: pd.DataFrame) -> int:
+    """
+    Number of distinct grid points a run queried: unique (query_lat, query_lon).
+
+    THE definition of a run's grid size, shared by the stored coverage
+    denominator (calculate_coverage_stats), the catalog's
+    ``runs.total_grid_points`` (calculate_run_stats, issue #289) and the
+    published ``search_grid.total_search_points`` (json_summarizer), so the three
+    can never disagree. It is NOT ``len(df)``: a census provider (Mapillary,
+    KartaView, Panoramax -- ``checkpointing.CENSUS_PROVIDERS``) writes one row
+    per image plus one row per empty point, so its row count mixes images with
+    points. An ordinary GSV run writes one row per point, so the two agree there
+    -- but not always: a legacy ``is_baseline=1`` GSV run that was resumed can
+    repeat rows for one point (seen on a development catalog in the PR #422
+    review), and this counts that point once.
+
+    Examples:
+        >>> import pandas as pd
+        >>> count_grid_points(pd.DataFrame({"query_lat": [1.0, 1.0, 2.0],
+        ...                                 "query_lon": [5.0, 5.0, 5.0]}))
+        2
+    """
+    return int(len(df[GRID_POINT_COLUMNS].drop_duplicates()))
+
+
 def calculate_coverage_stats(df: pd.DataFrame) -> CoverageStats:
     """
     Calculate grid-point coverage and pano-distance statistics.
@@ -500,8 +530,8 @@ def calculate_coverage_stats(df: pd.DataFrame) -> CoverageStats:
     pairs. Coordinates within a run come from a single grid-generation
     pass, so exact equality is safe.
     """
-    point_cols = ["query_lat", "query_lon"]
-    num_total_points = len(df[point_cols].drop_duplicates())
+    point_cols = GRID_POINT_COLUMNS
+    num_total_points = count_grid_points(df)
 
     # A grid point is covered if it holds >= 1 present pano (OK or NO_DATE):
     # a dateless pano is still imagery within reach (see PRESENT_STATUSES).
@@ -925,6 +955,21 @@ def calculate_run_stats(df: pd.DataFrame, run_date, provider: str = "gsv") -> di
 
     Returns:
         Dict matching db.register_run keyword arguments (stats subset).
+
+    ROW counts versus GRID-POINT counts (issue #289). ``total_points`` and every
+    ``status_*`` bucket count CSV ROWS, and they partition ``len(df)`` exactly.
+    For an ordinary gsv run a row is a grid point, so they are point counts too
+    -- except in a legacy ``is_baseline=1`` gsv run that was resumed, which can
+    repeat rows for one point, so never assume the equality. For a census
+    provider (``checkpointing.CENSUS_PROVIDERS``: mapillary, kartaview,
+    panoramax) a run writes one row per IMAGE plus one row per empty point, so
+    ``status_ok``/``status_no_date`` count images and ``total_points`` is a
+    mixture of images and empty points -- neither is a grid size, and a ratio
+    of the two is not a coverage rate. ``total_grid_points`` is the grid size
+    (distinct query points, :func:`count_grid_points`), the same denominator
+    ``coverage_rate_pct`` and the published ``total_search_points`` use. The row
+    counts are kept as they are on purpose: changing their meaning would mix
+    two definitions inside every census series.
     """
     now = pd.Timestamp(run_date)
     # The query-radius rule (issue #367) is applied HERE as well as at the
@@ -978,7 +1023,12 @@ def calculate_run_stats(df: pd.DataFrame, run_date, provider: str = "gsv") -> di
     coverage = calculate_coverage_stats(df)
 
     return {
+        # ROW count (see the docstring): images plus empty points for a census.
         "total_points": len(df),
+        # GRID-POINT count (issue #289), the coverage denominator. Read this,
+        # never total_points, wherever "how many points did the run query" is
+        # the question.
+        "total_grid_points": count_grid_points(df),
         "status_ok": status_ok,
         "status_no_date": status_no_date,
         "status_zero_results": status_zero,

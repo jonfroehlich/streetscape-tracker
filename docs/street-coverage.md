@@ -261,7 +261,10 @@ The orchestrator now removes it (the row's pointer up front, the deterministic n
 It is still not sufficient for the public server: the publish rsync never passes `--delete`, so a copy already published stays there until it is removed from the docroot by hand.
 Note also that the artifact cannot repair itself — its per-edge aggregates were already computed under the old definition, so the dropped `NO_DATE` samples are simply not in it, which rules out the cheap artifact-reading design `backfill_streetwalk_coverage.py` and `backfill_streetwalk_length.py` both use.
 Until #262 lands, the affected deltas are the FIRST walk diff of each series after 2026-08-24.
-Most will round to 0.0 — both providers sit at zero through p95 — but the tail renders: production's worst GSV run would shift **0.33** percentage points and its worst Mapillary run **2.7**, and 2.7 points is larger than most real run-to-run coverage changes, so it will read as a substantial imagery refresh rather than as noise.
+Most will round to 0.0 — both providers sit at zero through p95 — but the tail renders: production's worst GSV run would shift **0.33** percentage points, which is visible.
+Mapillary's tail is not measured.
+The 2.7-point figure that stood here divided undated images by a ROW count and is withdrawn ([#289](https://github.com/jonfroehlich/streetscape-tracker/issues/289)); its replacement waits for the `runs.total_grid_points` backfill on production, and even then is an upper bound on the shift rather than the shift (see the writeup's correction).
+What is measured is that Mapillary's worst run has 23.3% of its present imagery undated, so a visible delta there remains plausible.
 
 ## Overpass is on the critical path of every first road walk (issue #209)
 

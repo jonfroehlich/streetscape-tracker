@@ -214,6 +214,38 @@ Historical `run_diffs` rows and the published diff detail CSVs stay under the ol
 So after #367 a city's "Changes since" panel for an old pair can still count a far pano as added or removed, until a GSV re-diff pass exists (a follow-up).
 Diffs computed from the deploy on are correct, because both of their sides load through the new rule.
 
+### Schema v20 and the `runs.total_grid_points` backfill (issue #289)
+
+v20 is not a stats-definition change — no stored value moves — but it is the first schema step since v16 whose deploy needs the same care.
+
+- **The migration is one-way.**
+  Code older than v20 refuses a v20 catalog (`init_schema` raises "newer than this code supports"), so once any process has connected with the new code, rolling the code back stops every command, the 02:00 batch included.
+  A rollback is a **catalog restore** (`scheduler restore-backup`, see [`catalog-backups.md`](catalog-backups.md)) as well as a code revert, and it loses every run cataloged since that backup.
+- **Deploy only with no `run-due` in flight** (`pgrep -af '[s]cheduler .*run-due'`, as [`../deploy/README.md`](../deploy/README.md) says for any deploy): a child launched from the new tree would migrate the catalog under a parent still running the old module, which then refuses its own next connect.
+- **A v19 laptop bundle is refused** by `import-bundle` (it requires the bundle's schema to equal this host's).
+  Update the laptop checkout, open its catalog once with any command that connects (that migrates it), and copy the bundle again.
+
+The column arrives NULL on every existing run.
+Backfill it with the column-restricted mode, which reads only `query_lat,query_lon` from each CSV and writes only `total_grid_points`:
+
+```bash
+# Dry run: one line per run that would change. Expect every run, NULL -> N.
+.venv-makelab2/bin/python scripts/recompute_run_stats.py \
+    --data-dir /projects/makeabilitylab/streetscape-tracker/data --only total_grid_points --provider gsv
+# Apply, one provider per invocation, in the daytime.
+.venv-makelab2/bin/python scripts/recompute_run_stats.py \
+    --data-dir /projects/makeabilitylab/streetscape-tracker/data --only total_grid_points \
+    --provider mapillary --execute >> logs/backfill_289.log 2>&1
+```
+
+**Never backfill with a plain `--execute`.**
+It loads every CSV through the full loader (the PR #422 review put a 16.5M-row Mapillary census run at ~15 GiB resident, on the host that runs the batch), and it applies every OTHER pending definition change too.
+If one of those moves a capture-date column without `--regenerate-json`, that run's published JSON keeps the old dates and no later `--regenerate-json` pass can find it, because nothing moves any more.
+The `--only` dry run's summary line says no other column is read or written; if a plain dry run is what you are reading, it is the wrong command.
+
+Run it **per provider, in the daytime, never overlapping the 02:00 timer** — it shares the catalog with the batch, and a census provider's pass still reads millions of rows apiece.
+Nothing published reads `total_grid_points`, so the backfill republishes nothing; `scripts/undated_imagery_share_analyze.py` is its first reader, and that regeneration waits for the backfill (see [`experiments/undated-imagery-share.md`](experiments/undated-imagery-share.md)).
+
 ## Landing a laptop investigation in this catalog: `scheduler import-bundle` (issue #330)
 
 **Added after the 2026-08-22 split.**
