@@ -2321,6 +2321,43 @@ _RACE_BARRIER_TIMEOUT_S = 30
 _RACE_DEADLINE_S = 60
 
 
+def _race_first_connects(worker, paths, processes):
+    """Start ``processes`` racers running ``worker(index, paths, barrier, errors)``.
+
+    Returns the error strings the racers reported (empty on success), and fails
+    the test if any racer exited nonzero or overran ``_RACE_DEADLINE_S``.
+    """
+    ctx = multiprocessing.get_context("spawn")
+    barrier = ctx.Barrier(processes)
+    errors = ctx.Queue()
+    # daemon, and terminated in `finally`: a racer that dies must FAIL this
+    # test, never leave its peers parked on the barrier where multiprocessing's
+    # atexit join would hang pytest until the CI runner's own timeout.
+    procs = [
+        ctx.Process(target=worker, args=(i, paths, barrier, errors), daemon=True)
+        for i in range(processes)
+    ]
+    try:
+        for proc in procs:
+            proc.start()
+        deadline = time.monotonic() + _RACE_DEADLINE_S
+        while any(proc.is_alive() for proc in procs) and time.monotonic() < deadline:
+            if any(proc.exitcode not in (None, 0) for proc in procs):
+                barrier.abort()  # releases every waiter with BrokenBarrierError
+            time.sleep(0.05)
+        exitcodes = [proc.exitcode for proc in procs]
+    finally:
+        for proc in procs:
+            if proc.is_alive():
+                proc.terminate()
+            proc.join(timeout=10)
+    assert exitcodes == [0] * processes
+    failures = []
+    while not errors.empty():
+        failures.append(errors.get())
+    return failures
+
+
 def test_concurrent_first_connects_seed_the_v16_backfill_exactly_once(tmp_path):
     """Issue #385 review: ``BEGIN IMMEDIATE`` makes the backfill race-safe.
 
@@ -2343,35 +2380,7 @@ def test_concurrent_first_connects_seed_the_v16_backfill_exactly_once(tmp_path):
         raw.execute("PRAGMA journal_mode=WAL")
         raw.close()
         paths.append(path)
-    ctx = multiprocessing.get_context("spawn")
-    barrier = ctx.Barrier(_RACE_PROCESSES)
-    errors = ctx.Queue()
-    # daemon, and terminated in `finally`: a racer that dies must FAIL this
-    # test, never leave its peers parked on the barrier where multiprocessing's
-    # atexit join would hang pytest until the CI runner's own timeout.
-    procs = [
-        ctx.Process(target=_race_worker, args=(i, paths, barrier, errors), daemon=True)
-        for i in range(_RACE_PROCESSES)
-    ]
-    try:
-        for proc in procs:
-            proc.start()
-        deadline = time.monotonic() + _RACE_DEADLINE_S
-        while any(proc.is_alive() for proc in procs) and time.monotonic() < deadline:
-            if any(proc.exitcode not in (None, 0) for proc in procs):
-                barrier.abort()  # releases every waiter with BrokenBarrierError
-            time.sleep(0.05)
-        exitcodes = [proc.exitcode for proc in procs]
-    finally:
-        for proc in procs:
-            if proc.is_alive():
-                proc.terminate()
-            proc.join(timeout=10)
-    assert exitcodes == [0] * _RACE_PROCESSES
-    failures = []
-    while not errors.empty():
-        failures.append(errors.get())
-    assert failures == []
+    assert _race_first_connects(_race_worker, paths, _RACE_PROCESSES) == []
     for path in paths:
         raw = sqlite3.connect(path)
         rows = raw.execute("SELECT provider, requests FROM host_usage ORDER BY provider").fetchall()
@@ -2381,3 +2390,62 @@ def test_concurrent_first_connects_seed_the_v16_backfill_exactly_once(tmp_path):
             db.SCHEMA_VERSION,
             [("mapillary", 1198), ("mapillary_streets", 5)],
         ), path
+
+
+def _column_race_worker(index, paths, barrier, errors):
+    """Racer ``index``: first-connect each catalog in ``paths`` in step with the others.
+
+    Unlike ``_race_worker`` nothing widens the window: the barrier alone lines
+    six racers up closely enough that an un-transactioned check-then-ALTER
+    loses on most connects (see the test).
+    """
+    for path in paths:
+        barrier.wait(timeout=_RACE_BARRIER_TIMEOUT_S)
+        try:
+            db.connect(path).close()
+        except Exception as exc:  # reported, so the parent can fail by name
+            errors.put(f"{path}: {exc!r}")
+
+
+_COLUMN_RACE_PROCESSES = 6
+_COLUMN_RACE_TRIALS = 6
+
+
+def test_concurrent_first_connects_add_the_every_connect_columns_once(tmp_path):
+    """PR #422 review: the every-connect column steps are race-safe.
+
+    _migrate_add_query_radius_columns (the v17 pair) and
+    _migrate_add_total_grid_points_column (v20) run on EVERY connect, so the
+    first connects after a deploy race each other -- the 02:00 run-due among
+    them. Six processes first-connect the same catalog at once, for a v19
+    catalog lacking total_grid_points and a v16 catalog lacking the query-radius
+    pair, over several fresh catalogs of each. No connect may fail and every
+    catalog must end current with all three columns.
+
+    Killed by either step's check-then-ALTER outside ``BEGIN IMMEDIATE``: every
+    racer reads the column as missing and all but one then raise ``duplicate
+    column name``. Measured in the review at 162-164 of 240 connects (6
+    racers, 40 trials), so losing none of the 72 here is not a matter of luck.
+    """
+    paths = []
+    for trial in range(_COLUMN_RACE_TRIALS):
+        for stamp, builder in (
+            (19, lambda d: _pre_total_grid_points_catalog(d)),
+            (16, lambda d: _pre_query_radius_catalog(d, user_version=16)),
+        ):
+            catalog_dir = tmp_path / f"v{stamp}-{trial}"
+            catalog_dir.mkdir()
+            path = builder(catalog_dir)
+            raw = sqlite3.connect(path)
+            raw.execute("PRAGMA journal_mode=WAL")
+            raw.close()
+            paths.append(path)
+    assert _race_first_connects(_column_race_worker, paths, _COLUMN_RACE_PROCESSES) == []
+    wanted = {"total_grid_points", *db._QUERY_RADIUS_RUN_COLUMNS}
+    for path in paths:
+        raw = sqlite3.connect(path)
+        cols = {r[1] for r in raw.execute("PRAGMA table_info(runs)").fetchall()}
+        version = raw.execute("PRAGMA user_version").fetchone()[0]
+        raw.close()
+        assert version == db.SCHEMA_VERSION, path
+        assert wanted <= cols, path

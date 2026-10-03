@@ -84,6 +84,47 @@ def test_of_present_reads_every_run_and_is_unchanged(catalog):
 
 
 def test_a_census_of_queried_is_labelled_an_upper_bound(catalog):
+    # gsv is exact here only because its one run has as many rows as points.
     assert catalog["gsv"]["of_queried_kind"] == "exact"
     assert catalog["mapillary"]["of_queried_kind"] == "upper_bound"
     assert {p for p in CENSUS_PROVIDERS if of_queried_kind(p) != "upper_bound"} == set()
+
+
+def test_a_gsv_run_with_more_rows_than_points_makes_gsv_an_upper_bound(conn):
+    """PR #422 review: "one gsv row is one grid point" is a property of the CSV,
+    not of the provider. A legacy resumed gsv run can hold several rows for one
+    point, where a duplicated NO_DATE row counts twice, so a gsv block with any
+    such run is labelled ``upper_bound``. Killed by deciding the kind from the
+    provider alone."""
+    cid = _city(conn)
+    _run(conn, cid, "gsv", 1, ok=90, nd=10, rows=200, grid=200)
+    _run(conn, cid, "gsv", 2, ok=90, nd=10, rows=290, grid=200)  # resumed: 90 repeated rows
+    m = measure_catalog(conn)["gsv"]
+    assert m["runs_with_more_rows_than_grid_points"] == 1
+    assert m["of_queried_kind"] == "upper_bound"
+
+
+def test_the_run_behind_each_maximum_is_named(conn):
+    """PR #422 review: a writeup that names the worst run must trace the name
+    to the metrics file. The maximum of each per-run distribution carries its
+    run, and the of_present and of_queried maxima can be different runs."""
+    cid = _city(conn)
+    _run(
+        conn, cid, "mapillary", 1, ok=10, nd=10, rows=40, grid=400
+    )  # 50% of present, 2.5% of queried
+    _run(
+        conn, cid, "mapillary", 2, ok=270, nd=30, rows=500, grid=100
+    )  # 10% of present, 30% of queried
+    m = measure_catalog(conn)["mapillary"]
+    assert m["max_run_pct_of_present"] == {
+        "city_id": cid,
+        "run_date": "2026-05-01",
+        "pct": 50.0,
+    }
+    assert m["max_run_pct_of_queried"] == {
+        "city_id": cid,
+        "run_date": "2026-05-02",
+        "pct": 30.0,
+    }
+    assert m["per_run_pct_of_present"]["max"] == m["max_run_pct_of_present"]["pct"]
+    assert m["per_run_pct_of_queried"]["max"] == m["max_run_pct_of_queried"]["pct"]

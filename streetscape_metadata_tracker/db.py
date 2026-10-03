@@ -82,7 +82,8 @@ CREATE TABLE IF NOT EXISTS runs (
     finished_at         TEXT,
     duration_seconds    REAL,
     -- total_points and every status_* column are ROW counts (issue #289): they
-    -- partition the run CSV's rows exactly. For gsv a row is a grid point; for
+    -- partition the run CSV's rows exactly. For an ordinary gsv run a row is a
+    -- grid point (a resumed legacy baseline run can repeat one); for
     -- a census provider (mapillary, kartaview, panoramax) a row is an IMAGE,
     -- plus one row per empty point, so these count images and total_points is
     -- not the grid size. The grid size is total_grid_points below.
@@ -132,10 +133,11 @@ CREATE TABLE IF NOT EXISTS runs (
     status_out_of_radius INTEGER,
     query_radius_m      REAL,
     -- Distinct (query_lat, query_lon) grid points in the run (v20, issue #289):
-    -- the coverage_rate_pct denominator, equal to total_points for gsv and
-    -- smaller than it for a census. NULL is "not measured" -- a row cataloged
-    -- before v20 and not yet re-derived by scripts/recompute_run_stats.py --
-    -- never a copy of total_points.
+    -- the coverage_rate_pct denominator. Never larger than total_points: equal
+    -- for an ordinary gsv run, smaller for a census, and smaller for a resumed
+    -- legacy baseline gsv run that repeats rows. NULL is "not measured" -- a
+    -- row cataloged before v20 and not yet re-derived by
+    -- scripts/recompute_run_stats.py -- never a copy of total_points.
     total_grid_points   INTEGER,
     UNIQUE (city_id, provider, run_date)
 );
@@ -1184,20 +1186,57 @@ def _migrate_add_query_radius_columns(conn: sqlite3.Connection) -> None:
     _migrate_v13_to_v14 -- each ADD COLUMN is skipped when the column already
     exists, so an interrupted migration completes on the next connect -- and an
     absent table means the CREATE TABLE in _SCHEMA below builds it current.
+    Race-safe against concurrent first connects: see _add_missing_run_columns.
 
     No DEFAULT, deliberately: NULL is "computed before the rule existed", and
     inventing a 0 would claim every historical run had been checked.
     """
-    cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
-    if not cols:
+    _add_missing_run_columns(
+        conn, _QUERY_RADIUS_RUN_COLUMNS, "GSV query-radius columns (issue #367)"
+    )
+
+
+def _add_missing_run_columns(conn: sqlite3.Connection, columns: dict[str, str], label: str) -> None:
+    """ADD each of ``columns`` (name -> SQL type) that ``runs`` lacks, race-safely.
+
+    The shared body of the every-connect column steps
+    (_migrate_add_query_radius_columns, _migrate_add_total_grid_points_column).
+    Those run on EVERY connect, so the first connect after a deploy is a race:
+    the 02:00 run-due, a hand-run command and the backup timer can all open a
+    pre-migration catalog at once. Done as a bare check-then-ALTER, every racer
+    reads the column as missing and all but the first then fail with
+    ``duplicate column name`` -- measured in the PR #422 review at 164 of 240
+    connects (6 processes first-connecting one v19 catalog, 40 trials), and a
+    run-due that loses the race loses the night.
+
+    So the check that decides to ALTER and the ALTERs share one ``BEGIN
+    IMMEDIATE`` transaction, as _migrate_v15_to_v16 does: a second racer waits
+    on the write lock (``busy_timeout``), then re-reads the schema and finds the
+    columns present. SQLite DDL is transactional, so an ALTER that fails rolls
+    back with the rest. A lock-free read comes first, so a current catalog --
+    every connect but the first after a deploy -- returns without taking the
+    write lock at all. An absent ``runs`` table adds nothing: the CREATE TABLE
+    in _SCHEMA builds it current.
+    """
+
+    def missing_columns() -> list[str]:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
+        return [c for c in columns if c not in cols] if cols else []
+
+    if not missing_columns():
         return
-    missing = [c for c in _QUERY_RADIUS_RUN_COLUMNS if c not in cols]
-    if not missing:
-        return
-    logger.info(f"Migrating catalog: adding GSV query-radius columns (runs: {', '.join(missing)})")
-    for column in missing:
-        conn.execute(f"ALTER TABLE runs ADD COLUMN {column} {_QUERY_RADIUS_RUN_COLUMNS[column]}")
-    conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        # Re-read under the lock: another process may have added them meanwhile.
+        missing = missing_columns()
+        if missing:
+            logger.info(f"Migrating catalog: adding {label} (runs: {', '.join(missing)})")
+            for column in missing:
+                conn.execute(f"ALTER TABLE runs ADD COLUMN {column} {columns[column]}")
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
 
 
 def _migrate_add_total_grid_points_column(conn: sqlite3.Connection) -> None:
@@ -1207,19 +1246,18 @@ def _migrate_add_total_grid_points_column(conn: sqlite3.Connection) -> None:
     _migrate_add_query_radius_columns: init_schema calls it from the v19 -> v20
     rung AND on every connect, so a catalog stamped v20 by a branch that did not
     carry this column still gains it, and an absent table means the CREATE TABLE
-    in _SCHEMA builds it current.
+    in _SCHEMA builds it current. Race-safe against concurrent first connects,
+    which every-connect makes the normal case after a deploy: see
+    _add_missing_run_columns.
 
     No DEFAULT and no backfill from total_points, deliberately: for a census
     run total_points is a row count that overstates the grid, so copying it
     would write a wrong number under the right name. NULL is "not measured"
     until scripts/recompute_run_stats.py re-derives the row from its CSV.
     """
-    cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
-    if not cols or "total_grid_points" in cols:
-        return
-    logger.info("Migrating catalog: adding runs.total_grid_points (issue #289)")
-    conn.execute("ALTER TABLE runs ADD COLUMN total_grid_points INTEGER")
-    conn.commit()
+    _add_missing_run_columns(
+        conn, {"total_grid_points": "INTEGER"}, "the grid-point count (issue #289)"
+    )
 
 
 def derive_city_id(city_name: str, state_name: str | None, country_name: str | None) -> str:

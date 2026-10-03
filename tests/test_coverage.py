@@ -23,6 +23,7 @@ from streetscape_metadata_tracker.analysis import (
     calculate_coverage_stats,
     calculate_pano_stats,
     calculate_run_stats,
+    count_grid_points,
     detect_systemic_failure,
     out_of_radius_count,
 )
@@ -183,9 +184,12 @@ class TestGridPointsAreNotRows:
         assert stats["any_imagery_coverage_rate_pct"] == pytest.approx(100.0 * 3 / 5)
 
     def test_gsv_total_grid_points_equals_total_points(self):
-        # GSV writes one row per grid point, so the two counts agree -- and the
-        # duplicate pano id "a" (two points snapped to one pano) must not merge
-        # two POINTS.
+        # An ORDINARY gsv run writes one row per grid point, so the two counts
+        # agree here -- and the duplicate pano id "a" (two points snapped to one
+        # pano) must not merge two POINTS. Not every gsv run is ordinary: a
+        # legacy is_baseline=1 run that was resumed can repeat rows for one
+        # point, and there total_grid_points is the smaller number (see
+        # test_a_repeated_gsv_row_is_one_grid_point).
         df = make_city_df(
             [("a", "2020-01-01"), ("a", "2020-01-01"), ("b", "2021-01-01")], n_empty=2
         )
@@ -193,6 +197,29 @@ class TestGridPointsAreNotRows:
         assert stats["total_grid_points"] == stats["total_points"] == 5
         assert stats["coverage_rate_pct"] == pytest.approx(100.0 * 3 / 5)
         assert stats["coverage_rate_pct"] == pytest.approx(100.0 * 3 / stats["total_grid_points"])
+
+    def test_a_repeated_gsv_row_is_one_grid_point(self):
+        # A legacy resumed gsv run can write one point twice (seen on a
+        # development catalog in the PR #422 review); the grid size counts it
+        # once while total_points, a ROW count, counts both rows.
+        df = make_city_df([("a", "2020-01-01"), ("b", "2021-01-01")], n_empty=1)
+        df = pd.concat([df, df.iloc[[0]]], ignore_index=True)
+        stats = calculate_run_stats(df, date(2026, 1, 15), provider="gsv")
+        assert (stats["total_points"], stats["total_grid_points"]) == (4, 3)
+
+    def test_a_grid_point_is_the_lat_lon_pair_not_either_coordinate(self):
+        # A real grid is 2-D: rows share latitudes AND longitudes, so a dedupe
+        # on either coordinate alone undercounts. Every other fixture here
+        # varies latitude only, which is why a lat-only key survived the whole
+        # suite (PR #422 review). 2 x 2 = 4, written down, never re-derived;
+        # the fifth row repeats a point, as a census image row would.
+        df = pd.DataFrame(
+            {
+                "query_lat": [47.60, 47.60, 47.61, 47.61, 47.61],
+                "query_lon": [-122.30, -122.31, -122.30, -122.31, -122.31],
+            }
+        )
+        assert count_grid_points(df) == 4
 
 
 class TestNoDateCountsAsPresent:

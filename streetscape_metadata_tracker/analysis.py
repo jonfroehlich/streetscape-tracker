@@ -500,7 +500,10 @@ def count_grid_points(df: pd.DataFrame) -> int:
     can never disagree. It is NOT ``len(df)``: a census provider (Mapillary,
     KartaView, Panoramax -- ``checkpointing.CENSUS_PROVIDERS``) writes one row
     per image plus one row per empty point, so its row count mixes images with
-    points. GSV writes one row per point, so the two agree there.
+    points. An ordinary GSV run writes one row per point, so the two agree there
+    -- but not always: a legacy ``is_baseline=1`` GSV run that was resumed can
+    repeat rows for one point (seen on a development catalog in the PR #422
+    review), and this counts that point once.
 
     Examples:
         >>> import pandas as pd
@@ -955,7 +958,9 @@ def calculate_run_stats(df: pd.DataFrame, run_date, provider: str = "gsv") -> di
 
     ROW counts versus GRID-POINT counts (issue #289). ``total_points`` and every
     ``status_*`` bucket count CSV ROWS, and they partition ``len(df)`` exactly.
-    For gsv a row IS a grid point, so they are point counts too. For a census
+    For an ordinary gsv run a row is a grid point, so they are point counts too
+    -- except in a legacy ``is_baseline=1`` gsv run that was resumed, which can
+    repeat rows for one point, so never assume the equality. For a census
     provider (``checkpointing.CENSUS_PROVIDERS``: mapillary, kartaview,
     panoramax) a run writes one row per IMAGE plus one row per empty point, so
     ``status_ok``/``status_no_date`` count images and ``total_points`` is a

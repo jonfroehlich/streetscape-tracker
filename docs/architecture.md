@@ -90,13 +90,14 @@ Like the v17 pair, the step is named by content (`_migrate_add_total_grid_points
 ### Row counts are not grid points (#289)
 
 **`runs.total_points` and every `runs.status_*` column are ROW counts**: they partition the run CSV's rows exactly, which is why they always sum to `total_points` and why nothing looks wrong from inside the row.
-For gsv a row is a grid point, so they are point counts too.
+For an ordinary gsv run a row is a grid point, so they are point counts too.
+Not for every gsv run: a legacy `is_baseline=1` run that was resumed can hold several rows for one grid point (seen on a development catalog in the PR #422 review), so **never assume `total_points == total_grid_points` for gsv** — read `total_grid_points` whenever the question is the grid.
 For a census provider (`checkpointing.CENSUS_PROVIDERS`: kartaview, mapillary, panoramax) a run writes one row per **image** plus one row per empty point, so `status_ok`/`status_no_date` count images and `total_points` is a mixture of images and empty points.
 Measured in the issue, `(status_ok + status_no_date) / total_points` overstates a census run's real coverage 3–5×, in the direction that flatters it.
 
 - **The grid size is `total_grid_points`**: the distinct `(query_lat, query_lon)` count, from `analysis.count_grid_points`.
   That one function is also the `coverage_rate_pct` denominator (`calculate_coverage_stats`) and the published `search_grid.total_search_points` (`json_summarizer`), so the three can never disagree.
-  For gsv it equals `total_points`; for a census it is smaller.
+  It is never larger than `total_points`: equal for an ordinary gsv run, smaller for a census and for a resumed legacy gsv run.
 - `coverage_rate_pct` and `any_imagery_coverage_rate_pct` were always computed on grid points and are unaffected.
 - The row counts keep their meaning on purpose (option 2 of the issue): making the buckets point-based would change every stored value across Mapillary's whole history.
   A ratio of two of them is a row ratio; a ratio of a bucket to `total_grid_points` mixes images with points for a census, so it is at best a bound — see `scripts/undated_imagery_share_analyze.py`, the one consumer that had divided by `total_points`.

@@ -678,3 +678,119 @@ def test_recompute_backfills_total_grid_points_for_every_provider(conn, data_dir
     rerun = _run_script(data_dir)
     assert rerun.returncode == 0, rerun.stderr
     assert "0 would change" in rerun.stdout
+
+
+def _bend(conn):
+    return db.register_city(
+        conn,
+        city_name="Bend",
+        state_name="Oregon",
+        state_code="OR",
+        country_name="United States",
+        country_code="US",
+        center_lat=44.0,
+        center_lon=-121.0,
+        grid_width_m=1000,
+        grid_height_m=1000,
+        step_m=20,
+    )
+
+
+def test_only_total_grid_points_backfills_that_column_and_touches_nothing_else(conn, data_dir):
+    """PR #422 review: the #289 backfill path, `--only total_grid_points`.
+
+    The run is cataloged with total_grid_points NULL AND a stale newest date --
+    a date repair still pending. The --only pass must fill the grid size (5, a
+    census run's distinct points, not its 9 rows) and leave the stale date
+    exactly as it was, so a later --regenerate-json pass can still see it move
+    and rebuild the JSON. Killed by the --only pass writing the full stats row.
+    """
+    run_date = date(2026, 4, 15)
+    cid = _bend(conn)
+    df = make_mapillary_city_df(
+        [(f"m{i}", "2022-01-01") for i in range(6)],
+        run_date=run_date,
+        panos_per_point=3,
+        n_empty=2,
+        n_flat_only=1,
+    )
+    name = generate_run_filename(cid, 1000, 1000, 20, run_date, provider="mapillary") + ".csv.gz"
+    csv_path = os.path.join(data_dir, name)
+    write_city_csv_gz(df, csv_path)
+    stats = calculate_run_stats(load_city_csv_file(csv_path), run_date, provider="mapillary")
+    stats["total_grid_points"] = None  # cataloged before v20
+    stats["newest_capture_date"] = "1999-01-01T00:00:00"  # a pending date repair
+    db.register_run(
+        conn, city_id=cid, run_date=run_date, csv_filename=name, provider="mapillary", **stats
+    )
+
+    dry = _run_script(data_dir, "--only", "total_grid_points")
+    assert dry.returncode == 0, dry.stderr
+    assert "total_grid_points NULL -> 5" in dry.stdout
+    assert "1 would change" in dry.stdout
+    assert conn.execute("SELECT total_grid_points FROM runs").fetchone()[0] is None
+
+    done = _run_script(data_dir, "--only", "total_grid_points", "--execute")
+    assert done.returncode == 0, done.stderr
+    row = conn.execute(
+        "SELECT total_points, total_grid_points, newest_capture_date FROM runs"
+    ).fetchone()
+    assert tuple(row) == (9, 5, "1999-01-01T00:00:00")
+
+    again = _run_script(data_dir, "--only", "total_grid_points")
+    assert "0 would change" in again.stdout
+    # The pending date repair is still visible to the full pass.
+    full = _run_script(data_dir, "--regenerate-json")
+    assert "1 have capture-date columns this pass moves" in full.stdout
+
+
+def test_only_total_grid_points_reads_just_the_coordinate_columns(conn, data_dir):
+    """The --only pass reads ``query_lat,query_lon`` and nothing else (pandas
+    usecols), which is what keeps a census CSV of millions of rows off the full
+    loader. Pinned with a CSV holding ONLY those two columns, on a 2 x 2 grid
+    with one repeated point: the full loader would raise on the missing
+    query_timestamp, and the count is 4. Killed by routing --only through
+    load_city_csv_file."""
+    run_date = date(2026, 4, 15)
+    cid = _bend(conn)
+    name = generate_run_filename(cid, 1000, 1000, 20, run_date, provider="mapillary") + ".csv.gz"
+    pd.DataFrame(
+        {
+            "query_lat": [44.0, 44.0, 44.001, 44.001, 44.001],
+            "query_lon": [-121.0, -121.001, -121.0, -121.001, -121.001],
+        }
+    ).to_csv(os.path.join(data_dir, name), index=False, compression="gzip")
+    db.register_run(conn, city_id=cid, run_date=run_date, csv_filename=name, provider="mapillary")
+    result = _run_script(data_dir, "--only", "total_grid_points", "--execute")
+    assert result.returncode == 0, result.stderr
+    assert conn.execute("SELECT total_grid_points FROM runs").fetchone()[0] == 4
+
+
+def test_only_refuses_regenerate_json(data_dir):
+    result = _run_script(data_dir, "--only", "total_grid_points", "--regenerate-json")
+    assert result.returncode == 2
+    assert "drop --regenerate-json" in result.stderr
+
+
+def test_moving_dates_without_regenerate_json_is_warned(conn, data_dir):
+    """PR #422 review trap: the JSON rebuild keys on a date column MOVING, so a
+    plain --execute that moves one strands that run's published JSON for good.
+    The pass says so, dry and applied. Killed by dropping the warning."""
+    run_date = date(2026, 4, 15)
+    cid = _bend(conn)
+    df = make_city_df([("p1", "2022-09-15"), ("p2", "2024-03-15")], run_date=run_date)
+    name = generate_run_filename(cid, 1000, 1000, 20, run_date) + ".csv.gz"
+    write_city_csv_gz(df, os.path.join(data_dir, name))
+    db.register_run(conn, city_id=cid, run_date=run_date, csv_filename=name)  # dates NULL
+
+    dry = _run_script(data_dir)
+    assert "WARNING: 1 runs' capture-date columns would be moved without --regenerate-json" in (
+        dry.stdout
+    )
+    applied = _run_script(data_dir, "--execute")
+    assert applied.returncode == 0, applied.stderr
+    assert "WARNING: 1 runs' capture-date columns were moved" in applied.stdout
+    # And the trap itself: the run is no longer findable by the rebuild trigger.
+    later = _run_script(data_dir, "--regenerate-json")
+    assert "WARNING" not in later.stdout
+    assert "0 would change" in later.stdout
