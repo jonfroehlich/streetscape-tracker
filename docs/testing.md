@@ -528,7 +528,7 @@ Added in the fifth review round:
 ## The failure quarantine, made visible (issue #421)
 
 `tests/test_failure_quarantine.py` drives one real `cmd_run_due` per night with a fake `_run_one_city`, gsv + mapillary enabled, and `failure_threshold = 99`, so a plain failed collection sends nothing and any email a test sees came from a condition that alerts on its own.
-Every "killed by" below was run against the committed code on a scratch copy, one mutation at a time with the file restored after; 21 mutants, all killed.
+Every "killed by" below was run against the committed code, one mutation at a time with the file restored after; 28 mutants (7 of them from the review fixes), all killed.
 
 - `test_a_fill_failure_that_reaches_the_cap_is_reported_as_a_transition` — at `max_consecutive_failures = 1` (the fill adds at most one failure, so only there can it reach the cap), with nothing due, the FILL's failure is the night's only one and still alerts as `1 QUARANTINED`; killed by taking the after-snapshot right after `_run_city_loop`, ahead of the fill.
 - `test_a_later_night_does_not_re_alert_but_keeps_counting` — a pair already at the cap is not attempted, sends no email, and is counted on the `Done:` line without `new tonight`; killed by using the standing set as the transition (`count >= max`).
