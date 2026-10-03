@@ -20,7 +20,8 @@ import pytest
 from streetscape_metadata_tracker import db
 from streetscape_metadata_tracker.analysis import calculate_run_stats
 from streetscape_metadata_tracker.fileutils import load_city_csv_file
-from tests.conftest import COLUMNS, make_city_df, write_city_csv_gz
+from streetscape_metadata_tracker.naming import generate_run_filename
+from tests.conftest import COLUMNS, make_city_df, make_mapillary_city_df, write_city_csv_gz
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _SCRIPT = os.path.join(_PROJECT_ROOT, "scripts", "recompute_run_stats.py")
@@ -614,3 +615,66 @@ def test_recompute_reclassifies_panos_beyond_the_query_radius(conn, data_dir):
     again = _run_script(data_dir, "--execute", "--regenerate-json")
     assert again.returncode == 0, again.stderr
     assert "Rebuilt 0 of 0" in again.stdout
+
+
+def test_recompute_backfills_total_grid_points_for_every_provider(conn, data_dir):
+    """Issue #289's backfill handle: a pre-v20 row carries total_grid_points
+    NULL while every other stat is already right, and one pass fills it from the
+    CSV for a census run AND a gsv run -- the whole series in one pass, with no
+    --provider needed. The dry run writes nothing; the census row's value is the
+    distinct grid-point count (5) rather than its row count (9), which is left
+    exactly as it was; a second pass changes nothing."""
+    run_date = date(2026, 4, 15)
+    cid = db.register_city(
+        conn,
+        city_name="Bend",
+        state_name="Oregon",
+        state_code="OR",
+        country_name="United States",
+        country_code="US",
+        center_lat=44.0,
+        center_lon=-121.0,
+        grid_width_m=1000,
+        grid_height_m=1000,
+        step_m=20,
+    )
+    frames = {
+        # 6 images at 3 per point + 2 empty + 1 flat-only: 9 rows, 5 points.
+        "mapillary": make_mapillary_city_df(
+            [(f"m{i}", "2022-01-01") for i in range(6)],
+            run_date=run_date,
+            panos_per_point=3,
+            n_empty=2,
+            n_flat_only=1,
+        ),
+        "gsv": make_city_df([("p1", "2020-06-15"), ("p2", "2024-01-10")], run_date=run_date),
+    }
+    for provider, df in frames.items():
+        name = generate_run_filename(cid, 1000, 1000, 20, run_date, provider=provider) + ".csv.gz"
+        csv_path = os.path.join(data_dir, name)
+        write_city_csv_gz(df, csv_path)
+        stats = calculate_run_stats(load_city_csv_file(csv_path), run_date, provider=provider)
+        stats["total_grid_points"] = None  # cataloged before v20
+        db.register_run(
+            conn, city_id=cid, run_date=run_date, csv_filename=name, provider=provider, **stats
+        )
+
+    def _grid(provider):
+        return conn.execute(
+            "SELECT total_points, total_grid_points FROM runs WHERE provider = ?", (provider,)
+        ).fetchone()
+
+    dry = _run_script(data_dir)
+    assert dry.returncode == 0, dry.stderr
+    assert "2 would change" in dry.stdout
+    assert "total_grid_points NULL -> 5" in dry.stdout
+    assert _grid("mapillary")["total_grid_points"] is None  # a dry run writes nothing
+
+    result = _run_script(data_dir, "--execute")
+    assert result.returncode == 0, result.stderr
+    assert tuple(_grid("mapillary")) == (9, 5)
+    assert tuple(_grid("gsv")) == (3, 3)
+
+    rerun = _run_script(data_dir)
+    assert rerun.returncode == 0, rerun.stderr
+    assert "0 would change" in rerun.stdout

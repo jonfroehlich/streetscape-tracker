@@ -1897,8 +1897,8 @@ def test_a_catalog_already_stamped_v16_without_the_columns_gains_them(tmp_path):
 def test_a_v15_catalog_takes_both_rungs_backfill_and_columns(tmp_path, frozen_utc_clock):
     """Prod is at v15 and takes v16 (#385) and v17 (#367) in one connect: the
     host_usage backfill must seed AND the query-radius columns must land, in
-    that order, ending at v19 (v18 and v19 are additive). Killed by a v17 rung keyed on 15 and placed
-    ahead of the v16 rung: it consumes the v15 stamp and the backfill never
+    that order, ending at v20 (v18 and v19 are additive tables, v20 is one
+    column). Killed by a v17 rung keyed on 15 and placed ahead of the v16 rung: it consumes the v15 stamp and the backfill never
     runs, while the columns (also added unconditionally) still land."""
     frozen_utc_clock(_HOST_NOW)
     db_path = _pre_query_radius_catalog(tmp_path)
@@ -1911,7 +1911,7 @@ def test_a_v15_catalog_takes_both_rungs_backfill_and_columns(tmp_path, frozen_ut
     raw.close()
 
     conn = db.connect(db_path)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 19
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 20
     cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
     assert set(db._QUERY_RADIUS_RUN_COLUMNS) <= cols
     assert _host_rows(conn) == [("2026-09-28T06:00:00+00:00", "mapillary_tiles", "mapillary", 194)]
@@ -1942,6 +1942,87 @@ def test_register_run_round_trips_the_query_radius_pair(conn):
     )
     run = db.get_latest_run(conn, cid)
     assert (run.status_out_of_radius, run.query_radius_m) == (7, 50.0)
+
+
+def _pre_total_grid_points_catalog(tmp_path, user_version=19):
+    """A current catalog minus runs.total_grid_points, stamped ``user_version``,
+    with one pre-v20 mapillary run whose ROW count overstates its grid."""
+    db_path = str(tmp_path / "v19.db")
+    raw = sqlite3.connect(db_path)
+    raw.executescript(db._SCHEMA)
+    raw.execute("ALTER TABLE runs DROP COLUMN total_grid_points")
+    raw.execute(
+        """INSERT INTO cities (city_id, display_name, city_name, center_lat,
+           center_lon, grid_width_m, grid_height_m, step_m, created_at)
+           VALUES ('bend--or', 'Bend, OR', 'Bend', 44.05, -121.31,
+                   5000, 5000, 20, '2026-01-01T00:00:00+00:00')"""
+    )
+    raw.execute(
+        """INSERT INTO runs (city_id, provider, run_date, csv_filename,
+                             total_points, status_ok, coverage_rate_pct)
+           VALUES ('bend--or', 'mapillary', '2026-05-01', 'old.csv.gz', 289, 52, 5.5)"""
+    )
+    raw.execute(f"PRAGMA user_version = {user_version}")
+    raw.commit()
+    raw.close()
+    return db_path
+
+
+def test_migrate_v19_to_v20_adds_total_grid_points_as_null(tmp_path):
+    """v19 -> v20 (issue #289): the column arrives NULL ("not measured") on an
+    existing row -- NOT a copy of total_points, which for a census run is a row
+    count that overstates the grid -- and every stored stat survives. Killed by
+    an ADD COLUMN with a DEFAULT, or a backfill from total_points."""
+    conn = db.connect(_pre_total_grid_points_catalog(tmp_path))
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 20
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
+    assert "total_grid_points" in cols
+    run = db.get_latest_run(conn, "bend--or", provider="mapillary")
+    assert run.total_grid_points is None
+    assert (run.total_points, run.status_ok, run.coverage_rate_pct) == (289, 52, 5.5)
+    conn.close()
+    # Idempotent: reopening must not error or re-add the column.
+    db.connect(str(tmp_path / "v19.db")).close()
+
+
+def test_a_catalog_stamped_v20_without_total_grid_points_gains_it(tmp_path):
+    """The step also runs on every connect, like the query-radius pair: a
+    catalog another in-flight branch stamped v20 for its own reason must still
+    gain the column, or register_run fails on the INSERT. Killed by calling the
+    step only from its rung."""
+    conn = db.connect(_pre_total_grid_points_catalog(tmp_path, user_version=20))
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
+    assert "total_grid_points" in cols
+    conn.close()
+
+
+def test_register_run_round_trips_total_grid_points(conn):
+    cid = db.register_city(
+        conn,
+        city_name="Bend",
+        state_name="Oregon",
+        state_code="OR",
+        country_name="United States",
+        country_code="US",
+        center_lat=44.05,
+        center_lon=-121.31,
+        grid_width_m=200,
+        grid_height_m=200,
+        step_m=20,
+    )
+    db.register_run(
+        conn,
+        city_id=cid,
+        run_date=date(2026, 5, 1),
+        csv_filename="r.csv.gz",
+        total_points=9,
+        total_grid_points=5,
+    )
+    run = db.get_latest_run(conn, cid)
+    assert (run.total_points, run.total_grid_points) == (9, 5)
+    # Omitted, it is NULL rather than inferred from total_points.
+    db.register_run(conn, city_id=cid, run_date=date(2026, 6, 1), csv_filename="s.csv.gz")
+    assert db.get_latest_run(conn, cid).total_grid_points is None
 
 
 def test_run_row_carries_every_runs_column(conn):
@@ -2097,7 +2178,7 @@ def test_migrate_v15_to_v16_backfills_two_utc_dates_of_metered_channels(tmp_path
     raw.close()
 
     conn = db.connect(db_path)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 19
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 20
     assert _host_rows(conn) == [
         ("2026-09-27T23:59:59+00:00", "kartaview", "kartaview", 16),
         ("2026-09-27T23:59:59+00:00", "mapillary_tiles", "mapillary", 1198),
@@ -2296,4 +2377,7 @@ def test_concurrent_first_connects_seed_the_v16_backfill_exactly_once(tmp_path):
         rows = raw.execute("SELECT provider, requests FROM host_usage ORDER BY provider").fetchall()
         version = raw.execute("PRAGMA user_version").fetchone()[0]
         raw.close()
-        assert (version, rows) == (19, [("mapillary", 1198), ("mapillary_streets", 5)]), path
+        assert (version, rows) == (
+            db.SCHEMA_VERSION,
+            [("mapillary", 1198), ("mapillary_streets", 5)],
+        ), path

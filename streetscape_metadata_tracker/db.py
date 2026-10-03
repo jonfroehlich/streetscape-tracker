@@ -30,7 +30,7 @@ from .naming import sanitize_city_query_str
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
 
 # The v16 per-host ledger (issue #385). One constant, spliced into _SCHEMA
 # below AND executed by _migrate_v15_to_v16, which runs before _SCHEMA and needs
@@ -81,6 +81,11 @@ CREATE TABLE IF NOT EXISTS runs (
     started_at          TEXT,
     finished_at         TEXT,
     duration_seconds    REAL,
+    -- total_points and every status_* column are ROW counts (issue #289): they
+    -- partition the run CSV's rows exactly. For gsv a row is a grid point; for
+    -- a census provider (mapillary, kartaview, panoramax) a row is an IMAGE,
+    -- plus one row per empty point, so these count images and total_points is
+    -- not the grid size. The grid size is total_grid_points below.
     total_points        INTEGER,
     status_ok           INTEGER,
     status_no_date      INTEGER,
@@ -126,6 +131,12 @@ CREATE TABLE IF NOT EXISTS runs (
     -- is the honest "computed before the rule existed".
     status_out_of_radius INTEGER,
     query_radius_m      REAL,
+    -- Distinct (query_lat, query_lon) grid points in the run (v20, issue #289):
+    -- the coverage_rate_pct denominator, equal to total_points for gsv and
+    -- smaller than it for a census. NULL is "not measured" -- a row cataloged
+    -- before v20 and not yet re-derived by scripts/recompute_run_stats.py --
+    -- never a copy of total_points.
+    total_grid_points   INTEGER,
     UNIQUE (city_id, provider, run_date)
 );
 CREATE INDEX IF NOT EXISTS idx_runs_city_date
@@ -743,6 +754,9 @@ class RunRow:
     # v17 (issue #367); defaulted for the same SELECT * reason as v14's pair.
     status_out_of_radius: int | None = None
     query_radius_m: float | None = None
+    # v20 (issue #289); defaulted for the same SELECT * reason as v14's pair.
+    # The GRID size, where total_points above is a ROW count.
+    total_grid_points: int | None = None
 
 
 def utc_now_iso() -> str:
@@ -885,6 +899,12 @@ def init_schema(conn: sqlite3.Connection) -> None:
     # once it does, that rung runs first and this one sees 18.
     if user_version in (17, 18):
         user_version = 19
+    # v19 -> v20 (issue #289): runs.total_grid_points. Like the v17 pair, the
+    # step is also run unconditionally below, so a catalog another in-flight
+    # branch stamped v20 for a different reason still gains the column.
+    if user_version == 19:
+        _migrate_add_total_grid_points_column(conn)
+        user_version = 20
     conn.executescript(_SCHEMA)
     # The GSV query-radius pair (issue #367) is ALSO added on every connect, not
     # only on its rung: while in flight it and PR #388 both stamped v16, so a
@@ -893,6 +913,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
     # per column, so on a current catalog it is one PRAGMA table_info and nothing else.
     # After executescript(_SCHEMA), so a fresh catalog (built current) is a no-op.
     _migrate_add_query_radius_columns(conn)
+    _migrate_add_total_grid_points_column(conn)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
 
@@ -1179,6 +1200,28 @@ def _migrate_add_query_radius_columns(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _migrate_add_total_grid_points_column(conn: sqlite3.Connection) -> None:
+    """Add runs.total_grid_points (v20, issue #289).
+
+    Named by content and idempotent, for the same reason as
+    _migrate_add_query_radius_columns: init_schema calls it from the v19 -> v20
+    rung AND on every connect, so a catalog stamped v20 by a branch that did not
+    carry this column still gains it, and an absent table means the CREATE TABLE
+    in _SCHEMA builds it current.
+
+    No DEFAULT and no backfill from total_points, deliberately: for a census
+    run total_points is a row count that overstates the grid, so copying it
+    would write a wrong number under the right name. NULL is "not measured"
+    until scripts/recompute_run_stats.py re-derives the row from its CSV.
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
+    if not cols or "total_grid_points" in cols:
+        return
+    logger.info("Migrating catalog: adding runs.total_grid_points (issue #289)")
+    conn.execute("ALTER TABLE runs ADD COLUMN total_grid_points INTEGER")
+    conn.commit()
+
+
 def derive_city_id(city_name: str, state_name: str | None, country_name: str | None) -> str:
     """
     Canonical city id: the sanitized slug of the full (never abbreviated)
@@ -1410,6 +1453,7 @@ def register_run(
     census_fetched_at: str | None = None,
     status_out_of_radius: int | None = None,
     query_radius_m: float | None = None,
+    total_grid_points: int | None = None,
 ) -> int:
     """
     Register a completed collection run. Raises sqlite3.IntegrityError if a
@@ -1427,9 +1471,9 @@ def register_run(
             coverage_rate_pct, any_imagery_coverage_rate_pct, num_flat_images,
             oldest_capture_date, newest_capture_date, median_pano_age_years,
             api_requests, census_fetched_by, census_fetched_at,
-            status_out_of_radius, query_radius_m)
+            status_out_of_radius, query_radius_m, total_grid_points)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                   ?, ?, ?, ?)""",
+                   ?, ?, ?, ?, ?)""",
         (
             city_id,
             provider,
@@ -1459,6 +1503,7 @@ def register_run(
             census_fetched_at,
             status_out_of_radius,
             query_radius_m,
+            total_grid_points,
         ),
     )
     conn.commit()

@@ -830,3 +830,83 @@ def test_aggregate_survives_a_dead_output_stream(conn, data_dir, monkeypatch):
     assert summary["schema_version"] == 4
     assert os.path.exists(os.path.join(data_dir, "cities.json.gz"))
     assert any(c["city_id"] == city_id for c in summary["cities"])
+
+
+@pytest.mark.parametrize("provider", ["gsv", "kartaview", "mapillary", "panoramax"])
+def test_published_total_search_points_is_the_deduplicated_grid_size(conn, data_dir, provider):
+    """Issue #289: the per-run JSON's ``search_grid.total_search_points`` and the
+    aggregate's ``latest.total_search_points`` are the DISTINCT grid-point count,
+    the same number as ``runs.total_grid_points`` -- never ``runs.total_points``,
+    which for a census is a row count (images + empty points). Pinned so a
+    refactor cannot quietly repoint the published grid size at the row count.
+    The census fixture is 9 rows on 5 points; gsv is 5 rows on 5 points."""
+    from streetscape_metadata_tracker.analysis import calculate_run_stats
+    from streetscape_metadata_tracker.naming import generate_run_filename
+    from tests.conftest import make_kartaview_city_df, make_panoramax_city_df
+
+    builders = {
+        "kartaview": make_kartaview_city_df,
+        "mapillary": make_mapillary_city_df,
+        "panoramax": make_panoramax_city_df,
+    }
+    run_date = date(2026, 1, 15)
+    if provider == "gsv":
+        df = make_city_df(
+            [("a", "2020-01-01"), ("b", "2021-01-01"), ("c", "2022-01-01")], n_empty=2
+        )
+        rows = 5
+    else:
+        df = builders[provider](
+            [(f"x{i}", "2022-01-01") for i in range(6)],
+            run_date=run_date,
+            panos_per_point=3,
+            n_empty=2,
+            n_flat_only=1,
+        )
+        rows = 9
+    city_id = db.register_city(
+        conn,
+        city_name="Gridtown",
+        state_name=None,
+        state_code=None,
+        country_name="Testland",
+        country_code=None,
+        center_lat=44.0,
+        center_lon=-121.0,
+        grid_width_m=100,
+        grid_height_m=100,
+        step_m=20,
+    )
+    name = generate_run_filename(city_id, 100, 100, 20, run_date, provider=provider) + ".csv.gz"
+    csv_path = os.path.join(data_dir, name)
+    write_city_csv_gz(df, csv_path)
+    df = load_city_csv_file(csv_path)
+    json_path = generate_city_metadata_summary_as_json(
+        csv_path,
+        df,
+        "Gridtown",
+        None,
+        "Testland",
+        100,
+        100,
+        20,
+        force_recreate_file=True,
+        run_date=run_date,
+        provider=provider,
+    )
+    stats = calculate_run_stats(df, run_date, provider=provider)
+    assert stats["total_points"] == rows
+    assert stats["total_grid_points"] == 5
+    assert strict_load(json_path)["search_grid"]["total_search_points"] == 5
+
+    db.register_run(
+        conn,
+        city_id=city_id,
+        run_date=run_date,
+        csv_filename=name,
+        provider=provider,
+        json_filename=os.path.basename(json_path),
+        **stats,
+    )
+    summary = generate_aggregate_v2(conn, data_dir)
+    assert summary["cities"][0]["providers"][provider]["latest"]["total_search_points"] == 5

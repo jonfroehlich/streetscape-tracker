@@ -26,8 +26,15 @@ from streetscape_metadata_tracker.analysis import (
     detect_systemic_failure,
     out_of_radius_count,
 )
+from streetscape_metadata_tracker.checkpointing import CENSUS_PROVIDERS
 from streetscape_metadata_tracker.geoutils import EARTH_RADIUS_M, haversine_m
-from tests.conftest import COLUMNS, make_city_df, make_mapillary_city_df
+from tests.conftest import (
+    COLUMNS,
+    make_city_df,
+    make_kartaview_city_df,
+    make_mapillary_city_df,
+    make_panoramax_city_df,
+)
 
 
 class TestCalculateCoverageStats:
@@ -123,6 +130,69 @@ class TestCatalogedCoverageRate:
         # rate (6 OK rows / 7 rows)
         assert stats["status_ok"] == 6 and stats["total_points"] == 7
         assert abs(stats["coverage_rate_pct"] - 100 * 2 / 3) < 1e-9
+
+
+_CENSUS_BUILDERS = {
+    "kartaview": make_kartaview_city_df,
+    "mapillary": make_mapillary_city_df,
+    "panoramax": make_panoramax_city_df,
+}
+
+
+class TestGridPointsAreNotRows:
+    """Issue #289: ``total_points`` and the ``status_*`` buckets are ROW counts,
+    and ``total_grid_points`` is the grid size.
+
+    The census fixture is 6 images at 3 per point (2 covered points), 2 empty
+    points and 1 flat-only point: 9 rows on 5 grid points. The expected 5 is
+    written down rather than re-derived with the code's own dedupe, so the test
+    cannot agree with a wrong implementation by construction.
+    """
+
+    def _census_df(self, provider):
+        return _CENSUS_BUILDERS[provider](
+            [(f"{provider[0]}{i}", "2022-01-01") for i in range(6)],
+            panos_per_point=3,
+            n_empty=2,
+            n_flat_only=1,
+        )
+
+    def test_every_census_provider_has_a_builder_here(self):
+        # A census provider added later must join the parametrization below,
+        # or its grid size goes unpinned while the suite stays green.
+        assert set(_CENSUS_BUILDERS) == set(CENSUS_PROVIDERS)
+
+    @pytest.mark.parametrize("provider", sorted(_CENSUS_BUILDERS))
+    def test_census_total_grid_points_is_the_distinct_point_count(self, provider):
+        df = self._census_df(provider)
+        stats = calculate_run_stats(df, date(2026, 1, 15), provider=provider)
+        assert stats["total_grid_points"] == 5
+        # The row counts keep their meaning (option 2 of #289): images + empty
+        # points, and status_ok counts IMAGES, not covered points.
+        assert stats["total_points"] == len(df) == 9
+        assert stats["status_ok"] == 6
+        assert stats["total_grid_points"] != stats["total_points"]
+
+    @pytest.mark.parametrize("provider", sorted(_CENSUS_BUILDERS))
+    def test_census_stored_coverage_uses_the_grid_point_denominator(self, provider):
+        stats = calculate_run_stats(self._census_df(provider), date(2026, 1, 15), provider=provider)
+        # 2 covered of 5 points -- and NOT a row rate (6 / 9), which is the
+        # plausible-looking wrong answer the issue measured at 3-5x.
+        assert stats["coverage_rate_pct"] == pytest.approx(100.0 * 2 / 5)
+        assert stats["coverage_rate_pct"] == pytest.approx(100.0 * 2 / stats["total_grid_points"])
+        assert stats["any_imagery_coverage_rate_pct"] == pytest.approx(100.0 * 3 / 5)
+
+    def test_gsv_total_grid_points_equals_total_points(self):
+        # GSV writes one row per grid point, so the two counts agree -- and the
+        # duplicate pano id "a" (two points snapped to one pano) must not merge
+        # two POINTS.
+        df = make_city_df(
+            [("a", "2020-01-01"), ("a", "2020-01-01"), ("b", "2021-01-01")], n_empty=2
+        )
+        stats = calculate_run_stats(df, date(2026, 1, 15), provider="gsv")
+        assert stats["total_grid_points"] == stats["total_points"] == 5
+        assert stats["coverage_rate_pct"] == pytest.approx(100.0 * 3 / 5)
+        assert stats["coverage_rate_pct"] == pytest.approx(100.0 * 3 / stats["total_grid_points"])
 
 
 class TestNoDateCountsAsPresent:

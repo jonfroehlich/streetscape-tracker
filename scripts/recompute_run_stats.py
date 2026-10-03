@@ -6,7 +6,7 @@ Re-run whenever a stats definition changes: because the stored numbers cannot
 be recovered with pure SQL, every run's CSV is reloaded and re-summarized with
 analysis.calculate_run_stats, the same function the live pipeline uses.
 
-Three definitions have moved so far:
+Four definitions have moved so far, and one column was added:
 
   * schema v3 changed what "present imagery" means — a pano the provider
     returned but whose capture date we couldn't read (status NO_DATE) now
@@ -33,8 +33,18 @@ Three definitions have moved so far:
     a 60-city archived sample, that is 10.4% of covered points -- a large move
     for a published coverage number, so this one too belongs to the WHOLE gsv
     series in one pass.
+  * issue #289 (schema v20) ADDED runs.total_grid_points, the distinct
+    (query_lat, query_lon) count, because total_points and the status_*
+    buckets are ROW counts and a census run (mapillary, kartaview, panoramax)
+    writes one row per image. No existing value moves; the column arrives NULL
+    ("not measured") on every pre-v20 row, and this script is its backfill.
+    It is a property of the CSV, so it is filled for every provider, and a
+    single `--execute` pass over the whole catalog fills it everywhere. That
+    pass reads every census CSV (millions of rows apiece), so budget hours, and
+    read the dry run first: it also applies any OTHER definition change the
+    catalog has not yet taken.
 
-Columns refreshed per run: total_points, status_ok, status_no_date,
+Columns refreshed per run: total_points, total_grid_points, status_ok, status_no_date,
 status_zero_results, status_flat_only, status_out_of_radius, status_other,
 unique_panos, unique_google_panos, coverage_rate_pct,
 any_imagery_coverage_rate_pct, oldest/newest_capture_date,
@@ -80,6 +90,7 @@ Usage:
     python scripts/recompute_run_stats.py --execute              # apply
     python scripts/recompute_run_stats.py --provider gsv \\
         --regenerate-json --execute        # issue #213's and #226's repair on prod
+    python scripts/recompute_run_stats.py --execute   # issue #289's backfill: ALL providers
 
 --provider gsv is not just a filter there: --regenerate-json re-reads every
 rebuilt run's CSV, and a Mapillary census run is millions of rows.
@@ -120,6 +131,10 @@ logger = logging.getLogger(__name__)
 # Stat columns owned by calculate_run_stats that this script refreshes.
 STAT_COLUMNS = (
     "total_points",
+    # Issue #289: the grid size, where total_points is a row count. NULL on
+    # every row cataloged before v20, so the first pass after the migration
+    # "changes" every run -- which is the backfill, not a regression.
+    "total_grid_points",
     "status_ok",
     "status_no_date",
     "status_zero_results",
@@ -277,7 +292,8 @@ def main() -> int:
     params = (args.provider,) if args.provider else ()
     rows = conn.execute(
         f"""SELECT run_id, city_id, provider, run_date, csv_filename, json_filename,
-                   total_points, status_ok, status_no_date, status_zero_results,
+                   total_points, total_grid_points, status_ok, status_no_date,
+                   status_zero_results,
                    status_flat_only, status_out_of_radius, status_other,
                    unique_panos, unique_google_panos, coverage_rate_pct,
                    any_imagery_coverage_rate_pct, oldest_capture_date,
@@ -367,7 +383,9 @@ def main() -> int:
                 f"coverage {('NULL' if cov_old is None else f'{cov_old:.1f}%')}"
                 f" -> {cov_new:.1f}%, unique_panos "
                 f"{r['unique_panos']} -> {stats['unique_panos']}, "
-                f"status_no_date -> {nd}"
+                f"status_no_date -> {nd}, total_grid_points "
+                f"{('NULL' if r['total_grid_points'] is None else r['total_grid_points'])}"
+                f" -> {stats['total_grid_points']}"
                 f"{_age_delta_note(r, stats, n_implausible, n_out_of_radius)}"
             )
 

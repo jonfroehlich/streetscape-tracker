@@ -40,10 +40,33 @@ They answer different questions and differ by the coverage rate:
                queried point, what share is undated. The provider-honesty
                number, and the one comparable to the KartaView audit's
                photos_invalid / photos_audited.
-  of_queried   ``no_date / total_points`` — the percentage-POINT shift a
+  of_queried   ``no_date / total_grid_points`` — the percentage-POINT shift a
                coverage rate takes when undated panos start counting. The
                phantom-delta number: ``coverage_pct_by_length`` is published to
                one decimal, so anything under 0.05 here rounds away entirely.
+
+of_queried's denominator is the GRID size, ``runs.total_grid_points`` (issue
+#289), never ``runs.total_points``. ``total_points`` and the status buckets are
+ROW counts, and a census provider writes one row per IMAGE plus one per empty
+point, so ``no_date / total_points`` divided images by a mixture of images and
+points. That is what the first version of this script did, and it is why the
+committed Mapillary ``pct_of_queried`` figures are wrong by construction.
+
+The denominator is fixed; the NUMERATOR is still the catalog's ``status_no_date``
+and so still counts rows. For gsv a row is a point, so of_queried is the exact
+shift. For a census provider (``checkpointing.CENSUS_PROVIDERS``) the shift is
+the share of grid points whose ONLY present imagery is undated, which is at
+most the share holding any undated image, which is at most undated images /
+grid points -- so the census figure is an UPPER BOUND on the shift, labelled
+``of_queried_kind: "upper_bound"`` in the metrics, never the shift itself. The
+exact census number needs the per-point join, i.e. the CSV, which the catalog
+does not hold. A bound under 0.05 still settles "is it invisible?"; a bound
+above it settles nothing.
+
+A run whose ``total_grid_points`` is NULL (cataloged before v20 and not yet
+backfilled by ``scripts/recompute_run_stats.py``) is NOT measured: it is left
+out of every of_queried figure and counted in ``runs_without_grid_points``,
+never read as zero and never replaced by ``total_points``.
 
 WHAT THIS IS NOT
 ----------------
@@ -69,6 +92,7 @@ from datetime import UTC, datetime
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 from streetscape_metadata_tracker import db  # noqa: E402
+from streetscape_metadata_tracker.checkpointing import CENSUS_PROVIDERS  # noqa: E402
 from streetscape_metadata_tracker.paths import get_default_data_dir  # noqa: E402
 
 TOPIC = "undated-imagery-share"
@@ -129,26 +153,46 @@ def percentiles(values: list[float]) -> dict:
     }
 
 
+def of_queried_kind(provider: str) -> str:
+    """Whether ``no_date / total_grid_points`` is the shift or a bound on it.
+
+    "exact" for a sample provider, where one row is one grid point, so the
+    NO_DATE row count IS the count of points covered only by undated imagery.
+    "upper_bound" for a census provider, whose NO_DATE rows are images: several
+    can share one point, and a point holding an undated image may also hold a
+    dated one (see the module docstring).
+    """
+    return "upper_bound" if provider in CENSUS_PROVIDERS else "exact"
+
+
 def measure_catalog(conn: sqlite3.Connection) -> dict:
     """Per-provider undated share, pooled and as a per-run distribution."""
     out: dict = {}
     providers = [r[0] for r in conn.execute("SELECT DISTINCT provider FROM runs ORDER BY provider")]
     for provider in providers:
+        # total_grid_points is NOT coalesced: NULL is "not measured" (issue
+        # #289), and a 0 would silently drop the run as though it had queried
+        # nothing rather than say it was never backfilled.
         rows = conn.execute(
             "SELECT COALESCE(status_ok, 0), COALESCE(status_no_date, 0), "
-            "COALESCE(total_points, 0), city_id, run_date FROM runs WHERE provider = ?",
+            "total_grid_points, city_id, run_date FROM runs WHERE provider = ?",
             (provider,),
         ).fetchall()
         ok_total = sum(r[0] for r in rows)
         nd_total = sum(r[1] for r in rows)
-        queried_total = sum(r[2] for r in rows)
+        measured = [r for r in rows if r[2] is not None]
+        queried_total = sum(r[2] for r in measured)
+        # The pooled of_queried numerator is restricted to the SAME runs as its
+        # denominator; pooling every run's NO_DATE over only the backfilled
+        # runs' grid would overstate it.
+        nd_measured = sum(r[1] for r in measured)
         present_total = ok_total + nd_total
 
         of_present, of_queried = [], []
         for ok, nd, queried, _city, _run_date in rows:
             if ok + nd > 0:
                 of_present.append(100.0 * nd / (ok + nd))
-            if queried > 0:
+            if queried:
                 of_queried.append(100.0 * nd / queried)
 
         out[provider] = {
@@ -156,11 +200,13 @@ def measure_catalog(conn: sqlite3.Connection) -> dict:
             "panos_present": present_total,
             "panos_no_date": nd_total,
             "points_queried": queried_total,
+            "runs_without_grid_points": len(rows) - len(measured),
+            "of_queried_kind": of_queried_kind(provider),
             "runs_with_any_no_date": sum(1 for r in rows if r[1] > 0),
             "pooled_pct_of_present": round(100.0 * nd_total / present_total, 6)
             if present_total
             else None,
-            "pooled_pct_of_queried": round(100.0 * nd_total / queried_total, 6)
+            "pooled_pct_of_queried": round(100.0 * nd_measured / queried_total, 6)
             if queried_total
             else None,
             "per_run_pct_of_present": percentiles(of_present),
@@ -277,8 +323,9 @@ def main() -> int:
             f"{provider}: {block['runs']} runs, {block['panos_present']:,} present panos, "
             f"{block['panos_no_date']:,} NO_DATE "
             f"({block['pooled_pct_of_present']}% of present, "
-            f"{block['pooled_pct_of_queried']}% of queried); "
-            f"{block['runs_with_any_no_date']} runs carry any"
+            f"{block['pooled_pct_of_queried']}% of queried, {block['of_queried_kind']}); "
+            f"{block['runs_with_any_no_date']} runs carry any; "
+            f"{block['runs_without_grid_points']} runs not yet backfilled with total_grid_points"
         )
     kv = metrics["kartaview_audit"]
     if kv["available"]:
