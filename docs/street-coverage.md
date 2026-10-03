@@ -245,22 +245,47 @@ KartaView is **9.56%** of audited photos, all one 2025-11-19 ingest.
 Those are GRID runs standing in for walks, because no walk recorded an undated count until this change added one — an estimate of the right order, not the walk's value.
 **Measure this on makelab2, never on a dev catalog**: a laptop holding three Mapillary runs against production's 1,201 produced the opposite conclusion, that Mapillary emits no undated imagery at all.
 
-### It changes recorded numbers for the existing GSV and Mapillary walk series, and those are not being recomputed
+### It changes recorded numbers for the existing GSV and Mapillary walk series, and `scripts/recompute_streetwalk_stats.py` recomputes them (#262)
 
-Walk coverage is computed at collection time into `street_walks` rows and `*_coverage.json.gz` artifacts, and there is no walk analogue of `scripts/recompute_run_stats.py`.
+Walk coverage is computed at collection time into `street_walks` rows and `*_coverage.json.gz` artifacts.
 So every walk collected before 2026-08-24 undercounts by its own `NO_DATE` population, and each city's **next walk diff will show a one-time phantom positive coverage delta** — walk diffs compare recorded coverage numbers, so a definition change reads as imagery churn.
 Do not read that first delta as a real improvement; it is the fix landing, not Google or Mapillary driving.
+**Until the recompute has run on production**, that is; it is the handle that removes the phantom rather than explaining it.
+
+**The recompute (#262) is the walk twin of `recompute_run_stats.py`.**
+It goes back to the two inputs `collect.py` had — the snapshot CSV, through the same `fileutils.load_city_csv_file` the collectors read it back with, and the frozen GraphML — and calls the collector's own `generate_samples`, `compute_streetwalk_coverage` and `build_streetwalk_geojson`, so it cannot drift from the collector (a test compares it against a fresh collection of the same responses).
+Three rules are load-bearing:
+
+- **It never fetches Overpass.** The network is read with `ox.load_graphml` from `naming.network_cache_path` and nowhere else; a missing GraphML refuses the walk, because `fetch_graph` falls through to a live fetch on a miss.
+- **It validates the sample frame instead of trusting the network.** `street_networks` is UNIQUE per (city, network type), so a `--refresh` overwrote the graph a walk was collected on; `street_walks.sample_points` is the cheap pre-check, then every regenerated sample must lie within `COORD_TOLERANCE_DEG` (1e-8°, ~1 mm) of exactly one of the CSV's unique query locations, and every location must be hit.
+- **Whole series or none.** One refused walk skips its (city, provider, network type) series, reported by name and counted per reason (missing GraphML, sample count, sample key, NULL column, missing CSV, error) with exit 1, so a history never mixes two definitions.
+  A series that spans a network refresh is therefore refused whole, even though its post-refresh walks alone could be repaired.
+
+**The frame match is tolerant, and it substitutes the CSV's coordinates, because exact keys refuse real walks over float noise.**
+Measured on dev-catalog walks, regenerated and CSV coordinates differ by up to ~1.4e-14°, and a few points per large walk sit on `quantize_coord`'s 9-decimal half-way boundary (Seattle gsv/drive: 5 of 247k), so an exact key match would refuse most large series with a message that reads like a refreshed network.
+Loosening only the check would not do: `compute_streetwalk_coverage` joins samples to rows on those same 9-decimal keys, so a boundary sample would silently score as uncovered — hence the substitution.
+The keys are taken from Python floats, as the scorer's own `zip` over a Series yields them; `round()` on an `np.float64` takes numpy's path, which can land a half-way value on the other side.
+Duplicate CSV rows are accepted and counted, exactly as the scorer's `drop_duplicates(keep="first")` accepts them.
+
+**What it cannot repair.** For a census walk (Mapillary, KartaView, Panoramax) the CSV is itself a derived join, already reduced to one row per sample with the provider's date rule applied, so a future change to a census-side date or status rule needs the census, which is not kept; this tool re-applies only what `compute_streetwalk_coverage` does.
+
+Dry run by default; `--execute` rewrites each stale coverage artifact (temp name, then `os.replace`), moves the rows (one transaction per series), and re-diffs every walk diff that disagrees with a diff of the recomputed artifacts through `compute_and_record_walk_diff` — including a MISSING row where a same-frame predecessor exists, which is also what heals a re-diff that failed between the orchestrator's committed delete and its write.
+`--catalog-only` moves the rows alone, and the report says what that costs: the site is left mixed, and each series' next nightly walk diffs against the OLD artifact and re-creates the phantom.
+The manifest is regenerated after any write.
+`--execute` re-checks for an in-flight `run-due` before each series' writes and re-selects the series' walk ids, abandoning a series that changed; neither sees a manual `collect` or `assess-city`.
+A diff's `diff_id` changes on a re-diff (the orchestrator deletes and re-inserts), which nothing reads: the manifest looks a diff up by its `to_walk_id`.
+The walk diff detail file is now written to a `.tmp` name and renamed in (`walk_diff.write_walk_diff_detail`), for the collector too, so a crash never leaves a truncated published file.
 
 **That phantom is publicly visible, and it outlives the walk that produced it.**
 It is not confined to the diff table: the delta reaches `street_walk_diffs`, from there the streetwalk manifest's `change` block, and from there the **"Δ coverage" column on `streets.html`** — a published number a reader has no way to distinguish from imagery churn.
 And unlike the coverage numbers themselves it does not wash out on the following walk: a `street_walk_diffs` row is an immutable record of one date pair, so recomputing `street_walks` and the artifacts does not by itself repair a diff already written.
-Issue #262 scopes that correctly — it recomputes affected diff rows through `walk_diff.compute_and_record_walk_diff` and regenerates the manifest, rather than stopping at coverage.
+The #262 recompute handles that — it re-diffs affected diff rows through `walk_diff.compute_and_record_walk_diff` and regenerates the manifest, rather than stopping at coverage.
 **The edge it had to handle was the published detail file, and #265 closed it locally.**
 `{city_id}_streetwalkdiff_...csv.gz` used to be written **only when a diff had changes** and never deleted, so a pair whose only change was the phantom delta recomputed to "no changes" and left the old, wrong file sitting in `data/`.
 The orchestrator now removes it (the row's pointer up front, the deterministic name on no changes), so re-diffing through `compute_and_record_walk_diff` is sufficient for `data/`.
 It is still not sufficient for the public server: the publish rsync never passes `--delete`, so a copy already published stays there until it is removed from the docroot by hand.
 Note also that the artifact cannot repair itself — its per-edge aggregates were already computed under the old definition, so the dropped `NO_DATE` samples are simply not in it, which rules out the cheap artifact-reading design `backfill_streetwalk_coverage.py` and `backfill_streetwalk_length.py` both use.
-Until #262 lands, the affected deltas are the FIRST walk diff of each series after 2026-08-24.
+Until `recompute_streetwalk_stats.py --execute` runs on production, the affected deltas are the FIRST walk diff of each series after 2026-08-24.
 Most will round to 0.0 — both providers sit at zero through p95 — but the tail renders: production's worst GSV run would shift **0.33** percentage points and its worst Mapillary run **2.7**, and 2.7 points is larger than most real run-to-run coverage changes, so it will read as a substantial imagery refresh rather than as noise.
 
 ## Overpass is on the critical path of every first road walk (issue #209)
