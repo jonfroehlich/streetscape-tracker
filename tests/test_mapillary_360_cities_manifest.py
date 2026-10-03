@@ -53,8 +53,10 @@ ASCII_SPELLING_OVERRIDES = {"2692969": "Malmo"}
 #     back to the node's bbox: 20.1x35.6 km (717 km2), ~15 km into countryside
 #     and the Oresund. The catalog was re-registered from "Copenhagen
 #     Municipality, Denmark" (17.7x13.3 km) with resize_city.py while it had no
-#     runs; this row is what keeps a fresh registration from re-freezing the bad
-#     box, since geometry is frozen and no later run can correct it.
+#     runs; this row makes a fresh registration's FIRST geocode attempt use the
+#     municipality query. It is not a full guarantee: register_frame.py still
+#     appends the bare "City, Country" fallback, so a transient geocode failure
+#     on the override would fall through to it.
 # An override changes only the GEOCODE query. Identity — and so the frozen
 # city_id — still comes from the GeoNames city/admin/country columns.
 QUERY_OVERRIDES = {
@@ -156,6 +158,10 @@ def test_query_strings_are_what_the_frame_generator_would_write(manifest_rows, g
         # An override that matches what the generator would write anyway is a
         # lie about why it exists — and would silently stop being tested.
         assert QUERY_OVERRIDES[gid] != generated, gid
+        # Nor may it be register_frame.geocode_queries' bare fallback, which is
+        # the query an override exists to avoid (for Copenhagen, the
+        # polygon-less node).
+        assert QUERY_OVERRIDES[gid] != f"{row['city']}, {row['country']}", gid
 
 
 def test_city_ids_are_the_pinned_permanent_slugs(manifest_rows):
