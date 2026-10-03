@@ -713,18 +713,28 @@ Staleness is deliberately not part of it, so the count tracks the set an operato
 It is never `count >= max`, which would re-alert every night forever, and a pair some other path pushes from 5 to 6 is in both snapshots and stays silent.
 It reaches `_finish_batch` as `newly_quarantined`: an `N QUARANTINED` subject part (the subject is what gets read at 03:00) and a paragraph naming each pair's count, `last_error` and its pasteable `reset-failures ... --execute` command, `--config` included.
 It is part of `unhealthy`, so it alerts regardless of `failure_threshold` — it is that pair's last email.
-It cannot change a night's exit status in practice: the failure that tripped it already made `attempted > succeeded`.
+It rarely changes a night's exit status, since the failure that tripped it already made `attempted > succeeded` in the same process — but not never: with two `run-due` processes overlapping, the one that did NOT record the failure still sees the pair enter between its snapshots, reports it as new, and exits 1 on a night whose own collections all succeeded.
 A separate email was rejected (the night email already carries every other condition), as was a per-night "realign blocked" email, which would duplicate the per-failure alert.
 
 **The standing set is counted on every `Done:` line while it is nonempty** — `; quarantined: 3 (kartaview 2, panoramax 1; 1 new tonight)` — over every enabled channel, not a filtered night's, so a `--provider mapillary` catch-up never reports a KartaView quarantine as gone.
 `status` marks each quarantined pair `QUARANTINED` in its failing-pairs list, from the same query, and prints the count with the clear command.
 
+**Both snapshots are guarded** (`_quarantine_snapshot`): the first runs ahead of the pre-loop backup and the second between the loop and `_finish_batch`, so an unguarded raise in either would cost the whole night or its whole tail — aggregate, manifests, backup, publish and the alert — for a reporting query.
+A raise is logged, named on the `Done:` line as `; quarantine check FAILED (before|after the night: <error>)`, and alerts on its own as a `QUARANTINE CHECK FAILED` subject part, since that is exactly the night a transition could go unreported.
+A failed FIRST snapshot means the transition is unknown, so nothing is reported as new: diffing against an empty set would call the whole standing set tonight's and re-alert every pair already alerted on.
+A failed second snapshot reports neither the transition nor the standing count that night.
+
 **What it does not catch**, named rather than argued away:
-a pair quarantined OUTSIDE `run-due` (an `assess-city` failure, say) is already in the next night's first snapshot, so it never alerts and appears only in the count; so does every pair a LOWERED `max_consecutive_failures` sweeps in at once.
+a pair that enters the set BETWEEN nights is already in the next night's first snapshot, so it never alerts and appears only in the count.
+`assess-city` is not one of those paths — it runs with `record_failures=False`, so a manual probe never increments `consecutive_failures` at all — but these are:
+a LOWERED `max_consecutive_failures`, which sweeps every pair between the old and new caps in at once;
+a re-enabled city whose counter was already at the cap;
+a re-enrolled channel (`enroll-city --clear`, or a bare enrol on an opt-in channel) over a row whose counter was already at the cap;
+and enabling a `[providers.X]` block, which brings that channel's at-cap rows into both snapshots at once.
 Two `run-due` processes overlapping could each see the same transition, and both would alert — once each.
 
 **The amnestied exit-code families can never reach it.**
-Blocked (75/76/81/84), busy (79/80/82/85), crawl-incomplete (83) and argv-rejected (2) record no `consecutive_failure`, so a host block never quarantines the city it stopped; `test_an_amnestied_outcome_never_quarantines_a_pair_one_failure_from_the_cap` pins each against a plain failure that does.
+Blocked (75/76/81/84), busy (79/80/82/85), crawl-incomplete (83) and argv-rejected (2) record no `consecutive_failure`, and neither does a child killed by the SIGTERM wind-down (#206), so a host block or a `systemctl stop` never quarantines the city it stopped; `test_an_amnestied_outcome_never_quarantines_a_pair_one_failure_from_the_cap` pins each against a plain failure that does.
 
 **`reset-failures CITY --channel C [--execute]`** is the way out, so the alert's fix is a command rather than SQL against the live catalog.
 It is DRY-RUN until `--execute`, and the preview prints the count, whether the pair is quarantined, and its `last_error`, so the cause is read before it is cleared.

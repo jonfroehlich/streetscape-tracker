@@ -9022,8 +9022,9 @@ def cmd_run_due(
     # tonight is reported exactly once -- "count >= max" would re-alert it every
     # night forever, since a quarantined pair keeps its count until cleared.
     # After the dry-run return: a preview writes no failure, so it has no
-    # transition to find.
-    quarantined_before = _quarantined_pairs(cfg, conn)
+    # transition to find. Guarded: this runs ahead of the pre-loop backup, so a
+    # raise here would lose the whole night (see _quarantine_snapshot).
+    quarantined_before, quarantine_before_error = _quarantine_snapshot(cfg, conn, "before")
 
     # Back up the catalog BEFORE the city loop, so the night has a verified
     # copy even if the process is SIGKILLed mid-loop (issue #145; the tail
@@ -9127,9 +9128,20 @@ def cmd_run_due(
         if fill_report is not None
         else ""
     )
-    # After the fill, so its failures count too (issue #421).
-    quarantined = _quarantined_pairs(cfg, conn)
-    newly_quarantined = _newly_quarantined(quarantined_before, quarantined)
+    # After the fill, so its failures count too (issue #421). Guarded, because
+    # a raise here would cost the whole tail (see _quarantine_snapshot).
+    quarantined, quarantine_after_error = _quarantine_snapshot(cfg, conn, "after")
+    quarantine_error = "; ".join(e for e in (quarantine_before_error, quarantine_after_error) if e)
+    if quarantined is None:
+        quarantined = []
+    # A failed BEFORE snapshot means the transition is UNKNOWN, not that every
+    # quarantined pair is new: diffing against an empty set would report the
+    # whole standing set as tonight's, and re-alert pairs already alerted on.
+    newly_quarantined = (
+        _newly_quarantined(quarantined_before, quarantined)
+        if quarantined_before is not None
+        else []
+    )
     summary = (
         f"run-due {today}{filter_note}: {succeeded}/{attempted} runs succeeded across "
         f"{processed} cities{cities_note} in {elapsed_h:.2f} h"
@@ -9203,6 +9215,7 @@ def cmd_run_due(
         # transition alerts once, and this is what keeps the set from being
         # forgotten after that one email.
         + _quarantine_summary_note(quarantined, newly_quarantined)
+        + (f"; {quarantine_error}" if quarantine_error else "")
         + (f"; stopped early ({stop_reason})" if stop_reason else "")
         + (f"; {plan_error}" if plan_error else "")
     )
@@ -9222,6 +9235,7 @@ def cmd_run_due(
         busy_hosts=busy_hosts,
         rejected_argv=rejected_argv,
         newly_quarantined=newly_quarantined,
+        quarantine_error=quarantine_error or None,
     )
 
 
@@ -12654,8 +12668,9 @@ def _stranded_alert_note(cfg: SchedulerConfig, breaker: HostBreaker, today: date
 # - the STANDING set is counted on every `Done:` line while it is nonempty, so
 #   it cannot be forgotten once the one email has scrolled away.
 #
-# The amnestied exit-code families (blocked / busy / crawl-incomplete) never
-# increment the counter, so none of them can reach either signal -- pinned by
+# The amnestied exit-code families (blocked / busy / crawl-incomplete /
+# argv-rejected) and a child killed by the SIGTERM wind-down never increment
+# the counter, so none of them can reach either signal -- pinned by
 # test_an_amnestied_outcome_never_quarantines_a_pair_one_failure_from_the_cap.
 
 
@@ -12672,6 +12687,24 @@ def _quarantined_pairs(cfg: SchedulerConfig, conn) -> list:
         default_membership=CHANNEL_DEFAULT_MEMBERSHIP,
         max_consecutive_failures=cfg.max_consecutive_failures,
     )
+
+
+def _quarantine_snapshot(cfg: SchedulerConfig, conn, when: str) -> tuple[list | None, str | None]:
+    """``_quarantined_pairs``, guarded: ``(rows, None)``, or ``(None, error)`` on any exception.
+
+    Both of ``cmd_run_due``'s snapshots sit where a raise costs the most: the
+    BEFORE one ahead of the pre-loop backup (the whole night), the AFTER one
+    between the loop and ``_finish_batch`` (aggregate, manifests, backup,
+    publish and the alert). A reporting query must never cost either, so a
+    failure is logged and returned as a ``Done:``-line clause instead -- the
+    same posture as ``_tail_artifact``. ``when`` ("before"/"after") names the
+    snapshot in that clause.
+    """
+    try:
+        return _quarantined_pairs(cfg, conn), None
+    except Exception as exc:
+        logger.exception(f"Quarantine check ({when} the night) failed")
+        return None, f"quarantine check FAILED ({when} the night: {type(exc).__name__}: {exc})"
 
 
 def _newly_quarantined(before: Sequence, after: Sequence) -> list:
@@ -12785,6 +12818,7 @@ def _finish_batch(
     rejected_argv: ArgvRejections | None = None,
     crashed: str = "LOOP",
     newly_quarantined: Sequence | None = None,
+    quarantine_error: str | None = None,
 ) -> int:
     """Rebuild the published indexes, back up the catalog, publish, alert.
 
@@ -12838,6 +12872,12 @@ def _finish_batch(
     with a paragraph naming each pair and its ``reset-failures`` command,
     because it is the last email that pair can ever produce: from tomorrow it
     is not attempted, so it cannot fail again.
+
+    ``quarantine_error`` is set when either quarantine snapshot raised
+    (``_quarantine_snapshot``). The ``summary`` already carries it as a clause;
+    it is passed separately because it alerts on its own, as ``QUARANTINE CHECK
+    FAILED``: a failed check is exactly the night a transition could go
+    unreported, and that transition's email is the only one the pair gets.
     """
     # Every index rebuild goes through _tail_artifact, which reports a failure
     # instead of propagating it — see there for why a lost tail is the worse
@@ -13028,6 +13068,9 @@ def _finish_batch(
         # The night a pair ENTERS quarantine (issue #421). Unconditional rather
         # than left to failure_threshold: it is that pair's last email.
         newly_quarantined,
+        # ...and the night the check that would have SEEN that transition
+        # failed, for the same reason.
+        quarantine_error,
         # Deliberately NOT `blocked_hosts.stranded` (issue #373): a host
         # stranding already alerts through its host condition, and a DEADLINE
         # stranding alone is routine once nights end on the deadline -- the
@@ -13079,6 +13122,8 @@ def _finish_batch(
             parts.append(f"{sum(rejected_argv.values())} launch(es) REJECTED by our own CLI")
         if newly_quarantined:
             parts.append(f"{len(newly_quarantined)} QUARANTINED")
+        if quarantine_error:
+            parts.append("QUARANTINE CHECK FAILED")
         # The failure count is the subject on an ordinary bad night, and noise
         # ("0 failed collection(s)") when something above already carries it.
         if failures or not any(unhealthy):

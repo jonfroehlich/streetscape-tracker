@@ -11,15 +11,23 @@ channel each alerted, and night 6 onward was silent. These tests pin, in order:
 * the live night: the TRANSITION alerts once (as a subject part of the night
   email, past `failure_threshold`), a later night does not re-alert, and the
   `Done:` line carries the standing count only while it is nonzero;
-* the amnestied exit-code families can never reach the cap, against a plain
-  failure as the positive control that does;
+* a FILL failure that reaches the cap is a transition too (the after-snapshot
+  is taken behind the fill, not behind the due loop);
+* a raising quarantine snapshot -- before or after the night -- costs neither
+  the collection nor the tail, and alerts as a failed check rather than as a
+  transition nobody observed;
+* the amnestied exit-code families (and a child killed by the SIGTERM
+  wind-down) can never reach the cap, against a plain failure as the positive
+  control that does;
 * `scheduler status` marks the quarantined pair;
 * `reset-failures`: dry run by default, `--execute` writes, and bad input
   exits 64 having written nothing.
 """
 
 import logging
-from datetime import date
+import os
+import signal
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
@@ -98,8 +106,14 @@ def _failures(conn, city_id, provider):
     return None if row is None else row["consecutive_failures"]
 
 
-def _night(monkeypatch, conn, cfg, run_one, today=TODAY, caplog=None):
-    """Drive one real ``cmd_run_due`` with a fake collector; return (rc, alerts, done)."""
+def _night(monkeypatch, conn, cfg, run_one, today=TODAY, caplog=None, tail=None):
+    """Drive one real ``cmd_run_due`` with a fake collector; return (rc, alerts, done).
+
+    ``tail``, when given, is a list the night's tail steps append their names to
+    (``aggregate``, ``manifest``, ``publish``), so a test can tell a night whose
+    tail ran from one that died before it.
+    """
+    tail = [] if tail is None else tail
     monkeypatch.setattr(
         sched,
         "_run_one_city",
@@ -107,9 +121,11 @@ def _night(monkeypatch, conn, cfg, run_one, today=TODAY, caplog=None):
     )
     monkeypatch.setattr(sched.db, "connect", lambda path: conn)
     monkeypatch.setattr(sched.time, "sleep", lambda s: None)
-    monkeypatch.setattr(sched, "generate_aggregate_v2", lambda c, d: None)
-    monkeypatch.setattr(sched, "generate_streetwalk_manifest", lambda c, d: {})
-    monkeypatch.setattr(sched, "_publish", lambda cfg, summary, **kw: 0)
+    monkeypatch.setattr(sched, "generate_aggregate_v2", lambda c, d: tail.append("aggregate"))
+    monkeypatch.setattr(
+        sched, "generate_streetwalk_manifest", lambda c, d: tail.append("manifest") or {}
+    )
+    monkeypatch.setattr(sched, "_publish", lambda cfg, summary, **kw: tail.append("publish") or 0)
     alerts = []
     monkeypatch.setattr(
         sched, "send_alert", lambda c, subject, body: alerts.append((subject, body))
@@ -283,6 +299,14 @@ def test_a_pair_already_over_the_cap_that_fails_again_is_not_a_new_transition():
     assert sched._newly_quarantined(after, after) == []
 
 
+def _killed_by_the_stop():
+    """A child that dies of the SIGTERM stopping the batch, as systemd's
+    control-group kill delivers it: the stop is requested while it runs, and it
+    exits -15, which is in no amnestied exit-code family on its own."""
+    os.kill(os.getpid(), signal.SIGTERM)
+    return CollectionOutcome(False, "exited -15", exit_code=-15)
+
+
 @pytest.mark.parametrize(
     "outcome",
     [
@@ -302,6 +326,10 @@ def test_a_pair_already_over_the_cap_that_fails_again_is_not_a_new_transition():
             CollectionOutcome(False, "argv", exit_code=ARGV_REJECTED_EXIT_CODE),
             id="argv-rejected",
         ),
+        # The #206 wind-down: the child fails BECAUSE the stop's SIGTERM reached
+        # its cgroup, so the stop is credited rather than the city. A callable,
+        # because the signal has to arrive while the child is in flight.
+        pytest.param(_killed_by_the_stop, id="sigterm-wind-down"),
     ],
 )
 def test_an_amnestied_outcome_never_quarantines_a_pair_one_failure_from_the_cap(
@@ -323,10 +351,13 @@ def test_an_amnestied_outcome_never_quarantines_a_pair_one_failure_from_the_cap(
             monkeypatch,
             conn,
             _cfg(),
-            lambda city, p: True if p == "gsv" else outcome,
+            lambda city, p: True if p == "gsv" else (outcome() if callable(outcome) else outcome),
             caplog=caplog,
         )
 
+    if callable(outcome):
+        # Not vacuous: the child really did land in the stop's amnesty branch.
+        assert "child was killed by the stop signal" in caplog.text
     assert _failures(conn, cid, "mapillary") == CAP - 1
     assert not any("QUARANTINED" in subject for subject, _body in alerts)
     assert "quarantined" not in done
@@ -340,6 +371,127 @@ def test_the_positive_control_a_plain_failure_one_from_the_cap_does_quarantine(c
     )
     assert _failures(conn, cid, "mapillary") == CAP
     assert any("QUARANTINED" in subject for subject, _body in alerts)
+
+
+def test_a_fill_failure_that_reaches_the_cap_is_reported_as_a_transition(conn, monkeypatch, caplog):
+    """The after-snapshot sits behind the FILL (issue #404), not the due loop.
+
+    The fill admits only a city with no failure since its last success on a
+    default channel, so it adds at most one -- which reaches the cap only at
+    `max_consecutive_failures = 1`, the setting this test runs at. Nothing is
+    due (both channels succeeded 60 days ago: past the 30-day floor, short of
+    the 83-day due wall), so the ONLY failure of the night is the fill's.
+    Taking the snapshot right after `_run_city_loop` would miss it.
+    """
+    cid = _register(conn, "Bend")
+    stamp = (datetime.combine(TODAY, datetime.min.time(), UTC) - timedelta(days=60)).isoformat()
+    for provider in ("gsv", "mapillary"):
+        conn.execute(
+            """INSERT INTO schedule_state
+               (city_id, provider, day_of_cycle, last_attempt_at, last_success_at,
+                consecutive_failures)
+               VALUES (?, ?, 0, ?, ?, 0)""",
+            (cid, provider, stamp, stamp),
+        )
+    conn.commit()
+    ran = []
+
+    def run_one(city, p):
+        ran.append(p)
+        return True if p == "gsv" else _failing("the fill's tile host said 500")
+
+    with caplog.at_level(logging.INFO, logger="streetscape_scheduler"):
+        rc, alerts, done = _night(
+            monkeypatch,
+            conn,
+            _cfg(fill_min_days=30, max_consecutive_failures=1),
+            run_one,
+            caplog=caplog,
+        )
+
+    assert ran == ["gsv", "mapillary"], "the fill must be what ran the city"
+    assert "1 fill" in done
+    assert _failures(conn, cid, "mapillary") == 1
+    assert rc == 1
+    assert len(alerts) == 1
+    subject, body = alerts[0]
+    assert "1 QUARANTINED" in subject
+    assert f"{cid} [mapillary]: 1 consecutive failure(s)" in body
+    assert "; quarantined: 1 (mapillary 1; 1 new tonight)" in done
+
+
+@pytest.mark.parametrize("failing_call", ["before", "after"])
+def test_a_raising_quarantine_check_costs_neither_the_night_nor_its_tail(
+    conn, monkeypatch, caplog, failing_call
+):
+    """Each snapshot raises in turn; the night still collects, publishes and alerts.
+
+    BEFORE sits ahead of the pre-loop backup (a raise there was the whole
+    night); AFTER sits between the loop and `_finish_batch` (a raise there was
+    the aggregate, manifests, backup, publish and the alert). Either failure is
+    named on the Done line and alerts on its own -- `failure_threshold` is 99 and
+    every collection succeeds, so nothing else here sends mail.
+
+    A standing pair already at the cap is the trap for the BEFORE case: with no
+    before-set, diffing against an empty one would report it as new tonight
+    and re-alert a pair that was alerted on when it entered quarantine.
+    """
+    cid = _register(conn, "Bend")
+    standing = _register(conn, "Corvallis")
+    _set_failures(conn, standing, "mapillary", CAP)
+    real = sched._quarantined_pairs
+    calls = []
+
+    def flaky(cfg, c):
+        calls.append(1)
+        if len(calls) == (1 if failing_call == "before" else 2):
+            raise RuntimeError("database disk image is malformed")
+        return real(cfg, c)
+
+    monkeypatch.setattr(sched, "_quarantined_pairs", flaky)
+    backups = []
+    real_backup = sched.catalog_backup.write_backup
+    monkeypatch.setattr(
+        sched.catalog_backup,
+        "write_backup",
+        lambda *a, **k: backups.append(1) or real_backup(*a, **k),
+    )
+    ran, tail = [], []
+
+    def run_one(city, p):
+        ran.append((city.city_id, p))
+        return True
+
+    with caplog.at_level(logging.INFO, logger="streetscape_scheduler"):
+        rc, alerts, done = _night(
+            monkeypatch,
+            conn,
+            _cfg(publish_enabled=True),
+            run_one,
+            caplog=caplog,
+            tail=tail,
+        )
+
+    assert len(calls) == 2, "both snapshots were attempted"
+    assert (cid, "gsv") in ran and (cid, "mapillary") in ran, "the night still collected"
+    assert tail == ["aggregate", "manifest", "publish"], "and its tail still ran"
+    assert len(backups) == 2, "both the pre-loop and the tail backup ran"
+    assert done is not None
+    assert (
+        f"; quarantine check FAILED ({failing_call} the night: RuntimeError: "
+        "database disk image is malformed)"
+    ) in done
+    assert rc == 1
+    assert len(alerts) == 1
+    subject, body = alerts[0]
+    assert "QUARANTINE CHECK FAILED" in subject
+    assert "quarantine check FAILED" in body
+    # Never a transition read off a missing snapshot.
+    assert "QUARANTINED" not in subject.replace("QUARANTINE CHECK FAILED", "")
+    assert "new tonight" not in done
+    if failing_call == "before":
+        # The after-set is still known, so the standing count is still reported.
+        assert "; quarantined: 1 (mapillary 1)" in done
 
 
 # ── status ───────────────────────────────────────────────────────────────────
