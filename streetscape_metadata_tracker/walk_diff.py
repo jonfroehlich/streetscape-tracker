@@ -297,9 +297,16 @@ def compute_walk_diff(fc_old: dict, fc_new: dict) -> WalkDiff:
 
 
 def write_walk_diff_detail(diff: WalkDiff, output_path: str) -> None:
-    """Write the diff's detail rows as a gzipped CSV."""
-    with gzip.open(output_path, "wt", encoding="utf-8", newline="") as f:
+    """Write the diff's detail rows as a gzipped CSV.
+
+    Written beside the final name and renamed in, so a crash mid-write never
+    leaves a truncated published file at the deterministic name (the ``.tmp``
+    suffix is outside the publish rsync's ``*.csv.gz`` whitelist).
+    """
+    tmp_path = output_path + ".tmp"
+    with gzip.open(tmp_path, "wt", encoding="utf-8", newline="") as f:
         diff.detail.to_csv(f, index=False)
+    os.replace(tmp_path, output_path)
     logger.info(f"Wrote walk diff detail ({len(diff.detail)} rows) to {output_path}")
 
 

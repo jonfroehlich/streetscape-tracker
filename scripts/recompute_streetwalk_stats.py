@@ -20,46 +20,71 @@ GraphML -- and calls the collector's own functions: `generate_samples`,
 `compute_streetwalk_coverage`, `build_streetwalk_geojson`. `spacing_m`,
 `match_dist_m`, `run_date`, `provider` and `network_type` come off the row.
 
-What makes a walk REFUSED (and its whole series skipped, untouched):
+What it can repair, and what it cannot. It re-applies whatever
+`compute_streetwalk_coverage` does to the CSV's rows (the PRESENT vocabulary,
+the GSV copyright gate, the match distance). For a CENSUS walk (Mapillary,
+KartaView, Panoramax) the CSV is itself a derived join -- the census rows were
+already reduced to one row per sample, with the provider's date rule already
+applied -- so a future change to a census-side date or status rule cannot be
+repaired here; that needs the census, which is not kept.
 
-- **No frozen GraphML on disk.** The network is loaded with `ox.load_graphml`
-  from `naming.network_cache_path` and from nowhere else. This script never
-  calls `download_street_network.fetch_graph`, which falls through to Overpass
-  on a cache miss -- the per-IP volunteer service that banned makelab2. A
-  sweep over a few hundred walks must not make even one request.
-- **The regenerated sample frame is not the CSV's.** `street_networks` is
-  UNIQUE per (city, network_type), so a `--refresh` overwrote the network in
-  place and the graph a walk was collected on may be gone. Rather than reason
-  about `fetched_at`, the frame is validated directly: `quantize_coord` over the
-  regenerated samples must give EXACTLY the CSV's key set -- same count, same
-  keys, no duplicate CSV rows -- with `street_walks.sample_points` as the cheap
-  pre-check. Scoring a walk against a frame it never observed would be silent.
-- A missing snapshot CSV, a NULL `spacing_m`/`match_dist_m`/`coverage_filename`
-  (nothing to reproduce the collection with, or nowhere to publish it), or any
+What makes a walk REFUSED (and its whole series skipped, untouched), counted
+per reason in the summary:
+
+- **missing GraphML.** The network is loaded with `ox.load_graphml` from
+  `naming.network_cache_path` and from nowhere else. This script never calls
+  `download_street_network.fetch_graph`, which falls through to Overpass on a
+  cache miss -- the per-IP volunteer service that banned makelab2. A sweep over
+  a few hundred walks must not make even one request.
+- **sample count mismatch / sample key mismatch.** `street_networks` is UNIQUE
+  per (city, network_type), so a `--refresh` overwrote the network in place and
+  the graph a walk was collected on may be gone. Rather than reason about
+  `fetched_at`, the frame is validated directly. `street_walks.sample_points`
+  is the cheap pre-check; then every regenerated sample must lie within
+  COORD_TOLERANCE_DEG of exactly one of the CSV's unique query locations, and
+  every one of those locations must be hit. A tolerance, not exact 9-decimal
+  keys, because the regenerated floats and the CSV's differ by ~1 ULP (measured
+  up to 1.4e-14 deg on dev-catalog walks), and a handful of points per large
+  walk sit exactly on `quantize_coord`'s half-way boundary, so exact keys
+  would refuse most large series for float noise. The CSV's coordinates are
+  then SUBSTITUTED into the samples before scoring, because
+  `compute_streetwalk_coverage` joins on those same 9-decimal keys and would
+  otherwise silently score a boundary sample as uncovered. Duplicate CSV rows
+  (one location twice) are accepted and counted, exactly as the collector's
+  own `drop_duplicates(keep="first")` accepts them.
+- **NULL column / missing CSV / recompute error.** A NULL
+  `spacing_m`/`match_dist_m`/`coverage_filename` (nothing to reproduce the
+  collection with, or nowhere to publish it), a missing snapshot CSV, or any
   exception while loading or recomputing.
 
 **Whole series in one pass.** Per (city, provider, network_type) every walk is
 recomputed in memory first; one refusal skips the series, so a city's walk
 history never mixes two definitions. A refused series is reported by name and
-makes the pass exit 1.
+makes the pass exit 1. A series that spans a network refresh is therefore
+refused whole, even though its post-refresh walks alone could be repaired.
 
 What --execute writes, per series that moved:
 
-1. With --regenerate-artifacts, each stale `*_coverage.json.gz` (written to a
-   temp name and `os.replace`d, so a crash never leaves a truncated artifact).
+1. Each stale `*_coverage.json.gz` (written to a temp name and `os.replace`d,
+   so a crash never leaves a truncated artifact).
 2. The `street_walks` stat columns, in ONE transaction for the series:
    edges_total, edges_fully_covered, mean_edge_coverage,
    coverage_pct_by_length, coverage_pct_by_length_any, coverage_by_highway,
    length_km, length_km_covered, length_km_covered_any,
    median_covered_age_years.
-3. With --regenerate-artifacts, every EXISTING `street_walk_diffs` row of the
-   series whose recomputation disagrees with what is stored (counters,
-   `from_walk_id`, detail pointer, detail file presence or content), re-diffed
-   through the collector's own `walk_diff.compute_and_record_walk_diff`, which
-   since #265 removes a detail file a no-changes diff no longer has. A walk
-   with no diff row gets none: inventing a diff is the collector's job.
-   Without the flag the artifacts on disk are still old-definition, which is
-   what a diff reads, so stale diffs are reported and left alone.
+3. Every walk diff that disagrees with a diff of the recomputed artifacts --
+   an existing row whose counters, `from_walk_id`, detail pointer or detail
+   file (presence or content) differ, a row the orchestrator would now remove
+   (no same-frame predecessor), and a MISSING row for a walk that has a
+   same-frame predecessor -- re-diffed through the collector's own
+   `walk_diff.compute_and_record_walk_diff`. Since #265 that removes a detail
+   file a no-changes diff no longer has.
+
+`--catalog-only` writes step 2 alone. That leaves the site MIXED: the catalog
+and manifest say one definition, the published per-edge artifacts and change
+blocks the other -- and each series' next nightly walk diffs against the OLD
+artifact on disk, which re-creates the very phantom delta this tool exists to
+remove. The report says so whenever the flag is used.
 
 Then `streetwalks.json.gz` is regenerated (its headline stats AND its `change`
 block both read what this pass changed), guarded so a manifest failure reports
@@ -67,30 +92,39 @@ rather than making a committed repair look failed.
 
 The snapshot CSV is never rewritten: it records what the provider said.
 
-Idempotent: a series whose rows, artifacts and diffs already agree with the
-recomputation is untouched, and a re-run heals a pass that crashed between
-steps (rows and diffs are compared against the in-memory recomputation, not
-against whether an artifact was just written).
+Idempotent, and a re-run heals an interrupted pass. A series whose rows,
+artifacts and diffs already agree with the recomputation is untouched. Rows and
+diffs are compared against the in-memory recomputation, never against whether
+this pass wrote something, so a crash after the artifacts but before the rows
+is finished by the next pass. `compute_and_record_walk_diff` deletes a walk's
+diff row (committed) before it writes the new one, so a re-diff that fails in
+between leaves NO row; the next pass sees a same-frame predecessor with no row
+and records it.
 
 Nothing is rsynced: publish afterwards (`scheduler regenerate-aggregate
 --publish`, or `./sync_data_to_server.sh`). The publish never passes rsync
 `--delete`, so a walk diff detail file REMOVED here stays on the web server
 until removed there; the script lists those names.
 
-Concurrency, the catalog, and exit status follow `recompute_run_diffs.py`:
---execute is refused while a `run-due` is in flight on this machine; a dry run
-opens the catalog read-only (`open_catalog_readonly`) and writes nothing; a
-missing, other-version or empty catalog is refused. Exit 0 when every series
-was recomputed or left alone; 1 when a series was refused or a step failed; 2
-for an argument error; 64 for a refusal (catalog, unknown --city, in flight).
+Concurrency. --execute is refused while a `run-due` is in flight on this
+machine, and that is re-checked before each series' writes (the pass stops at
+the first series that finds one); each series' walk ids are also re-selected
+before writing and the series is abandoned if they changed. Neither can see a
+manual `collect` or `assess-city`, which are not `run-due`: do not run one
+alongside this. A dry run opens the catalog read-only (`open_catalog_readonly`)
+and writes nothing; a missing, other-version or empty catalog is refused.
+
+Exit 0 when every series was recomputed or left alone; 1 when a series was
+refused, abandoned or a step failed; 2 for an argument error; 64 for a refusal
+(catalog, unknown --city, run-due in flight at the start).
 
 Catalog/disk only: no API calls, no Overpass, no network of any kind.
 
 Usage:
     python scripts/recompute_streetwalk_stats.py                       # dry run
     python scripts/recompute_streetwalk_stats.py --provider mapillary  # filter
-    python scripts/recompute_streetwalk_stats.py --execute             # catalog only
-    python scripts/recompute_streetwalk_stats.py --regenerate-artifacts --execute
+    python scripts/recompute_streetwalk_stats.py --execute             # apply
+    python scripts/recompute_streetwalk_stats.py --execute --catalog-only
 """
 
 import argparse
@@ -100,9 +134,11 @@ import logging
 import math
 import os
 import sys
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date
 
+import numpy as np
 import osmnx as ox
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -175,9 +211,34 @@ DIFF_COLUMNS = (
     "coverage_pct_by_length_any_delta",
 )
 
+# How far a regenerated sample may sit from its CSV query location and still be
+# the same point: ~1 mm. Float noise is ~1e-14 deg; the closest two distinct
+# sample locations can be is set by --spacing (metres, so ~1e-5 deg).
+COORD_TOLERANCE_DEG = 1e-8
+# Hash-grid cell for the tolerance search; must exceed 2 * COORD_TOLERANCE_DEG
+# so a neighbour within tolerance is always in one of the 9 surrounding cells.
+_CELL_DEG = 1e-6
+
+# Refusal reasons, in summary order.
+MISSING_GRAPHML = "missing GraphML"
+COUNT_MISMATCH = "sample count mismatch"
+KEY_MISMATCH = "sample key mismatch"
+NULL_COLUMN = "NULL column"
+MISSING_CSV = "missing CSV"
+RECOMPUTE_ERROR = "recompute error"
+REASONS = (MISSING_GRAPHML, COUNT_MISMATCH, KEY_MISMATCH, NULL_COLUMN, MISSING_CSV, RECOMPUTE_ERROR)
+
 
 class WalkRefused(Exception):
     """This walk cannot be recomputed faithfully; its whole series is skipped."""
+
+    def __init__(self, reason: str, message: str):
+        super().__init__(message)
+        self.reason = reason
+
+
+class RunDueStarted(Exception):
+    """A run-due began during an --execute pass; stop before the next write."""
 
 
 @dataclass
@@ -189,9 +250,11 @@ class Report:
     unchanged_series: int = 0
     changed_walks: list = field(default_factory=list)
     changed_diffs: list = field(default_factory=list)
-    stale_diffs_left: list = field(default_factory=list)  # no --regenerate-artifacts
+    left_stale: list = field(default_factory=list)  # what --catalog-only did not write
     refused: list = field(default_factory=list)
+    refusal_reasons: Counter = field(default_factory=Counter)
     failed: list = field(default_factory=list)
+    notes: list = field(default_factory=list)  # float-noise matches, duplicate rows
     artifacts_written: int = 0
     rows_updated: int = 0
     removed_files: list = field(default_factory=list)
@@ -260,8 +323,9 @@ def load_frozen_edges(city_id: str, data_dir: str, network_type: str):
     path = network_cache_path(city_id, data_dir, network_type)
     if not os.path.isfile(path):
         raise WalkRefused(
+            MISSING_GRAPHML,
             f"no frozen {network_type} network at {path}; refusing rather than "
-            "fetching it from Overpass"
+            "fetching it from Overpass",
         )
     return graph_to_edges(ox.load_graphml(path))
 
@@ -273,38 +337,119 @@ def _spacing_arg(spacing_m: float):
     return int(value) if value.is_integer() else value
 
 
-def recompute_walk(row, edges, data_dir: str) -> Recomputed:
+def _cells(lat: float, lon: float) -> tuple[int, int]:
+    return (math.floor(lat / _CELL_DEG), math.floor(lon / _CELL_DEG))
+
+
+def match_frame(samples, df):
+    """
+    Match the regenerated ``samples`` to the CSV's unique query locations within
+    COORD_TOLERANCE_DEG, and return ``(samples_on_csv_coords, n_noise, n_dup)``.
+
+    The CSV's unique locations are taken exactly as ``compute_streetwalk_coverage``
+    takes them -- one per 9-decimal key, first row wins -- so ``n_dup`` counts the
+    rows it would drop too. Every sample must hit exactly one location within the
+    tolerance and every location must be hit; otherwise WalkRefused. The returned
+    copy carries the CSV's coordinates, so the scorer's own key join is exact.
+    ``n_noise`` counts samples whose exact key differed (float noise).
+    """
+    keys = [quantize_coord(la, lo) for la, lo in zip(df["query_lat"], df["query_lon"], strict=True)]
+    first = {}
+    for i, key in enumerate(keys):
+        first.setdefault(key, i)
+    n_dup = len(keys) - len(first)
+    qlat = df["query_lat"].to_numpy(dtype=float)
+    qlon = df["query_lon"].to_numpy(dtype=float)
+    loc_lat = np.array([qlat[i] for i in first.values()], dtype=float)
+    loc_lon = np.array([qlon[i] for i in first.values()], dtype=float)
+    key_to_loc = {key: n for n, key in enumerate(first)}
+
+    grid: dict = {}
+    for n, (la, lo) in enumerate(zip(loc_lat, loc_lon, strict=True)):
+        grid.setdefault(_cells(la, lo), []).append(n)
+
+    def near(la, lo, tol):
+        ci, cj = _cells(la, lo)
+        return [
+            n
+            for di in (-1, 0, 1)
+            for dj in (-1, 0, 1)
+            for n in grid.get((ci + di, cj + dj), ())
+            if abs(loc_lat[n] - la) <= tol and abs(loc_lon[n] - lo) <= tol
+        ]
+
+    # Two CSV locations closer than twice the tolerance would make a sample's
+    # match ambiguous; nothing the collector writes is that close.
+    crowded = sum(
+        1
+        for la, lo in zip(loc_lat, loc_lon, strict=True)
+        if len(near(la, lo, 2 * COORD_TOLERANCE_DEG)) > 1
+    )
+    if crowded:
+        raise WalkRefused(
+            KEY_MISMATCH,
+            f"sample key mismatch: {crowded} CSV locations lie within "
+            f"{2 * COORD_TOLERANCE_DEG:g} deg of another, so samples cannot be matched",
+        )
+
+    # Python floats, as the scorer's own `zip` over a Series yields them:
+    # round() on an np.float64 takes numpy's path, which can land a half-way
+    # value on the other side of quantize_coord's boundary.
+    s_lat = samples["lat"].astype(float).tolist()
+    s_lon = samples["lon"].astype(float).tolist()
+    assigned = np.empty(len(samples), dtype=np.int64)
+    unmatched = n_noise = 0
+    for i, (la, lo) in enumerate(zip(s_lat, s_lon, strict=True)):
+        n = key_to_loc.get(quantize_coord(la, lo))
+        if n is None:
+            hits = near(la, lo, COORD_TOLERANCE_DEG)
+            if len(hits) != 1:
+                unmatched += 1
+                assigned[i] = -1
+                continue
+            n = hits[0]
+            n_noise += 1
+        assigned[i] = n
+    hit = set(assigned[assigned >= 0].tolist())
+    unhit = len(first) - len(hit)
+    if unmatched or unhit:
+        raise WalkRefused(
+            KEY_MISMATCH,
+            f"sample key mismatch: {unmatched} of {len(samples)} regenerated samples "
+            f"match no CSV location within {COORD_TOLERANCE_DEG:g} deg, and "
+            f"{unhit} of the CSV's {len(first)} locations match no sample",
+        )
+    out = samples.copy()
+    out["lat"] = loc_lat[assigned]
+    out["lon"] = loc_lon[assigned]
+    return out, n_noise, n_dup
+
+
+def recompute_walk(row, edges, data_dir: str, report: Report) -> Recomputed:
     """Recompute one walk in memory. Raises WalkRefused on any input mismatch."""
     for column in ("spacing_m", "match_dist_m", "coverage_filename"):
         if row[column] is None:
-            raise WalkRefused(f"{column} is NULL; the collection cannot be reproduced")
+            raise WalkRefused(NULL_COLUMN, f"{column} is NULL; the collection cannot be reproduced")
     csv_path = os.path.join(data_dir, row["csv_filename"])
     if not os.path.isfile(csv_path):
-        raise WalkRefused(f"snapshot CSV missing ({row['csv_filename']})")
+        raise WalkRefused(MISSING_CSV, f"snapshot CSV missing ({row['csv_filename']})")
 
     spacing = _spacing_arg(row["spacing_m"])
     match_dist = float(row["match_dist_m"])
     samples = generate_samples(edges, spacing)
     if row["sample_points"] is not None and int(row["sample_points"]) != len(samples):
         raise WalkRefused(
+            COUNT_MISMATCH,
             f"the frozen network yields {len(samples)} samples at {spacing} m, the walk "
-            f"recorded {row['sample_points']}: the network was refreshed since this walk"
+            f"recorded {row['sample_points']}: the network was refreshed since this walk",
         )
 
     df = load_city_csv_file(csv_path)
-    sample_keys = {
-        quantize_coord(la, lo) for la, lo in zip(samples["lat"], samples["lon"], strict=True)
-    }
-    csv_keys = [
-        quantize_coord(la, lo) for la, lo in zip(df["query_lat"], df["query_lon"], strict=True)
-    ]
-    csv_key_set = set(csv_keys)
-    if len(csv_keys) != len(csv_key_set) or csv_key_set != sample_keys:
-        raise WalkRefused(
-            f"sample frame mismatch: the CSV has {len(csv_keys)} rows over "
-            f"{len(csv_key_set)} locations, the frozen network yields {len(sample_keys)}; "
-            f"{len(sample_keys - csv_key_set)} regenerated locations are not in the CSV "
-            f"and {len(csv_key_set - sample_keys)} CSV locations are not regenerated"
+    samples, n_noise, n_dup = match_frame(samples, df)
+    if n_noise or n_dup:
+        report.notes.append(
+            f"{_label(row)}: {n_noise} samples matched within {COORD_TOLERANCE_DEG:g} deg "
+            f"(float noise), {n_dup} duplicate CSV rows ignored as the collector ignores them"
         )
 
     covered = compute_streetwalk_coverage(
@@ -350,30 +495,37 @@ def _detail_matches(path: str, detail) -> bool:
         return False
 
 
+def _same_frame(prev: Recomputed, cur: Recomputed) -> bool:
+    """compute_and_record_walk_diff's own gate: same spacing AND match distance."""
+    return float(prev.row["spacing_m"]) == float(cur.row["spacing_m"]) and float(
+        prev.row["match_dist_m"]
+    ) == float(cur.row["match_dist_m"])
+
+
 def stale_diffs(conn, recomputed: list, data_dir: str) -> list:
     """
-    The series' existing street_walk_diffs rows that disagree with a diff of the
-    RECOMPUTED artifacts, as (to_walk Recomputed, stored row, description).
+    The series' walk diffs that disagree with a diff of the RECOMPUTED artifacts,
+    as (to_walk Recomputed, stored row or None, description).
 
     The predecessor is the previous walk of the series, which is what
     `db.get_previous_street_walk` returns (the series is in run_date order and a
-    date is unique within it). A row the orchestrator would DELETE (no
-    predecessor, or a changed sample frame) is stale too.
+    date is unique within it). Three shapes are stale: a stored row that
+    differs, a stored row the orchestrator would now remove (no same-frame
+    predecessor), and a MISSING row where a same-frame predecessor exists -- the
+    last is what a failed re-diff leaves behind, so recording it is the heal.
     """
     out = []
     for i, cur in enumerate(recomputed):
         stored = conn.execute(
             "SELECT * FROM street_walk_diffs WHERE to_walk_id = ?", (cur.row["walk_id"],)
         ).fetchone()
-        if stored is None:
-            continue
         prev = recomputed[i - 1] if i > 0 else None
-        same_frame = prev is not None and (
-            float(prev.row["spacing_m"]) == float(cur.row["spacing_m"])
-            and float(prev.row["match_dist_m"]) == float(cur.row["match_dist_m"])
-        )
-        if not same_frame:
-            out.append((cur, stored, "no same-frame predecessor; the row would be removed"))
+        if prev is None or not _same_frame(prev, cur):
+            if stored is not None:
+                out.append((cur, stored, "no same-frame predecessor; the row would be removed"))
+            continue
+        if stored is None:
+            out.append((cur, None, f"no diff row against {prev.row['run_date']}; record one"))
             continue
         diff = compute_walk_diff(prev.geojson, cur.geojson)
         notes = []
@@ -406,16 +558,16 @@ def stale_diffs(conn, recomputed: list, data_dir: str) -> list:
     return out
 
 
-def _walk_line(rec: Recomputed, regenerate: bool) -> str:
+def _walk_line(rec: Recomputed, catalog_only: bool) -> str | None:
+    """What this pass writes for one walk, or None when it writes nothing."""
     notes = [
         f"{c} {old} -> {new}" for c, (old, new) in rec.moved.items() if c != "coverage_by_highway"
     ]
     if "coverage_by_highway" in rec.moved:
         notes.append("coverage_by_highway moved")
-    if rec.artifact_stale:
-        action = "rewrite" if regenerate else "NOT rewritten without --regenerate-artifacts"
-        notes.append(f"artifact stale, {action} ({rec.row['coverage_filename']})")
-    return f"{_label(rec.row)}: {'; '.join(notes)}"
+    if rec.artifact_stale and not catalog_only:
+        notes.append(f"rewrite artifact {rec.row['coverage_filename']}")
+    return f"{_label(rec.row)}: {'; '.join(notes)}" if notes else None
 
 
 def _write_artifact(path: str, geojson: dict) -> None:
@@ -427,13 +579,20 @@ def _write_artifact(path: str, geojson: dict) -> None:
     os.replace(tmp, path)
 
 
+def _series_where(row) -> tuple:
+    return (
+        "city_id = ? AND provider = ? AND network_type = ?",
+        (row["city_id"], row["provider"], row["network_type"]),
+    )
+
+
 def process_series(
-    conn, walks: list, edges_for, data_dir: str, execute: bool, regenerate: bool, report: Report
+    conn, walks: list, edges_for, data_dir: str, execute: bool, catalog_only: bool, report: Report
 ) -> bool:
     """
     Recompute one (city, provider, network_type) series and, under ``execute``,
     apply it. All-or-nothing: any refusal skips the series untouched. Returns
-    whether anything was written.
+    whether anything was written. Raises RunDueStarted when a batch began.
     """
     first = walks[0]
     series = f"{first['city_id']} [{first['provider']}/{first['network_type']}]"
@@ -443,43 +602,60 @@ def process_series(
     for row in walks:
         try:
             edges = edges_for(row["city_id"], row["network_type"])
-            recomputed.append(recompute_walk(row, edges, data_dir))
-        except WalkRefused as exc:
+            recomputed.append(recompute_walk(row, edges, data_dir, report))
+        except Exception as exc:  # one bad series must not end the sweep
+            if isinstance(exc, WalkRefused):
+                reason, detail = exc.reason, str(exc)
+            else:
+                logger.exception(f"{_label(row)}: recompute failed")
+                reason, detail = RECOMPUTE_ERROR, f"{type(exc).__name__}: {exc}"
+            report.refusal_reasons[reason] += 1
             report.refused.append(
                 f"{series}: {len(walks)} walk(s) skipped, because {row['run_date']} is "
-                f"refused: {exc}"
-            )
-            return False
-        except Exception as exc:  # one bad series must not end the sweep
-            logger.exception(f"{_label(row)}: recompute failed")
-            report.refused.append(
-                f"{series}: {len(walks)} walk(s) skipped, because {row['run_date']} "
-                f"failed: {type(exc).__name__}: {exc}"
+                f"refused ({reason}): {detail}"
             )
             return False
 
     diffs = stale_diffs(conn, recomputed, data_dir)
-    moved_walks = [r for r in recomputed if r.moved or r.artifact_stale]
-    if not moved_walks and not diffs:
+    walk_lines = [line for r in recomputed if (line := _walk_line(r, catalog_only))]
+    stale_artifacts = [r for r in recomputed if r.artifact_stale]
+    if not walk_lines and not diffs and not stale_artifacts:
         report.unchanged_series += 1
         return False
-    report.changed_walks.extend(_walk_line(r, regenerate) for r in moved_walks)
+    report.changed_walks.extend(walk_lines)
     diff_lines = [f"{_label(cur.row)} diff: {note}" for cur, _, note in diffs]
-    if not regenerate:
-        # A diff reads the artifacts on disk, which this pass leaves old.
-        report.stale_diffs_left.extend(diff_lines)
+    if catalog_only:
+        report.left_stale.extend(
+            f"{_label(r.row)}: artifact {r.row['coverage_filename']}" for r in stale_artifacts
+        )
+        report.left_stale.extend(diff_lines)
     else:
         report.changed_diffs.extend(diff_lines)
     if not execute:
         return False
 
+    # The write phase. Re-check what the pass started from: a run-due that began
+    # since, or a walk added or replaced in this series since it was selected.
+    in_flight = _run_due_in_flight()
+    if in_flight:
+        raise RunDueStarted(f"a run-due started ({in_flight}); stopped before {series}")
+    where, params = _series_where(first)
+    now_ids = [
+        r["walk_id"]
+        for r in conn.execute(
+            f"SELECT walk_id FROM street_walks WHERE {where} ORDER BY run_date", params
+        )
+    ]
+    if now_ids != [r["walk_id"] for r in walks]:
+        report.failed.append(f"{series}: its walks changed during the pass; abandoned unwritten")
+        return False
+
     wrote = False
-    if regenerate:
-        for rec in recomputed:
-            if rec.artifact_stale:
-                wrote = True
-                _write_artifact(os.path.join(data_dir, rec.row["coverage_filename"]), rec.geojson)
-                report.artifacts_written += 1
+    if not catalog_only:
+        for rec in stale_artifacts:
+            _write_artifact(os.path.join(data_dir, rec.row["coverage_filename"]), rec.geojson)
+            report.artifacts_written += 1
+            wrote = True
     to_update = [r for r in recomputed if r.moved]
     if to_update:
         with conn:  # one transaction: the series' rows move together
@@ -492,35 +668,38 @@ def process_series(
         report.rows_updated += len(to_update)
         wrote = True
 
-    if regenerate:
-        for cur, stored, _ in diffs:
-            row = cur.row
-            try:
-                compute_and_record_walk_diff(
-                    conn,
-                    data_dir=data_dir,
-                    city_id=row["city_id"],
-                    walk_id=row["walk_id"],
-                    run_date=date.fromisoformat(row["run_date"]),
-                    provider=row["provider"],
-                    network_type=row["network_type"],
-                    spacing_m=float(row["spacing_m"]),
-                    match_dist_m=float(row["match_dist_m"]),
-                    fc_new=cur.geojson,
-                )
-            except Exception as exc:  # the stats repair above is committed
-                logger.exception(f"{_label(row)}: re-diff failed")
-                report.failed.append(f"{_label(row)} diff: {type(exc).__name__}: {exc}")
-                continue
-            wrote = True
-            old = stored["detail_filename"]
-            after = conn.execute(
-                "SELECT detail_filename FROM street_walk_diffs WHERE to_walk_id = ?",
-                (row["walk_id"],),
-            ).fetchone()
-            new = after["detail_filename"] if after is not None else None
-            if old and old != new and not os.path.exists(os.path.join(data_dir, old)):
-                report.removed_files.append(old)
+    if catalog_only:
+        return wrote
+    for cur, stored, _ in diffs:
+        row = cur.row
+        try:
+            compute_and_record_walk_diff(
+                conn,
+                data_dir=data_dir,
+                city_id=row["city_id"],
+                walk_id=row["walk_id"],
+                run_date=date.fromisoformat(row["run_date"]),
+                provider=row["provider"],
+                network_type=row["network_type"],
+                spacing_m=float(row["spacing_m"]),
+                match_dist_m=float(row["match_dist_m"]),
+                fc_new=cur.geojson,
+            )
+        except Exception as exc:  # the stats repair above is committed
+            logger.exception(f"{_label(row)}: re-diff failed")
+            report.failed.append(
+                f"{_label(row)} diff: {type(exc).__name__}: {exc} (a re-run records it)"
+            )
+            continue
+        wrote = True
+        old = stored["detail_filename"] if stored is not None else None
+        after = conn.execute(
+            "SELECT detail_filename FROM street_walk_diffs WHERE to_walk_id = ?",
+            (row["walk_id"],),
+        ).fetchone()
+        new = after["detail_filename"] if after is not None else None
+        if old and old != new and not os.path.exists(os.path.join(data_dir, old)):
+            report.removed_files.append(old)
     return wrote
 
 
@@ -582,6 +761,15 @@ def _parse_list(values) -> list[str]:
     return out
 
 
+CATALOG_ONLY_WARNING = (
+    "--catalog-only: the published per-edge artifacts and the walk diffs were NOT "
+    "rewritten, so the site now MIXES two definitions (catalog and manifest new, "
+    "artifacts and change blocks old), and each series' next nightly walk diffs "
+    "against the OLD artifact, re-creating the phantom delta. Re-run without "
+    "--catalog-only to finish."
+)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -606,10 +794,10 @@ def main(argv: list[str] | None = None) -> int:
         "understands). Always whole series.",
     )
     parser.add_argument(
-        "--regenerate-artifacts",
+        "--catalog-only",
         action="store_true",
-        help="Also rewrite each stale published *_coverage.json.gz and re-diff the "
-        "street_walk_diffs rows that read them (without it: catalog rows only)",
+        help="Update the street_walks rows only: leave the published artifacts and the "
+        "walk diffs as they are (leaves the site mixed; see the module docstring)",
     )
     args = parser.parse_args(argv)
 
@@ -656,15 +844,19 @@ def main(argv: list[str] | None = None) -> int:
         wrote = False
         for walks in _group_series(select_walks(conn, providers, city_ids)):
             report.series_scanned += 1
-            wrote |= process_series(
-                conn,
-                walks,
-                edges_for,
-                args.data_dir,
-                args.execute,
-                args.regenerate_artifacts,
-                report,
-            )
+            try:
+                wrote |= process_series(
+                    conn,
+                    walks,
+                    edges_for,
+                    args.data_dir,
+                    args.execute,
+                    args.catalog_only,
+                    report,
+                )
+            except RunDueStarted as exc:
+                report.failed.append(f"{exc}; the remaining series were not processed")
+                break
 
         mode = "EXECUTING" if args.execute else "DRY RUN (pass --execute to apply)"
         verb = "changed" if args.execute else "would change"
@@ -673,26 +865,28 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {verb}: {line}")
         for line in report.changed_diffs:
             print(f"  {verb}: {line}")
-        for line in report.stale_diffs_left:
-            print(f"  diff left stale (needs --regenerate-artifacts): {line}")
+        for line in report.left_stale:
+            print(f"  left stale (--catalog-only): {line}")
+        for line in report.notes:
+            print(f"  note: {line}")
         for line in report.refused:
             print(f"  REFUSED: {line}")
         for line in report.failed:
             print(f"  FAILED: {line}")
+        reasons = ", ".join(
+            f"{r} {report.refusal_reasons[r]}" for r in REASONS if report.refusal_reasons[r]
+        )
         print(
             f"\n{report.series_scanned} series ({report.walks_scanned} walks) scanned, "
             f"{report.unchanged_series} unchanged, {len(report.changed_walks)} walks and "
-            f"{len(report.changed_diffs)} diffs {verb}, {len(report.refused)} series refused, "
-            f"{len(report.failed)} failed"
+            f"{len(report.changed_diffs)} diffs {verb}, {len(report.refused)} series refused"
+            f"{f' ({reasons})' if reasons else ''}, {len(report.failed)} failed"
         )
-        if not args.regenerate_artifacts and (report.changed_walks or report.stale_diffs_left):
-            print(
-                "Published artifacts and walk diffs not rewritten (no --regenerate-artifacts): "
-                "the site keeps the old per-edge coverage and the old change blocks."
-            )
+        if args.catalog_only:
+            print(CATALOG_ONLY_WARNING)
         exit_code = 1 if (report.refused or report.failed) else 0
         if not args.execute:
-            if report.changed_walks or report.changed_diffs or report.stale_diffs_left:
+            if report.changed_walks or report.changed_diffs or report.left_stale:
                 print("Dry run complete. Re-run with --execute to apply.")
             return exit_code
 
