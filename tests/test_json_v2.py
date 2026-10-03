@@ -494,6 +494,72 @@ def test_aggregate_v2_groups_runs_and_reports_change(conn, data_dir):
 
     # The written aggregate must be strict-parseable
     strict_load(os.path.join(data_dir, "cities.json.gz"))
+    # Issue #404: no run the fill did not take carries the key, so the records
+    # above are byte-identical to their pre-#404 form.
+    assert all("early_refresh" not in r for r in gsv["runs"])
+
+
+def test_aggregate_marks_only_the_early_refreshed_run(conn, data_dir):
+    """A fill-phase run (issue #404) is marked in ``runs[]``; its sibling is not.
+
+    Keyed on (city, provider, run_date): a row for another provider or another
+    date must not mark this run, which is what a city-keyed lookup would do.
+    """
+    city_id = db.register_city(
+        conn,
+        city_name="Early",
+        state_name=None,
+        state_code=None,
+        country_name="Testland",
+        country_code=None,
+        center_lat=44.0,
+        center_lon=-121.0,
+        grid_width_m=100,
+        grid_height_m=100,
+        step_m=20,
+    )
+    for run_date in (date(2026, 1, 15), date(2026, 3, 1)):
+        csv_name = f"{city_id}_width_100_height_100_step_20_{run_date}.csv.gz"
+        csv_path = _write_run(data_dir, [("p1", "2020-01-15")], run_date, csv_name)
+        json_path = generate_city_metadata_summary_as_json(
+            csv_path,
+            load_city_csv_file(csv_path),
+            "Early",
+            None,
+            "Testland",
+            100,
+            100,
+            20,
+            force_recreate_file=True,
+            run_date=run_date,
+        )
+        db.register_run(
+            conn,
+            city_id=city_id,
+            run_date=run_date,
+            csv_filename=csv_name,
+            json_filename=os.path.basename(json_path),
+        )
+    db.record_early_refresh(
+        conn,
+        city_id,
+        "gsv",
+        date(2026, 3, 1),
+        prior_success_at="2026-01-15T09:00:00+00:00",
+        floor_days=30,
+    )
+    # Two decoys, neither of which may mark a gsv run: the UNMARKED run's date
+    # on another channel (a channel-blind lookup would mark that run), and gsv's
+    # own channel on a date with no run (a date-blind lookup would mark both).
+    db.record_early_refresh(
+        conn, city_id, "mapillary", date(2026, 1, 15), prior_success_at="x", floor_days=30
+    )
+    db.record_early_refresh(
+        conn, city_id, "gsv", date(2026, 2, 1), prior_success_at="x", floor_days=30
+    )
+    runs = generate_aggregate_v2(conn, data_dir)["cities"][0]["providers"]["gsv"]["runs"]
+    assert [r.get("early_refresh") for r in runs] == [None, True]
+    assert "early_refresh" not in runs[0]
 
 
 def test_aggregate_v3_two_providers(conn, data_dir):

@@ -8,6 +8,18 @@ An edit that changes a rule belongs in both files; anything written since the sp
 
 `tests/`, pytest. No real network; the downloader tests substitute an in-memory fetch primitive rather than mocking HTTP.
 
+**"No real network" is enforced, not a convention (since the PR #411 review).**
+`tests/conftest.py`'s autouse `_no_real_network` makes every non-loopback AF_INET/AF_INET6 `connect`/`connect_ex` raise `RealNetworkBlocked` (an `OSError`, so the code under test sees an ordinary transport failure), every `getaddrinfo` of a non-loopback NAME raise `RealDNSBlocked` (a `socket.gaierror`, so no DNS query leaves the machine; an IP literal resolves locally and meets the connect check), and then FAILS the test at teardown, because code that swallows the error would otherwise turn the attempt into a pass.
+Loopback means 127.0.0.0/8, `::1`, IPv4-mapped loopback (`::ffff:127.0.0.1`) and `localhost`; AF_UNIX stays open; a test that fakes DNS (`tests/_dns_fakes.py`) patches `getaddrinfo` after the guard and so wins.
+**Not covered, by where it hooks:** a UDP `sendto` (no connect), and anything a SUBPROCESS does — a child imports none of this, so a test that spawns one stubs its network itself.
+**The e2e tests are exempt** — the `e2e` marker, or a file under `tests/e2e/` — because they talk to the network by design: `tests/e2e/test_basemap_key.py` fetches a real CARTO tile (the only detector of a missing basemap key), and CI runs that job as `pytest tests/e2e -m e2e`; guarded, it would skip and error every run.
+It was added after `tests/test_fill_underfull_nights.py` drove `run-due` without `tests/test_scheduler.py`'s local stubs and made 168 real GETs of Google's driving-plan feed; with the guard on, nothing else in the DEFAULT (non-e2e) suite tried to connect or resolve a name.
+Two more suite-wide autouse fixtures close the same hole for files on disk:
+`_no_nightly_side_effects` (moved from `tests/test_scheduler.py`) stubs the driving-plan fetch, the catalog backup and the driving-plan summary for every test — a test marked `real_catalog_backup` keeps the real `write_backup` (`tests/test_catalog_backup.py` marks itself) — and `_scheduler_config_defaults_in_tmp` puts a `SchedulerConfig`'s DEFAULT `data_dir`, `backup_dir` and `log_dir` under `tmp_path`.
+`tests/test_hermetic_guard.py` pins all of it: loopback open across the range, a swallowed connect and a swallowed lookup still erroring the test (nested pytest runs), the e2e exemption by marker (identity of the real `connect`/`getaddrinfo`, so no packet leaves) and by path, the marker-based backup exemption, and the real default dirs of `SchedulerConfig` beside their redirection.
+The second was needed beyond the fill tests: the `regenerate-aggregate` tests built default configs and left `data/provider_screen.json.gz` in the working tree — from the production checkout, the published data directory.
+A test passing its own path, and `load_scheduler_config` (which always passes one), are untouched.
+
 ## The CLAUDE.md router (issues #252 and #254)
 
 `tests/test_claude_md_router.py`. The router split shipped two defects of its own, and the
@@ -329,6 +341,16 @@ Incidental coverage of a deprecated spelling trains readers to ignore the notice
   Two tests are about the halves that are NOT Panoramax, because widening a gate is where a neighbouring behaviour changes unnoticed: a default-membership channel must still print no enrolment cost note (`--remove --channel mapillary` reaches that same line, where a figure reads as a spend about to happen), and the walk's cap flag must refuse `0` the way both sibling flags do.
   The dry-run test drives a fixture deliberately BETWEEN the launch floor (5, one tile's retries) and the estimate (42 tiles), so the capped-launch arm is the only one it can be exercising — the same shape `_wall_cfg` uses for the age wall — and then stamps a cache entry so the walk's `0 requests` line and its `cached census from panoramax` label are both pinned.
   `assess-city` refusing `--provider panoramax_streets` is pinned as a DECISION rather than left to be re-litigated, message included: the rejection text explained the GSV grid run for every rejection, which answers a question an operator asking for a Panoramax walk did not ask.
+  The production pace is #405's staged raise, and stage 1 (60/min, 8,000/day per channel) is pinned twice: exactly, in `test_makelab1_production_config_is_wired`, and by what it DERIVES, in `test_production_panoramax_stage_one_derived_figures`.
+  The second exists because the raise is two numbers that must move together: at prod's 180-minute floor the configured rate affords 8,160 requests (`_sweep_requests_within_timeout`), so raising the budget without the rate — 30/min affords 4,080 — is a cap the child cannot reach, and that test goes red while the exact pin, edited alongside, would not.
+  It also pins `city_timeout_seconds` through the real prod config at 3,132, 5,440, 5,441 and 6,000 tiles: the floor for the first two, one second past it at 5,441, and the derivation above it, so the 5,440-tile threshold the comments quote is exact rather than approximate.
+  `test_the_enrolment_note_prices_at_the_CONFIGURED_panoramax_rate` closes a gap the #408 review found: the existing enrol-note test configured 30/min, which IS the collector default, so an `_enrolment_cost_note` that ignored the configured rate passed it; the new one asserts a non-default 45/min, and prod's 60, for both channels.
+  The #405 gate's 5xx check is pinned in `tests/test_panoramax.py`: a 503 then a 502 then a 200 must log two `TILE_RETRY_LOG_PHRASE` lines naming each status and try, and an exhausted tile must log `TILE_MAX_TRIES − 1` retries plus the give-up line; removing either backoff handler fails its test.
+  The gate's RULE and its READER are pinned in `tests/test_panoramax_gate_check.py`, separately because either can be wrong while the other is right: every boundary of the per-night rule on both sides (exactly 1% is clean, one more holds; exactly 10% holds, one more reverts; 999 requests is quiet unless it holds anyway), the window's streak (quiet nights skip, a hold resets, two holds within seven nights revert, a revert outranks any later clean run), and the reader over lines produced by the collector's REAL handlers and REAL `HostBlockedError` messages — so rewording a refusal fails a test instead of silently counting zero blocks, which is the failure a grep-shaped gate is most prone to.
+  The #408 second review added the reader's other real writer, the SCHEDULER: `_run_collection_subprocess` is run for real with a fake child, and the test asserts that the 25-line tail it copies into the scheduler log does not double-count the child's retries (8 must stay 8, not 16) and that its own `exited 84 (` line is a block.
+  Also pinned there: UNKNOWN (ledger traffic, no child log) and PROVISIONAL (today) nights; a TimeoutError give-up and a retried 4xx counting as "other", never 5xx; the rotated scheduler-log file being read; a Pacific-time log judged by UTC date across the two local rotations a UTC night spans; the ledger opened read-only (a write raises); and the command's exit codes, required `--since`, default end of yesterday, and refusal of a future `--end`.
+  The collector's and the screen's `aiohttp.ClientSession` are each checked to be BUILT with the `User-Agent` header (`tests/test_panoramax_collector.py`), since pinning the constant could not see the header being dropped at either call site.
+  The Panoramax `User-Agent` is pinned in `tests/test_panoramax.py` against RFC 9110's `product *( RWS ( product / comment ) )` grammar, with the contact address inside the comment and the screen importing the same constant.
 - `regenerate-aggregate` exiting nonzero when the driving-plan rebuild failed while still publishing the two artifacts that succeeded (the guard exists so #167's posture holds, but rebuilding the published JSON *is* that command's job, so a partial rebuild must not read as success to a wrapper)
 - On-demand catch-up path (issue #214: the `--provider` filter running only the named channel and leaving the others' `schedule_state` untouched, the comma form meaning the repeated form and keeping gsv-first order, `assign_schedule` still covering the full enabled set, and refusal
   — with `USAGE_EXIT_CODE` and **without opening the catalog**
@@ -407,6 +429,107 @@ Incidental coverage of a deprecated spelling trains readers to ignore the notice
     `test_a_blocked_host_still_records_what_it_spent` and `test_a_resumed_census_row_takes_the_crawl_and_the_ledger_this_process` (`tests/test_cli_policy.py`, the grid CLI's failure and success arms);
     `test_a_walk_whose_tail_dies_still_records_what_the_census_cost` and `test_panos_along_the_edge_cover_it_and_meter_only_the_streets_channel` (`tests/test_streetwalk_mapillary.py`, read under `collect.STREET_BUDGET_CHANNELS["mapillary"]`, so renaming that entry kills them too);
     and `test_a_screen_writes_the_rows_the_ledger_and_the_artifact` (`tests/test_panoramax_screen.py`).
+
+## Filling under-full nights (issue #404)
+
+`tests/test_fill_underfull_nights.py` drives `cmd_run_due` with a fake `_run_one_city` that writes what the child would have spent to `api_usage` (and so `host_usage`), under a frozen UTC clock so tonight's stamps sort at the batch start.
+Seeded successes sit at midnight, so a channel's age is a whole number of days, read the way `get_due_cities` reads it.
+A test that builds a second catalog keeps the unpatched `db.connect`, since `_run_night` replaces it for the night; a lane test writes no ledger, since a lane worker has no catalog handle.
+A live checkpoint is faked by replacing `_sweep_checkpoint_progress`, which both the resumer scan and `_sweep_launch_plan` read.
+Every "killed by" below was run against the committed code, one mutation at a time with the file restored after (106 mutants in the fifth review round of PR #411, run with the socket guard on — every earlier round's, the reviewers', and Jon's 2026-10-02 decisions — all killed but one EQUIVALENT mutant, named below):
+
+- `test_a_backlog_holds_the_whole_fill` — a never-collected due city's mapillary deferred for budget holds the fill, and no fill gsv runs either; killed by ignoring the backlog.
+- `test_a_backlog_on_an_opt_in_channel_does_not_hold_the_fill` — a KartaView deferral does not stop a gsv/mapillary fill; killed by filling every provider instead of the default-membership ones.
+- `test_a_bad_fill_key_turns_the_fill_off_rather_than_unbounded` and `test_the_loader_reads_the_fill_keys` — eight bad spellings, including a ceiling on unmetered `overpass` and a TOML `true`, each turn the fill off with a warning.
+- `test_a_city_the_due_phase_ran_on_an_opt_in_channel_is_realigned` — a late KartaView enrolment runs kartaview in the due phase and gsv/mapillary in the fill, all on one date, with only the fill's runs marked; killed by not leaving tonight's runs out of the candidate's run.
+- `test_a_city_due_tonight_on_another_channel_still_has_its_orphan_resumed` and `test_a_channel_due_tonight_is_never_resumed_by_the_fill`; killed by dropping the per-channel due exclusion in the resumers.
+- `test_a_city_is_declined_whole_when_one_channel_does_not_fit` — the pure rule, in both channel orders, and `<=` at an exact fit; killed by dropping the per-channel check.
+- `test_a_due_city_always_runs_before_any_fill_city`.
+- `test_a_due_pair_that_can_never_fit_does_not_hold_the_fill` — a due gsv grid priced over the whole daily budget is logged and does not hold the fill; killed by letting such pairs hold.
+- `test_a_due_refresh_deferred_for_budget_holds_the_fill` — the hold read on a city ATTEMPTED 85 days ago, not only a never-attempted one.
+- `test_a_failed_due_channel_is_not_a_backlog`.
+- `test_a_failed_fill_channel_is_not_marked_an_early_refresh` — only a channel whose `last_success_at` moved is written, with its prior success, and the failure is recorded once; killed by marking every channel.
+- `test_a_fill_city_is_never_collected_on_a_subset_of_its_channels` — THE acceptance test: a big city whose mapillary does not fit runs on neither channel while a smaller one behind it runs on both, and the fill ends `candidates exhausted`; killed by dropping the per-channel check, and by never clearing the trailing-decline count.
+- `test_a_full_night_is_unchanged_and_the_fill_is_not_reached` — due cities fill the cap: the launch order is identical with the fill on and off; killed by running the fill behind a stopped due loop.
+- `test_a_host_refused_tonight_declines_the_fill_city` (admission alone) and `test_a_host_that_latches_on_one_fill_city_declines_the_next` (live: the tile CDN refuses city 1's mapillary, city 2 runs nothing); the live one is killed by handing `_fill_admission` a fresh `HostBreaker()`.
+- `test_a_launch_the_plan_would_cap_is_declined` — a plan with no skip but a cap under the price declines the city, and a cap equal to it does not; killed by dropping the `request_cap < est` test.
+- `test_a_launch_time_budget_skip_inside_the_fill_is_counted` — the walk's remainder is spent between admission and its launch, the launch floor-skips it, and the `Done:` line counts it; killed by dropping the fill's `skipped_budget` fold.
+- `test_a_non_default_floor_is_the_one_recorded` — `fill_min_days = 45` admits only the 50-day city and records 45; killed by recording a constant.
+- `test_a_paused_fill_crawl_is_resumed_even_while_a_backlog_holds_the_fill` — the orphan resume runs on its paused channel while a due gsv deferral holds every new fill city; killed by dropping the backlog's `< since_iso` test (which then misses a previously-attempted due pair, so nothing is held).
+- `test_a_paused_fill_crawl_is_resumed_first_by_the_next_nights_fill` — night 1's exit 83 is logged as not due (never "stays due"); night 2 resumes it first, on mapillary only, and marks it against the old success; killed by never resuming orphans and by the old pause wording.
+- `test_a_v17_catalog_gains_the_early_refreshes_table` — the additive v18 rung, and two identical writes leave COUNT(*) = 1; killed by dropping the PRIMARY KEY (a key-set assert could not see it).
+- `test_a_walk_on_an_unfrozen_network_declines_its_city` — no Overpass traffic from the fill; once the GraphML is frozen the city runs and BOTH channels are marked, the walk with network type `drive`; killed by admitting an unfrozen walk, by never marking walk channels, and by dropping walks from the fill.
+- `test_a_walk_stranded_in_the_fill_is_retried_then_named_without_a_dead_command` and `test_the_fill_strandings_due_date_is_the_walks_own_wall` — the fill's own retry pass runs, the `Done:` line says `(1 in the fill, not lost)`, and the alert names the walk's own due date (2026-10-24, its 83-day wall) with no `--provider` recovery command; killed by not recording the stranding, and by printing it in the due paragraph.
+- `test_admission_asks_the_launch_plan_not_only_the_remainder` — a 1-tile census against a 4-request remainder is declined live and in the dry run; killed by not asking the launch plan.
+- `test_an_error_in_the_fill_still_publishes_and_reports_unhealthy` — the fill's own error wording; killed by leaving it out of `errored`.
+- `test_an_operator_narrowed_run_never_fills` — `--limit`, `--provider` and `--city`; killed by letting `--limit` fill.
+- `test_an_opt_in_enrolment_neither_qualifies_nor_disqualifies_a_fill_city`.
+- `test_an_under_full_night_refreshes_eligible_cities_stalest_first` — order, the rows, and the `Done:` line's due/fill split; killed by not counting fill cities into `processed`.
+- `test_budget_drawn_down_by_earlier_fill_cities_declines_a_later_one` — `ended by budget (mapillary)`; killed by dropping the per-channel check.
+- `test_fill_candidates_need_every_member_channel_past_the_floor_and_not_due` — floor, not-due wall, never-collected, quarantine, ONE failure, exclusion, disabled, and the oldest-channel order; killed by ignoring the floor, ordering freshest-first, ignoring failures, and ignoring membership.
+- `test_fill_host_room_is_the_smaller_of_budget_and_ceiling` and `test_the_fill_ceiling_binds_below_the_host_budget`; killed by ignoring the ceiling.
+- `test_makelab1_fills_at_30_days_under_the_measured_mapillary_ceiling`.
+- `test_sigterm_mid_city_in_the_fill_stops_the_night` — a SIGTERM during a fill city's gsv stops its mapillary, the fill and the night; killed by not making a fill SIGTERM the night's stop.
+- `test_the_deadline_check_sums_the_channels_needs` and `test_the_fill_ends_at_the_deadline_and_says_so`; killed by dropping the deadline check.
+- `test_the_dry_run_draws_its_ledgers_down_across_fill_cities` and `test_the_dry_run_draws_the_fill_ceiling_down_across_fill_cities`; killed by not subtracting an admitted city's price, and by leaving the preview's own spend out of the host room.
+- `test_the_dry_run_previews_the_fill_through_the_same_rule` and `test_the_dry_run_says_when_the_fill_is_not_reached_or_held`; the first killed by handing the preview unlimited budgets.
+- `test_the_fill_composes_with_the_hoist_and_the_refresh_reserve` — on two fresh catalogs the due phase's launch order and the opening line's `hoisted=1`/`(2 promoted)` are identical with the fill on and off.
+- `test_the_fill_runs_every_member_channel_opt_ins_included` — an enrolled city runs gsv, mapillary, kartaview and panoramax on one date, all marked; killed by filling only the default-membership channels.
+- `test_the_fill_runs_through_two_lanes` and `test_the_mapillary_pair_runs_whole_through_the_fill`.
+- `test_the_fill_stops_at_the_city_cap`; killed by ignoring the cap in the fill.
+- `test_the_floor_is_inclusive_and_only_the_floor_moves_eligibility`.
+- `test_the_host_check_sums_both_mapillary_channels`; killed by checking per channel.
+- `test_the_repo_default_has_no_fill_and_logs_nothing_about_it`.
+
+Elsewhere:
+`tests/test_json_v2.py::test_aggregate_marks_only_the_early_refreshed_run` pins the aggregate mark on (city, channel, run date) with two decoys, the unmarked run's date on another channel and gsv's channel on a date with no run; killed by marking by city alone.
+`tests/test_night_length.py::test_a_filled_night_parses_and_is_never_pooled_into_full` parses the real `(D due, F fill)` line and keeps a filled night out of `full`; killed by dropping the optional group and by pooling.
+`tests/test_purge_tainted_runs.py::test_purge_drops_the_purged_runs_early_refresh_mark_only` and `tests/test_archival_import.py::test_deleting_an_archival_run_drops_its_early_refresh_mark`; each killed by keeping the mark.
+
+Added for Jon's decisions (2026-10-02) and the third review round:
+
+- `test_a_due_city_whose_grid_needs_more_than_the_window_does_not_hold_the_fill` — the #373 cascade (probe P1); killed by dropping the window arm and by dropping the first-grid cascade.
+- `test_a_fill_crash_is_named_as_the_fills_in_the_subject`; killed by passing `LOOP`.
+- `test_a_heavy_tomorrow_shrinks_tonights_fill` and `test_an_empty_tomorrow_leaves_the_ceiling`; the first killed by dropping the reserve term and by keying the reserve on the channel.
+- `test_a_paused_fill_grid_resumes_with_the_walk_it_held_back` — probe P2, on a one-city resume night so only the resume can run the walk; killed by dropping the walk from the resume and by planning the walk as behind its earlier sibling.
+- `test_a_resumer_never_runs_a_failing_channel` (probe P3); killed by dropping the failure test in `_resumable_member`.
+- `test_a_walk_the_fill_did_not_hold_behind_a_sibling_checkpoint`; killed by dropping the never-fits sibling arm.
+- `test_an_opt_in_channel_that_does_not_fit_declines_the_whole_city`.
+- `test_an_orphan_with_no_success_at_all_is_still_resumed` (probe P4); killed by never recording the fill attempt.
+- `test_misaligned_cities_go_first_among_equally_stale`; killed by dropping the misalignment key.
+- `test_only_an_early_success_is_marked_an_early_refresh`; killed by marking every success.
+- `test_resumers_are_members_of_enabled_cities_only` (M3, M4) and `test_the_checkpoint_nearest_its_age_wall_is_resumed_first` (M7).
+- `test_the_dry_run_counts_tonights_due_spend_against_the_host_budget`, `test_the_dry_run_does_not_hold_on_a_due_pair_that_can_never_fit`, `test_the_dry_run_prints_and_applies_tomorrows_reserve` and `test_the_dry_runs_reserve_assumes_tonights_due_slate_succeeds`; killed respectively by leaving the preview's spend out of `used`, by ignoring never-fits in the preview's hold, and by not handing the preview's reserve tonight's slate.
+- `test_the_fills_own_spend_counts_against_tomorrows_room`; killed by dropping the fill's own spend from tomorrow's term.
+- `test_the_fills_retry_pass_leaves_the_due_phases_strandings_alone` — one due and one fill stranding; killed by dropping `only=` (M1) or its filter (M2), and by counting fill strandings in the subject.
+- `test_the_launch_check_draws_the_host_and_the_clock_down_in_launch_order`; killed by not drawing down either (M6, and the clock).
+- `test_the_reserve_is_cut_at_a_channels_daily_budget` and `test_the_reserve_is_cut_at_the_city_cap`, and `test_the_reserve_sums_grid_and_walk_on_one_host_key` (now also: a paired walk is priced 0, an unpaired one in full; killed by pricing the paired walk in full).
+
+Added in the fourth review round:
+
+- `test_a_city_due_tomorrow_is_credited_its_own_reserve` (P2) and `test_the_dry_run_credits_a_city_its_own_tomorrow`; killed by not crediting the judged city, live and in the preview.
+- `test_a_city_the_fill_pulled_forward_leaves_tomorrows_demand`; killed by not crediting what the fill collected.
+- `test_a_failing_opt_in_channel_does_not_freeze_the_city_out` — dropped from the run, reported as `realign blocked`; killed by skipping the whole city again and by not reporting it.
+- `test_a_fill_launch_cap_reaches_the_child` (P6) — mapillary capped at <= 12 under a 12-tile ceiling, KartaView at its ceiling; killed by not handing the launch `fill_cap` and by ignoring it there.
+- `test_a_free_walk_extra_needs_a_frozen_network`; killed by dropping the frozen check (the reviewers' M12).
+- `test_a_hosts_reserve_is_cut_at_its_cap`.
+- `test_a_never_collected_opt_in_channel_is_the_due_phases_not_the_fills` — the branch that admitted one was unreachable and is removed (the reviewers' M23 is gone with it).
+- `test_a_partly_collected_city_is_finished_before_a_staler_one` (P1); killed by ranking staleness first.
+- `test_a_paused_kartaview_due_sweep_holds_kartaview_visibly`; killed by dropping the held count from the report.
+- `test_a_paused_walk_alone_is_resumed_alone` (P7); killed by realigning without the coverage gate.
+- `test_old_fill_attempts_are_pruned`.
+- `test_the_dry_run_previews_finishing_a_partly_due_city`; killed by excluding due cities from the preview again.
+- `test_the_fills_own_spend_excludes_what_was_already_in_the_window`; killed by ignoring the baseline (the reviewers' M15).
+- `tests/test_hermetic_guard.py` — loopback stays open, and a swallowed non-loopback connect still errors the test at teardown (run in a nested pytest); killed by not failing at teardown.
+
+Added in the fifth review round:
+
+- `test_a_failed_run_is_not_counted_realigned` and `test_realigned_counts_only_a_city_that_ended_aligned` — `realigned` means every member channel now carries tonight's date; killed by counting misaligned-before alone.
+- `test_a_paired_walk_pays_when_its_grid_will_not_run_tomorrow`; killed by pricing every paired walk at 0.
+- `test_a_retried_fill_walk_is_capped_at_the_fill_room` and `test_the_fills_walk_retry_is_a_fill_launch`; killed by not threading `fill`/`fill_cap` through the fill's retry pass.
+- `test_credits_let_the_next_city_into_tomorrows_window_and_reserve_it`; killed by cutting tomorrow's lists before the credits.
+
+**The equivalent mutant**: dropping `CHANNEL_METERED_HOST.get(channel) is None` from the resume's free extras (the reviewers' M21) changes nothing, because the coverage gate admits extras only when every usable metered member channel is already in the resume — so no metered channel is left for the extras loop to add. The check stays as the statement of intent.
 
 ## Concurrent channel lanes (issue #240)
 
@@ -835,10 +958,14 @@ Three files, split the way the other census providers' are, because each pins so
   `type` is kept verbatim as `image_type` beside the `is_pano` it produces, and an ABSENT type decodes to flat with a non-nullable `bool` column rather than to a null;
   a picture the layer does not name is **dropped rather than given the MVT feature id** — that fallback was copied over with the decoder's shape, and since `mapbox_vector_tile` supplies a feature id even when the properties carry none, it would have minted id `0` in every tile of the city into a `dedupe_census` that factorizes on it.
   The date rules are pinned scalar-against-vectorized element-wise (the same contract Mapillary's pair carries), plus the measured 1970 sentinel, a future date, and **mixed precision in one column** — the last with a companion assertion that an inferred format really does NaT one of the values, so the `format="ISO8601"` pin is not protecting against a hazard that does not exist.
-  Transport: 403/429 raise `HostBlockedError` after exactly ONE call, a redirect is seen rather than followed, an HTML body under a 200 is a block, a 404 is an empty tile that is counted and not retried, and a 5xx is retried with every attempt paced AND counted (the #198 contract).
+  Transport: 403/429 raise `HostBlockedError` after exactly ONE call, a redirect is seen rather than followed, an HTML body under a 200 is a block, a 204 is the empty tile — counted, not retried, and empty even under an error Content-Type — while a 404 raises `TileNotServedError` (neither a `DownloadError` nor an aiohttp error, uncounted, not retried; #407), and a 5xx is retried with every attempt paced AND counted (the #198 contract).
 - `tests/test_panoramax_grid_run.py` — the join between the fetch and the shared tail, which neither of the other two files can see: that the bindings actually reached are Panoramax's, so the CSV carries its schema in **its own column order**.
-  Also the three #116 statuses over one city (a pano is OK, a flat-only point is FLAT_ONLY with a NULL capture date, an empty point is ZERO_RESULTS), the 1970 sentinel landing as **NO_DATE rather than as a dropped row** — it is in `PRESENT_STATUSES`, so the imagery still covers while ageing nothing — an undownloaded tile marking REQUEST_FAILED at this provider's zoom, the spend surviving a crash in the tail, and both halves of the 404 rule: an all-404 lattice is refused, while a city that genuinely holds nothing and answers 200 publishes as ZERO_RESULTS.
-  That pair is the point — 730 of 1,144 catalog cities really are empty, so a guard keyed on emptiness rather than on the 404 would fail two thirds of the catalog.
+  Also the three #116 statuses over one city (a pano is OK, a flat-only point is FLAT_ONLY with a NULL capture date, an empty point is ZERO_RESULTS), the 1970 sentinel landing as **NO_DATE rather than as a dropped row** — it is in `PRESENT_STATUSES`, so the imagery still covers while ageing nothing — an undownloaded tile marking REQUEST_FAILED at this provider's zoom, the spend surviving a crash in the tail, and the status rule of #407 — driven through the REAL `_fetch_tile` over an in-memory session, because a stub that calls `on_empty` itself decides the classification it is meant to test.
+  An all-404 lattice is refused by name, also on the night after it checkpointed; a lone 404 publishes REQUEST_FAILED (and is refused as failed tiles, not as a move, at the real 2% tolerance); a lattice of 204s, or of layer-less 200s, publishes as ZERO_RESULTS; a 204 is committed as a zero-row tile and a 404 is not; and the walk's census seam lists the 404 tile in `failed_tiles` and not the 204 one.
+  The 204 pair is the point — 730 of 1,144 catalog cities really are empty, so a guard keyed on emptiness rather than on the 404 would fail two thirds of the catalog.
+  The #407 review added the guard's other bound: a RESUME and a census-cache HANDBACK whose remaining tiles all 404 are priced by the tolerance (published inside it, refused as failed tiles naming the endpoint outside it), never refused as a moved endpoint, while a one-tile city that 404s is.
+  Also the collapse guard (`refuse_empty_census`): an all-204 census is refused before promotion, refused again when re-finalized from its checkpoint, refused on reuse of an empty cache entry, and published when unarmed or when the census holds imagery; and a tolerated 404 promotes with its tile in the marker's `failed` list, so the road walk reusing it marks those samples REQUEST_FAILED.
+  The ARMING is pinned where the history lives: `tests/test_cli_policy.py` (previous grid run positive by 360° or flat counts, override, prior zero, no prior; plus an end-to-end all-204 collapse exiting 1 with nothing cataloged) and `tests/test_streetwalk_panoramax.py` (the walk reads its own city and `--network-type` series).
 - `tests/test_panoramax_collector.py` — resume and the shared cache.
   The headline is **byte identity asserted three ways against each other** — one uninterrupted pass, a run interrupted after one tile and resumed, and a different channel reading the promoted census for zero requests — rather than against a committed golden fixture.
   Three-way because the two grid columns come from a geodesic solve whose last ULP differs between macOS and glibc, so a second committed fixture would have to carry the same numeric tolerance the Mapillary one does, while comparing runs produced on one machine pins the ORDERING exactly, which is the property at risk.
@@ -859,7 +986,7 @@ It was renamed from `_no_mapillary_tile_pacing` rather than duplicated, and the 
 - **Selection is by overlap, not by centre**, pinned with the normal case rather than an edge case: a city sitting wholly inside one screen hexagon is found by overlap and missed by centre, and centre selection would therefore call most of the catalog empty, conclusively and wrongly.
 - **The economy**: neighbouring cities collapse to one shared z6 tile, and the tiles are enumerated from the GROWN bbox — asserted at an exact z6 seam, where the bare bbox is one tile and the grown one is two.
   Without the margin the union never reconstructs a hexagon clipped across that seam, and a city beside it is screened against a hexagon nobody fetched.
-- **Both refusals, and what they must not refuse.** An all-404 pass is a moved endpoint; a single 404 is a hole. A catalog-wide zero is refused when cities have screened positive before, and the test asserts the previous screen is still standing afterwards, because the damage is the write.
+- **Both refusals, and what they must not refuse.** An all-204 pass is refused and a single 204 beside imagery is an ordinary empty tile; a single 404 ends the pass, since it is an unread tile rather than an empty one (#407) — all three driven through the real `_fetch_tile`. The bounded z14 measure is the exception and is pinned as one: a city whose tiles all answer 204 measures an exact zero rather than being refused. A catalog-wide zero is refused when cities have screened positive before, and the test asserts the previous screen is still standing afterwards, because the damage is the write.
   Its companion is the one that keeps the guard honest: a FIRST screen finding nothing anywhere is recorded, since 730 of 1,144 cities screening zero is the measured normal case.
   And a tile that cannot be read ends the pass — a screen tile is every city under ~5.6° of longitude, so a census's 2% tolerance would write conclusive zeroes for cities nobody measured.
 - **The catalog contract**: a second screen on one day replaces rather than duplicates, `first_positive_date` is the earliest NON-ZERO screen (not the earliest screen), and a city that has never screened positive carries no such key at all — absent, not null, the driving-plan artifact's convention.
@@ -877,11 +1004,22 @@ A second block of tests came out of the three-reviewer pass on [PR #325](https:/
 
 - **The antimeridian, three ways.** A crossing bbox (`min_lon > max_lon`, which `grid_bbox` produces for a city near 180°) selecting its hexagons instead of nothing; the margin WRAPPING across the seam rather than being clamped to the edge column, so the tile holding the other half of a seam hexagon is actually fetched; and a hexagon reassembled from its two clipped halves keeping the width of a hexagon rather than the width of the world — with its centre on the seam, not a quarter of the planet away at longitude 0.
   All three failed silently before the fix, and all three are latent rather than live: the catalog tops out at 175.6°E, and nothing prevents registering a city past it.
-- **Two refusals that need no history.** A city whose bbox maps to zero tiles is refused by name rather than stored as a measured zero; and tiles that ANSWER while decoding to no hexagons at all are refused as a renamed layer. The second is the one that protects production's first run, where `provider_screen` is empty and the catalog-collapse check cannot fire — so its companion test asserts the bound (one answering tile, or tiles that merely 404, are not evidence) as well as the trigger.
+- **Two refusals that need no history.** A city whose bbox maps to zero tiles is refused by name rather than stored as a measured zero; and tiles that ANSWER while decoding to no hexagons at all are refused as a renamed layer. The second is the one that protects production's first run, where `provider_screen` is empty and the catalog-collapse check cannot fire — so its companion test asserts the bound (one answering tile, or tiles that answered 204, are not evidence) as well as the trigger.
 - **A corrupt tile body is a `DownloadError` carrying its spend.** `google.protobuf.message.DecodeError` subclasses neither `DownloadError` nor `aiohttp.ClientError`, so before the fix it escaped the fetch loop's two arms and both of the command's, losing the day's ledger charge on the way out.
 - **The pacing test now runs through `load_scheduler_config`.** The version this replaced built `SchedulerConfig(providers={"panoramax": ...})` by hand and asserted the block won — green against a state the loader cannot produce, since an unwired channel's block is dropped at load. It is the #323 lesson recurring in the same PR that wrote it down, which is worth stating plainly: the trap is not knowing about the trap, it is that a hand-built fixture always looks like the real thing. The replacement pins today's behaviour (the block does NOT move the screen) and goes red when #316 PR 3 wires the channel, which is the intended prompt to update the test and the prose together.
 - **The published instrument block is asserted to BE the module's constants** (`is`, not `==`), so a second copy of the endpoint cannot creep back into the file every visitor downloads.
 - **The unit's `TimeoutStopSec` is pinned above `PUBLISH_TIMEOUT_S` and below its own `TimeoutStartSec`**, the same bracket the collection unit carries, because this unit publishes too.
+
+`tests/test_panoramax_screen_cells.py` pins what a screen CELL is, measured rather than written down (#406) — kept in its own file so it does not collide with branches editing the refusal tests above.
+
+- **The decode** is checked against ids verified with the reference `h3` library (v4.5.0, which is deliberately not a dependency): thirteen cells from resolution 0 to 15, a pentagon among them, each decoding to its published resolution; and twelve ids that are NOT cells — a directed edge and a vertex (whose resolution bits still read a number), two that break ONLY the mode (the edge and vertex also set the mode-dependent bits, so without these a missing mode check survived mutation), each reserved bit, base cell 122, an unused digit inside the resolution, a used digit just past it, and a used digit 15 (the last, which a loop stopping at 14 never reads) — each decoding to None.
+  The second list is the point: four bits read off any hex string are 0–15, so the bare shift would "measure" a resolution for a layer that had changed id scheme.
+- **The pass** returns the histogram of every distinct hexagon it READ (not only the selected ones), and a mixed pass logs a warning and still screens.
+  A pass finer than `MAX_SCREEN_H3_RESOLUTION` is REFUSED with its spend stamped (res 10 refused, res 9 recorded, so the bound is pinned on both sides), `--allow-fine-cells` records it (the flag pinned from argv through `main` and `cmd_screen_provider` to `screen_targets`), and the artifact then says its zeros are not conclusive.
+- **The catalog and the artifact**: the command stores the pass's histogram and the artifact's `cell` is derived from it, asserted end to end through `cmd_screen_provider` because a missing pass-through would still produce a valid artifact.
+  A mixed or non-H3 pass publishes a `cell_warning` (absent otherwise) and the operator sees a `WARNING:` line; a screen from before the measurement says "not recorded" rather than falling back to a constant, while a pass MEASURED with no hexagons is stored as a `(NULL, 0)` sentinel and says so, with no area source cited.
+  A same-day re-run REPLACES the date's histogram, which an upsert keyed on resolution would not; and the area table is pinned to H3's published one at every resolution, with areas printed without scientific notation.
+- **The caveat** states the mechanism — overlap selection, whole-cell counting, the bbox being a rectangle — and no longer claims the cells are larger than the city.
 
 ## The Panoramax feasibility probe (issue #316)
 
@@ -890,7 +1028,7 @@ Every property is a way the study could publish a confident wrong number:
 
 - The three decoders: a v1 lattice anchor snapping back onto its 0.1° graticule after MVT quantization, so the same cell arriving from two tiles is one cell; an empty tile and empty bytes decoding to "nothing here" rather than raising; and the pictures layer keeping `type` verbatim, since 360-vs-flat is read off it.
 - The screen's asymmetry — a zero is conclusive, a positive is not — from both ends: v1 cell selection is a strict superset of the bbox under either anchor convention and over-inclusion can create a false positive but never a false zero; the one-cell margin is applied where **tiles are chosen**, not only where cells are filtered, since a bbox within one cell of a z6 seam otherwise filters for cells nobody fetched; latitude is clamped at the poles and longitude deliberately is not.
-- The v2 H3 screen, which replaced the lossy v1 lattice, selects a screen hex by **overlap** rather than centre — a res-6 hex is often larger than a city bbox, so centre selection would screen a covered city zero — and the default variant is pinned to `v2_h3` with the reason in the docstring.
+- The v2 H3 screen, which replaced the lossy v1 lattice, selects a screen hex by **overlap** rather than centre — a screen hex can be larger than a small city's bbox (the study recorded res 6, ~36 km²; the ids measured res 7, ~5.2 km², in #406), so centre selection could screen a covered city zero — and the default variant is pinned to `v2_h3` with the reason in the docstring.
 - `stage_screen` end to end for both variants: a hex overlapping the city but centred outside it counts, a far hex in the same tile does not, neighbouring cities share a tile so two cities cost one request, and the dry run prices the distinct tile set.
 - The hex contract the whole measure stage rests on: counters are whole-hex figures against tile-clipped polygons, so they are taken **once per id** across tiles while the geometry is **unioned** — the clipped piece's own centroid is off-centre, and the centre decides bbox membership.
   `measure_city` end to end: a seam hex served in every tile of the city counts once, a run cut short at five tiles scales by `tiles_total / 5`, and the same seed visits the same five tiles.
@@ -919,6 +1057,18 @@ Every property is a way the study could publish a confident wrong number:
 - The screen reports the traffic it SENT rather than the tiles it planned (`Fetcher.get` counts every attempt, so a retried 5xx exceeds the plan) — the one stage whose cost the writeup quotes forward as a standing recommendation.
 - The committed record (skipped until it exists): each summary recomputes from its own raw block — `access` included, or the recompute KeyErrors the night that stage joins the record — an unrun stage is an explicit null, no measured in-bbox count exceeds its city's screen upper bound, and **every control measured zero**, which is the one test that turns "a zero screen is conclusive" from an assumption into a measurement.
   The two tile instruments agree within the larger of 5% and **2 pictures**, with a second test asserting the absolute half is still needed: a ratio band alone silently demands EXACT agreement on any city where one picture exceeds 5%, and three of the eight cross-check cities are that small (Aberdeen 3, Pierre 7, Ridgeley 28).
+
+## The Panoramax candidate-city screen (issue #406)
+
+`tests/test_panoramax_world_screen.py` pins `scripts/panoramax_world_screen_{collect,analyze}.py`, offline; the raw outputs are gitignored, so nothing here reads them (one check that the old evidence dir would be refused skips when it is absent).
+Every distance and threshold is asserted at a LITERAL value placed on both sides of it — the tests compute offsets on their own sphere and never read the module's constant back — and each was checked by mutating the constant and watching the test fail.
+
+- The sampling invariant: the region plan is the **235 tiles** the 2026-10-01 log records, split by region exactly as it was, a tile two regions share belongs to the first, and the dry run sends nothing.
+- The collector cannot destroy a record: the default output is a fresh dated dir under the repo root, and a `panoramax/` dir that already holds files is refused by both `main` (dry run included) and `collect`, with the file left untouched.
+- The pass, over an injected `get` and pacer: `s` is the request's latency and excludes the pacer's sleep; a 429 stops after one attempt; an exhausted 5xx or transport error ends in a `stop` record, never an uncaught exception; the 250 cap counts retries; a plan over the cap is refused unsent.
+- The analyzer refuses a request log that is not one complete pass: a missing, repeated (two runs) or out-of-plan tile, a failed status, or a `stop` record.
+- The derivation: the 10 km place radius at 9.5 and 10.5 km; the 2,000 floor at 2,000 and 1,999; descending rank order; the 20 km cluster radius at 19.5 and 20.5 km, measured from the ANCHOR (a chain 15 + 15 km splits); a cluster taking its bound and max hex from the anchor, its name and point from the most populous member, and its newest date from any member; the candidate thresholds at 5,000/4,999 and, for both the US and Canada, 2,000/1,999 (Mexico stays at 5,000); the 25 km catalog radius at 24.9 and 25.1 km; a match found at 70°N and across the antimeridian; tracked-by-name vs tracked-by-anchor reported separately; the H3 resolution read from an id.
+- The committed record: its `parameters` equal both the literal values the writeup quotes and the module's constants, its hexagons are all resolution 7, request counts add to 239 with no refusal, the cluster CSV regenerates every cluster count and the `tracked_split` list, the ranked lists are the CSV's rows in order, each cluster's bound is its anchor place's row in the places CSV, and no GeoNames population is published.
 
 ## Frontend node tests
 

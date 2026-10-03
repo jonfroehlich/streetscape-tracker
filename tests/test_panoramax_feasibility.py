@@ -308,7 +308,8 @@ def test_the_screen_selects_hexes_by_OVERLAP_not_by_centre():
     """
     The screen and the measure stage select hexes differently on purpose. A
     res-11 hexagon is 25 m across so its centre is as good as its extent; a
-    res-6 SCREEN hexagon is ~36 km2 and a city bbox is often smaller than one,
+    SCREEN hexagon (recorded here as res 6, ~36 km2; measured res 7, ~5.2 km2,
+    in #406) can still be larger than a small city's bbox,
     so centre-based selection would miss the very hex the city sits inside --
     turning a covered city into a screened zero, which is the one failure the
     design cannot tolerate.

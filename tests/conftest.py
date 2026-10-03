@@ -1,7 +1,9 @@
 """Shared fixtures: temp data dir, catalog DB, and a synthetic city CSV factory."""
 
 import gzip
+import ipaddress
 import os
+import socket
 import sys
 import time
 from datetime import UTC, date, datetime
@@ -649,6 +651,198 @@ def stamp_census_cache(
     with open(os.path.join(cache_path, CENSUS_CACHE_MARKER), "w", encoding="utf-8") as fh:
         json.dump(marker, fh)
     return cache_path
+
+
+# The real socket entry points, saved at import so the guard below can delegate.
+_REAL_SOCKET_CONNECT = socket.socket.connect
+_REAL_SOCKET_CONNECT_EX = socket.socket.connect_ex
+_REAL_GETADDRINFO = socket.getaddrinfo
+_TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+_E2E_DIR = os.path.join(_TESTS_DIR, "e2e")
+
+
+class RealNetworkBlocked(OSError):
+    """A test tried to open a real (non-loopback) network connection."""
+
+
+class RealDNSBlocked(socket.gaierror):
+    """A test tried to resolve a real (non-loopback) host name."""
+
+
+def _is_loopback(host) -> bool:
+    """127.0.0.0/8, ::1, IPv4-mapped loopback (``::ffff:127.0.0.1``) and ``localhost``."""
+    if not isinstance(host, str):
+        return False
+    if host.lower() in ("localhost", "localhost."):
+        return True
+    try:
+        ip = ipaddress.ip_address(host.split("%", 1)[0])
+    except ValueError:
+        return False
+    mapped = getattr(ip, "ipv4_mapped", None)
+    return ip.is_loopback or (mapped is not None and mapped.is_loopback)
+
+
+def _is_ip_literal(host) -> bool:
+    try:
+        ipaddress.ip_address(str(host).split("%", 1)[0])
+        return True
+    except ValueError:
+        return False
+
+
+def _is_e2e(request) -> bool:
+    """An e2e test talks to the real network BY DESIGN, and is exempt.
+
+    ``tests/e2e/test_basemap_key.py`` fetches a real CARTO tile to detect the
+    watermark (it is the only detector of a missing key), and CI runs the e2e
+    job as ``pytest tests/e2e -m e2e``. Either signal exempts a test: the
+    ``e2e`` marker, or a file under ``tests/e2e/`` -- so a new e2e file that
+    forgets its marker is still not turned into a permanent red job.
+    """
+    if request.node.get_closest_marker("e2e") is not None:
+        return True
+    path = str(getattr(request.node, "path", "") or "")
+    return path.startswith(_E2E_DIR + os.sep)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_network(monkeypatch, request):
+    """
+    FAIL any test that touches the real network (review of PR #411).
+
+    The suite's rule is "fast, no real network", and until this guard it was a
+    convention: a scheduler test outside tests/test_scheduler.py ran run-due
+    without that file's local stubs and made 168 real GETs of Google's
+    driving-plan feed. Now, for every test except the e2e ones
+    (:func:`_is_e2e`):
+
+    * every non-loopback AF_INET/AF_INET6 ``connect``/``connect_ex`` raises
+      :class:`RealNetworkBlocked` (an ``OSError``, so the code under test sees
+      an ordinary transport failure);
+    * every ``getaddrinfo`` of a non-loopback NAME raises
+      :class:`RealDNSBlocked` (a ``socket.gaierror``), so no DNS query leaves
+      the machine either -- an IP literal resolves locally and is left to the
+      connect check. A test that fakes DNS (``tests/_dns_fakes.py``) patches
+      ``getaddrinfo`` after this fixture and so wins;
+    * and the test is FAILED at teardown if either was attempted, because code
+      that swallows an ``OSError`` (the driving-plan hook reports a failed
+      fetch as a string) would otherwise turn the attempt into a pass.
+
+    Loopback (127.0.0.0/8, ::1, IPv4-mapped loopback, ``localhost``) and
+    AF_UNIX stay open: an in-process server or a local socketpair is not "the
+    network".
+
+    NOT covered, by design of where it hooks: a UDP ``sendto`` (no connect),
+    and anything a SUBPROCESS does -- a child process imports none of this.
+    Tests that spawn children (the CLI and script smoke tests) must stub their
+    network themselves.
+    """
+    if _is_e2e(request):
+        yield
+        return
+    attempts: list = []
+
+    def _check(sock, address):
+        if sock.family in (socket.AF_INET, socket.AF_INET6):
+            host = address[0] if isinstance(address, tuple) else address
+            if not _is_loopback(host):
+                attempts.append(address)
+                raise RealNetworkBlocked(f"test attempted a real network connection to {address}")
+
+    def connect(self, address):
+        _check(self, address)
+        return _REAL_SOCKET_CONNECT(self, address)
+
+    def connect_ex(self, address):
+        _check(self, address)
+        return _REAL_SOCKET_CONNECT_EX(self, address)
+
+    def getaddrinfo(host, *args, **kwargs):
+        if host is not None and not _is_loopback(host) and not _is_ip_literal(host):
+            attempts.append(host)
+            raise RealDNSBlocked(socket.EAI_NONAME, f"test attempted a real DNS lookup of {host!r}")
+        return _REAL_GETADDRINFO(host, *args, **kwargs)
+
+    monkeypatch.setattr(socket.socket, "connect", connect)
+    monkeypatch.setattr(socket.socket, "connect_ex", connect_ex)
+    monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
+    yield
+    if attempts:
+        pytest.fail(
+            f"{request.node.nodeid} attempted {len(attempts)} real network connection(s) or "
+            f"lookup(s), e.g. {attempts[0]} -- stub the call (see tests/conftest.py)",
+            pytrace=False,
+        )
+
+
+@pytest.fixture(autouse=True)
+def _scheduler_config_defaults_in_tmp(monkeypatch, tmp_path):
+    """
+    A ``SchedulerConfig`` built in a test without explicit paths writes under
+    ``tmp_path``, never the repo (review of PR #411).
+
+    The class defaults are ``<repo>/data``, ``<repo>/backups`` and
+    ``<repo>/logs`` -- right for an operator, and from the production checkout
+    exactly where the published site and the real backups live. Tests built
+    configs with defaults and reached the tail: ``regenerate-aggregate`` tests
+    left ``data/provider_screen.json.gz`` in the working tree, and the fill
+    tests ``data/driving_plan.json.gz`` and ``backups/``. Only the DEFAULT is
+    redirected: a test passing a path, or ``load_scheduler_config`` (which
+    always passes one), is untouched.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    real_init = sched.SchedulerConfig.__init__
+
+    def init(self, *args, **kwargs):
+        kwargs.setdefault("data_dir", str(tmp_path / "default_data"))
+        kwargs.setdefault("backup_dir", str(tmp_path / "default_backups"))
+        kwargs.setdefault("log_dir", str(tmp_path / "default_logs"))
+        real_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(sched.SchedulerConfig, "__init__", init)
+
+
+@pytest.fixture(autouse=True)
+def _no_nightly_side_effects(monkeypatch, request):
+    """
+    Neutralize run-due's three nightly side effects for the WHOLE suite.
+
+    Moved here from tests/test_scheduler.py (review of PR #411): defined there,
+    they covered that file only, and tests/test_fill_underfull_nights.py ran
+    run-due without them -- fetching Google's driving-plan feed for real and
+    writing ``archive/gsv_driving_plan/``, ``data/driving_plan.json.gz`` and
+    ``backups/`` relative to the working directory. From the production
+    checkout during a live batch that would overwrite published data and the
+    real catalog backup.
+
+    * ``_fetch_driving_plan_nightly`` -- the feed snapshot (#176): a real GET
+      and archive writes;
+    * ``catalog_backup.write_backup`` -- the dated catalog backup (#145), whose
+      ``backup_dir`` defaults to <repo>/backups;
+    * ``generate_driving_plan_summary`` -- the tail's published join, whose
+      ``data_dir`` defaults to <repo>/data.
+
+    The dedicated tests restore the real functions explicitly (see the
+    ``_REAL_*`` names in tests/test_scheduler.py). A test marked
+    ``real_catalog_backup`` keeps the real ``write_backup`` -- its unit under
+    test (tests/test_catalog_backup.py marks itself).
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    monkeypatch.setattr(sched, "_fetch_driving_plan_nightly", lambda cfg, conn, today: None)
+    monkeypatch.setattr(
+        sched, "generate_driving_plan_summary", lambda conn, data_dir: {"records": []}
+    )
+    if request.node.get_closest_marker("real_catalog_backup") is None:
+        monkeypatch.setattr(
+            sched.catalog_backup,
+            "write_backup",
+            lambda conn, backup_dir, when, **kw: sched.catalog_backup.BackupResult(
+                ok=True, path=os.path.join(backup_dir, "stubbed.backup")
+            ),
+        )
 
 
 @pytest.fixture(autouse=True)

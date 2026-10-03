@@ -16,6 +16,18 @@ largely-US catalog.** This script measures it and nothing else. There is no
 collector here, no scheduler channel, no credential, and no write of any kind
 to `data/`.
 
+KNOWN BLIND SPOT -- A RE-RUN REPEATS IT (issue #407). This script counts HTTP
+404 as the empty tile, and Panoramax's empty tile is actually 204 (measured
+2026-10-01; the meta-catalog never 404s a tile route). A 204 reaches
+`get_tile` as `.content == b""` and is tallied as a tile that ANSWERED, so
+`empty_tiles` here is a count of 404s and says nothing about how many tiles
+were empty. The logic is left as it was on purpose -- this is the instrument
+that produced docs/experiments/panoramax-feasibility.md, and changing it would
+make a re-run disagree with the record it is meant to reproduce. The decoded
+numbers are unaffected (an empty tile decodes to nothing whichever status
+carried it). For the classification production uses, see
+`download_panoramax._fetch_tile`.
+
 READ THIS BEFORE CHANGING THE INSTRUMENT. #316 proposed answering the question
 with the federated `/api/search` over a stratified sample. Probing it first (the
 standing rule) showed that cannot work, and the alternative is strictly better:
@@ -61,7 +73,11 @@ standing rule) showed that cannot work, and the alternative is strictly better:
      out of EXIF in the SEARCH response, not of the imagery. Stage `instances`
      measures both against the same bbox so the writeup can say which.
 
-WHY A ZERO SCREEN IS CONCLUSIVE AND A NON-ZERO ONE IS NOT. A res-6 H3 hexagon
+WHY A ZERO SCREEN IS CONCLUSIVE AND A NON-ZERO ONE IS NOT. (Correction,
+#406: the z6 hexagon ids decode to H3 RESOLUTION 7, ~5.2 km2, not the res 6
+below -- docs/experiments/panoramax-world-screen.md. The argument survives
+because hexes are selected by overlap and counted whole, not because they
+are larger than a city; the study is left as it ran.) A res-6 H3 hexagon
 is roughly 36 km2 and the median catalog city is 19.5 km2, so the screen sums
 hexes far larger than the city inside them: it is an UPPER BOUND. That asymmetry is
 the point. An upper bound of zero means the city has no imagery, full stop; a
@@ -217,6 +233,8 @@ ACCESS_PROBE_LIMIT = 300
 ACCESS_PROBE_FALLBACK_DATETIME = "2026-01-01T00:00:00Z/.."
 DEFAULT_TIMEOUT_S = 60
 
+# Left verbatim because it is the record this study wrote; its "res-6 hexagons
+# (~36 km2 each)" is corrected by #406 -- the ids decode to res 7, ~5.2 km2.
 DOCS_RECORD_NOTE = (
     "Phase 1 of #316: read-only, no credential, no collector. Three instruments, and they are "
     "not interchangeable. `screen` sums the v2 z6 H3 grid layer's res-6 hexagons (~36 km2 each) "
@@ -461,6 +479,11 @@ class Fetcher:
                     f"happened in docs/provider-access.md."
                 )
             if response.status_code == 404:
+                # PHASE-1 READING, KEPT FOR REPRODUCIBILITY AND WRONG (issue #407):
+                # the host's empty tile is 204, which falls through to
+                # raise_for_status below and is returned as an answering tile.
+                # See the module docstring's KNOWN BLIND SPOT.
+                #
                 # A tile the host has nothing for. Counted, never silent: a
                 # 404 that is really a URL mistake would otherwise read as a
                 # city with no imagery, which is exactly the wrong answer for a

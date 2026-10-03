@@ -567,7 +567,7 @@ def test_the_crawl_store_paths_are_channel_keyed_date_free_and_outside_data(tmp_
 # Panoramax's crawl is Mapillary's, so the cap is the same code reached through
 # a different module -- which is exactly why it is tested here rather than
 # assumed from the Mapillary suite. The two censuses have diverged before (the
-# zoom, the 404-is-empty rule, `type` being two-state), and a cap that raised
+# zoom, the empty-tile status rule, `type` being two-state), and a cap that raised
 # the wrong exception or promoted a partial entry would be silent in both.
 #
 # Nothing SCHEDULES Panoramax yet -- CHANNEL_RESUMABLE keeps it False because no
@@ -937,3 +937,59 @@ def test_a_clock_that_runs_out_before_the_first_commit_is_a_failure_not_a_pause(
     assert not isinstance(excinfo.value, SweepIncompleteError)
     assert "nothing can be resumed" in str(excinfo.value).lower()
     assert record == []
+
+
+# ── The User-Agent actually goes on the wire (#405) ────────────────────────
+
+
+class _RecordingSession:
+    """Stands in for aiohttp.ClientSession, recording what it was built with."""
+
+    built: list[dict] = []
+
+    def __init__(self, *args, **kwargs):
+        type(self).built.append(kwargs)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+def test_the_collector_session_sends_the_contact_user_agent(monkeypatch, tmp_path):
+    """`USER_AGENT` is pinned as a string in test_panoramax.py; this pins that
+    the collector's session is BUILT with it, which a constant test cannot see
+    -- deleting the `headers=` argument left the whole suite green."""
+    _RecordingSession.built = []
+    monkeypatch.setattr(dp.aiohttp, "ClientSession", _RecordingSession)
+    _stub(monkeypatch, {})
+    _collect(tmp_path, *SEATTLE)
+    assert _RecordingSession.built, "the collector opened no session"
+    for kwargs in _RecordingSession.built:
+        assert kwargs.get("headers", {}).get("User-Agent") == dp.USER_AGENT
+
+
+def test_the_screen_session_sends_the_contact_user_agent(monkeypatch):
+    from streetscape_metadata_tracker import panoramax_screen as ps
+
+    _RecordingSession.built = []
+    monkeypatch.setattr(ps.aiohttp, "ClientSession", _RecordingSession)
+
+    async def empty_tile(*args, **kwargs):
+        return mapbox_vector_tile.encode([])
+
+    monkeypatch.setattr(ps, "_fetch_tile", empty_tile)
+    asyncio.run(
+        ps._fetch_screen_tiles(
+            [(32, 22)],
+            zoom=6,
+            max_requests_per_minute=0,
+            jitter=0.0,
+            request_timeout=5,
+            label="ua test",
+        )
+    )
+    assert _RecordingSession.built, "the screen opened no session"
+    for kwargs in _RecordingSession.built:
+        assert kwargs.get("headers", {}).get("User-Agent") == dp.USER_AGENT

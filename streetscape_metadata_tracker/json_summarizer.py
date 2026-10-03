@@ -3,6 +3,7 @@ import hashlib
 import itertools
 import json
 import logging
+import math
 import os
 from dataclasses import asdict
 from datetime import date
@@ -641,11 +642,18 @@ def _load_city_json(json_path: str) -> dict[str, Any] | None:
         return None
 
 
-def _build_provider_summary(runs, latest_json, data_dir, conn) -> dict[str, Any]:
+def _build_provider_summary(
+    runs, latest_json, data_dir, conn, early_refreshes: frozenset[tuple[str, str, str]]
+) -> dict[str, Any]:
     """
     Build one provider's {latest, runs, change} block for a city's
     aggregate record. `runs` is that provider's run series (oldest first)
     and `latest_json` the loaded per-run JSON of its newest run.
+
+    `early_refreshes` is ``db.get_early_refresh_keys`` read once for the
+    catalog: a run whose ``(city_id, provider, run_date)`` is in it was taken
+    by run-due's fill phase before its cycle wall (issue #404), and its
+    ``runs[]`` entry carries ``"early_refresh": true``.
     """
     from . import db  # local import to keep module import order simple
 
@@ -737,22 +745,29 @@ def _build_provider_summary(runs, latest_json, data_dir, conn) -> dict[str, Any]
             "diff_file": diff_row["detail_filename"],
         }
 
+    runs_out = []
+    for r in runs:
+        entry = {
+            "run_date": r.run_date,
+            "is_baseline": r.is_baseline,
+            "data_file": r.csv_filename,
+            "json_file": r.json_filename,
+            "unique_panos": r.unique_panos,
+            "unique_google_panos": r.unique_google_panos,
+            "coverage_rate_percent": r.coverage_rate_pct,
+            "any_imagery_coverage_rate_percent": r.any_imagery_coverage_rate_pct,
+            "median_pano_age_years": r.median_pano_age_years,
+        }
+        # Issue #404. Present only when true, so every run the fill did not
+        # take is byte-identical to its pre-#404 form and the aggregate keeps
+        # schema_version 4 (the additive-field rule the per-run v2 summary
+        # follows for its v17 columns).
+        if (r.city_id, r.provider, r.run_date) in early_refreshes:
+            entry["early_refresh"] = True
+        runs_out.append(entry)
     return {
         "latest": latest_block,
-        "runs": [
-            {
-                "run_date": r.run_date,
-                "is_baseline": r.is_baseline,
-                "data_file": r.csv_filename,
-                "json_file": r.json_filename,
-                "unique_panos": r.unique_panos,
-                "unique_google_panos": r.unique_google_panos,
-                "coverage_rate_percent": r.coverage_rate_pct,
-                "any_imagery_coverage_rate_percent": r.any_imagery_coverage_rate_pct,
-                "median_pano_age_years": r.median_pano_age_years,
-            }
-            for r in runs
-        ],
+        "runs": runs_out,
         "change": change,
     }
 
@@ -801,6 +816,7 @@ def generate_aggregate_v2(conn, data_dir: str) -> dict[str, Any]:
     # disable=None is not enough (it inspects stderr, then flushes both).
     # One query for the catalog rather than a lookup per city (issue #301).
     exclusions_by_city = db.get_channel_exclusions_all(conn)
+    early_refreshes = frozenset(db.get_early_refresh_keys(conn))
     for city in progress(db.get_all_cities(conn), desc="Aggregating cities", unit="city"):
         runs_by_provider: dict[str, list] = {}
         for run in db.get_runs_for_city(conn, city.city_id, provider=None):
@@ -835,7 +851,9 @@ def generate_aggregate_v2(conn, data_dir: str) -> dict[str, Any]:
                     f"per-run JSON ({json_filename or latest.json_filename})"
                 )
                 continue
-            providers_out[provider] = _build_provider_summary(runs, latest_json, data_dir, conn)
+            providers_out[provider] = _build_provider_summary(
+                runs, latest_json, data_dir, conn, early_refreshes
+            )
             latest_run_jsons_by_provider.setdefault(provider, []).append(latest_json)
             if city_block is None:  # gsv first, so GSV's city block wins
                 city_block = latest_json["city"]
@@ -1539,19 +1557,140 @@ _SCREEN_INSTRUMENTS: dict[str, dict[str, Any]] = {
         "endpoint": panoramax_screen.SCREEN_URL_TEMPLATE,
         "layer": panoramax_screen.SCREEN_LAYER,
         "zoom": panoramax_screen.SCREEN_ZOOM,
-        "cell": "H3 resolution 6 (~36 km²)",
-        "selection": "hexagons overlapping the city's frozen grid bbox",
+        # No "cell" here: it is MEASURED per screen pass and filled in by
+        # `_screen_cell_fields`. It was a literal ("H3 resolution 6 (~36 km²)")
+        # until the ids were read and said 7 (#406).
+        "selection": "hexagons overlapping the city's frozen grid bbox, each counted whole",
         "attribution": "© Panoramax contributors",
     },
 }
 
+# Why the figures are upper bounds, stated as the MECHANISM rather than as a
+# size comparison. It used to say the cells were "LARGER than the city inside
+# them", which rested on the hardcoded resolution 6 (~36 km²) against a 19.5 km²
+# median city; at the measured resolution 7 (~5.2 km²) that is false for most
+# cities, while the bound itself never depended on it. Every clause below holds
+# at any resolution a z6 tile can still DRAW: selection is by overlap, a
+# selected hexagon's counters are for the WHOLE hexagon, and the bbox is a
+# rectangle around the city. Hexagons finer than that can vanish in
+# quantization, which is why such a pass is refused
+# (`panoramax_screen.MAX_SCREEN_H3_RESOLUTION`) rather than described here.
+#
+# "A zero is conclusive" survives for the same reason, and is stated for the
+# bbox rather than for "the city": no overlapping hexagon counting anything
+# means nothing the provider had indexed lies anywhere in the box -- and a pass
+# that could not read every tile is refused rather than written (which, for a
+# tile answering 404, holds once #407's reading of 404 as an UNREAD tile lands).
 _SCREEN_CAVEAT = (
-    "Upper bounds, not counts. Each figure sums provider-published counters for "
-    "map cells LARGER than the city inside them, so it over-counts by including "
-    "imagery outside the city's bounding box. A zero is conclusive — the city "
-    "holds no imagery — while a positive number means only that a closer look is "
-    "worth taking. Only a collection run measures coverage."
+    "Upper bounds, not counts. Each figure sums provider-published counters over "
+    "every map cell that overlaps the city's bounding box, and counts each such "
+    "cell whole — so a cell straddling the box's edge contributes the imagery "
+    "outside it too, and the box is itself a rectangle around the city, not its "
+    "boundary. A figure can therefore over-count the city but never under-count "
+    "the box. A zero is conclusive — the provider had indexed no imagery anywhere "
+    "in the box — while a positive number means only that a closer look is worth "
+    "taking. Only a collection run measures coverage."
 )
+
+# The published H3 average-area table the `cell` description is sized from.
+_H3_AREA_SOURCE = "https://h3geo.org/docs/core-library/restable"
+
+
+def _screen_cell_list(counts: dict[int | None, int]) -> list[dict[str, Any]]:
+    """A measured resolution histogram as published rows, commonest first."""
+    return [
+        {
+            "resolution": res,
+            "hexagons": n,
+            "average_area_km2": panoramax_screen.H3_AVERAGE_HEX_AREA_KM2.get(res),
+        }
+        for res, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0] is None, kv[0] or 0))
+    ]
+
+
+def _format_area_km2(area: float) -> str:
+    """
+    An average area to three significant figures, never in scientific notation.
+
+    Example::
+
+        >>> [_format_area_km2(a) for a in (4357449.416078381, 36.129062164, 0.000000895)]
+        ['4,357,449', '36.1', '0.000000895']
+    """
+    if area >= 100:
+        return f"{area:,.0f}"
+    decimals = max(0, 2 - math.floor(math.log10(area)))
+    return f"{area:.{decimals}f}"
+
+
+def _describe_screen_cells(counts: dict[int | None, int] | None, screen_date: str | None) -> str:
+    """
+    The `cell` sentence for a screen, from what that pass MEASURED.
+
+    Example::
+
+        >>> _describe_screen_cells({7: 261913}, "2026-10-08")
+        'H3 resolution 7 (~5.16 km² average)'
+    """
+    if counts is None:
+        return (
+            f"H3 hexagons; resolution not recorded for the screen of {screen_date} "
+            f"(it predates per-pass measurement)"
+        )
+    if not counts:
+        return f"No hexagons decoded in the screen of {screen_date}"
+    parts = []
+    for row in _screen_cell_list(counts):
+        n = row["hexagons"]
+        hexagons = f"{n:,} hexagon{'s' if n != 1 else ''}"
+        if row["resolution"] is None:
+            ids = "ids are" if n != 1 else "id is"
+            parts.append(f"{hexagons} whose {ids} not H3 cells")
+            continue
+        area = row["average_area_km2"]
+        text = f"H3 resolution {row['resolution']} (~{_format_area_km2(area)} km² average)"
+        parts.append(text if len(counts) == 1 else f"{text} for {hexagons}")
+    return parts[0] if len(parts) == 1 else "Mixed: " + "; ".join(parts)
+
+
+def _screen_cell_fields(
+    cells_by_date: dict[str, dict[int | None, int]], latest_screen_date: str | None
+) -> dict[str, Any]:
+    """
+    The instrument's measured-cell keys, describing the LATEST screen.
+
+    ``cell`` stays a string, as it was in v1; ``cell_resolutions`` is the
+    histogram behind it (null when that screen predates the measurement), and
+    ``cell_warning`` is present only when the pass saw anything but the one
+    expected resolution — absent-not-null, like ``first_positive_date``.
+    """
+    counts = cells_by_date.get(latest_screen_date) if latest_screen_date else None
+    fields: dict[str, Any] = {
+        "cell": _describe_screen_cells(counts, latest_screen_date),
+        "cell_resolutions": _screen_cell_list(counts) if counts is not None else None,
+    }
+    if counts is not None:
+        # Cited only when an area was actually quoted from it: a pass that
+        # decoded nothing, or only ids that are not H3 cells, sized nothing.
+        if any(res is not None for res in counts):
+            fields["cell_area_source"] = _H3_AREA_SOURCE
+        unexpected = panoramax_screen.unexpected_cell_resolutions(counts)
+        too_fine = panoramax_screen.too_fine_cell_resolutions(counts)
+        if too_fine:
+            # Only reachable through --allow-fine-cells, and the one case where
+            # "still upper bounds" cannot be promised.
+            fields["cell_warning"] = (
+                f"This screen's hexagons were {unexpected}, and {too_fine}. It was "
+                f"recorded by explicit override: a hexagon that small can vanish from "
+                f"the tile, so a zero in this screen is NOT conclusive."
+            )
+        elif unexpected:
+            fields["cell_warning"] = (
+                f"This screen's hexagons were {unexpected}. The figures are still "
+                f"upper bounds, but `cells` is not comparable with a screen read at "
+                f"another resolution."
+            )
+    return fields
 
 
 def generate_provider_screen_summary(conn, data_dir: str) -> dict[str, Any]:
@@ -1588,7 +1727,13 @@ def generate_provider_screen_summary(conn, data_dir: str) -> dict[str, Any]:
     providers: dict[str, Any] = {}
     for provider in db.get_screened_providers(conn):
         firsts = db.get_provider_screen_firsts(conn, provider)
+        cells_by_date = db.get_provider_screen_cells(conn, provider)
         series = [dict(row) for row in db.get_provider_screen_series(conn, provider)]
+        for point in series:
+            # Per date, because `cells` is only comparable between two dates read
+            # at one resolution. Null for a screen that predates the measurement.
+            counts = cells_by_date.get(point["screen_date"])
+            point["cell_resolutions"] = _screen_cell_list(counts) if counts is not None else None
         rows = []
         for row in db.get_latest_provider_screen(conn, provider):
             city = cities.get(row["city_id"])
@@ -1616,11 +1761,15 @@ def generate_provider_screen_summary(conn, data_dir: str) -> dict[str, Any]:
                 record["first_positive_date"] = firsts[row["city_id"]]
             rows.append(record)
 
+        latest_screen_date = series[-1]["screen_date"] if series else None
         providers[provider] = {
-            "instrument": _SCREEN_INSTRUMENTS.get(provider, {}),
+            "instrument": {
+                **_SCREEN_INSTRUMENTS.get(provider, {}),
+                **_screen_cell_fields(cells_by_date, latest_screen_date),
+            },
             "caveat": _SCREEN_CAVEAT,
             "first_screen_date": series[0]["screen_date"] if series else None,
-            "latest_screen_date": series[-1]["screen_date"] if series else None,
+            "latest_screen_date": latest_screen_date,
             "cities": rows,
             "series": series,
         }

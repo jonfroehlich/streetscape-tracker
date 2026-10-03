@@ -20,7 +20,7 @@ import hashlib
 import logging
 import os
 import sqlite3
-from collections.abc import Iterable, Sequence
+from collections.abc import Collection, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
@@ -30,7 +30,7 @@ from .naming import sanitize_city_query_str
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 19
 
 # The v16 per-host ledger (issue #385). One constant, spliced into _SCHEMA
 # below AND executed by _migrate_v15_to_v16, which runs before _SCHEMA and needs
@@ -380,10 +380,12 @@ CREATE INDEX IF NOT EXISTS idx_swd_to_walk ON street_walk_diffs(to_walk_id);
 
 -- One dated whole-catalog SCREEN of a provider (v15, issue #316): is there any
 -- imagery in this city yet? Not a run and never a substitute for one -- every
--- count here is an UPPER BOUND read off hexagons larger than the city they
--- contain, which is what makes a whole-catalog pass cost 113 requests. A zero
--- is conclusive ("this city holds nothing"); a positive number means only
--- "look closer", and only a real collection settles how much.
+-- count here is an UPPER BOUND: it sums every hexagon OVERLAPPING the city's
+-- bbox, whole, so a hexagon straddling the edge brings in imagery from outside
+-- it (and the bbox is a rectangle, not the city). Coarse hexagons in coarse
+-- tiles are what make a whole-catalog pass cost 113 requests. A zero is
+-- conclusive ("nothing in this bbox"); a positive number means only "look
+-- closer", and only a real collection settles how much.
 --
 -- Keyed by `provider` because the instrument is not Panoramax-specific: any
 -- provider serving a coarse count layer screens into these same columns. The
@@ -416,6 +418,37 @@ CREATE TABLE IF NOT EXISTS provider_screen (
 CREATE INDEX IF NOT EXISTS idx_provider_screen_date
     ON provider_screen(provider, screen_date);
 
+-- v19: what the CELLS of one dated screen were, MEASURED -- one row per H3
+-- resolution decoded from the hexagon ids that pass read, with how many
+-- distinct hexagons carried it. The published description of a screen cell
+-- used to be a constant ("H3 resolution 6"), and the ids said 7 (#406); this
+-- is what lets the artifact say what each pass actually read, and what makes
+-- `cells` interpretable across dates if the provider ever changes resolution.
+--
+-- `cell_resolution` is NULL for ids that are NOT H3 cells at all: counted, not
+-- dropped, so a layer that changed id scheme shows up here. No primary key for
+-- that reason (NULLs are distinct in a UNIQUE); `record_provider_screen`
+-- replaces a date's rows wholesale instead, which an upsert could not do -- a
+-- same-day re-run that no longer sees some resolution must not keep its row.
+--
+-- Three states per screen date, and they must stay distinguishable:
+--   no rows at all             -> screened before v19: resolution NOT MEASURED;
+--   one row (NULL, 0)          -> measured, and the pass decoded NO hexagons
+--                                 (only an --allow-collapse pass can record it);
+--   rows with hexagons > 0     -> the measured histogram.
+-- The (NULL, 0) sentinel cannot collide with the non-H3 bucket, which only
+-- ever holds a positive count.
+--
+-- Purely additive (the v2 -> v3 pattern): no migration function.
+CREATE TABLE IF NOT EXISTS provider_screen_cells (
+    provider        TEXT NOT NULL,
+    screen_date     TEXT NOT NULL,
+    cell_resolution INTEGER,
+    hexagons        INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_provider_screen_cells_date
+    ON provider_screen_cells(provider, screen_date);
+
 -- v16 (issue #385): a TIMESTAMPED per-host spend ledger beside api_usage.
 -- api_usage is keyed by (usage_date, provider), so it cannot answer "how much
 -- has this per-IP host taken in the last 24 h" -- neither across the two
@@ -438,6 +471,56 @@ CREATE INDEX IF NOT EXISTS idx_provider_screen_date
 -- The DDL itself is _HOST_USAGE_DDL, appended below.
 """
     + _HOST_USAGE_DDL
+    + """
+-- v18 (issue #404): which collections were EARLY REFRESHES -- taken by
+-- run-due's fill phase on a night the due slate left under-full, before the
+-- channel's cycle_days - grace_days wall. One row per (city, channel, run
+-- date) the fill collected successfully. A shortened interval is then a fact
+-- in the series rather than something inferred from run dates.
+--
+-- Its own table rather than a column on `runs`, because a walk channel's run
+-- lives in street_walks, and because the migration is then purely additive
+-- (the v2 -> v3 pattern): no function, the CREATE TABLE IF NOT EXISTS builds
+-- it on any older catalog, and pre-#404 code ignores it after a rollback.
+-- prior_success_at is the channel's last success BEFORE the fill run, so the
+-- interval the fill shortened is recorded with it; floor_days is the
+-- [schedule].fill_min_days it was admitted under.
+--
+-- `channel` holds a SCHEDULER CHANNEL name (gsv, gsv_streets, mapillary,
+-- mapillary_streets -- the schedule_state.provider vocabulary), deliberately
+-- not called `provider`: everywhere else in this catalog `provider` names an
+-- imagery provider (runs.provider, street_walks.provider), and a walk channel
+-- is not one. A grid channel's name IS its runs.provider, so the aggregate
+-- joins grid rows on (city_id, channel = runs.provider, run_date).
+--
+-- network_type is the walk's OSM network type ([providers.<walk>].network_type
+-- at the time) and NULL for a grid channel. Recorded now, while the table is
+-- empty, because a walk series is keyed by network type (street_walks has one
+-- series per type) and a later join of these rows onto street_walks needs it:
+-- (city_id, STREET_CHANNELS[channel], network_type, run_date). Not in the key,
+-- because a channel runs ONE network type a night.
+CREATE TABLE IF NOT EXISTS early_refreshes (
+    city_id          TEXT NOT NULL REFERENCES cities(city_id),
+    channel          TEXT NOT NULL,
+    run_date         TEXT NOT NULL,
+    network_type     TEXT,
+    prior_success_at TEXT NOT NULL,
+    floor_days       INTEGER NOT NULL,
+    recorded_at      TEXT NOT NULL,
+    PRIMARY KEY (city_id, channel, run_date)
+);
+-- v18 (issue #404): the nights the fill ATTEMPTED a city, written at
+-- admission, whatever its channels then did. What finds an ORPHANED fill
+-- checkpoint (a fill crawl that paused, on a channel nothing due-side will
+-- resume): keyed on the attempt, not on early_refreshes, which needs some
+-- channel to have SUCCEEDED -- a city whose gsv failed while its mapillary
+-- paused has no early refresh at all. Additive in the same v17 -> v18 rung.
+CREATE TABLE IF NOT EXISTS fill_attempts (
+    city_id  TEXT NOT NULL REFERENCES cities(city_id),
+    run_date TEXT NOT NULL,
+    PRIMARY KEY (city_id, run_date)
+);
+"""
 )
 
 # v1 → v2: add the provider dimension. Three tables need constraint changes
@@ -789,6 +872,19 @@ def init_schema(conn: sqlite3.Connection) -> None:
     if user_version == 16:
         _migrate_add_query_radius_columns(conn)
         user_version = 17
+    # v17 -> v18 (issue #404): the early_refreshes and fill_attempts tables.
+    # Purely additive, so like v2 -> v3 it needs no migration function.
+    if user_version == 17:
+        user_version = 18
+    # v18 -> v19: the provider_screen_cells table (the screen's measured H3
+    # resolution, #406). v18 is #411's early_refreshes table. Both are purely
+    # additive, so like v2 -> v3 neither needs a migration function: the CREATE
+    # TABLE IF NOT EXISTS in _SCHEMA builds every missing table on every
+    # connect, whichever order the two branches landed in. Keyed on 17 as well
+    # so a v17 catalog is correct on a tree that does not yet carry the v18 rung;
+    # once it does, that rung runs first and this one sees 18.
+    if user_version in (17, 18):
+        user_version = 19
     conn.executescript(_SCHEMA)
     # The GSV query-radius pair (issue #367) is ALSO added on every connect, not
     # only on its rung: while in flight it and PR #388 both stamped v16, so a
@@ -1402,6 +1498,44 @@ def get_previous_run(
         (city_id, provider, before_date.isoformat()),
     ).fetchone()
     return _row_to_run(row) if row else None
+
+
+def run_held_imagery(run: RunRow | None) -> bool:
+    """
+    Did this run observe ANY imagery? False for None (no run at all).
+
+    Read from every column that can say so rather than one, because the census
+    providers fill them differently: ``unique_panos`` counts 360° pictures only
+    and ``num_flat_images`` is NULL on rows collected before it existed, while
+    the status counts carry any point that matched a picture of either kind.
+    Backs the Panoramax collapse guard (issue #407 review): an empty census is
+    refused only when the previous run of the same series was positive.
+    """
+    if run is None:
+        return False
+    counts = (
+        run.unique_panos,
+        run.num_flat_images,
+        run.status_ok,
+        run.status_no_date,
+        run.status_flat_only,
+    )
+    return any((value or 0) > 0 for value in counts)
+
+
+def street_walk_held_imagery(walk: sqlite3.Row | None) -> bool:
+    """
+    Did this road walk cover ANY street length? False for None (no walk).
+
+    The walk-series twin of :func:`run_held_imagery`. A walk's own record of
+    imagery is street coverage -- it stores no picture count -- so a census
+    with pictures that matched no sample reads as not positive here. That is the
+    permissive direction: such a series is never refused, only left unguarded.
+    """
+    if walk is None:
+        return False
+    keys = ("coverage_pct_by_length", "coverage_pct_by_length_any", "length_km_covered")
+    return any((walk[key] or 0) > 0 for key in keys)
 
 
 def get_runs_for_city(
@@ -2185,6 +2319,202 @@ def get_host_usage(conn: sqlite3.Connection, host: str, since: datetime) -> int:
     return int(row[0])
 
 
+def record_early_refresh(
+    conn: sqlite3.Connection,
+    city_id: str,
+    channel: str,
+    run_date: date,
+    *,
+    prior_success_at: str,
+    floor_days: int,
+    network_type: str | None = None,
+) -> None:
+    """Record that ``channel``'s ``run_date`` collection of a city was an early refresh (#404).
+
+    ``channel`` is a scheduler channel name (``gsv_streets``, not ``gsv``) and
+    ``network_type`` is set for a walk channel only. Written by ``run-due``'s
+    fill phase after the channel succeeded. Idempotent on the key, so a second
+    write for the same night replaces the first.
+    """
+    conn.execute(
+        """INSERT OR REPLACE INTO early_refreshes
+           (city_id, channel, run_date, network_type, prior_success_at, floor_days,
+            recorded_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (
+            city_id,
+            channel,
+            run_date.isoformat(),
+            network_type,
+            prior_success_at,
+            floor_days,
+            utc_now_iso(),
+        ),
+    )
+    conn.commit()
+
+
+def get_early_refresh_keys(conn: sqlite3.Connection) -> set[tuple[str, str, str]]:
+    """Every early refresh as ``(city_id, channel, run_date)`` (issue #404).
+
+    One query for the catalog, for the aggregate builder, which marks each
+    matching GRID run in ``cities.json.gz`` (a grid channel's name is its
+    ``runs.provider``; a walk channel's rows match no run).
+    """
+    return {
+        (row["city_id"], row["channel"], row["run_date"])
+        for row in conn.execute("SELECT city_id, channel, run_date FROM early_refreshes")
+    }
+
+
+def record_fill_attempt(conn: sqlite3.Connection, city_id: str, run_date: date) -> None:
+    """Record that the fill attempted ``city_id`` on ``run_date`` (issue #404); idempotent."""
+    conn.execute(
+        "INSERT OR IGNORE INTO fill_attempts (city_id, run_date) VALUES (?, ?)",
+        (city_id, run_date.isoformat()),
+    )
+    conn.commit()
+
+
+def prune_fill_attempts(conn: sqlite3.Connection, before: date) -> int:
+    """Delete fill attempts dated before ``before``; return the count (issue #404).
+
+    An attempt only matters while a checkpoint it could have left is alive, so
+    the fill prunes everything older than CHECKPOINT_MAX_AGE_S as it starts.
+    """
+    cur = conn.execute("DELETE FROM fill_attempts WHERE run_date < ?", (before.isoformat(),))
+    conn.commit()
+    return cur.rowcount
+
+
+def get_recent_fill_attempt_city_ids(conn: sqlite3.Connection, since: date) -> set[str]:
+    """Cities the fill attempted on or after ``since`` (issue #404).
+
+    The candidates for an ORPHANED fill checkpoint: the fill attempted the
+    city, one of its resumable channels paused, and that channel is not due,
+    so nothing but the fill resumes it.
+    """
+    return {
+        row["city_id"]
+        for row in conn.execute(
+            "SELECT DISTINCT city_id FROM fill_attempts WHERE run_date >= ?",
+            (since.isoformat(),),
+        )
+    }
+
+
+def delete_early_refresh_for_run(conn: sqlite3.Connection, run_id: int) -> int:
+    """Drop the early-refresh mark of the grid run ``run_id``, if it has one (#404).
+
+    For the scripts that DELETE a run: a mark left behind would point at a run
+    that no longer exists, and a re-collection on the same date would inherit
+    it. Call BEFORE deleting the run (the key is read off it). Does not commit;
+    the caller's transaction does.
+    """
+    row = conn.execute(
+        "SELECT city_id, provider, run_date FROM runs WHERE run_id = ?", (run_id,)
+    ).fetchone()
+    if row is None:
+        return 0
+    cur = conn.execute(
+        "DELETE FROM early_refreshes WHERE city_id = ? AND channel = ? AND run_date = ?",
+        (row["city_id"], row["provider"], row["run_date"]),
+    )
+    return cur.rowcount
+
+
+def get_fill_candidates(
+    conn: sqlite3.Connection,
+    *,
+    today: date,
+    channels: Sequence[str],
+    default_membership: dict[str, bool],
+    fill_min_days: int,
+    due_threshold_days: int,
+    ran_since: str | None = None,
+    ran_tonight: dict[str, Collection[str]] | None = None,
+) -> list[tuple[CityRow, dict[str, str]]]:
+    """Cities ``run-due``'s fill phase may refresh early, and the channels it would run (#404).
+
+    The fill ALIGNS a city: it runs every channel the city is a member of
+    (``channels`` is every enabled channel, opt-in ones included) on one UTC
+    date. A channel that already ran tonight is on that date already and is
+    left out of the run: live, one that succeeded at or after ``ran_since``
+    (the batch start); in the dry run, the city's channels in ``ran_tonight``
+    (tonight's due slate, assumed to succeed). Every OTHER member channel must
+    have succeeded before, at least ``fill_min_days`` ago (the floor) and
+    under ``due_threshold_days`` (``cycle_days - grace_days``) ago -- a due
+    or never-collected channel belongs to the due phase (a late opt-in
+    enrolment is caught up there, through the bounded hoist, and the fill then
+    finishes the city's other channels the same night). One channel short of
+    the floor skips the city whole.
+
+    No consecutive failure since its last success: on a DEFAULT channel that
+    skips the city, so the fill adds at most one failure per channel between
+    successes and can never quarantine it. On an OPT-IN channel it drops only
+    that channel from the run -- a failing KartaView must not freeze the city
+    out of the fill for good -- and the scheduler reports it as a blocked
+    realignment.
+
+    Returns ``(city, {channel to run: last_success_at})``, ordered:
+
+    1. a city PARTLY collected tonight first: its fresh channel will be under
+       the floor tomorrow, so tonight is its one chance to be aligned;
+    2. then by the day of the oldest last success among the channels to run;
+    3. then MISALIGNED before aligned (member channels on different days);
+    4. then ``city_id``.
+    """
+    if not channels:
+        return []
+    states: dict[str, dict[str, sqlite3.Row]] = {}
+    marks = ",".join("?" for _ in channels)
+    for row in conn.execute(
+        f"""SELECT city_id, provider, member, last_success_at, consecutive_failures,
+                   julianday(?) - julianday(last_success_at) AS age_days
+            FROM schedule_state WHERE provider IN ({marks})""",
+        (today.isoformat(), *channels),
+    ):
+        states.setdefault(row["city_id"], {})[row["provider"]] = row
+    ranked = []
+    for city in get_all_cities(conn, enabled_only=True):
+        rows = states.get(city.city_id, {})
+        assumed = set((ran_tonight or {}).get(city.city_id, ()))
+        days: set[str | None] = set()
+        to_run: dict[str, str] = {}
+        partial = False
+        ok = True
+        for channel in channels:
+            row = rows.get(channel)
+            member = row["member"] if row is not None else None
+            if (default_membership[channel] if member is None else member) != 1:
+                continue
+            last = row["last_success_at"] if row is not None else None
+            if channel in assumed or (
+                last is not None and ran_since is not None and last >= ran_since
+            ):
+                days.add(today.isoformat())
+                partial = True
+                continue  # already collected tonight: on tonight's date
+            days.add(last[:10] if last else None)
+            if row is not None and row["consecutive_failures"] > 0:
+                if default_membership[channel]:
+                    ok = False
+                    break
+                continue  # a failing opt-in channel: dropped, reported by the caller
+            if last is None or not (fill_min_days <= row["age_days"] < due_threshold_days):
+                ok = False
+                break
+            to_run[channel] = last
+        if not ok or not to_run:
+            continue
+        stale = min(v[:10] for v in to_run.values())
+        ranked.append(
+            (0 if partial else 1, stale, 0 if len(days) > 1 else 1, city.city_id, city, to_run)
+        )
+    ranked.sort(key=lambda t: t[:4])
+    return [(city, to_run) for *_k, city, to_run in ranked]
+
+
 def prune_host_usage(conn: sqlite3.Connection, before: datetime) -> int:
     """Delete ``host_usage`` rows stamped strictly before ``before``; return the count."""
     cur = conn.execute("DELETE FROM host_usage WHERE recorded_at < ?", (_utc_iso(before),))
@@ -2801,6 +3131,7 @@ def record_provider_screen(
     provider: str,
     screen_date: date,
     rows: list[dict[str, Any]],
+    cell_resolutions: dict[int | None, int] | None = None,
 ) -> int:
     """
     Write one dated whole-catalog screen (issue #316).
@@ -2812,6 +3143,13 @@ def record_provider_screen(
 
     Each row needs ``city_id``, ``cells``, ``pictures_upper_bound``,
     ``pictures_360_upper_bound`` and ``pictures_flat_upper_bound``.
+
+    ``cell_resolutions`` is the pass's measured histogram (resolution -> distinct
+    hexagons, ``None`` for ids that are not H3 cells; see
+    ``panoramax_screen.cell_resolution_counts``). When given it REPLACES the
+    date's `provider_screen_cells` rows in the same transaction; when omitted
+    the date's cells are left untouched, so a caller that measured nothing
+    never erases a measurement.
 
     Written in ONE transaction. A screen is only interpretable whole: half a
     catalog's cities carrying today's date and half carrying last week's would
@@ -2846,8 +3184,45 @@ def record_provider_screen(
             for row in rows
         ],
     )
+    if cell_resolutions is not None:
+        conn.execute(
+            "DELETE FROM provider_screen_cells WHERE provider = ? AND screen_date = ?",
+            (provider, screen_date.isoformat()),
+        )
+        # An EMPTY histogram is a measurement ("no hexagons decoded"), not the
+        # absence of one, so it is stored as the (NULL, 0) sentinel -- writing
+        # nothing would read back as "not measured".
+        histogram = cell_resolutions or {None: 0}
+        conn.executemany(
+            """INSERT INTO provider_screen_cells
+               (provider, screen_date, cell_resolution, hexagons) VALUES (?, ?, ?, ?)""",
+            [(provider, screen_date.isoformat(), res, int(n)) for res, n in histogram.items()],
+        )
     conn.commit()
     return len(rows)
+
+
+def get_provider_screen_cells(
+    conn: sqlite3.Connection, provider: str
+) -> dict[str, dict[int | None, int]]:
+    """
+    Per screen date, the measured resolution histogram of that pass's hexagons.
+
+    A date absent from the result was screened before v19 recorded cells: its
+    resolution was never measured. A date mapping to ``{}`` was measured and
+    decoded no hexagon at all (the stored (NULL, 0) sentinel). The two are not
+    the same and are never folded together.
+    """
+    out: dict[str, dict[int | None, int]] = {}
+    for row in conn.execute(
+        """SELECT screen_date, cell_resolution, hexagons FROM provider_screen_cells
+            WHERE provider = ? ORDER BY screen_date, cell_resolution""",
+        (provider,),
+    ).fetchall():
+        histogram = out.setdefault(row["screen_date"], {})
+        if row["hexagons"]:
+            histogram[row["cell_resolution"]] = int(row["hexagons"])
+    return out
 
 
 def get_latest_provider_screen(conn: sqlite3.Connection, provider: str) -> list[sqlite3.Row]:
