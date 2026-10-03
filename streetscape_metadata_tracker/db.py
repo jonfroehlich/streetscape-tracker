@@ -2727,6 +2727,91 @@ def record_attempt(
     conn.commit()
 
 
+def get_quarantined(
+    conn: sqlite3.Connection,
+    *,
+    channels: Sequence[str],
+    default_membership: dict[str, bool],
+    max_consecutive_failures: int,
+) -> list[sqlite3.Row]:
+    """The (city, channel) pairs ``get_due_cities`` drops for failing too often (issue #421).
+
+    A pair is QUARANTINED when it would otherwise be eligible on this channel --
+    the city is enabled and a member, ``COALESCE(member, default)`` exactly as
+    dueness reads it -- and ``consecutive_failures`` has reached
+    ``max_consecutive_failures``. That is the one gate of the four in
+    :func:`get_due_cities_with_last_success` that nothing but a success (or
+    ``scheduler reset-failures``) ever lifts, and a quarantined pair is never
+    attempted again, so it never fails again, so it never alerts again: this
+    query is what lets the scheduler say so instead.
+
+    Staleness is deliberately NOT part of it. A quarantined pair that happens
+    not to be stale yet is still one that will be skipped the night it is, and
+    reporting it only once due would make the standing count flicker with the
+    cycle rather than track the set an operator has to clear.
+
+    A disabled city and a non-member are left out: neither can be due on this
+    channel whatever its counter says, so counting them would be a quarantine
+    with nothing behind it. ``default_membership`` is the code-side
+    ``scheduler.CHANNEL_DEFAULT_MEMBERSHIP`` (passed in rather than imported,
+    the same shape :func:`get_fill_candidates` takes), and it is indexed rather
+    than ``.get()``-ed, so a channel missing from it is a ``KeyError`` and never
+    a silent default.
+
+    Returns rows with ``city_id``, ``provider``, ``consecutive_failures``,
+    ``last_error`` and ``last_attempt_at``, ordered by channel then city so a
+    report built from them is stable night to night.
+    """
+    out: list[sqlite3.Row] = []
+    for channel in channels:
+        out.extend(
+            conn.execute(
+                """SELECT s.city_id, s.provider, s.consecutive_failures, s.last_error,
+                          s.last_attempt_at
+                   FROM schedule_state s
+                   JOIN cities c ON c.city_id = s.city_id
+                   WHERE s.provider = ?
+                     AND c.enabled = 1
+                     AND COALESCE(s.member, ?) = 1
+                     AND s.consecutive_failures >= ?
+                   ORDER BY s.city_id""",
+                (channel, 1 if default_membership[channel] else 0, max_consecutive_failures),
+            ).fetchall()
+        )
+    out.sort(key=lambda r: (r["provider"], r["city_id"]))
+    return out
+
+
+def reset_consecutive_failures(conn: sqlite3.Connection, city_id: str, provider: str) -> int:
+    """Zero one pair's ``consecutive_failures``; return the count it held (issue #421).
+
+    The operator's way out of a quarantine, so the alert's suggested fix is a
+    command rather than hand-written SQL against the live catalog.
+
+    Only the counter moves. ``last_success_at`` is untouched -- a reset is not
+    a success, and stamping one would make the pair look fresh and push its
+    next attempt a whole cycle away, which is the opposite of what an operator
+    clearing a quarantine wants. ``last_error`` is KEPT for the same reason a
+    failure keeps it: it is the only record of why the pair was quarantined,
+    and the next attempt overwrites it either way.
+
+    Returns 0, writing nothing, when there is no row or no failure to clear --
+    the caller decides whether that is an error.
+    """
+    row = conn.execute(
+        "SELECT consecutive_failures FROM schedule_state WHERE city_id = ? AND provider = ?",
+        (city_id, provider),
+    ).fetchone()
+    if row is None or not row["consecutive_failures"]:
+        return 0
+    conn.execute(
+        "UPDATE schedule_state SET consecutive_failures = 0 WHERE city_id = ? AND provider = ?",
+        (city_id, provider),
+    )
+    conn.commit()
+    return row["consecutive_failures"]
+
+
 def get_channel_membership(conn: sqlite3.Connection, city_id: str, provider: str) -> int | None:
     """This pair's explicit ``schedule_state.member``, or None.
 
