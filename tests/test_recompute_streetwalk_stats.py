@@ -523,6 +523,26 @@ def test_a_sample_frame_mismatch_refuses_the_whole_series(tmp_path, monkeypatch,
     assert _tree_digest(data_dir, without_db=True) == digest
 
 
+def test_a_csv_location_no_sample_reaches_is_refused(tmp_path, monkeypatch, capsys):
+    """The other direction: every regenerated sample matches, but the CSV holds
+    a query location none of them reaches (it was walked on another frame). The
+    scorer would silently ignore that row, so only the frame check can see it."""
+    data_dir = _setup(tmp_path, monkeypatch)
+    _collect(data_dir, D1, monkeypatch, old_definition=True)
+    before = _walk(data_dir, D1)
+
+    def add_stray(raw):
+        stray = raw.iloc[[0]].copy()
+        stray["query_lat"] = "44.06"  # ~900 m north of the network's last node
+        return pd.concat([raw, stray], ignore_index=True)
+
+    _rewrite_csv(os.path.join(data_dir, before["csv_filename"]), add_stray)
+    assert _run(data_dir, "--execute") == 1
+    out = capsys.readouterr().out
+    assert "1 of the CSV's" in out and "(sample key mismatch 1)" in out
+    assert _walk(data_dir, D1) == before
+
+
 def test_a_refreshed_network_is_refused_by_the_sample_count(tmp_path, monkeypatch, capsys):
     data_dir = _setup(tmp_path, monkeypatch)
     _collect(data_dir, D1, monkeypatch, old_definition=True)
