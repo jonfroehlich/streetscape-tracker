@@ -527,6 +527,30 @@ Added in the fifth review round:
 
 **The equivalent mutant**: dropping `CHANNEL_METERED_HOST.get(channel) is None` from the resume's free extras (the reviewers' M21) changes nothing, because the coverage gate admits extras only when every usable metered member channel is already in the resume — so no metered channel is left for the extras loop to add. The check stays as the statement of intent.
 
+## The failure quarantine, made visible (issue #421)
+
+`tests/test_failure_quarantine.py` drives one real `cmd_run_due` per night with a fake `_run_one_city`, gsv + mapillary enabled, and `failure_threshold = 99`, so a plain failed collection sends nothing and any email a test sees came from a condition that alerts on its own.
+Every "killed by" below was run against the committed code, one mutation at a time with the file restored after; 33 mutants (12 of them from the review fixes), all killed.
+
+- `test_a_fill_failure_that_reaches_the_cap_is_reported_as_a_transition` — at `max_consecutive_failures = 1` (the fill adds at most one failure, so only there can it reach the cap), with nothing due, the FILL's failure is the night's only one and still alerts as `1 QUARANTINED`; killed by taking the after-snapshot right after `_run_city_loop`, ahead of the fill.
+- `test_a_later_night_does_not_re_alert_but_keeps_counting` — a pair already at the cap is not attempted, sends no email, and is counted on the `Done:` line without `new tonight`; killed by using the standing set as the transition (`count >= max`).
+- `test_a_pair_already_over_the_cap_that_fails_again_is_not_a_new_transition` — the set difference, on hand-built rows.
+- `test_a_raising_quarantine_check_costs_neither_the_night_nor_its_tail` — `_quarantined_pairs` raises on the BEFORE call, then (separately) on the AFTER one; the night still collects, runs both backups, rebuilds, publishes, names the failure on the `Done:` line and alerts as `QUARANTINE CHECK FAILED`, and a standing pair already at the cap is never reported as new; killed by unguarding either snapshot, by dropping the subject part or its `unhealthy` entry, and by diffing a failed before-snapshot as an empty set; the AFTER case asserts no standing count, killed by reporting the before-set when the after-snapshot failed (`quarantined = list(quarantined_before or [])`).
+- `test_an_amnestied_outcome_never_quarantines_a_pair_one_failure_from_the_cap` — blocked, busy, crawl-incomplete, argv-rejected and a child killed by the SIGTERM wind-down (#206), each on a pair one failure from the cap, leave the counter there, alert nothing as `QUARANTINED` and add nothing to the `Done:` line; the SIGTERM case also asserts the stop's amnesty branch was the one taken; killed, per family, by recording a failure in that family's amnesty branch.
+- `test_get_quarantined_is_exactly_the_pairs_dueness_drops_for_failing` — each non-quarantined row differs from a quarantined one in one respect; killed by `>` for `>=`, by dropping the `enabled` gate, and by dropping the membership gate.
+- `test_reset_consecutive_failures_commits_what_another_connection_reads` — reads the reset back through a SECOND connection to the file database, since every other test reads through the writer, which sees its own uncommitted transaction; killed by deleting `conn.commit()` in `db.reset_consecutive_failures`.
+- `test_reset_consecutive_failures_zeroes_only_the_counter` — `last_error` and `last_success_at` survive, the sibling channel is untouched; killed by stamping a success in the reset.
+- `test_reset_failures_bad_input_exits_64_and_writes_nothing` — asserts each refusal's MESSAGE, not just 64: an unknown channel also exits 64 as "nothing to reset" (no row matches it), so the status alone survived deleting the channel check.
+- `test_reset_failures_execute_clears_the_quarantine_and_the_pair_is_due_again` — through `get_due_cities`, not just the column.
+- `test_reset_failures_is_a_dry_run_without_execute`; killed by writing regardless of `--execute`.
+- `test_reset_failures_is_wired_into_the_cli` — through `main()`; killed by dropping `--execute` on the way to the command.
+- `test_status_marks_the_quarantined_pair_and_counts_them`; killed by dropping the marker.
+- `test_the_done_line_says_nothing_about_quarantine_when_there_is_none`; killed by printing the clause unconditionally.
+- `test_the_quarantine_clauses_hold_no_semicolon_past_their_leading_separator` — the `Done:` line is split on `;` (`scripts/night_length_analyze.py`), so the count clause (with and without `new tonight`) and a failed check's clause, on an exception message that itself holds `;`, each carry exactly one; killed by a `;` before `new tonight` and by passing the exception text through unescaped.
+- `test_the_night_a_pair_reaches_the_cap_alerts_once_naming_it_and_its_fix` — the fifth failure alerts once past the threshold, with the subject part, the pair's count and `last_error`, the exact `--config ... reset-failures ... --execute` command, and the `Done:` clause; killed by dropping the subject part, the body paragraph, the `unhealthy` entry, the `Done:` clause, `--execute` from the command, or the snapshot's channel list.
+- `test_the_positive_control_a_plain_failure_one_from_the_cap_does_quarantine` — the control that keeps the amnesty test from passing by never counting at all.
+- `test_the_reset_command_survives_an_apostrophe_in_the_city_id` — the alert's pasted command, for `coeur-d'alene--idaho--united-states` and a `--config` path with a space, round-trips through `shlex.split` to the exact argv; killed by joining the argv unquoted.
+
 ## Concurrent channel lanes (issue #240)
 
 **Added after the split.**
