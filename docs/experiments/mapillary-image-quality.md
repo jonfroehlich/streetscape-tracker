@@ -133,7 +133,7 @@ Organizational capture is still worth surfacing — it says something about *sys
 3. **Never rank on quality alone.** Pair it with the on-foot share, or a quality ranking silently ranks against sidewalk-relevant imagery.
 4. Everything above is computable from censuses already on disk; none of it needs a re-collection.
 
-**Shipped as PR #TBD (2026-10-04, issue #321).**
+**Shipped as PR #427 (2026-10-04, issue #321).**
 Every Mapillary run's `mapillary_meta` now carries a `quality` block — `p10`…`p90`, `pct_ge_good`/`pct_lt_poor` at this study's 0.9/0.6 cuts, the drive count and drive-weighted `seq_p25`/`seq_p50`/`seq_p75`, and the on-foot/vehicle medians and counts — computed with this study's definitions (the collect script now imports its thresholds from `streetscape_metadata_tracker/mapillary_quality.py`, and a test reproduces its per-city row from the published block).
 The aggregate carries the block, and `grid.html` offers it as an opt-in "Imagery quality (Mapillary's prediction)" group whose fourth column is the on-foot share, so decisions 1–3 hold on the site; the runs predating the column stay absent.
 
