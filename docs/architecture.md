@@ -129,7 +129,7 @@ So is the road walk, which bounds sample-to-pano distance itself (`street_covera
 **Running it is a REQUIRED deploy step, before the next 02:00 timer**: `recompute_run_stats.py --provider gsv` dry, then with `--execute --regenerate-json`, then `scheduler regenerate-aggregate --publish`.
 The exact commands are in [`operations.md`](operations.md), "Deploying a stats-definition change".
 Without it, runs collected after the deploy are cataloged under 50 m while older rows keep the unfiltered `coverage_rate_pct`, and the aggregate and driving page read that stored column, so every re-collected city shows a phantom drop of about 10% (the share of covered points the rule flips in the sample).
-Historical `run_diffs` rows and diff detail CSVs stay under the old definition even after the repair, until a GSV re-diff pass exists; diffs computed after the deploy are correct.
+Historical `run_diffs` rows and diff detail CSVs stay under the old definition even after the stats repair, until the GSV series is re-diffed with `scripts/recompute_run_diffs.py` — a pending deploy step (issue #394), not yet run or scheduled, whose commands are in [`operations.md`](operations.md); diffs computed after the deploy are correct.
 
 ## Pipeline per run
 

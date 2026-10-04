@@ -210,9 +210,35 @@ Step 2 is a whole-series pass over every GSV CSV, so budget hours rather than mi
 If it cannot finish before 02:00, disable the timer for the night (`systemctl --user disable --now streetscape-tracker.timer`, and `enable --now` after step 3; never `stop`, which the #369 watchdog re-arms) rather than let a night catalog runs beside a half-repaired series.
 
 **What the repair does NOT move.**
-Historical `run_diffs` rows and the published diff detail CSVs stay under the old definition: `recompute_run_stats.py` re-derives run stats, never diffs, and nothing re-diffs a GSV series yet.
-So after #367 a city's "Changes since" panel for an old pair can still count a far pano as added or removed, until a GSV re-diff pass exists (a follow-up).
+Historical `run_diffs` rows and the published diff detail CSVs stay under the old definition: `recompute_run_stats.py` re-derives run stats, never diffs.
+So after #367 a city's "Changes since" panel for an old pair can still count a far pano as added or removed, until the GSV series is re-diffed.
 Diffs computed from the deploy on are correct, because both of their sides load through the new rule.
+
+**Re-diffing a GSV series (issue #394) is a pending deploy step, not done and not scheduled.**
+The handle exists: `scripts/recompute_run_diffs.py` (#245) loads both CSVs of every existing row through the default `fileutils.load_city_csv_file`, so it inherits the 50 m rule (pinned by `test_a_gsv_rediff_applies_the_query_radius_rule`).
+Whether and when to run it on prod is the operator's call; until it runs, the paragraph above describes prod.
+Run it only AFTER the #367 stats repair above (`recompute_run_stats.py --provider gsv --execute --regenerate-json`) has completed and its aggregate has been published, so the series' stats and diffs move to the new definition in that order and never the other way round.
+A whole-series `--provider gsv` pass also covers the Amsterdam and Auckland rows that #245's phantom-diff repair targets, so no separate `--city` pass is needed for them.
+
+```bash
+cd ~/streetscape-tracker
+# 1. Dry run: performs the FULL recomputation (both CSVs per row) and prints what would change. Read it before step 2.
+.venv-makelab2/bin/python scripts/recompute_run_diffs.py \
+    --data-dir /projects/makeabilitylab/streetscape-tracker/data --provider gsv
+# 2. Apply to the catalog and the detail files, and rebuild the affected per-run JSONs.
+.venv-makelab2/bin/python scripts/recompute_run_diffs.py \
+    --data-dir /projects/makeabilitylab/streetscape-tracker/data --provider gsv \
+    --execute --regenerate-json >> logs/rediff_394.log 2>&1
+# 3. Rebuild the aggregate from the repaired catalog and publish it.
+.venv-makelab2/bin/python -m streetscape_metadata_tracker.scheduler \
+    --config config/scheduler.makelab1.toml regenerate-aggregate --publish
+```
+
+`--provider gsv` matters for the same memory reason as above.
+Steps 1 and 2 each load two GSV CSVs per diff row over every series, so budget hours rather than minutes for EACH; drive them into a file, never a pipe.
+The script checks for an in-flight `run-due` only when it starts (`--execute` is refused then), and the nightly batch never checks for this script, so a pass still running at 02:00 would race a night that catalogs new runs and diffs beside a half re-diffed series.
+If step 2 might not finish before 02:00, disable the timer for the night (`systemctl --user disable --now streetscape-tracker.timer`, and `enable --now` after step 3; never `stop`, which the #369 watchdog re-arms).
+The publish never passes rsync `--delete`, so a detail file the pass REMOVES stays on the web server until removed there; the pass lists those names.
 
 ## Landing a laptop investigation in this catalog: `scheduler import-bundle` (issue #330)
 
