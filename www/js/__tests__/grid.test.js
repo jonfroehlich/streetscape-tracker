@@ -925,3 +925,137 @@ test("the default preset's title never names a group that is not shown", () => {
     }
   }
 });
+
+// --- Imagery quality (issue #321) -------------------------------------------
+
+const QUALITY = {
+  n_scored: 900,
+  p50: 0.834,
+  pct_ge_good: 14.2,
+  pct_lt_poor: 9.8,
+  n_on_foot: 300,
+  n_foot_known: 1000,
+};
+
+const SEATTLE_MAPILLARY_Q = { ...SEATTLE_MAPILLARY, quality: QUALITY };
+
+/** buildFor, with the quality set the render path passes too. */
+function qualityBuildFor(raw, cityId) {
+  const { rows, providers, qualityProviders } = pivotGridRows(raw);
+  const columns = buildGridColumns(providers, qualityProviders);
+  return {
+    qualityProviders,
+    row: rows.find((r) => r.cityId === cityId),
+    columns,
+    presets: buildGridPresets(columns),
+    filters: buildGridFilters(providers, qualityProviders),
+  };
+}
+
+test("quality: a payload with no block anywhere gets no group, no preset and no filters", () => {
+  const { qualityProviders, row, columns, presets, filters } = qualityBuildFor(
+    payload(SEATTLE_GSV, SEATTLE_MAPILLARY),
+    "seattle--wa"
+  );
+  assert.deepEqual(qualityProviders, []);
+  assert.ok(!columns.some((c) => c.group?.id === "quality"));
+  assert.ok(!presets.some((p) => p.id === "quality"));
+  assert.ok(!filters.some((f) => f.key.startsWith("quality_") || f.key.startsWith("onfoot_")));
+  assert.ok(!Object.keys(row).some((k) => k.startsWith("quality_")));
+});
+
+test("quality: a block on one provider's record gives THAT provider the group, and only it", () => {
+  const { qualityProviders, row, columns, filters } = qualityBuildFor(
+    payload(SEATTLE_GSV, SEATTLE_MAPILLARY_Q),
+    "seattle--wa"
+  );
+  assert.deepEqual(qualityProviders, ["mapillary"]);
+  const leaves = columns.filter((c) => c.group?.id === "quality").map((c) => c.key);
+  assert.deepEqual(leaves, [
+    "quality_mapillary_p50",
+    "quality_mapillary_ge_good",
+    "quality_mapillary_lt_poor",
+    "quality_mapillary_on_foot",
+  ]);
+  assert.ok(!Object.keys(row).some((k) => k.startsWith("quality_gsv")));
+  const qualityFilters = filters
+    .filter((f) => f.key.startsWith("quality_") || f.key.startsWith("onfoot_"))
+    .map((f) => [f.key, f.field, f.type, f.min, f.max]);
+  assert.deepEqual(qualityFilters, [
+    ["quality_mapillary", "quality_mapillary_p50", "histogram-range", 0, 1],
+    ["onfoot_mapillary", "quality_mapillary_on_foot", "histogram-range", 0, 100],
+  ]);
+  for (const f of filters) assert.ok(f.key === "provider" || f.field in row, f.key);
+});
+
+test("quality: presence is read from the payload, not the provider name", () => {
+  // A block on the third provider is enough, and the name "mapillary" without
+  // a block is not.
+  const third = { ...SEATTLE_MAPILLARY, provider: "thirdparty", quality: QUALITY };
+  const { qualityProviders } = qualityBuildFor(
+    payload(SEATTLE_GSV, SEATTLE_MAPILLARY, third),
+    "seattle--wa"
+  );
+  assert.deepEqual(qualityProviders, ["thirdparty"]);
+});
+
+test("quality: the row carries the block's numbers, and the on-foot share from its counts", () => {
+  const { row } = qualityBuildFor(payload(SEATTLE_GSV, SEATTLE_MAPILLARY_Q), "seattle--wa");
+  assert.equal(row.quality_mapillary_p50, 0.834);
+  assert.equal(row.quality_mapillary_ge_good, 14.2);
+  assert.equal(row.quality_mapillary_lt_poor, 9.8);
+  assert.equal(row.quality_mapillary_on_foot, 30);
+});
+
+test("quality: a city without the block reads null and renders em-dashes", () => {
+  // Bend has a Mapillary run predating the quality_score column, beside a
+  // Seattle that has the block -- so the group exists and Bend's cells in it
+  // must say "not measured", never zero.
+  const bendMly = { ...SEATTLE_MAPILLARY, city_id: "bend--or", city: "Bend" };
+  const raw = payload(SEATTLE_MAPILLARY_Q, bendMly);
+  const { row, columns } = qualityBuildFor(raw, "bend--or");
+  for (const suffix of ["p50", "ge_good", "lt_poor", "on_foot"]) {
+    assert.equal(row[`quality_mapillary_${suffix}`], null, suffix);
+  }
+  const qualityCols = columns.filter((c) => c.group?.id === "quality");
+  for (const col of qualityCols) assert.match(col.cell(row), />—</);
+  const seattle = qualityBuildFor(raw, "seattle--wa").row;
+  assert.match(qualityCols[0].cell(seattle), /0\.83/);
+});
+
+test("quality: an unknown capture mode is no on-foot share, not 0%", () => {
+  const unknown = { ...SEATTLE_MAPILLARY, quality: { ...QUALITY, n_on_foot: 0, n_foot_known: 0 } };
+  const { row } = qualityBuildFor(payload(unknown), "seattle--wa");
+  assert.equal(row.quality_mapillary_on_foot, null);
+});
+
+test("quality: every header says what the number is and carries the on-foot caveat", () => {
+  const { columns } = qualityBuildFor(payload(SEATTLE_MAPILLARY_Q), "seattle--wa");
+  const qualityCols = columns.filter((c) => c.group?.id === "quality");
+  assert.equal(qualityCols.length, 4);
+  const group = qualityCols[0].group;
+  assert.match(group.label, /prediction/i);
+  for (const text of [group.title, ...qualityCols.map((c) => c.title)]) {
+    assert.match(text, /prediction of visual quality/);
+    assert.match(text, /0–1/);
+    assert.match(text, /84\.5%/);
+    assert.match(text, /never rank a city on it alone/);
+  }
+  // The on-foot leaf is IN the group, so the figures never render without it.
+  assert.ok(qualityCols.some((c) => c.key.endsWith("_on_foot")));
+});
+
+test("quality: not in the default preset; its own preset is cov + quality + collected", () => {
+  const { columns, presets } = qualityBuildFor(
+    payload(SEATTLE_GSV, SEATTLE_MAPILLARY_Q),
+    "seattle--wa"
+  );
+  const byKey = new Map(columns.map((c) => [c.key, c]));
+  assert.ok(!presets[0].columns.some((k) => byKey.get(k)?.group?.id === "quality"));
+  const preset = presets.find((p) => p.id === "quality");
+  assert.equal(preset.label, "Mapillary quality");
+  const groups = [...new Set(preset.columns.map((k) => byKey.get(k)?.group?.id))];
+  assert.deepEqual(groups, ["cov", "quality", "collected"]);
+  assert.ok(!preset.columns.some((k) => byKey.get(k)?.isGroupDelta), "no Δ in this preset");
+  assert.equal(preset.columns.filter((k) => byKey.get(k)?.group?.id === "quality").length, 4);
+});

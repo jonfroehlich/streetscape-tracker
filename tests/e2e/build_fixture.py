@@ -241,12 +241,24 @@ def _add_kartaview_run(conn, city_id, city_name, state, country, panos, run_date
     )
 
 
+# Per-pano quality_score and on_foot, cycled over a Mapillary run's pano rows,
+# so the published `mapillary_meta.quality` block (issue #321) holds a real
+# distribution -- one good, one poor, one on foot -- rather than the shared
+# builder's single constant, under which every percentile, both tail shares
+# and the on-foot share would be indistinguishable from a broken reduction.
+MAPILLARY_FIXTURE_QUALITY = (0.92, 0.58)
+MAPILLARY_FIXTURE_ON_FOOT = (True, False)
+
+
 def _add_mapillary_run(conn, city_id, city_name, state, country, panos, run_date, grid_origin):
     name = _run_name(city_id, run_date, provider="mapillary")
     csv_path = os.path.join(FIXTURE_DIR, name)
-    write_city_csv_gz(
-        make_mapillary_city_df(panos, run_date=run_date, grid_origin=grid_origin), csv_path
-    )
+    df = make_mapillary_city_df(panos, run_date=run_date, grid_origin=grid_origin)
+    ok = df.index[df["status"] == "OK"]
+    for i, idx in enumerate(ok):
+        df.at[idx, "quality_score"] = MAPILLARY_FIXTURE_QUALITY[i % len(MAPILLARY_FIXTURE_QUALITY)]
+        df.at[idx, "on_foot"] = MAPILLARY_FIXTURE_ON_FOOT[i % len(MAPILLARY_FIXTURE_ON_FOOT)]
+    write_city_csv_gz(df, csv_path)
     json_path, df = _write_summary(
         csv_path, city_name, state, country, run_date, provider="mapillary"
     )

@@ -72,7 +72,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import gzip
 import json
 import os
 import sys
@@ -84,6 +83,11 @@ import pandas as pd
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 from streetscape_metadata_tracker import db  # noqa: E402
+from streetscape_metadata_tracker.mapillary_quality import (  # noqa: E402
+    GOOD_THRESHOLD,
+    POOR_THRESHOLD,
+    has_quality_column,
+)
 from streetscape_metadata_tracker.paths import get_default_data_dir  # noqa: E402
 
 TOPIC = "mapillary-image-quality"
@@ -115,9 +119,11 @@ CHUNK_ROWS = 500_000
 
 # The two tail shares the study reports. The median compresses every city into
 # ~0.80-0.87 (measured); these are where the cities actually separate, so they
-# are the headline rather than a supplementary cut.
-GOOD_THRESHOLD = 0.90
-POOR_THRESHOLD = 0.60
+# are the headline rather than a supplementary cut. GOOD_THRESHOLD and
+# POOR_THRESHOLD are imported from the package above (issue #321), which
+# publishes the same shares in every Mapillary run's `mapillary_meta.quality`
+# block, so the study and the site cannot disagree on where "good" and "poor"
+# begin.
 
 # One row per city. Declared here rather than built ad hoc so the committed CSV
 # has a pinned column order a test can assert against.
@@ -199,10 +205,11 @@ def _has_quality_column(path: str) -> bool:
 
     Reads the header line only. A pandas `usecols` miss would raise mid-parse
     after the file was already half-decompressed, and the answer is one line in.
+    The package's copy is the one `recompute_run_stats.py
+    --regenerate-json-mapillary-meta` selects runs with (issue #321), so the
+    study and the backfill agree on which runs are legacy.
     """
-    with gzip.open(path, "rt", encoding="utf-8", newline="") as fh:
-        header = fh.readline()
-    return "quality_score" in next(csv.reader([header]), [])
+    return has_quality_column(path)
 
 
 def _pct(numerator: int, denominator: int) -> float | None:

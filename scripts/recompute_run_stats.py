@@ -75,11 +75,36 @@ derived from them — until some later unrelated `scheduler run-due`.
 Idempotent: a run whose stored stats already match is left untouched. Runs
 whose CSV is missing (skipped, reported) keep their existing values.
 
+THE MAPILLARY QUALITY BACKFILL (issue #321)
+--regenerate-json-mapillary-meta is a separate mode, and it skips everything
+above: no stats pass, no catalog write. Issue #321 added a `quality` block
+(the quality_score distribution and its on-foot split) to every Mapillary
+run's `mapillary_meta`, and a run summarized before that deploy lacks it. The
+mode, which requires --provider mapillary, rebuilds the per-run JSON of
+exactly the runs whose JSON lacks `mapillary_meta.quality` AND whose CSV
+header carries `quality_score` -- the header line only, never a census load,
+decides. The ~129 runs collected before 2026-07-24 have no such column and
+stay ABSENT, never zero; the report counts them.
+
+Its cost is one full census reload per selected run (regenerate_run_json,
+the live pipeline's own writer), and a Mapillary census is up to millions of
+rows: on production that is HOURS. Run it in the daytime ops window, never
+inside a night: --execute is refused while a `run-due` is in flight on this
+machine (`scheduler._run_due_in_flight`, as recompute_run_diffs.py does),
+because the nightly tail writes cities.json.gz through the same temp name and
+the summarizer tail is the per-city memory high-water mark. Only this mode is
+gated; the stats pass above keeps its existing behaviour. A dry run proceeds
+and says a batch is running.
+
 Usage:
     python scripts/recompute_run_stats.py                        # dry run
     python scripts/recompute_run_stats.py --execute              # apply
     python scripts/recompute_run_stats.py --provider gsv \\
         --regenerate-json --execute        # issue #213's and #226's repair on prod
+    python scripts/recompute_run_stats.py --provider mapillary \\
+        --regenerate-json-mapillary-meta   # issue #321's backfill: list only
+    python scripts/recompute_run_stats.py --provider mapillary \\
+        --regenerate-json-mapillary-meta --execute   # ...and rebuild (daytime)
 
 --provider gsv is not just a filter there: --regenerate-json re-reads every
 rebuilt run's CSV, and a Mapillary census run is millions of rows.
@@ -111,6 +136,7 @@ from streetscape_metadata_tracker.json_summarizer import (  # noqa: E402
     generate_driving_plan_summary,
     regenerate_run_json,
 )
+from streetscape_metadata_tracker.mapillary_quality import has_quality_column  # noqa: E402
 from streetscape_metadata_tracker.naming import KNOWN_PROVIDERS  # noqa: E402
 from streetscape_metadata_tracker.paths import get_default_data_dir  # noqa: E402
 
@@ -232,6 +258,99 @@ def _age_delta_note(row, stats, n_implausible: int, n_out_of_radius: int = 0) ->
     return f"; {', '.join(parts)}" if parts else ""
 
 
+def _json_has_quality_block(data_dir: str, json_filename: str | None) -> bool:
+    """
+    True when a run's published JSON already carries `mapillary_meta.quality`.
+
+    What keeps the #321 backfill idempotent. A file that is missing, unreadable
+    or predates the block reads False, i.e. a candidate -- the CSV header then
+    decides whether there is anything to build it from.
+    """
+    if not json_filename:
+        return False
+    try:
+        with gzip.open(os.path.join(data_dir, json_filename), "rt", encoding="utf-8") as fh:
+            meta = json.load(fh).get("mapillary_meta") or {}
+    except (OSError, EOFError, ValueError):
+        return False
+    return "quality" in meta
+
+
+def backfill_mapillary_quality(data_dir: str, *, execute: bool, publish: bool) -> int:
+    """
+    Issue #321's backfill: rebuild the per-run JSON of every Mapillary run
+    that lacks `mapillary_meta.quality` but whose CSV carries `quality_score`.
+
+    Selection reads one JSON and one CSV header line per run, never a census.
+    Dry run (the default) lists the selection and writes nothing; `execute`
+    rebuilds each through `regenerate_run_json` (one census reload apiece, so
+    hours on production) and then the aggregate, unless `publish` is False.
+
+    Returns the process exit status: 0, or `USAGE_EXIT_CODE` when `execute`
+    is refused because a `run-due` is in flight on this machine.
+    """
+    # Imported here so the stats pass never pays for (or depends on) the
+    # scheduler module.
+    from streetscape_metadata_tracker.scheduler import USAGE_EXIT_CODE, _run_due_in_flight
+
+    in_flight = _run_due_in_flight()
+    if in_flight:
+        if execute:
+            logger.error(
+                f"A run-due is in flight on this machine ({in_flight}); refusing --execute: "
+                "this backfill reloads whole censuses and rewrites cities.json.gz, so it "
+                "belongs in the daytime ops window. Wait for the night to finish."
+            )
+            return USAGE_EXIT_CODE
+        logger.warning(f"A run-due is in flight on this machine ({in_flight}); dry run only.")
+
+    conn = db.connect(db.get_default_db_path(data_dir))
+    rows = conn.execute(
+        """SELECT run_id, city_id, run_date, csv_filename, json_filename
+             FROM runs WHERE provider = 'mapillary'
+            ORDER BY city_id, run_date"""
+    ).fetchall()
+
+    targets = []
+    n_has_block = n_legacy = n_missing = 0
+    for r in rows:
+        if _json_has_quality_block(data_dir, r["json_filename"]):
+            n_has_block += 1
+            continue
+        csv_path = os.path.join(data_dir, r["csv_filename"])
+        if not os.path.exists(csv_path):
+            logger.warning(f"CSV missing, skipping: {r['csv_filename']}")
+            n_missing += 1
+            continue
+        if not has_quality_column(csv_path):
+            n_legacy += 1
+            continue
+        targets.append(r)
+        print(f"  {r['city_id']} [mapillary] {r['run_date']}: {r['csv_filename']}")
+
+    print(
+        f"\n{len(rows)} Mapillary runs scanned: {n_has_block} already carry the quality "
+        f"block, {n_legacy} predate the quality_score column and stay absent, "
+        f"{n_missing} skipped (missing CSV), {len(targets)} "
+        f"{'will' if execute else 'would'} be rebuilt (one census reload each)"
+    )
+    if not execute:
+        print("\nDry run complete. Re-run with --execute to apply (daytime only).")
+        return 0
+
+    rebuilt = 0
+    for r in targets:
+        if regenerate_run_json(conn, r["run_id"], data_dir) is None:
+            logger.warning(f"Could not rebuild JSON for run {r['run_id']} ({r['csv_filename']})")
+        else:
+            rebuilt += 1
+    print(f"Rebuilt {rebuilt} of {len(targets)} per-run JSON summaries.")
+    if publish:
+        generate_aggregate_v2(conn, data_dir)
+        print(f"Regenerated aggregate: {os.path.join(data_dir, 'cities.json.gz')}")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Recompute stored per-run stats from every run's CSV under "
@@ -269,7 +388,27 @@ def main() -> int:
         "kind is a second full pass per CSV, so it runs only under this flag; "
         "combine with --provider gsv and no --execute for a preview",
     )
+    parser.add_argument(
+        "--regenerate-json-mapillary-meta",
+        action="store_true",
+        help="Issue #321's backfill, a SEPARATE mode that skips the stats pass: "
+        "rebuild the per-run JSON of every Mapillary run that lacks "
+        "mapillary_meta.quality but whose CSV header carries quality_score. "
+        "Requires --provider mapillary. One census reload per run (hours on "
+        "production); --execute is refused while run-due is in flight",
+    )
     args = parser.parse_args()
+
+    if args.regenerate_json_mapillary_meta:
+        if args.provider != "mapillary":
+            parser.error("--regenerate-json-mapillary-meta requires --provider mapillary")
+        if args.regenerate_json:
+            parser.error(
+                "--regenerate-json-mapillary-meta is its own mode; run --regenerate-json separately"
+            )
+        return backfill_mapillary_quality(
+            args.data_dir, execute=args.execute, publish=not args.no_publish_json
+        )
 
     conn = db.connect(db.get_default_db_path(args.data_dir))
 
