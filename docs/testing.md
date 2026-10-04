@@ -1357,3 +1357,14 @@ the solar day keeping an American afternoon and evening on its own date, cells a
 the catalog match inside / outside / disabled / never-collected, the SMALLEST of two overlapping bboxes winning with the other in `also_in`, the latest Mapillary run (not a newer gsv one) read, and `after_last_run` and `newer_than_seen` each shown true without the other (the 2026-08-26 Spokane case) — including a NULL newest capture — against a catalog opened read-only;
 a missing catalog reported and never created, a catalog at schema 0 or newer than `db.SCHEMA_VERSION` exiting 64, the GeoJSON's properties, exits 64 / 75 / 83, a block on page 2 still reporting page 1, the default `--since` derived from `--until`, catalog paths committed without a home directory, the metrics upsert replacing a window rather than appending it, and a `makelab*` host refused.
 Every mutation of the script listed in the PR (#368) was run after commit and fails at least one test.
+
+## The Mapillary candidate probe (#406)
+
+**Added after the 2026-08-22 split.**
+
+`tests/test_mapillary_candidate_probe.py` drives `scripts/mapillary_candidate_probe.py` with the same in-memory `HttpResult` fetch and injected clock as the user-activity tool, whose client and pacer the probe imports.
+It pins each clause of the probe's contract: exactly one request per candidate, to `graph.mapillary.com/images` with `fields=id,captured_at,creator_id,is_pano`, `limit` 200 by default and passed through when lowered, and a bbox 2 km on a side centred on the candidate (its longitude span checked as square on the ground at 60° N);
+request starts at least 3 s apart on the injected clock;
+**no retry at all** — a 500 (the research pass's payload-size refusal), a 429 with a `Retry-After`, a 302, an HTML 200 and a transport error each stop the run after the second of three candidates, keeping the first one's row and both log lines, with exit 1 or, for the two block shapes, 75;
+a summary that marks a limit-filling answer `capped` (a floor) and reads the pano count, the dominant creator's share and the newest capture date;
+dry-run by default without building an HTTP client, a `makelab*` host refused under `--execute` before one is built, `--limit` above 200 or `--min-interval` under 3 s refused with exit 64, `--execute` without `--out` refused, an existing `--out` never overwritten, and a malformed candidates file a usage error.

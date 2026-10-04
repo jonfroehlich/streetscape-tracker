@@ -513,3 +513,21 @@ A 403 "Application request limit reached" is the Graph API's per-APP limit, scop
 `--max-requests` (default 200, retries included) stops a heavy contributor cleanly with exit **83**; the cursor is newest-first, so a stopped run holds the most recent images and says its counts are lower bounds.
 It refuses a `makelab*` host unless `--allow-collection-host`, and nothing in the scheduler calls it.
 The measurement behind it, including why the UTC date is the wrong grouping key, is [`experiments/mapillary-user-activity.md`](experiments/mapillary-user-activity.md).
+
+## Checking Mapillary candidates before registering one: `scripts/mapillary_candidate_probe.py` (#406)
+
+**Added after the 2026-08-22 split.**
+
+#406's acceptance item 4: before any Mapillary-only candidate is registered, re-run the Graph API probe the 2026-10-01 research pass abandoned after two requests (its second asked for `limit=2000` and drew HTTP 500 "Please reduce the amount of data you're asking for"; [`experiments/panoramax-world-screen.md`](experiments/panoramax-world-screen.md), finding 6).
+The probe sends ONE request per candidate — `graph.mapillary.com/images` over a 2 x 2 km box at the candidate's point, `fields=id,captured_at,creator_id,is_pano`, `limit` at most 200 — at least 3 s apart, and stops at the first answer that is not a 200, retrying nothing.
+
+```bash
+python scripts/mapillary_candidate_probe.py candidates.csv                                  # the plan: no request, no token
+python scripts/mapillary_candidate_probe.py candidates.csv --execute --out probe-2026-10.csv  # writes probe-2026-10.csv.requests.jsonl too
+```
+
+The candidates file needs `name`, `lat` and `lon` columns; the 42 unverified rows live in the research pass's gitignored `experiments/candidate-360-cities-2026-10-01/`, on the laptop that ran it.
+Each answered candidate gets its image count, a `capped` flag when the answer filled the limit (the counts are then a FLOOR), the pano count and share, the number of creators and the dominant one's id and share — the single-creator town sweep #406 found at Laurens, Iowa is the shape to look for — and the oldest and newest capture dates.
+It reuses `mapillary_user_activity.py`'s client (redirects not followed, the token in a header) and its hard-floor pacer, touches only `graph.mapillary.com` (never the per-IP-blocked tile CDN), and exits 75 on a 3xx or an HTML page, how Mapillary presents a per-IP block — stop then, and do not re-run from that IP for hours.
+Run it from a laptop: it refuses a `makelab*` host unless `--allow-collection-host`, and nothing in the scheduler calls it.
+It had not been run when it was committed; the first run's request log and result belong beside a writeup in `docs/experiments/`.
