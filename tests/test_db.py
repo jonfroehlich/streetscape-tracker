@@ -1897,8 +1897,8 @@ def test_a_catalog_already_stamped_v16_without_the_columns_gains_them(tmp_path):
 def test_a_v15_catalog_takes_both_rungs_backfill_and_columns(tmp_path, frozen_utc_clock):
     """Prod is at v15 and takes v16 (#385) and v17 (#367) in one connect: the
     host_usage backfill must seed AND the query-radius columns must land, in
-    that order, ending at v19 (v18 and v19 are additive). Killed by a v17 rung keyed on 15 and placed
-    ahead of the v16 rung: it consumes the v15 stamp and the backfill never
+    that order, ending at v20 (v18 and v19 are additive tables, v20 is one
+    column). Killed by a v17 rung keyed on 15 and placed ahead of the v16 rung: it consumes the v15 stamp and the backfill never
     runs, while the columns (also added unconditionally) still land."""
     frozen_utc_clock(_HOST_NOW)
     db_path = _pre_query_radius_catalog(tmp_path)
@@ -1911,7 +1911,7 @@ def test_a_v15_catalog_takes_both_rungs_backfill_and_columns(tmp_path, frozen_ut
     raw.close()
 
     conn = db.connect(db_path)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 19
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 20
     cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
     assert set(db._QUERY_RADIUS_RUN_COLUMNS) <= cols
     assert _host_rows(conn) == [("2026-09-28T06:00:00+00:00", "mapillary_tiles", "mapillary", 194)]
@@ -1942,6 +1942,87 @@ def test_register_run_round_trips_the_query_radius_pair(conn):
     )
     run = db.get_latest_run(conn, cid)
     assert (run.status_out_of_radius, run.query_radius_m) == (7, 50.0)
+
+
+def _pre_total_grid_points_catalog(tmp_path, user_version=19):
+    """A current catalog minus runs.total_grid_points, stamped ``user_version``,
+    with one pre-v20 mapillary run whose ROW count overstates its grid."""
+    db_path = str(tmp_path / "v19.db")
+    raw = sqlite3.connect(db_path)
+    raw.executescript(db._SCHEMA)
+    raw.execute("ALTER TABLE runs DROP COLUMN total_grid_points")
+    raw.execute(
+        """INSERT INTO cities (city_id, display_name, city_name, center_lat,
+           center_lon, grid_width_m, grid_height_m, step_m, created_at)
+           VALUES ('bend--or', 'Bend, OR', 'Bend', 44.05, -121.31,
+                   5000, 5000, 20, '2026-01-01T00:00:00+00:00')"""
+    )
+    raw.execute(
+        """INSERT INTO runs (city_id, provider, run_date, csv_filename,
+                             total_points, status_ok, coverage_rate_pct)
+           VALUES ('bend--or', 'mapillary', '2026-05-01', 'old.csv.gz', 289, 52, 5.5)"""
+    )
+    raw.execute(f"PRAGMA user_version = {user_version}")
+    raw.commit()
+    raw.close()
+    return db_path
+
+
+def test_migrate_v19_to_v20_adds_total_grid_points_as_null(tmp_path):
+    """v19 -> v20 (issue #289): the column arrives NULL ("not measured") on an
+    existing row -- NOT a copy of total_points, which for a census run is a row
+    count that overstates the grid -- and every stored stat survives. Killed by
+    an ADD COLUMN with a DEFAULT, or a backfill from total_points."""
+    conn = db.connect(_pre_total_grid_points_catalog(tmp_path))
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 20
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
+    assert "total_grid_points" in cols
+    run = db.get_latest_run(conn, "bend--or", provider="mapillary")
+    assert run.total_grid_points is None
+    assert (run.total_points, run.status_ok, run.coverage_rate_pct) == (289, 52, 5.5)
+    conn.close()
+    # Idempotent: reopening must not error or re-add the column.
+    db.connect(str(tmp_path / "v19.db")).close()
+
+
+def test_a_catalog_stamped_v20_without_total_grid_points_gains_it(tmp_path):
+    """The step also runs on every connect, like the query-radius pair: a
+    catalog another in-flight branch stamped v20 for its own reason must still
+    gain the column, or register_run fails on the INSERT. Killed by calling the
+    step only from its rung."""
+    conn = db.connect(_pre_total_grid_points_catalog(tmp_path, user_version=20))
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
+    assert "total_grid_points" in cols
+    conn.close()
+
+
+def test_register_run_round_trips_total_grid_points(conn):
+    cid = db.register_city(
+        conn,
+        city_name="Bend",
+        state_name="Oregon",
+        state_code="OR",
+        country_name="United States",
+        country_code="US",
+        center_lat=44.05,
+        center_lon=-121.31,
+        grid_width_m=200,
+        grid_height_m=200,
+        step_m=20,
+    )
+    db.register_run(
+        conn,
+        city_id=cid,
+        run_date=date(2026, 5, 1),
+        csv_filename="r.csv.gz",
+        total_points=9,
+        total_grid_points=5,
+    )
+    run = db.get_latest_run(conn, cid)
+    assert (run.total_points, run.total_grid_points) == (9, 5)
+    # Omitted, it is NULL rather than inferred from total_points.
+    db.register_run(conn, city_id=cid, run_date=date(2026, 6, 1), csv_filename="s.csv.gz")
+    assert db.get_latest_run(conn, cid).total_grid_points is None
 
 
 def test_run_row_carries_every_runs_column(conn):
@@ -2097,7 +2178,7 @@ def test_migrate_v15_to_v16_backfills_two_utc_dates_of_metered_channels(tmp_path
     raw.close()
 
     conn = db.connect(db_path)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 19
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 20
     assert _host_rows(conn) == [
         ("2026-09-27T23:59:59+00:00", "kartaview", "kartaview", 16),
         ("2026-09-27T23:59:59+00:00", "mapillary_tiles", "mapillary", 1198),
@@ -2240,6 +2321,43 @@ _RACE_BARRIER_TIMEOUT_S = 30
 _RACE_DEADLINE_S = 60
 
 
+def _race_first_connects(worker, paths, processes):
+    """Start ``processes`` racers running ``worker(index, paths, barrier, errors)``.
+
+    Returns the error strings the racers reported (empty on success), and fails
+    the test if any racer exited nonzero or overran ``_RACE_DEADLINE_S``.
+    """
+    ctx = multiprocessing.get_context("spawn")
+    barrier = ctx.Barrier(processes)
+    errors = ctx.Queue()
+    # daemon, and terminated in `finally`: a racer that dies must FAIL this
+    # test, never leave its peers parked on the barrier where multiprocessing's
+    # atexit join would hang pytest until the CI runner's own timeout.
+    procs = [
+        ctx.Process(target=worker, args=(i, paths, barrier, errors), daemon=True)
+        for i in range(processes)
+    ]
+    try:
+        for proc in procs:
+            proc.start()
+        deadline = time.monotonic() + _RACE_DEADLINE_S
+        while any(proc.is_alive() for proc in procs) and time.monotonic() < deadline:
+            if any(proc.exitcode not in (None, 0) for proc in procs):
+                barrier.abort()  # releases every waiter with BrokenBarrierError
+            time.sleep(0.05)
+        exitcodes = [proc.exitcode for proc in procs]
+    finally:
+        for proc in procs:
+            if proc.is_alive():
+                proc.terminate()
+            proc.join(timeout=10)
+    assert exitcodes == [0] * processes
+    failures = []
+    while not errors.empty():
+        failures.append(errors.get())
+    return failures
+
+
 def test_concurrent_first_connects_seed_the_v16_backfill_exactly_once(tmp_path):
     """Issue #385 review: ``BEGIN IMMEDIATE`` makes the backfill race-safe.
 
@@ -2262,38 +2380,72 @@ def test_concurrent_first_connects_seed_the_v16_backfill_exactly_once(tmp_path):
         raw.execute("PRAGMA journal_mode=WAL")
         raw.close()
         paths.append(path)
-    ctx = multiprocessing.get_context("spawn")
-    barrier = ctx.Barrier(_RACE_PROCESSES)
-    errors = ctx.Queue()
-    # daemon, and terminated in `finally`: a racer that dies must FAIL this
-    # test, never leave its peers parked on the barrier where multiprocessing's
-    # atexit join would hang pytest until the CI runner's own timeout.
-    procs = [
-        ctx.Process(target=_race_worker, args=(i, paths, barrier, errors), daemon=True)
-        for i in range(_RACE_PROCESSES)
-    ]
-    try:
-        for proc in procs:
-            proc.start()
-        deadline = time.monotonic() + _RACE_DEADLINE_S
-        while any(proc.is_alive() for proc in procs) and time.monotonic() < deadline:
-            if any(proc.exitcode not in (None, 0) for proc in procs):
-                barrier.abort()  # releases every waiter with BrokenBarrierError
-            time.sleep(0.05)
-        exitcodes = [proc.exitcode for proc in procs]
-    finally:
-        for proc in procs:
-            if proc.is_alive():
-                proc.terminate()
-            proc.join(timeout=10)
-    assert exitcodes == [0] * _RACE_PROCESSES
-    failures = []
-    while not errors.empty():
-        failures.append(errors.get())
-    assert failures == []
+    assert _race_first_connects(_race_worker, paths, _RACE_PROCESSES) == []
     for path in paths:
         raw = sqlite3.connect(path)
         rows = raw.execute("SELECT provider, requests FROM host_usage ORDER BY provider").fetchall()
         version = raw.execute("PRAGMA user_version").fetchone()[0]
         raw.close()
-        assert (version, rows) == (19, [("mapillary", 1198), ("mapillary_streets", 5)]), path
+        assert (version, rows) == (
+            db.SCHEMA_VERSION,
+            [("mapillary", 1198), ("mapillary_streets", 5)],
+        ), path
+
+
+def _column_race_worker(index, paths, barrier, errors):
+    """Racer ``index``: first-connect each catalog in ``paths`` in step with the others.
+
+    Unlike ``_race_worker`` nothing widens the window: the barrier alone lines
+    six racers up closely enough that an un-transactioned check-then-ALTER
+    loses on most connects (see the test).
+    """
+    for path in paths:
+        barrier.wait(timeout=_RACE_BARRIER_TIMEOUT_S)
+        try:
+            db.connect(path).close()
+        except Exception as exc:  # reported, so the parent can fail by name
+            errors.put(f"{path}: {exc!r}")
+
+
+_COLUMN_RACE_PROCESSES = 6
+_COLUMN_RACE_TRIALS = 6
+
+
+def test_concurrent_first_connects_add_the_every_connect_columns_once(tmp_path):
+    """PR #422 review: the every-connect column steps are race-safe.
+
+    _migrate_add_query_radius_columns (the v17 pair) and
+    _migrate_add_total_grid_points_column (v20) run on EVERY connect, so the
+    first connects after a deploy race each other -- the 02:00 run-due among
+    them. Six processes first-connect the same catalog at once, for a v19
+    catalog lacking total_grid_points and a v16 catalog lacking the query-radius
+    pair, over several fresh catalogs of each. No connect may fail and every
+    catalog must end current with all three columns.
+
+    Killed by either step's check-then-ALTER outside ``BEGIN IMMEDIATE``: every
+    racer reads the column as missing and all but one then raise ``duplicate
+    column name``. Measured in the review at 162-164 of 240 connects (6
+    racers, 40 trials), so losing none of the 72 here is not a matter of luck.
+    """
+    paths = []
+    for trial in range(_COLUMN_RACE_TRIALS):
+        for stamp, builder in (
+            (19, lambda d: _pre_total_grid_points_catalog(d)),
+            (16, lambda d: _pre_query_radius_catalog(d, user_version=16)),
+        ):
+            catalog_dir = tmp_path / f"v{stamp}-{trial}"
+            catalog_dir.mkdir()
+            path = builder(catalog_dir)
+            raw = sqlite3.connect(path)
+            raw.execute("PRAGMA journal_mode=WAL")
+            raw.close()
+            paths.append(path)
+    assert _race_first_connects(_column_race_worker, paths, _COLUMN_RACE_PROCESSES) == []
+    wanted = {"total_grid_points", *db._QUERY_RADIUS_RUN_COLUMNS}
+    for path in paths:
+        raw = sqlite3.connect(path)
+        cols = {r[1] for r in raw.execute("PRAGMA table_info(runs)").fetchall()}
+        version = raw.execute("PRAGMA user_version").fetchone()[0]
+        raw.close()
+        assert version == db.SCHEMA_VERSION, path
+        assert wanted <= cols, path

@@ -27,14 +27,14 @@ Legacy pre-2026 undated files are registered as `is_baseline=1` runs by `scripts
 
 ## The catalog
 
-The SQLite catalog `data/streetscape_tracker.db` (`streetscape_metadata_tracker/db.py`, stdlib sqlite3/WAL, no ORM; schema v19, auto-migrated on connect) is the operational source of truth.
+The SQLite catalog `data/streetscape_tracker.db` (`streetscape_metadata_tracker/db.py`, stdlib sqlite3/WAL, no ORM; schema v20, auto-migrated on connect) is the operational source of truth.
 It is **local-only and never rsynced** — it lives in exactly one place, which is why the dated backups in [`catalog-backups.md`](catalog-backups.md) exist.
 
 | Table | Key / uniqueness | Holds |
 |---|---|---|
 | `cities` | `city_id` PK | Canonical identity + **frozen grid geometry** (center, width, height, step), `enabled` flag |
 | `city_aliases` | `alias_slug` PK | Legacy slugs (e.g. `albany--ny`) → `city_id`, so the same query never re-geocodes |
-| `runs` | UNIQUE(city_id, provider, run_date) | Per-run stats incl. the #213 capture-date columns and the v14 census provenance; `unique_google_panos` is NULL for non-gsv runs |
+| `runs` | UNIQUE(city_id, provider, run_date) | Per-run stats incl. the #213 capture-date columns and the v14 census provenance; `unique_google_panos` is NULL for non-gsv runs; `total_points` and `status_*` are **ROW** counts and `total_grid_points` (v20) is the grid size — see "Row counts are not grid points" below |
 | `run_diffs` | UNIQUE(from_run_id, to_run_id) | Run-to-run change counters + detail filename |
 | `api_usage` | PK(usage_date, provider) | Daily request-budget ledger; **additive** (`add_api_usage`); streets channels metered under their own strings (#99) |
 | `host_usage` | index(host, recorded_at) | Timestamped per-HOST spend (#385, v16), one row per `add_api_usage` on a channel in `CHANNEL_METERED_HOST`; read over a rolling 24 h by the `[hosts.*]` budget gate, pruned after 30 days |
@@ -83,6 +83,24 @@ v19 added the `provider_screen_cells` table (#406; v18 is #411's `early_refreshe
 A NULL `cell_resolution` with a positive count is ids that are not H3 cells at all — counted, never dropped; a lone `(NULL, 0)` row is a pass that was measured and decoded no hexagon; and a screen date with no rows predates the table, meaning "not measured", never "no hexagons".
 Both v18 and v19 are `CREATE TABLE IF NOT EXISTS` with no migration function, and `init_schema` runs the whole `_SCHEMA` on every connect, so a catalog gains both tables whichever branch's build touched it first; the v19 rung is keyed on 17 and 18 so it is correct on a tree with or without the v18 rung.
 It is purely additive (no migration function, the `CREATE TABLE IF NOT EXISTS` builds it on any catalog), and `record_provider_screen` replaces a date's rows wholesale on a same-day re-run, which is why it has no primary key.
+
+v20 added `runs.total_grid_points` ([#289](https://github.com/jonfroehlich/streetscape-tracker/issues/289)), under the ordinary rule: NULL means "not measured", until `scripts/recompute_run_stats.py` re-derives the row from its CSV — never a copy of `total_points`, which for a census run is the wrong number.
+Like the v17 pair, the step is named by content (`_migrate_add_total_grid_points_column`), idempotent, and run on its v19 → v20 rung **and** on every connect, so a catalog another in-flight branch stamped v20 still gains the column.
+
+### Row counts are not grid points (#289)
+
+**`runs.total_points` and every `runs.status_*` column are ROW counts**: they partition the run CSV's rows exactly, which is why they always sum to `total_points` and why nothing looks wrong from inside the row.
+For an ordinary gsv run a row is a grid point, so they are point counts too.
+Not for every gsv run: a legacy `is_baseline=1` run that was resumed can hold several rows for one grid point (seen on a development catalog in the PR #422 review), so **never assume `total_points == total_grid_points` for gsv** — read `total_grid_points` whenever the question is the grid.
+For a census provider (`checkpointing.CENSUS_PROVIDERS`: kartaview, mapillary, panoramax) a run writes one row per **image** plus one row per empty point, so `status_ok`/`status_no_date` count images and `total_points` is a mixture of images and empty points.
+Measured in the issue, `(status_ok + status_no_date) / total_points` overstates a census run's real coverage 3–5×, in the direction that flatters it.
+
+- **The grid size is `total_grid_points`**: the distinct `(query_lat, query_lon)` count, from `analysis.count_grid_points`.
+  That one function is also the `coverage_rate_pct` denominator (`calculate_coverage_stats`) and the published `search_grid.total_search_points` (`json_summarizer`), so the three can never disagree.
+  It is never larger than `total_points`: equal for an ordinary gsv run, smaller for a census and for a resumed legacy gsv run.
+- `coverage_rate_pct` and `any_imagery_coverage_rate_pct` were always computed on grid points and are unaffected.
+- The row counts keep their meaning on purpose (option 2 of the issue): making the buckets point-based would change every stored value across Mapillary's whole history.
+  A ratio of two of them is a row ratio; a ratio of a bucket to `total_grid_points` mixes images with points for a census, so it is at best a bound — see `scripts/undated_imagery_share_analyze.py`, the one consumer that had divided by `total_points`.
 
 ## Provider model
 
