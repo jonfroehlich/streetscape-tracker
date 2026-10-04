@@ -192,14 +192,15 @@ Every published JSON artifact carries a `schema_version`; the frontend's `adaptC
 | Aggregate | `cities.json.gz` | 4 |
 | Streetwalk manifest | `streetwalks.json.gz` | 1 |
 | Driving-plan summary | `driving_plan.json.gz` | 1 |
-| Provider screen | `provider_screen.json.gz` | 1 |
+| Provider screen (read by `grid.html`, #349) | `provider_screen.json.gz` | 1 |
 
 The per-run summary stays at 2 across #367's additions to its `coverage` block (`num_points_out_of_radius`, and `query_radius_m`, which is null for census providers): both are additive, and no existing key changed shape.
 A summary written before #367 simply lacks them, and its coverage figures are the old definition until the run's JSON is rebuilt.
 
 The provider screen stays at 1 across #406's measured cell (v19's `provider_screen_cells`).
 `instrument.cell` is still a string — its value is now derived from the latest pass's decoded hexagon ids instead of the literal "H3 resolution 6 (~36 km²)", which the ids contradicted (resolution 7) — and every other change is a new key: `instrument.cell_resolutions` (null for a screen that predates the measurement), `instrument.cell_area_source`, the absent-unless-unexpected `instrument.cell_warning`, and a per-date `cell_resolutions` on each `series` point.
-The `caveat` text changed meaning but not shape; no `www/` page reads this artifact.
+The `caveat` text changed meaning but not shape.
+`grid.html` has read this artifact since #349, and shows `caveat` verbatim, so a change to its wording now reaches the site with the next weekly screen ([`frontend.md`](frontend.md)).
 
 The streetwalk manifest's version deliberately stayed 1 across the v12 catalog additions: every one of them is additive, and no existing key changed shape or meaning.
 The four scalar v12 keys (`length_km`, `length_km_covered`, `length_km_covered_any`, `median_covered_age_years`) are written unconditionally, so on a walk cataloged before v12 they are **present carrying `null`**, not absent; only the optional `coverage_by_highway` and `change` blocks are omitted when they have nothing to say.

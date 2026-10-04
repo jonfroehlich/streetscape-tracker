@@ -358,3 +358,31 @@ This issue is about what happens if it does anyway.
 `fileutils.dtypes_for_run_path` reaches the lookup only through `naming.parse_filename`, which raises on an unknown token, or `naming.parse_streetwalk_filename`, which is safe for a sharper reason — `_STREETWALK_FILENAME_RE` embeds a provider alternation built from `KNOWN_PROVIDERS`, so an unknown token fails the regex rather than reaching `match.group("provider")`.
 Left alone deliberately: its fallback catches names the naming contract does not parse at all (fixtures, ad-hoc exports), which is a different question.
 The tests around it are `test_dtypes_for_run_path_picks_the_schema_from_the_provider_token` (which is the one that actually calls the function, and has no unknown-token case) plus the two subset pins, `test_a_run_schema_is_reachable_from_a_filename` and `test_every_known_provider_has_a_run_schema`.
+
+## The growth screen is read by grid.html (issue #349)
+
+*Written after the split.*
+
+`provider_screen.json.gz` (schema v1, the weekly `screen-provider` artifact, #316) had no reader in `www/` for its first weeks, so the only enrolment shortlist for an opt-in provider could be read only by un-gzipping it on the production host.
+`grid.html` reads it now, as a column group rather than a fourth table page: `createTableControls` owns the whole query string, so a second table on any page would fight the first one over it.
+
+**The one design constraint is the artifact's own `caveat`: upper bounds, not counts.**
+Each figure sums provider counters over map cells larger than the city, so it can over-count and never miss; a ZERO is therefore conclusive while a POSITIVE number only says a closer look is worth taking.
+Every rendering carries that asymmetry rather than a number a reader could take for coverage:
+
+- A zero renders as the words "0 · none", titled "a zero is conclusive"; a positive bound renders as "≤ N", titled with the artifact's `caveat` **verbatim** (read from the file, never paraphrased in JS, since the writer's wording has already moved once in #406); an unscreened city renders "—".
+- The group is labelled "Growth screen (360°, upper bound)" and its header title says what the top of a descending sort means — the cities most worth MEASURING, not the best covered — because that sort is the misreading the issue named.
+- It is **not in the default preset**: a hint is not a measure, and the default is the page's headline read. It lives in its own "Where to look next" preset, beside measured coverage and the last collection date, so "worth measuring" reads against "already measured" in one row.
+- The per-provider filter is a select (no 360° imagery / positive / not screened), never a slider: a window over upper bounds asks a question the instrument cannot answer.
+- The caption reads "N of M cities screened positive" off the latest `series` point, not "hold imagery" — `cities_positive` counts ANY imagery, and a positive is still a hint.
+- `instrument.cell_warning`, present only when the latest pass read unexpected hexagons, replaces "conclusive" on cells from that pass's date (including the override case where a zero is NOT conclusive), and a first positive equal to `first_screen_date` is titled as when watching began, not when the imagery arrived — both are the writer's own caveats.
+
+**Gating.**
+The screened provider list is read from the payload (`screenedProviders`), never from `PROVIDERS` — a registered provider is not a screened one, and a screened provider need not be collected (#334's rule, one list further out).
+A missing or unreadable file resolves to null (`fetchProviderScreen` never rejects), and with no document the row model, columns, presets, filters, caption and sections are exactly what they were before.
+Rows are still the AGGREGATE's cities: a screened city with no published run is not a row, and the caption says how many there are.
+The verdict keys on `pictures_360_upper_bound`, matching the column's "360°" label; a flat-only city reads "none" for 360°, which is what the column claims.
+
+**Why no chart.** `grid.html` loads no chart library, and the series is a handful of weekly points, so it renders as a plain table in a closed "<Provider> screen over time" disclosure under the page lead (date, cities screened, cities positive, summed 360° bound).
+The summed bound double-counts imagery shared by neighbouring cities, so the table caption calls it a trend line, never an inventory.
+That table is a second `<table>` on the page, which is why the shared layout e2e tests scope their row locators to `.streets-table`.

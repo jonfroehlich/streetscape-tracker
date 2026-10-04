@@ -75,8 +75,28 @@
             picture. The address bar always carries the view you are looking at
             so it can be shared.
           </p>
+          <!-- Shown by grid.js only when provider_screen.json.gz loaded and
+               screened something (issue #349). -->
+          <p id="grid-screen-about" hidden>
+            The <strong>Growth screen</strong> columns come from a weekly
+            catalog-wide screen of providers whose imagery is still arriving,
+            not from a collection run. Each number is an
+            <strong>upper bound</strong> on the 360° pictures in or around a
+            city, read from map cells larger than the city itself, so it can
+            over-count but never miss. That makes the two readings unequal: a
+            <strong>zero is conclusive</strong> (the provider has no 360°
+            imagery anywhere in the city's box), while a positive bound only
+            says a closer look is worth taking. Sorting it high-to-low lists
+            the cities most worth <em>measuring</em>, not the best covered;
+            only a collection run measures coverage. A screened city with no
+            published run has no row here, and the caption says how many.
+          </p>
         </div>
       </details>
+      <!-- One <details> per screened provider, filled by grid.js; stays hidden
+           when there is no screen (issue #349). A plain table rather than a
+           chart: this page loads no chart library. -->
+      <div id="grid-screen-series" hidden></div>
     </div>
 
     <div id="grid-status" class="table-status" role="status" aria-live="polite">

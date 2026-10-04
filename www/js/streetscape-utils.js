@@ -1149,6 +1149,113 @@ function mergeStreetwalkStats(cities, manifest) {
   return matched;
 }
 
+// ---------------------------------------------------------------------------
+// Provider growth screen (issue #349).
+//
+// `provider_screen.json.gz` (schema v1, written weekly by `scheduler
+// screen-provider`, #316) holds, per screened provider, the latest UPPER BOUND
+// on each city's imagery plus a catalog-level series over screen dates. Its own
+// `caveat` field is the reading rule every consumer has to carry: a ZERO is
+// conclusive (the provider indexed nothing anywhere in the city's box), while a
+// POSITIVE number only means a closer look is worth taking. Sorting it
+// descending and reading the top as "best covered" is the misreading to design
+// against — those are the cities most worth MEASURING.
+// ---------------------------------------------------------------------------
+
+/**
+ * URL of the published provider screen.
+ * @returns {string}
+ */
+function providerScreenUrl() {
+  return STREETSCAPE_DATA_BASE_URL + "provider_screen.json.gz";
+}
+
+/**
+ * Fetch the provider screen, or null when it is absent or unreadable.
+ *
+ * Never rejects: the screen is an optional enrichment of grid.html, and a
+ * deployment that has not published one (or a transient fetch error) must
+ * render the page exactly as it rendered before the screen had a reader.
+ *
+ * @returns {Promise<?Object>} The parsed document, or null.
+ */
+async function fetchProviderScreen() {
+  try {
+    return await fetchGzippedJson(providerScreenUrl());
+  } catch (e) {
+    console.info("No provider screen (skipping the growth-screen column):", e.message);
+    return null;
+  }
+}
+
+/**
+ * The providers a screen document actually SCREENED, in the document's order.
+ *
+ * Read from the payload, never from the PROVIDERS registry (#334): a
+ * registered provider is not a screened one, and a key the registry lacks is
+ * still data somebody published. A provider entry with no cities screened
+ * nothing and is left out, so it cannot contribute a column of em-dashes.
+ *
+ * @param {?Object} doc - Parsed provider_screen.json.gz, or null.
+ * @returns {string[]}
+ */
+function screenedProviders(doc) {
+  const providers = doc?.providers;
+  if (!providers || typeof providers !== "object") return [];
+  return Object.keys(providers).filter(
+    (p) => Array.isArray(providers[p]?.cities) && providers[p].cities.length > 0
+  );
+}
+
+// Per-provider city_id index, built once per provider entry: the grid pivot
+// looks up every city for every screened provider, and a linear `find` over
+// ~1,200 records per lookup is quadratic in the catalog.
+const screenIndexes = new WeakMap();
+
+/**
+ * One city's latest screen record for a provider, or null.
+ *
+ * @param {?Object} doc - Parsed provider_screen.json.gz, or null.
+ * @param {string} provider
+ * @param {string} cityId
+ * @returns {?Object} The record (`pictures_360_upper_bound`, `screen_date`, …).
+ */
+function lookupScreen(doc, provider, cityId) {
+  const entry = doc?.providers?.[provider];
+  if (!entry || !Array.isArray(entry.cities)) return null;
+  let index = screenIndexes.get(entry);
+  if (!index) {
+    index = new Map();
+    for (const record of entry.cities) {
+      // First wins, the same rule the streetwalk index keeps for duplicates.
+      if (record?.city_id != null && !index.has(record.city_id)) index.set(record.city_id, record);
+    }
+    screenIndexes.set(entry, index);
+  }
+  return index.get(cityId) ?? null;
+}
+
+/**
+ * The reading of one screen record: "none", "hint", or null for no record.
+ *
+ * Keyed on the 360° bound, because that is what the grid column shows. "none"
+ * is a FACT (no 360° imagery anywhere in the box); "hint" is only a reason to
+ * measure. A malformed bound reads as null rather than as either.
+ *
+ * @param {?Object} record - From lookupScreen.
+ * @returns {?("none"|"hint")}
+ *
+ * @example
+ *   screenVerdict({ pictures_360_upper_bound: 0 });   // → "none"
+ *   screenVerdict({ pictures_360_upper_bound: 512 }); // → "hint"
+ *   screenVerdict(null);                              // → null
+ */
+function screenVerdict(record) {
+  const bound = record?.pictures_360_upper_bound;
+  if (typeof bound !== "number" || !Number.isFinite(bound)) return null;
+  return bound === 0 ? "none" : "hint";
+}
+
 /**
  * Flatten one aggregate city record into the flat shape the UI consumes.
  *
@@ -1779,6 +1886,11 @@ if (typeof module !== "undefined" && module.exports) {
     isKnownStreetNetworkType,
     lookupStreetwalk,
     mergeStreetwalkStats,
+    providerScreenUrl,
+    fetchProviderScreen,
+    screenedProviders,
+    lookupScreen,
+    screenVerdict,
     adaptCityRecord,
     adaptCitiesPayload,
     isGoogleCopyright,

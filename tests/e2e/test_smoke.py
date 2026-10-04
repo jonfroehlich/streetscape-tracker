@@ -1234,6 +1234,84 @@ def test_grid_collected_by_filter_replaces_the_multi_provider_checkbox(page: Pag
     assert errors == []
 
 
+def test_grid_reads_the_provider_screen_as_a_hint_not_a_measure(page: Page, base_url):
+    """
+    grid.html is the reader of ``provider_screen.json.gz`` (#349). The fixture
+    screens Panoramax twice: Alpha City positive (a bound, "≤ 1,234"), Zero
+    City a conclusive zero ("0 · none"), Map Ville never screened ("—").
+    The column is a hint, so it is NOT in the default view; it lives in its
+    own preset, and the zero/positive asymmetry has to survive into the cells.
+    """
+    errors = _capture_errors(page)
+    page.goto(f"{base_url}/grid.html")
+
+    rows = page.locator("#grid-tbody tr")
+    expect(rows).to_have_count(3)
+    # Never in the default (a hint is not a measure, and the default is the
+    # headline read), but the caption names the latest screen's own counts.
+    expect(page.locator('th[data-key="screen_panoramax"]')).to_have_count(0)
+    expect(page.locator("#grid-caption")).to_contain_text(
+        "Panoramax screen 2026-04-20: 1 of 2 cities screened positive"
+    )
+    # The prose and the series table are shown only because a screen loaded.
+    assert page.locator("#grid-screen-about").evaluate("el => el.hidden") is False
+    series = page.locator("details.screen-series")
+    expect(series).to_have_count(1)
+    expect(series.locator("summary")).to_have_text("Panoramax screen over time")
+    series.locator("summary").click()
+    expect(series.locator("tbody tr")).to_have_count(2)
+    expect(series.locator("tbody tr").last).to_contain_text("2026-04-20")
+
+    page.locator("#table-preset").select_option("screen")
+    expect(page.locator('th[data-key="screen_panoramax"]')).to_have_count(1)
+    expect(
+        page.locator("#grid-thead th.th-group", has_text="Growth screen (360°, upper bound)")
+    ).to_have_count(1)
+    alpha = rows.filter(has_text="Alpha City").locator("td.screen-cell")
+    zero = rows.filter(has_text="Zero City").locator("td.screen-cell")
+    map_ville = rows.filter(has_text="Map Ville").locator("td.screen-cell")
+    expect(alpha).to_have_text("≤ 1,234")
+    # The hint's title carries the artifact's OWN caveat, read from the file.
+    expect(alpha).to_have_attribute("title", re.compile(r"Upper bounds, not counts\."))
+    expect(zero).to_have_text("0 · none")
+    expect(zero).to_have_attribute("title", re.compile(r"a zero is conclusive"))
+    expect(map_ville).to_have_text("—")
+
+    # The per-provider select keys on the verdict, and round-trips the URL.
+    select = page.locator('select[data-filter="screen_panoramax"]')
+    select.select_option("none")
+    expect(rows).to_have_count(1)
+    expect(rows.first).to_contain_text("Zero City")
+    assert "screen_panoramax=none" in page.url
+    select.select_option("unscreened")
+    expect(rows).to_have_count(1)
+    expect(rows.first).to_contain_text("Map Ville")
+
+    assert errors == []
+
+
+def test_grid_renders_as_before_when_the_provider_screen_is_absent(page: Page, base_url):
+    """A deployment with no screen published must render grid.html exactly as
+    it did before #349: no column, no preset, no filter, no caption clause and
+    no screen sections — and no error, since the screen is optional."""
+    page.route(
+        "**/streetscape-tracker/data/provider_screen.json.gz",
+        lambda route: route.fulfill(status=404, body=b"not published"),
+    )
+    errors = _capture_errors(page)
+    page.goto(f"{base_url}/grid.html")
+
+    expect(page.locator("#grid-tbody tr")).to_have_count(3)
+    expect(page.locator('#table-preset option[value="screen"]')).to_have_count(0)
+    expect(page.locator('select[data-filter="screen_panoramax"]')).to_have_count(0)
+    expect(page.locator('th[data-key="screen_panoramax"]')).to_have_count(0)
+    expect(page.locator("#grid-caption")).not_to_contain_text("screen")
+    assert page.locator("#grid-screen-series").evaluate("el => el.hidden") is True
+    assert page.locator("#grid-screen-about").evaluate("el => el.hidden") is True
+    # The browser itself logs the 404 as a console error; anything else is ours.
+    assert [e for e in errors if "404" not in e] == []
+
+
 def test_freshness_metric_recolors_by_collection_recency(page: Page, base_url):
     """
     The Freshness metric colors cities by how recently they were collected —
@@ -1546,7 +1624,7 @@ def test_the_table_pages_replaced_the_strip_with_per_filter_histograms(page: Pag
     its coverage filter `cov`, which is why one body covers all three."""
     errors = _capture_errors(page)
     page.goto(f"{base_url}/{path}")
-    expect(page.locator("tbody tr").first).to_be_visible()
+    expect(page.locator(".streets-table tbody tr").first).to_be_visible()
 
     expect(page.locator("#distribution-strip")).to_have_count(0)
     cov = page.locator('.control-histogram[data-histogram="cov"]')
@@ -1778,7 +1856,7 @@ def test_the_table_and_its_filters_are_on_the_first_screen(page: Page, base_url,
     errors = _capture_errors(page)
     page.set_viewport_size({"width": 1440, "height": 900})
     page.goto(f"{base_url}/{path}")
-    expect(page.locator("tbody tr").first).to_be_visible()
+    expect(page.locator(".streets-table tbody tr").first).to_be_visible()
 
     top = page.evaluate(
         """() => ({
@@ -1810,7 +1888,7 @@ def test_the_filter_sidebar_spans_the_full_viewport_height(page: Page, base_url,
     errors = _capture_errors(page)
     page.set_viewport_size({"width": 1440, "height": 900})
     page.goto(f"{base_url}/{path}")
-    expect(page.locator("tbody tr").first).to_be_visible()
+    expect(page.locator(".streets-table tbody tr").first).to_be_visible()
 
     box = page.evaluate(
         """() => {
@@ -1848,7 +1926,7 @@ def test_filter_sidebar_sits_beside_the_table_and_collapses_on_narrow_screens(
     errors = _capture_errors(page)
     page.set_viewport_size({"width": 1440, "height": 900})
     page.goto(f"{base_url}/{path}")
-    expect(page.locator("tbody tr").first).to_be_visible()
+    expect(page.locator(".streets-table tbody tr").first).to_be_visible()
 
     aside = page.locator(".table-sidebar")
     table = page.locator(".streets-table-wrap")
@@ -1922,7 +2000,7 @@ def test_a_page_with_nothing_published_shows_no_empty_sidebar(page: Page, base_u
     expect(page.locator(".table-sidebar")).to_have_count(0)
     expect(page.locator('aside[aria-label="Search and filters"]')).to_have_count(0)
     expect(page.locator("#table-search")).to_have_count(0)
-    expect(page.locator("tbody tr")).to_have_count(0)
+    expect(page.locator(".streets-table tbody tr")).to_have_count(0)
 
     # The page head is still there: this is an empty state, not a broken page.
     expect(page.locator(".page-head h1")).to_be_visible()
@@ -2069,7 +2147,7 @@ def test_city_name_cell_is_truncated_not_left_to_overflow(page: Page, base_url, 
     scroll even though the short-named fixture never triggered it."""
     errors = _capture_errors(page)
     page.goto(f"{base_url}/{path}")
-    cell = page.locator("tbody th[scope='row']").first
+    cell = page.locator(".streets-table tbody th[scope='row']").first
     expect(cell).to_be_visible()
     style = cell.evaluate(
         "el => { const s = getComputedStyle(el); "
@@ -2097,7 +2175,7 @@ def test_the_page_itself_never_scrolls_sideways(page: Page, base_url, path):
     errors = _capture_errors(page)
     page.set_viewport_size({"width": 1440, "height": 900})
     page.goto(f"{base_url}/{path}")
-    expect(page.locator("tbody tr").first).to_be_visible()
+    expect(page.locator(".streets-table tbody tr").first).to_be_visible()
 
     overflow = page.evaluate(
         "() => document.documentElement.scrollWidth - document.documentElement.clientWidth"
@@ -2152,7 +2230,7 @@ def test_the_city_column_stays_pinned_while_the_table_scrolls(page: Page, base_u
     errors = _capture_errors(page)
     page.set_viewport_size({"width": 1440, "height": 900})
     page.goto(f"{base_url}/{path}")
-    expect(page.locator("tbody tr").first).to_be_visible()
+    expect(page.locator(".streets-table tbody tr").first).to_be_visible()
 
     wrap = page.locator(".streets-table-wrap")
     scrollable = wrap.evaluate("el => el.scrollWidth - el.clientWidth")

@@ -1159,6 +1159,28 @@ That third mode is the one the pin did not originally cover: the invariant was F
 The first is fixed in the regex, the second in how the test compiles it, and the impossible-date case is pinned as the one surviving exception rather than left out of the corpus.
 A test written against a fix is worth what its failure against the defect is worth.
 
+### The growth screen on grid.html (issue #349)
+
+*Added after the 2026-08-22 split.*
+
+`streetscape-utils.test.js` pins the four helpers.
+`screenedProviders` is asserted to read the PAYLOAD: a provider key the registry lacks is still listed, a registered provider absent from the document is not, and an entry with no cities screened nothing.
+`screenVerdict` separates `0` ("none"), a positive bound ("hint") and a missing record or missing bound (null), and `lookupScreen` misses on an absent city, provider or document.
+`fetchProviderScreen` resolves null for a 404 AND for an unparseable body, since grid.html must render as before #349 when the file is absent.
+
+`grid.test.js` pins the page.
+With no document, `pivotGridRows` returns rows deep-equal to the pre-#349 build and **carrying no `screen*` key at all** — "equal to each other" alone would pass a mutation that always adds the keys as nulls.
+With one, the keys appear for the SCREENED provider only (Panoramax, which that payload never collects), the absent `first_positive_date` reads null, and the screened city with no published run is counted in `screenUnlisted` rather than made a row.
+The column group exists only with a screened provider, has no Δ, and its title says what the top of a descending sort means.
+The cells are asserted on the asymmetry: "0 · none" with "a zero is conclusive", "≤ 512" for a bound, "—" for unscreened, and the hint title carrying a caveat string **no JS file contains**, so a paraphrase hardcoded in `grid.js` fails.
+Two of the writer's own caveats are pinned where they surface: a first positive equal to `first_screen_date` says when watching began, and `instrument.cell_warning` replaces "conclusive" only on cells from the latest screen date, which is the only pass it describes.
+Presets (never the default; "Where to look next" only with a screen), the per-provider filter's three values, the caption read from the LAST `series` point, and the series table's escaping complete it.
+
+The fixture screens Panoramax twice through the real writer (`build_fixture.py`), giving one positive city, one conclusive zero and one unscreened, and `test_the_fixture_carries_a_provider_screen_with_a_zero_and_a_positive_city` (fast suite) refuses a committed screen that has lost either reading.
+Two browser tests read it: the column, preset, filter, caption and series table end to end, and a 404'd screen leaving the page with no column, preset, filter, caption clause or section.
+The series table is a second `<table>` on grid.html, so the layout tests parametrized over all three pages now scope their bare `tbody tr` and `tbody th[scope='row']` locators to `.streets-table`; unscoped, they resolved to the series table's first row, hidden in its closed disclosure, and seven failed.
+Every assertion above was mutation-checked; the table is in the PR body.
+
 ## The pivoted data tables (issue #250)
 
 **The pivoted data tables (issue #250) are covered on both sides.**
