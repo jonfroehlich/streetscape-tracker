@@ -60,6 +60,7 @@ python -m streetscape_street_analyzer.collect "Seattle, WA" --network-type all_p
 python scripts/build_worldwide_frame.py
 python scripts/register_frame.py   # dry-run preview; --execute stays disabled until boundary-vetted
 python scripts/register_frame.py --manifest mapillary_360_cities.csv --overlap-km 5 --max-center-km 10 --center-from-geonames --notes-label "mapillary 360 leaders"
+python scripts/vet_manifest_geometry.py --manifest panoramax_360_cities.csv   # BEFORE registering: the geometry --execute would freeze + its price; Nominatim only, laptop only
 
 # Publish data/ to the UW Makeability Lab web server (rsync over SSH)
 ./sync_data_to_server.sh --dry-run

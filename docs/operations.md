@@ -358,6 +358,77 @@ Every dry run — `--estimate`, `import-bundle` without `--execute`, `enable-cit
 `ASSESS_CHANNELS` is unchanged (the opt-in channels stay refusable there, for the reasons at its definition); enrolment is what answers both of those reasons, since the city becomes a member and Panoramax is screened first.
 The closing summary says so in one sentence: the grid runs and the opt-in providers enrolled above arrive with the city's first nightly run, which collects every member channel on one UTC date.
 
+## Registering a purposive manifest on production (`panoramax_360_cities.csv`, issue #406)
+
+**Added after the 2026-08-22 split.**
+
+The exact sequence for landing a vetted manifest of new cities, written for the 40-city `panoramax_360_cities.csv` and valid for any manifest in its format.
+The selection, the vetting table and every query override are in [`worldwide_sampling.md`](worldwide_sampling.md) ("`panoramax_360_cities.csv`"); this section is only what to run on makelab2, in order, and why.
+Every path below is production's `[paths]` from `config/scheduler.makelab1.toml`; run from the production checkout.
+
+**1. Deploy `main` first.**
+On 2026-10-04 production runs `f1885f5`, 53 commits behind `main`, with the catalog at schema v17 against `main`'s v19.
+Those commits carry PR #411's fill, PR #408's Panoramax stage-1 raise (60/min, 8,000/day per channel — the budget the pricing below assumes) and the manifest itself; `enable-city` (#374) is already on production.
+Deploy per `deploy/README.md` and let the catalog migrate on connect before registering anything, so the new rows are written by the code that will collect them.
+
+**2. Register, disabled, then audit the boundaries.**
+
+```bash
+python scripts/register_frame.py --manifest panoramax_360_cities.csv \
+    --db-path /projects/makeabilitylab/streetscape-tracker/data/streetscape_tracker.db \
+    --notes-label "panoramax 360 programmes" --overlap-km 5 --max-center-km 10
+# read the dry run: expect NEW=40, reused-existing=0, already-registered=0; then the same with --execute
+```
+
+- `--overlap-km 5`, not the default 25, because the default silently ALIASES a genuine neighbour onto an existing city instead of registering it (PR #298's lesson: Johns Creek and Sandusky were 16–17 km from cities already registered). The manifest's own test already holds every row more than 25 km from every other row and every city registered since the screen, so a nonzero `reused-existing` in the dry run means the catalog holds a city this record does not know about; stop and find it.
+- `--max-center-km 10` because the vetting split cleanly there: every row's geocode landed within 7.5 km of its GeoNames point. `--center-from-geonames` is deliberately NOT passed — a row that geocodes differently on the day should be skipped and listed for review, not quietly recentered.
+- `--notes-label` is what makes the batch selectable later: without it all 40 claim to be worldwide-frame cities in `cities.notes`.
+- Each `--execute` line prints the frozen W x H; compare it with the vetting table and stop on any difference — Nominatim can answer differently than it did on 2026-10-04.
+
+Cities register with `enabled = 0`, so nothing is collected yet.
+Then run the boundary-audit chain (`audit_city_boundaries.py` → `build_boundary_review.py` → human review → `apply_decisions.py`, `docs/worldwide_sampling.md` step 2) over this batch only, in its own audit directory so the catalog-wide report is not overwritten:
+
+```bash
+DATA=/projects/makeabilitylab/streetscape-tracker/data
+python scripts/audit_city_boundaries.py --data-dir "$DATA" \
+    --cache audit/pmx406/nominatim_boundary_cache.jsonl --report audit/pmx406/boundary_audit_report.csv \
+    --city strasbourg--grand-est--france --city lyon--rhone-alpes--france ...   # all 40 ids, pinned in tests/test_panoramax_360_cities_manifest.py
+python scripts/build_boundary_review.py --data-dir "$DATA" --audit-dir audit/pmx406
+python scripts/apply_decisions.py --data-dir "$DATA" --decisions <the exported boundary_decisions.csv>   # dry run, then --execute
+```
+
+The audit geocodes one structured query per city through Nominatim (about 40 requests), never a provider.
+
+**3. Enable by tranche, one tranche per night: `scheduler enable-city CITY`.**
+`enable-city` enrols the opt-in pairs BEFORE flipping `enabled` (#374), so the city's grid runs and walks pair on one UTC date: Panoramax only on a nonzero one-city screen (a few z6 `grid` tiles each, sent at enable time to the Panoramax host), KartaView only at an estimate ≤ 1,000 — which all 40 clear (the largest is Norman's 691), so all 40 are enrolled on KartaView unless `enroll-city CITY --channel kartaview --remove` and `--channel kartaview_streets --remove` are set first (an explicit membership is never overwritten).
+An enabled city is due on every default channel (gsv, gsv_streets, mapillary, mapillary_streets) the next night, and a never-collected city ranks FIRST in each channel's queue (`NULLS FIRST`), so a tranche is what that night collects before anything else; that is why the batch is staged rather than enabled at once.
+Enable after the night's batch has finished and before the next 02:00 run, preview each with `--dry-run`, and pass the production config:
+
+```bash
+python -m streetscape_metadata_tracker.scheduler enable-city lons-le-saunier--bourgogne--france \
+    --config config/scheduler.makelab1.toml --dry-run
+```
+
+Then freeze the tranche's OSM networks during the day, so the gsv_streets walks never contact Overpass at night (#341): `python scripts/prefreeze_street_networks.py --config config/scheduler.makelab1.toml --nights 1`.
+Before the next tranche, read the night's log: every tranche city collected (or paused at a cap, exit 83, which resumes), no Mapillary block (exit 75), no Panoramax 403/429 (a refusal reverts #405's stage), no Overpass latch.
+
+**4. Pricing and the enable order.**
+From the vetting table: the 40 grids hold 13,682,485 GSV grid points (≈ 4.75 h at the 48,000/min nightly pace) plus ≈ 2.71 M GSV walk samples by the scheduler's area proxy (an over-estimate, ≈ 0.94 h), 2,350 Mapillary z14 tiles, 5,385 KartaView requests (≈ 5.6 h at 16/min) and 8,390 Panoramax z15 tiles (≈ 2.3 h at 60/min).
+Enabled at once, the Panoramax total alone exceeds the 8,000/day channel budget and the Mapillary total exceeds the 2,260-tile clean combined-night ceiling (`fill_host_ceilings`) before the night's own due Mapillary demand, so the batch is staged.
+The tranches below are cheapest-GSV-first (the order #301's 2026-09-10 comment used), each capped at 4 M GSV points and 800 Mapillary tiles so a tranche leaves most of the night's Mapillary room to the regular due queue:
+
+| Night | Cities | GSV points (h at 48k/min) | Mapillary tiles | KartaView requests (h at 16/min) | Panoramax tiles (min at 60/min) |
+|---|---|---|---|---|---|
+| 1 | Lons-le-Saunier, Kilkenny, Mayenne, Grenoble, Angouleme, Morlaix, Immokalee, Caen, Newton, Bayonne, Douarnenez, Laval | 1,255,892 (0.44) | 276 | 551 (0.6) | 911 (15) |
+| 2 | Beaune, Tours, Orleans, Lille, Owatonna, Fort Dodge, Le Havre, Saint-Nazaire, Bordeaux, Marshalltown, Ottumwa, Montpellier | 2,567,532 (0.89) | 482 | 1,003 (1.0) | 1,665 (28) |
+| 3 | Lyon, Brest, Mason City, Besancon, Cherbourg, Nantes, Kortrijk, Muscatine, Strasbourg, Montauban | 3,882,789 (1.35) | 703 | 1,552 (1.6) | 2,535 (42) |
+| 4 | Toulouse, Mannheim, Ulm, Davenport | 2,558,433 (0.89) | 448 | 1,005 (1.0) | 1,622 (27) |
+| 5 | Marseille, Norman | 3,417,839 (1.19) | 441 | 1,274 (1.3) | 1,657 (28) |
+
+So the batch takes **five nights** at the earliest, more if a night is not clean.
+The hours are paced request time at the configured rate; the scheduler's own per-city timeout adds ×1.5 headroom plus 600 s, and a tranche shares its night with whatever else is due.
+Mapillary, KartaView and Panoramax all checkpoint and resume at a cap (#318, #335), so a tranche that overruns one of those budgets spills into the next night rather than failing; GSV does not (#373 defers a city whose estimated need exceeds the night's remainder), which is the reason the largest GSV grids go last.
+
 ## Keeping Overpass out of the night: `scripts/prefreeze_street_networks.py` (issue #341)
 
 A road walk on a frozen network never contacts Overpass — `fetch_graph` returns the cached GraphML before it takes the host lock or probes — and only a city's *first* walk fetches one.
