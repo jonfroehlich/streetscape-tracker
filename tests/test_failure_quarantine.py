@@ -26,7 +26,9 @@ channel each alerted, and night 6 onward was silent. These tests pin, in order:
 
 import logging
 import os
+import shlex
 import signal
+import sqlite3
 from datetime import UTC, date, datetime, timedelta
 
 import pytest
@@ -214,6 +216,29 @@ def test_reset_consecutive_failures_zeroes_only_the_counter(conn):
     assert db.reset_consecutive_failures(conn, cid, "kartaview") == 0
 
 
+def test_reset_consecutive_failures_commits_what_another_connection_reads(conn, data_dir):
+    """The reset is visible to a SECOND connection to the same file.
+
+    Every other test reads back through the connection that wrote, which sees
+    its own uncommitted transaction -- so a reset that never commits passes
+    them all, and then vanishes when `reset-failures` exits.
+    """
+    cid = _register(conn, "Bend")
+    _set_failures(conn, cid, "mapillary", CAP)
+
+    assert db.reset_consecutive_failures(conn, cid, "mapillary") == CAP
+
+    other = sqlite3.connect(os.path.join(data_dir, "streetscape_tracker.db"))
+    try:
+        (n,) = other.execute(
+            "SELECT consecutive_failures FROM schedule_state WHERE city_id = ? AND provider = ?",
+            (cid, "mapillary"),
+        ).fetchone()
+    finally:
+        other.close()
+    assert n == 0
+
+
 # ── The live night ───────────────────────────────────────────────────────────
 
 
@@ -249,7 +274,7 @@ def test_the_night_a_pair_reaches_the_cap_alerts_once_naming_it_and_its_fix(
         "python -m streetscape_metadata_tracker.scheduler --config "
         f"/abs/scheduler.makelab1.toml reset-failures {cid} --channel mapillary --execute"
     ) in body
-    assert "; quarantined: 1 (mapillary 1; 1 new tonight)" in done
+    assert "; quarantined: 1 (mapillary 1, 1 new tonight)" in done
 
 
 def test_a_later_night_does_not_re_alert_but_keeps_counting(conn, monkeypatch, caplog):
@@ -417,7 +442,7 @@ def test_a_fill_failure_that_reaches_the_cap_is_reported_as_a_transition(conn, m
     subject, body = alerts[0]
     assert "1 QUARANTINED" in subject
     assert f"{cid} [mapillary]: 1 consecutive failure(s)" in body
-    assert "; quarantined: 1 (mapillary 1; 1 new tonight)" in done
+    assert "; quarantined: 1 (mapillary 1, 1 new tonight)" in done
 
 
 @pytest.mark.parametrize("failing_call", ["before", "after"])
@@ -492,6 +517,63 @@ def test_a_raising_quarantine_check_costs_neither_the_night_nor_its_tail(
     if failing_call == "before":
         # The after-set is still known, so the standing count is still reported.
         assert "; quarantined: 1 (mapillary 1)" in done
+    else:
+        # The after-set is UNKNOWN, so no standing count -- not the before-set
+        # re-reported as if it were tonight's (the standing pair makes that
+        # substitution visible: it would print "quarantined: 1").
+        assert "; quarantined:" not in done
+
+
+def test_the_reset_command_survives_an_apostrophe_in_the_city_id():
+    """The pasted command splits back into exactly the argv it was built from.
+
+    A real city_id can carry an apostrophe; unquoted, the shell reads it as an
+    open quote and the operator's paste fails or runs something else.
+    """
+    city_id = "coeur-d'alene--idaho--united-states"
+    cfg = _cfg(config_path="/abs/my scheduler.toml")
+
+    cmd = sched._reset_failures_command(cfg, city_id, "kartaview")
+
+    assert shlex.split(cmd) == [
+        "python",
+        "-m",
+        "streetscape_metadata_tracker.scheduler",
+        "--config",
+        "/abs/my scheduler.toml",
+        "reset-failures",
+        city_id,
+        "--channel",
+        "kartaview",
+        "--execute",
+    ]
+
+
+@pytest.mark.parametrize("newly", [0, 1], ids=["standing-only", "with-new"])
+def test_the_quarantine_clauses_hold_no_semicolon_past_their_leading_separator(monkeypatch, newly):
+    """The `Done:` line is split on ";" (scripts/night_length_analyze.py).
+
+    So each clause's leading "; " must be its only ";" -- in the count's
+    parenthetical, and in a failed check's exception text, which is not ours.
+    """
+    rows = [
+        {"city_id": "a", "provider": "kartaview"},
+        {"city_id": "b", "provider": "kartaview"},
+        {"city_id": "c", "provider": "panoramax"},
+    ]
+    note = sched._quarantine_summary_note(rows, rows[:newly])
+    assert note.startswith("; quarantined: 3 (")
+    assert note.count(";") == 1, note
+
+    def boom(cfg, c):
+        raise RuntimeError("host unavailable; retry later")
+
+    monkeypatch.setattr(sched, "_quarantined_pairs", boom)
+    rows_out, error = sched._quarantine_snapshot(_cfg(), None, "after")
+    assert rows_out is None
+    clause = f"; {error}"
+    assert clause.count(";") == 1, clause
+    assert "host unavailable, retry later" in clause
 
 
 # ── status ───────────────────────────────────────────────────────────────────

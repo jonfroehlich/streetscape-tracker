@@ -12704,7 +12704,11 @@ def _quarantine_snapshot(cfg: SchedulerConfig, conn, when: str) -> tuple[list | 
         return _quarantined_pairs(cfg, conn), None
     except Exception as exc:
         logger.exception(f"Quarantine check ({when} the night) failed")
-        return None, f"quarantine check FAILED ({when} the night: {type(exc).__name__}: {exc})"
+        # The Done line is "; "-separated and parsed by splitting on ";"
+        # (scripts/night_length_analyze.py), so a ";" in the exception text
+        # would split this clause in two.
+        reason = f"{type(exc).__name__}: {exc}".replace(";", ",")
+        return None, f"quarantine check FAILED ({when} the night: {reason})"
 
 
 def _newly_quarantined(before: Sequence, after: Sequence) -> list:
@@ -12722,14 +12726,16 @@ def _newly_quarantined(before: Sequence, after: Sequence) -> list:
 def _quarantine_summary_note(quarantined: Sequence, newly: Sequence) -> str:
     """The ``Done:`` line's quarantine clause, empty when nothing is quarantined.
 
-    Example: ``; quarantined: 3 (kartaview 2, panoramax 1; 1 new tonight)``.
+    Example: ``; quarantined: 3 (kartaview 2, panoramax 1, 1 new tonight)``.
+    The leading ``; `` is the only ``;`` in it: the ``Done:`` line is split
+    on ``;`` by ``scripts/night_length_analyze.py``.
     """
     if not quarantined:
         return ""
     per_channel = Counter(r["provider"] for r in quarantined)
     detail = ", ".join(f"{ch} {n}" for ch, n in sorted(per_channel.items()))
     if newly:
-        detail += f"; {len(newly)} new tonight"
+        detail += f", {len(newly)} new tonight"
     return f"; quarantined: {len(quarantined)} ({detail})"
 
 

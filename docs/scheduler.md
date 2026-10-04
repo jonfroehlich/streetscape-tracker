@@ -716,11 +716,11 @@ It is part of `unhealthy`, so it alerts regardless of `failure_threshold` — it
 It rarely changes a night's exit status, since the failure that tripped it already made `attempted > succeeded` in the same process — but not never: with two `run-due` processes overlapping, the one that did NOT record the failure still sees the pair enter between its snapshots, reports it as new, and exits 1 on a night whose own collections all succeeded.
 A separate email was rejected (the night email already carries every other condition), as was a per-night "realign blocked" email, which would duplicate the per-failure alert.
 
-**The standing set is counted on every `Done:` line while it is nonempty** — `; quarantined: 3 (kartaview 2, panoramax 1; 1 new tonight)` — over every enabled channel, not a filtered night's, so a `--provider mapillary` catch-up never reports a KartaView quarantine as gone.
+**The standing set is counted on every `Done:` line while it is nonempty** — `; quarantined: 3 (kartaview 2, panoramax 1, 1 new tonight)` — over every enabled channel, not a filtered night's, so a `--provider mapillary` catch-up never reports a KartaView quarantine as gone.
 `status` marks each quarantined pair `QUARANTINED` in its failing-pairs list, from the same query, and prints the count with the clear command.
 
 **Both snapshots are guarded** (`_quarantine_snapshot`): the first runs ahead of the pre-loop backup and the second between the loop and `_finish_batch`, so an unguarded raise in either would cost the whole night or its whole tail — aggregate, manifests, backup, publish and the alert — for a reporting query.
-A raise is logged, named on the `Done:` line as `; quarantine check FAILED (before|after the night: <error>)`, and alerts on its own as a `QUARANTINE CHECK FAILED` subject part, since that is exactly the night a transition could go unreported.
+A raise is logged, named on the `Done:` line as `; quarantine check FAILED (before|after the night: <error>)` — with any `;` in `<error>` turned into `,`, because the `Done:` line is split on `;` (`scripts/night_length_analyze.py`) and the clause's leading separator must be its only one — and alerts on its own as a `QUARANTINE CHECK FAILED` subject part, since that is exactly the night a transition could go unreported.
 A failed FIRST snapshot means the transition is unknown, so nothing is reported as new: diffing against an empty set would call the whole standing set tonight's and re-alert every pair already alerted on.
 A failed second snapshot reports neither the transition nor the standing count that night.
 
