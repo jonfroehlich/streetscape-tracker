@@ -1,0 +1,12 @@
+query_string,city,admin,iso2,country,continent,size_band,population,coverage_regime,geonameid,lat,lon
+"Tracy, California, United States",Tracy,California,US,United States,NA,,87075,,5403191,37.73987,-121.42618
+"Reno, Nevada, United States",Reno,Nevada,US,United States,NA,,264165,,5511077,39.52963,-119.8138
+"Woodland, California, United States",Woodland,California,US,United States,NA,,58567,,5410430,38.67852,-121.7733
+"Perris, California, United States",Perris,California,US,United States,NA,,74971,,5382146,33.78252,-117.22865
+"Payson, Utah, United States",Payson,Utah,US,United States,NA,,19548,,5779548,40.0444,-111.73215
+"Galesburg, Illinois, United States",Galesburg,Illinois,US,United States,NA,,31273,,4893392,40.94782,-90.37124
+"Phoenixville, Pennsylvania, United States",Phoenixville,Pennsylvania,US,United States,NA,,16658,,5205849,40.13038,-75.51491
+"Atwater, California, United States",Atwater,California,US,United States,NA,,29237,,5325187,37.34772,-120.60908
+"Keene, New Hampshire, United States",Keene,New Hampshire,US,United States,NA,,23265,,5088262,42.93369,-72.27814
+"Buffalo, Minnesota, United States",Buffalo,Minnesota,US,United States,NA,,16026,,5019588,45.17191,-93.87469
+"Toms River, New Jersey, United States",Toms River,New Jersey,US,United States,NA,,88791,,4504476,39.95373,-74.19792
