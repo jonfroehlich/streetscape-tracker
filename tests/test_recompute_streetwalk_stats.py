@@ -25,15 +25,23 @@ import pandas as pd
 import pytest
 
 import scripts.recompute_streetwalk_stats as recompute_module
-from scripts.recompute_streetwalk_stats import COORD_TOLERANCE_DEG, main, match_frame
+from scripts.recompute_streetwalk_stats import (
+    COORD_TOLERANCE_DEG,
+    WalkRefused,
+    main,
+    match_frame,
+)
 from streetscape_metadata_tracker import db
 from streetscape_metadata_tracker import download_gsv as dg
 from streetscape_metadata_tracker.fileutils import load_city_csv_file
-from streetscape_metadata_tracker.naming import network_cache_path
+from streetscape_metadata_tracker.naming import (
+    generate_streetwalk_diff_filename,
+    network_cache_path,
+)
 from streetscape_metadata_tracker.walk_diff import compute_walk_diff, load_streetwalk_coverage
 from streetscape_street_analyzer import collect, street_coverage
 from streetscape_street_analyzer import download_street_network as dsn
-from streetscape_street_analyzer.road_sampling import quantize_coord
+from streetscape_street_analyzer.road_sampling import generate_samples, quantize_coord
 
 CITY_QUERY = "Bend, Oregon, United States"
 CITY_ID = "bend--oregon--united-states"
@@ -72,27 +80,56 @@ def _no_batch_in_flight(monkeypatch):
     monkeypatch.setattr(recompute_module, "_run_due_in_flight", lambda: None)
 
 
-def _graph(extra_edge=False, footway=False):
+def _graph(extra_edge=False, footway=False, node_offset=0):
+    """``node_offset`` renumbers every OSM node over IDENTICAL geometry, as a
+    refresh can: same samples, same coordinates, different edge ids."""
     g = nx.MultiDiGraph(crs="EPSG:4326")
-    nodes = {1: (-121.30, 44.05), 2: (-121.30, 44.052), 3: (-121.30, 44.0525)}
+    n1, n2, n3, n4 = (node_offset + i for i in (1, 2, 3, 4))
+    nodes = {n1: (-121.30, 44.05), n2: (-121.30, 44.052), n3: (-121.30, 44.0525)}
     if extra_edge or footway:
-        nodes[4] = (-121.299, 44.0525)
+        nodes[n4] = (-121.299, 44.0525)
     for n, (x, y) in nodes.items():
         g.add_node(n, x=x, y=y)
-    g.add_edge(1, 2, 0, osmid=10, highway="residential", length=222.0)
-    g.add_edge(2, 1, 0, osmid=10, highway="residential", length=222.0)
-    g.add_edge(2, 3, 0, osmid=11, highway="service", length=55.0)
+    g.add_edge(n1, n2, 0, osmid=10, highway="residential", length=222.0)
+    g.add_edge(n2, n1, 0, osmid=10, highway="residential", length=222.0)
+    g.add_edge(n2, n3, 0, osmid=11, highway="service", length=55.0)
     if extra_edge:
-        g.add_edge(3, 4, 0, osmid=12, highway="residential", length=80.0)
+        g.add_edge(n3, n4, 0, osmid=12, highway="residential", length=80.0)
     if footway:
-        g.add_edge(3, 4, 0, osmid=13, highway="footway", length=80.0)
+        g.add_edge(n3, n4, 0, osmid=13, highway="footway", length=80.0)
     return g
 
 
-def _freeze(data_dir, city_id=CITY_ID, network_type="drive", **kw):
+# The north end of a single-sample edge, found by search: the edge's one
+# sample then sits one ULP from a 9-decimal half-way point, and pandas' default
+# C float parser (what fileutils.load_city_csv_file reads with) puts the CSV's
+# copy of it on the OTHER side, while Python's correctly rounded float() of the
+# same text reproduces the sample exactly. The test re-measures this premise.
+BOUNDARY_NORTH_LAT = 44.0501200169994
+
+
+def _boundary_graph():
+    """A boundary edge (south of NO_DATE_NORTH_OF, so its sample is OK and
+    covered unless its key misses) plus an all-NO_DATE edge, so a pre-#257
+    walk on it really moves."""
+    g = nx.MultiDiGraph(crs="EPSG:4326")
+    nodes = {
+        1: (-121.30, 44.05),
+        2: (-121.30, BOUNDARY_NORTH_LAT),
+        3: (-121.299, 44.0515),
+        4: (-121.299, 44.0518),
+    }
+    for n, (x, y) in nodes.items():
+        g.add_node(n, x=x, y=y)
+    g.add_edge(1, 2, 0, osmid=10, highway="residential", length=13.3)
+    g.add_edge(3, 4, 0, osmid=11, highway="residential", length=33.3)
+    return g
+
+
+def _freeze(data_dir, city_id=CITY_ID, network_type="drive", graph=None, **kw):
     path = network_cache_path(city_id, data_dir, network_type)
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    ox.save_graphml(_graph(**kw), path)
+    ox.save_graphml(graph if graph is not None else _graph(**kw), path)
     return path
 
 
@@ -262,7 +299,12 @@ def _artifact(data_dir, run_date, **kw):
 
 
 def _tree_digest(root, *, without_db=False):
-    """Every file under root, by relative path, with a content hash."""
+    """Every file under root, by relative path, with a content hash.
+
+    ``without_db`` is for an --execute pass: db.connect touches the catalog
+    itself (journal mode), so the catalog is compared by content elsewhere,
+    and every --execute pass regenerates the manifest (stamping a fresh
+    ``generated_at``), so it is compared by everything else it holds."""
     out = {}
     for dirpath, _, files in os.walk(root):
         for name in files:
@@ -270,10 +312,18 @@ def _tree_digest(root, *, without_db=False):
             with open(path, "rb") as fh:
                 out[os.path.relpath(path, root)] = hashlib.sha256(fh.read()).hexdigest()
     if without_db:
-        # db.connect touches the file itself (journal mode), so the catalog is
-        # compared by content and every other file by bytes.
         out.pop("streetscape_tracker.db")
+        manifest = os.path.join(root, "streetwalks.json.gz")
+        if os.path.exists(manifest):
+            out["streetwalks.json.gz"] = _manifest_body(root)
     return out
+
+
+def _manifest_body(data_dir):
+    with gzip.open(os.path.join(data_dir, "streetwalks.json.gz"), "rt") as fh:
+        body = json.load(fh)
+    body.pop("generated_at", None)
+    return body
 
 
 def _rewrite_csv(path, fn):
@@ -459,34 +509,85 @@ def test_match_frame_tolerates_one_ulp_across_the_half_way_boundary():
             "query_lon": [-121.3, -121.3, -121.3, -121.3],
         }
     )
-    out, n_noise, n_dup = match_frame(samples, csv)
-    assert (n_noise, n_dup) == (2, 1)
-    assert out["lat"].tolist() == [hi_side, 44.0505 + 0.5 * COORD_TOLERANCE_DEG, 44.0521]
-    assert {quantize_coord(a, b) for a, b in zip(out["lat"], out["lon"], strict=True)} == {
-        quantize_coord(a, b) for a, b in zip(csv["query_lat"], csv["query_lon"], strict=True)
-    }
+    before = samples.copy()
+    assert match_frame(samples, csv) == (2, 1)
+    # Validation only: the samples are never moved onto the CSV's coordinates.
+    pd.testing.assert_frame_equal(samples, before)
 
 
-def test_sub_tolerance_noise_in_the_csv_still_scores_every_sample(tmp_path, monkeypatch, capsys):
-    """End to end: a walk whose CSV coordinates moved by less than the tolerance
-    (enough to change their 9-decimal keys) is accepted AND scored as before --
-    loosening the check without substituting the CSV coordinates would score
-    those samples as uncovered."""
+def test_match_frame_refuses_two_csv_locations_closer_than_twice_the_tolerance():
+    """Two CSV locations with different 9-decimal keys but within 2x the
+    tolerance of each other make a tolerant match ambiguous, so the frame is
+    refused even though each sample here has an exact key match of its own."""
+    lat_a = 44.0505
+    lat_b = 44.0505 + 1.5 * COORD_TOLERANCE_DEG
+    assert quantize_coord(lat_a, -121.3) != quantize_coord(lat_b, -121.3)  # premise
+    samples = pd.DataFrame(
+        {
+            "edge_id": ["1_2", "1_2"],
+            "sample_idx": [0, 1],
+            "lat": [lat_a, lat_b],
+            "lon": [-121.3] * 2,
+        }
+    )
+    csv = pd.DataFrame({"query_lat": [lat_a, lat_b], "query_lon": [-121.3, -121.3]})
+    with pytest.raises(WalkRefused, match="2 CSV locations lie within"):
+        match_frame(samples, csv)
+
+
+def _keys(lats, lons):
+    """quantize_coord keys from Python floats, as the scorer's own zip yields them."""
+    return [quantize_coord(la, lo) for la, lo in zip(list(lats), list(lons), strict=True)]
+
+
+@pytest.mark.parametrize("provider", ("gsv", "mapillary"))
+def test_a_sample_the_loader_parses_across_the_boundary_scores_as_the_collector_scores_it(
+    tmp_path, monkeypatch, capsys, provider
+):
+    """A REAL collector run whose one boundary sample comes back through
+    load_city_csv_file one ULP across quantize_coord's half-way point. The
+    collector's key join misses it, so it scores that sample uncovered; the
+    recompute must too, so it equals a --force collection under the same
+    definition. Substituting the CSV's coordinates into the samples would
+    score it covered and break the equality."""
     data_dir = _setup(tmp_path, monkeypatch)
-    _collect(data_dir, D1, monkeypatch, old_definition=False)
-    before = _walk(data_dir, D1)
+    graph_path = _freeze(data_dir, graph=_boundary_graph())
+    _collect(data_dir, D1, monkeypatch, old_definition=True, provider=provider)
+    before = _walk(data_dir, D1, provider=provider)
     csv_path = os.path.join(data_dir, before["csv_filename"])
 
-    def jitter(raw):
-        lat = raw["query_lat"].astype(float)
-        raw["query_lat"] = [repr(v + 0.6 * COORD_TOLERANCE_DEG) for v in lat]
-        return raw
+    # The premise, measured on this run's own CSV: its text is exact (Python's
+    # correctly rounded parse reproduces every regenerated sample), and the
+    # loader's parse moves exactly one key -- the boundary sample's.
+    samples = generate_samples(dsn.graph_to_edges(ox.load_graphml(graph_path)), 15)
+    sample_keys = _keys(samples["lat"], samples["lon"])
+    with gzip.open(csv_path, "rt") as fh:
+        exact = pd.read_csv(fh, float_precision="round_trip")
+    loaded = load_city_csv_file(csv_path)
+    assert set(_keys(exact["query_lat"], exact["query_lon"])) == set(sample_keys)
+    missed = set(sample_keys) - set(_keys(loaded["query_lat"], loaded["query_lon"]))
+    assert len(missed) == 1
+    (boundary,) = samples[[k in missed for k in sample_keys]].itertuples()
+    assert boundary.edge_id == "1_2"
+    assert float(repr(boundary.lat)) == boundary.lat
+    # And the collector scored it uncovered: that edge is all of the gap.
+    assert before["coverage_pct_by_length"] < 100.0
 
-    _rewrite_csv(csv_path, jitter)
     assert _run(data_dir, "--execute") == 0
     out = capsys.readouterr().out
-    assert "1 unchanged" in out and "float noise" in out
-    assert _walk(data_dir, D1) == before
+    assert "1 samples matched only within" in out and "scored uncovered" in out
+    recomputed_row = _walk(data_dir, D1, provider=provider)
+    recomputed_artifact = _artifact(data_dir, D1, provider=provider)
+    assert recomputed_row["coverage_pct_by_length"] > before["coverage_pct_by_length"]  # NO_DATE
+
+    _collect(data_dir, D1, monkeypatch, old_definition=False, force=True, provider=provider)
+    collector_row = _walk(data_dir, D1, provider=provider)
+    assert {c: recomputed_row[c] for c in EXPECTED_STAT_COLUMNS} == {
+        c: collector_row[c] for c in EXPECTED_STAT_COLUMNS
+    }
+    assert recomputed_artifact == _artifact(data_dir, D1, provider=provider)
+    edge = next(f for f in recomputed_artifact["features"] if f["properties"]["edge_id"] == "1_2")
+    assert edge["properties"]["coverage_fraction"] == 0.0
 
 
 def test_duplicate_csv_rows_are_accepted_and_counted(tmp_path, monkeypatch, capsys):
@@ -556,6 +657,24 @@ def test_a_refreshed_network_is_refused_by_the_sample_count(tmp_path, monkeypatc
     assert _walk(data_dir, D1) == before
 
 
+def test_a_renumbered_network_is_refused_by_the_edge_ids(tmp_path, monkeypatch, capsys):
+    """A refresh that renumbered the OSM nodes over identical geometry passes
+    the count AND the coordinate checks; only the edge ids differ, and the walk
+    diff keys on them, so the series is refused rather than rewritten."""
+    data_dir = _setup(tmp_path, monkeypatch)
+    _collect(data_dir, D1, monkeypatch, old_definition=True)  # a walk that WOULD move
+    before = _walk(data_dir, D1)
+    _freeze(data_dir, node_offset=100)
+
+    assert _run(data_dir, "--execute") == 1
+    out = capsys.readouterr().out
+    assert (
+        "edge id mismatch: the frozen network's 2 edge ids are not the stored artifact's 2" in out
+    )
+    assert "(edge id mismatch 1)" in out
+    assert _walk(data_dir, D1) == before
+
+
 def test_a_missing_graphml_refuses_and_never_reaches_overpass(tmp_path, monkeypatch, capsys):
     data_dir = _setup(tmp_path, monkeypatch)
     _collect(data_dir, D1, monkeypatch, old_definition=True)
@@ -613,11 +732,37 @@ def test_a_run_due_starting_mid_pass_stops_before_the_next_write(tmp_path, monke
     data_dir = _setup(tmp_path, monkeypatch)
     _collect(data_dir, D1, monkeypatch, old_definition=True)
     before = _walk(data_dir, D1)
+    manifest = os.path.join(data_dir, "streetwalks.json.gz")
+    with open(manifest, "rb") as fh:
+        manifest_bytes = fh.read()
     answers = iter([None, "pid 9: run-due"])
     monkeypatch.setattr(recompute_module, "_run_due_in_flight", lambda: next(answers))
     assert _run(data_dir, "--execute") == 1
-    assert "a run-due started" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "a run-due started" in out
     assert _walk(data_dir, D1) == before
+    # The batch owns the manifest now (both writers share its fixed .tmp name).
+    assert "manifest NOT regenerated: a run-due is running" in out
+    with open(manifest, "rb") as fh:
+        assert fh.read() == manifest_bytes
+
+
+def test_a_rerun_heals_a_manifest_an_interrupted_pass_never_reached(tmp_path, monkeypatch):
+    """A pass that committed its writes and died before the manifest leaves a
+    re-run nothing to write; the manifest must be regenerated anyway."""
+    data_dir = _setup(tmp_path, monkeypatch)
+    _collect(data_dir, D1, monkeypatch, old_definition=True)
+    manifest = os.path.join(data_dir, "streetwalks.json.gz")
+    with open(manifest, "rb") as fh:
+        stale = fh.read()
+    assert _run(data_dir, "--execute") == 0
+    with open(manifest, "wb") as fh:  # as if the first pass had died before it
+        fh.write(stale)
+    assert _manifest_body(data_dir)["walks"][0]["coverage_pct_by_length"] < 100.0  # premise
+
+    assert _run(data_dir, "--execute") == 0
+    (entry,) = _manifest_body(data_dir)["walks"]
+    assert entry["coverage_pct_by_length"] == _walk(data_dir, D1)["coverage_pct_by_length"]
 
 
 def test_a_series_changed_since_selection_is_abandoned(tmp_path, monkeypatch, capsys):
@@ -761,6 +906,98 @@ def test_a_failed_rediff_is_healed_by_the_next_pass(tmp_path, monkeypatch, capsy
     assert _run(data_dir, "--execute") == 0
     assert "record one" in capsys.readouterr().out
     assert _diff_row(data_dir, D2)["coverage_pct_by_length_delta"] == 0.0
+
+
+def _real_change_pair(data_dir, monkeypatch):
+    """D1 -> D2 under one definition with a REAL change (D2's southern imagery
+    gone), so the diff row has counters, a pointer and a detail file. Returns
+    the healed row and the detail file's bytes, decompressed."""
+    _collect(data_dir, D1, monkeypatch, old_definition=False)
+    _collect(data_dir, D2, monkeypatch, old_definition=False)
+
+    def drop_south(raw):
+        south = raw["query_lat"].astype(float) <= NO_DATE_NORTH_OF
+        raw.loc[south, ["pano_lat", "pano_lon", "pano_id", "capture_date"]] = None
+        raw.loc[south, "status"] = "ZERO_RESULTS"
+        return raw
+
+    _rewrite_csv(os.path.join(data_dir, _walk(data_dir, D2)["csv_filename"]), drop_south)
+    assert _run(data_dir, "--execute") == 0
+    row = _diff_row(data_dir, D2)
+    assert row["detail_filename"] is not None and row["coverage_fraction_changed"] > 0  # premise
+    with gzip.open(os.path.join(data_dir, row["detail_filename"]), "rt") as fh:
+        return row, fh.read()
+
+
+def _corrupt_diff(data_dir, column, value):
+    conn = _conn(data_dir)
+    with conn:
+        conn.execute(
+            f"UPDATE street_walk_diffs SET {column} = ? WHERE to_walk_id = ?",
+            (value, _walk(data_dir, D2)["walk_id"]),
+        )
+    conn.close()
+
+
+def _without_id(row):
+    """A diff row minus what every re-diff restamps (the orchestrator deletes
+    and re-inserts)."""
+    return {k: v for k, v in row.items() if k not in ("diff_id", "computed_at")}
+
+
+@pytest.mark.parametrize(
+    "column, corrupt",
+    [
+        # Another real walk (a different series), so only the comparison can see it.
+        ("from_walk_id", lambda d: _walk(d, D1, provider="mapillary")["walk_id"]),
+        ("coverage_fraction_changed", lambda d: _diff_row(d, D2)["coverage_fraction_changed"] + 3),
+        # The right file stays on disk with the right rows; only the pointer is gone.
+        ("detail_filename", lambda d: None),
+    ],
+)
+def test_each_stale_diff_field_alone_is_repaired(tmp_path, monkeypatch, capsys, column, corrupt):
+    """Each staleness criterion on its own: one field of an otherwise correct
+    diff row is wrong, and the pass re-diffs it back to the correct row."""
+    data_dir = _setup(tmp_path, monkeypatch)
+    _collect(data_dir, D1, monkeypatch, old_definition=False, provider="mapillary")
+    good, detail = _real_change_pair(data_dir, monkeypatch)
+    _corrupt_diff(data_dir, column, corrupt(data_dir))
+    assert _diff_row(data_dir, D2)[column] != good[column]  # premise
+    capsys.readouterr()
+
+    assert _run(data_dir, "--execute") == 0
+    assert f"diff: {column} " in capsys.readouterr().out
+    assert _without_id(_diff_row(data_dir, D2)) == _without_id(good)
+    with gzip.open(os.path.join(data_dir, good["detail_filename"]), "rt") as fh:
+        assert fh.read() == detail
+
+
+@pytest.mark.parametrize("row_state", ("null_pointer", "missing_row"))
+def test_an_orphan_detail_file_removed_here_is_listed_for_the_web_server(
+    tmp_path, monkeypatch, capsys, row_state
+):
+    """A no-changes pair with a detail file at the deterministic name that no
+    row points at (an orphan from before #265): the re-diff removes it, and it
+    is as published as any other, so it must be listed for removal there."""
+    data_dir = _setup(tmp_path, monkeypatch)
+    _collect(data_dir, D1, monkeypatch, old_definition=False)
+    _collect(data_dir, D2, monkeypatch, old_definition=False)
+    assert _diff_row(data_dir, D2)["detail_filename"] is None  # premise: no changes
+    name = generate_streetwalk_diff_filename(CITY_ID, D1, D2, provider="gsv", network_type="drive")
+    path = os.path.join(data_dir, name)
+    with gzip.open(path, "wt") as fh:
+        fh.write("edge_id,change_type\n1_2,coverage_changed\n")
+    if row_state == "missing_row":
+        conn = _conn(data_dir)
+        with conn:
+            conn.execute("DELETE FROM street_walk_diffs")
+        conn.close()
+
+    assert _run(data_dir, "--execute") == 0
+    out = capsys.readouterr().out
+    assert not os.path.exists(path)
+    assert name in _removed_listing(out)
+    assert _diff_row(data_dir, D2)["detail_filename"] is None
 
 
 def test_a_changed_match_distance_is_not_a_diff_pair(tmp_path, monkeypatch, capsys):
