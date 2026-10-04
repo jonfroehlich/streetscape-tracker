@@ -239,11 +239,11 @@ A KartaView city could refresh substantially and have its published median age m
 
 The claim that this population is "large by construction for KartaView, small but real for Mapillary, empty in practice for GSV" was three prose assertions until it was measured against the **production** catalog.
 All three hold, but the pooled rates are the wrong summary: **undated imagery arrives in batches, so the per-run MAXIMUM is what a decision has to survive.**
-GSV pools to **0.0086%** of present panos and Mapillary to **0.150%** (about 17× GSV), yet both read zero through the 95th percentile of runs — and Mapillary's worst single run is **23.3%** undated against GSV's worst **0.34%**.
-Mapillary's entire undated corpus is 99.96% four adjacent Denver-metro runs, which for a census provider whose grids overlap most likely means one contributor's upload batch counted four times.
+GSV pools to **0.0092%** of present panos and Mapillary to **0.109%** (about 12× GSV), yet GSV reads zero through the 90th percentile of runs and Mapillary through the 95th — and Mapillary's worst single run is **23.3%** undated against GSV's worst **0.34%**.
+98.1% of Mapillary's undated corpus is four adjacent Denver-metro runs, which for a census provider whose grids overlap most likely means one contributor's upload batch counted four times; the next-largest, Jefferson City, Missouri, is a second batch of its own.
 KartaView is **9.56%** of audited photos, all one 2025-11-19 ingest.
 Those are GRID runs standing in for walks, because no walk recorded an undated count until this change added one — an estimate of the right order, not the walk's value.
-**Measure this on makelab2, never on a dev catalog**: a laptop holding three Mapillary runs against production's 1,201 produced the opposite conclusion, that Mapillary emits no undated imagery at all.
+**Measure this on makelab2, never on a dev catalog**: a laptop holding three Mapillary runs against production's 1,201 (1,959 by 2026-10) produced the opposite conclusion, that Mapillary emits no undated imagery at all.
 
 ### It changes recorded numbers for the existing GSV and Mapillary walk series, and `scripts/recompute_streetwalk_stats.py` recomputes them (#262)
 
@@ -292,10 +292,10 @@ The orchestrator now removes it (the row's pointer up front, the deterministic n
 It is still not sufficient for the public server: the publish rsync never passes `--delete`, so a copy already published stays there until it is removed from the docroot by hand.
 Note also that the artifact cannot repair itself — its per-edge aggregates were already computed under the old definition, so the dropped `NO_DATE` samples are simply not in it, which rules out the cheap artifact-reading design `backfill_streetwalk_coverage.py` and `backfill_streetwalk_length.py` both use.
 Until `recompute_streetwalk_stats.py --execute` runs on production, the affected deltas are the FIRST walk diff of each series after 2026-08-24.
-Most will round to 0.0 — both providers sit at zero through p95 — but the tail renders: production's worst GSV run would shift **0.33** percentage points, which is visible.
-Mapillary's tail is not measured.
-The 2.7-point figure that stood here divided undated images by a ROW count and is withdrawn ([#289](https://github.com/jonfroehlich/streetscape-tracker/issues/289)); its replacement waits for the `runs.total_grid_points` backfill on production, and even then is an upper bound on the shift rather than the shift (see the writeup's correction).
-What is measured is that Mapillary's worst run has 23.3% of its present imagery undated, so a visible delta there remains plausible.
+Most will be exactly 0.0 — only 149 of 2,429 GSV runs and 19 of 1,959 Mapillary runs hold any undated imagery at all — but the tail can render.
+These are **upper bounds** on the shift, never the shift: undated images over grid points, where several images can share a point that may also hold a dated one (see the writeup's correction).
+Production's worst GSV run (East Hollywood, 2026-08-09) bounds at **0.32** percentage points and its worst Mapillary run (Commerce City, Colorado, 2026-07-31) at **3.00**, both above the 0.05 that rounds away, so a visible delta is possible there and not established.
+The 2.7-point Mapillary figure that stood here divided undated images by a ROW count and is withdrawn ([#289](https://github.com/jonfroehlich/streetscape-tracker/issues/289)); the 3.00 replaces it, measured after the `runs.total_grid_points` backfill on production.
 
 ## Overpass is on the critical path of every first road walk (issue #209)
 

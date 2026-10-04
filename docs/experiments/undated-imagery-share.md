@@ -17,28 +17,23 @@ So the number that matters for any decision is the **per-run maximum**, not the 
 Numbers below come from [`undated-imagery-share_metrics.json`](undated-imagery-share_metrics.json), written by `scripts/undated_imagery_share_analyze.py` against the **makelab2 production catalog** (`catalog_label: makelab2-prod`).
 Read entirely out of the catalog and an already-committed metrics file: no network, no credentials, no collection.
 
-> **Correction (2026-10, [#289](https://github.com/jonfroehlich/streetscape-tracker/issues/289)): every Mapillary *of queried* figure in this writeup and its metrics file is wrong by construction and pending regeneration.**
+> **Correction (2026-10, [#289](https://github.com/jonfroehlich/streetscape-tracker/issues/289)): the first production pass's Mapillary *of queried* figures were wrong by construction, and this file now carries their regeneration.**
 > The script that produced them divided `status_no_date` by `runs.total_points`, and `total_points` is a **row** count.
 > A Mapillary run is a census that writes one row per image plus one row per empty grid point, so that denominator was a mixture of images and points, not the grid it was read as.
-> The affected numbers are Mapillary's `points_queried`, `pooled_pct_of_queried` and `per_run_pct_of_queried`, i.e. the Mapillary row of the phantom-delta table below and the 2.73 pp claim drawn from it.
+> The affected numbers were Mapillary's `points_queried`, `pooled_pct_of_queried` and `per_run_pct_of_queried` — the old 2.73 pp maximum among them.
 > **Unaffected:** every *of present* figure (`no_date / (ok + no_date)` is images over images for a census, points over points for GSV, and never read `total_points`), the run counts, and the batch analysis.
-> **GSV's *of queried* figures are believed unaffected, for a narrower reason than the format.**
-> An ordinary GSV run writes one row per grid point, so its row count is its grid; but a legacy `is_baseline=1` run that was resumed can repeat rows for a point, and in such a run `total_points` overstated the grid too.
-> Such a run's *of queried* figure is still right if it carries no `NO_DATE` row, since zero over either denominator is zero — and on a development catalog, every GSV run with repeated rows carried none (PR #422 review; a dev catalog, not production, so this is the expectation the regeneration checks, not a measurement of production).
-> What those runs do move is GSV's pooled `points_queried`, which counted their repeated rows, and with it `pooled_pct_of_queried`, by an amount not measured on production.
-> The regenerated metrics show whether production holds any: `runs_with_more_rows_than_grid_points` counts them, and GSV's `of_queried_kind` reads `exact` only if there are none.
-> KartaView has no *of queried* figure here at all: its number is the API audit's, which is *of present* only.
 >
-> The fix is [#289](https://github.com/jonfroehlich/streetscape-tracker/issues/289)'s `runs.total_grid_points` (schema v20), the de-duplicated grid-point count, which the script now divides by.
-> It cannot be regenerated from a development catalog, for the reason the next section records, and the production catalog's new column is NULL until `scripts/recompute_run_stats.py --only total_grid_points --provider <p> --execute`, run one provider at a time, backfills it there ([procedure](../operations.md#schema-v20-and-the-runstotal_grid_points-backfill-issue-289)).
-> So no corrected number is quoted here, and none is estimated.
-> The metrics file is left byte-for-byte as the pre-#289 script (as of `d974fd4`) wrote it, as the record of that pass, until it is regenerated on makelab2 after the backfill.
+> The fix is #289's `runs.total_grid_points` (schema v20), the de-duplicated grid-point count, which the script now divides by.
+> On 2026-10-04 it was backfilled on makelab2 for all 4,947 production runs ([procedure](../operations.md#schema-v20-and-the-runstotal_grid_points-backfill-issue-289)), and the metrics file was regenerated there by the committed script at `e32584d`; `runs_without_grid_points` is 0 for every provider, so no run is missing from an *of queried* figure.
+> The pre-#289 pass is preserved in git history as written at `d974fd4`.
 >
-> Two things are known about the corrected figure without running it.
-> Per run, the grid is never larger than the row count, so the new ratio is **at least** the old one: provided the backfill moves no run's `status_no_date`, the corrected per-run maximum cannot come back below 2.73.
-> (The metrics file does not record which run that maximum belongs to, so this writeup does not name it; the regenerated file will, in `max_run_pct_of_queried`.)
-> And it is an **upper bound** on the phantom shift rather than the shift itself, because its numerator still counts undated *images*, several of which can share a point, at points that may also hold a dated image; the exact census shift needs the per-point join, which only the CSV holds.
-> So the corrected Mapillary figure can only settle the visibility question in one direction: a bound under 0.05 pp means invisible, and a bound above it settles nothing.
+> The correction predicted one thing before it was run: per run, the grid is never larger than the row count, so the corrected Mapillary maximum could not come back below 2.73.
+> It came back at **3.00 pp** (`catalog.mapillary.per_run_pct_of_queried.max`), held by **Commerce City, Colorado, 2026-07-31** (`max_run_pct_of_queried`) — not Denver, which holds the largest undated *count*; a per-run maximum of a ratio need not be the largest numerator.
+>
+> **Every *of queried* figure is an upper bound on the phantom shift, not the shift itself** (`of_queried_kind: upper_bound` for all four providers).
+> For a census provider the numerator counts undated *images*, several of which can share a point, at points that may also hold a dated image; the exact census shift needs the per-point join, which only the CSV holds.
+> GSV is an upper bound too, for a narrower reason: 13 of its 2,429 production runs hold more rows than grid points (`runs_with_more_rows_than_grid_points`, legacy runs that repeated a point), and in such a run an undated row counted twice still counts twice in the numerator.
+> So an *of queried* figure settles visibility in one direction only: a bound under 0.05 pp means invisible, and a bound above it settles nothing.
 
 ## Read the production catalog, not a dev one — the answer inverts
 
@@ -46,7 +41,7 @@ Recording this first because it nearly shipped as a finding.
 The first pass of this measurement ran against a development laptop's catalog, which holds the full 1,144-city GSV baseline but only **three** Mapillary runs.
 It concluded that Mapillary emits no undated imagery at all and that *"small but real for Mapillary is not supported by anything we hold."*
 
-Production holds 1,201 Mapillary runs and says the opposite: **0.150%**, roughly **17× GSV's rate**.
+Production said the opposite: at the first production pass (1,201 Mapillary runs) **0.150%**, roughly 17× GSV's rate, and at the regeneration (1,959 runs) **0.109%**, roughly **12×** GSV's 0.0092%.
 The original claim was right and the dev-catalog refutation was an artifact of n=3.
 A per-provider question cannot be answered from a catalog that is only well-populated for one provider, and the run counts have to be quoted next to the share for exactly that reason.
 
@@ -54,13 +49,17 @@ A per-provider question cannot be answered from a catalog that is only well-popu
 
 | | frame | pooled undated | runs with **any** | worst single run |
 |---|---|---|---|---|
-| **GSV** | 1,766 prod grid runs, 242.5M present panos | 0.0086% | 119 of 1,749 | **0.336%** |
-| **Mapillary** | 1,201 prod grid runs, 68.3M present panos | 0.150% | **11 of 453** | **23.3%** |
-| **KartaView** | API sample of 48 sequences, 59,263 photos | 9.56% | 10 of 48 sequences | — |
+| **GSV** | 2,429 prod grid runs, 309.9M present panos | 0.0092% | 149 of 2,405 | **0.345%** |
+| **Mapillary** | 1,959 prod grid runs, 95.6M present panos | 0.109% | **19 of 789** | **23.3%** |
+| **KartaView** (catalog) | 527 prod grid runs, 89,548 present photos | 7.24% | 2 of 6 | **32.2%** |
+| **KartaView** (audit) | API sample of 48 sequences, 59,263 photos | 9.56% | 10 of 48 sequences | — |
+| **Panoramax** | 32 prod grid runs, 2.63M present pictures | 0.00011% | 1 of 27 | 0.00084% |
 
-The first two are a census of what we collected; the third is a sample of what the provider serves, lifted from [`kartaview-shotdate-audit_metrics.json`](kartaview-shotdate-audit_metrics.json) rather than re-probed, since that number already has a writeup and caveats of its own ([`kartaview-feasibility.md`](kartaview-feasibility.md)).
+"Runs with any" is out of the runs holding any present imagery (`per_run_pct_of_present.n`), since a run with none has no share to take.
+The catalog rows are a census of what we collected; the audit row is a sample of what the provider serves, lifted from [`kartaview-shotdate-audit_metrics.json`](kartaview-shotdate-audit_metrics.json) rather than re-probed, since that number already has a writeup and caveats of its own ([`kartaview-feasibility.md`](kartaview-feasibility.md)).
 They are not a controlled comparison.
-We hold no KartaView runs at all — it became a scheduler channel in #248 but an opt-in one, so it collects only enrolled cities — and the audit's own writeup calls its sample Grab-heavy and its count a lower bound.
+KartaView's catalog row is new since the first pass, and it is thin: the channel is opt-in (#248), and only **6** of its 527 runs hold any imagery at all, so it is two cities rather than a rate.
+Its 7.24% sits beside the audit's 9.56%, which its own writeup calls Grab-heavy and a lower bound; the two frames agree in order and are still not pooled.
 
 **And all three are proxies for the quantity actually at issue, which is the ROAD-WALK undated share.**
 No walk has ever recorded one: `street_walks` and the coverage artifact counted covered samples and nothing else, which is the gap #257 closed by adding `dated_covered_samples` per edge and `covered_samples_dated`/`dated_pct_of_covered` to the artifact's summary blocks.
@@ -69,44 +68,54 @@ Until walks collected under that column accumulate, the grid share is the only e
 
 ## The distribution is the finding: undated imagery comes in batches
 
-Both providers are zero through the 95th percentile, and both have a long right tail.
+GSV is zero through the 90th percentile and Mapillary through the 95th, and both have a long right tail.
 Per run, as a share of present panos:
 
-| | n | p50 | p90 | p95 | max |
-|---|---|---|---|---|---|
-| GSV | 1,749 | 0.0% | 0.0% | 0.0046% | **0.336%** |
-| Mapillary | 453 | 0.0% | 0.0% | 0.0% | **23.3%** |
+| | n | p50 | p90 | p95 | max | worst run (`max_run_pct_of_present`) |
+|---|---|---|---|---|---|---|
+| GSV | 2,405 | 0.0% | 0.0% | 0.0025% | **0.345%** | Del Mar, California, 2025-01-22 |
+| Mapillary | 789 | 0.0% | 0.0% | 0.0% | **23.3%** | Commerce City, Colorado, 2026-07-31 |
+| KartaView | 6 | 0.0% | 1.97% | 32.2% | **32.2%** | Yogyakarta, Indonesia, 2026-08-28 |
+| Panoramax | 27 | 0.0% | 0.0% | 0.0% | 0.00084% | Paris, France, 2026-10-01 |
 
-**Mapillary's entire undated population is essentially one metropolitan area.**
-Four Denver-area runs — Denver (66,441), Commerce City (32,059), Lakewood (2,378), Englewood (1,810) — account for 102,688 of the catalog's 102,733 undated Mapillary panos, or **99.96%**.
-The remaining seven runs contribute 45 panos between them.
+KartaView's n of 6 makes its percentiles a list rather than a distribution: two runs carry all 6,480 of its undated photos, Yogyakarta (5,451) and Krabi (1,029, 1.97% of its present imagery), both collected 2026-08-28.
+
+**Mapillary's undated population is still mostly one metropolitan area, but no longer only one.**
+Four Denver-area runs — Denver (66,441), Commerce City (32,059), Lakewood (2,378), Englewood (1,810) — account for 102,688 of the catalog's 104,668 undated Mapillary panos, or **98.1%** (99.96% at the first production pass).
+The fifth-largest is a second, unrelated batch: **Jefferson City, Missouri, 2026-09-29, 1,453** — a city collected after the first pass.
+The remaining 14 runs contribute 527 panos between them.
 Note these are adjacent cities whose frozen grids overlap, and Mapillary is a *census* provider that keeps every image in the bbox, so the likeliest reading is **one contributor's upload batch counted four times** rather than four independent events.
 That is a hypothesis from the geography, not something this measurement establishes; confirming it means comparing pano ids across the four snapshots.
 
-**GSV's is concentrated too, just less dramatically**: zero in 1,630 of 1,749 runs, with the pooled figure carried by 119 runs, largely the big baseline metros (Los Angeles alone contributes 2,670).
+**GSV's is concentrated too, just less dramatically**: zero in 2,256 of 2,405 runs, with the pooled figure carried by 149 runs, largely the big metros (Los Angeles's two runs contribute 2,448 and 1,724, New York's 1,280 and 1,223).
+The same GSV runs' counts are lower here than at the first pass (Los Angeles 2025-01-03 read 2,670 then), which this measurement does not explain; a candidate is #367's query-radius rule, which moves a GSV row out of `status_no_date` into `status_out_of_radius` when `recompute_run_stats.py` re-derives a run, but whether that pass ran on these runs is not checked here.
 
-So the shape generalizes across all three providers, and it is the transferable lesson here:
+So the shape generalizes across every provider with any undated imagery, and it is the transferable lesson here:
 **an undated population is a property of an upload batch, not of a provider.**
 A pooled per-provider rate describes no run in the distribution and will systematically understate what any single city can hit.
 
-## Will the phantom delta be visible? For GSV rarely, for Mapillary not yet measured
+## Will the phantom delta be visible? For most runs never; the tail is bounded, not measured
 
 `coverage_pct_by_length` is published to one decimal, so a shift under 0.05 percentage points rounds away completely.
 The relevant denominator is undated panos over **points queried**, not over present panos, because that is the percentage-*point* shift a coverage rate takes:
 
-| | p50 | p95 | max |
-|---|---|---|---|
-| GSV | 0.0% | 0.0028% | **0.329 pp** |
-| Mapillary | ~~0.0%~~ | ~~0.0%~~ | ~~2.73 pp~~ — **wrong by construction, pending regeneration** ([#289](https://github.com/jonfroehlich/streetscape-tracker/issues/289), see the correction above) |
+Every figure in this table is an **upper bound** on that shift, for the reasons the correction gives:
 
-For the overwhelming majority of runs of either provider the Δ column will read exactly 0.0.
-But the tail is not negligible: a GSV city can shift a third of a point.
-The Mapillary claim that stood here — *"a Denver-metro Mapillary walk can shift 2.7 points"* — rested on the struck-through figure and is withdrawn until it is regenerated ([#289](https://github.com/jonfroehlich/streetscape-tracker/issues/289)).
-What survives without it is the *of present* figure: Mapillary's worst run has 23.3% of its present imagery undated, so a visible shift there remains plausible, but how many points it moves is not measured.
-(The metrics file does not say which run that is; the top contributors by undated count are the four Denver-area runs above, but a per-run maximum of a ratio need not be the largest numerator, so it is not named here.)
+| | n | p50 | p95 | max | worst run (`max_run_pct_of_queried`) |
+|---|---|---|---|---|---|
+| GSV | 2,429 | 0.0 pp | 0.0010 pp | **≤ 0.320 pp** | East Hollywood, California, 2026-08-09 |
+| Mapillary | 1,959 | 0.0 pp | 0.0 pp | **≤ 3.00 pp** | Commerce City, Colorado, 2026-07-31 |
+| KartaView | 527 | 0.0 pp | 0.0 pp | **≤ 0.97 pp** | Yogyakarta, Indonesia, 2026-08-28 |
+| Panoramax | 32 | 0.0 pp | 0.0 pp | ≤ 0.0005 pp | Paris, France, 2026-10-01 |
+
+For the overwhelming majority of runs the Δ column will read exactly 0.0, and not merely by rounding: a run with no undated imagery cannot shift at all, and only 149 of 2,429 GSV runs, 19 of 1,959 Mapillary runs, 2 of 527 KartaView runs and 1 of 32 Panoramax runs hold any (`runs_with_any_no_date`).
+The tail is where the bound stops settling anything.
+A GSV city can shift at most a third of a point, which is still visible at one decimal.
+A Mapillary city can shift **at most 3.00 points** — the claim that stood here was *"a Denver-metro Mapillary walk can shift 2.7 points"*, which rested on the withdrawn row-count figure and named a run the file did not record; the corrected bound belongs to Commerce City, and it is a ceiling rather than the shift.
+Because every bound in the tail is above 0.05 pp, the measurement says a visible shift is *possible* for those few runs, not that it happens; the exact census shift needs the per-point join.
 That is the case the dated note in [`../street-coverage.md`](../street-coverage.md) exists for.
 
-An earlier review of the fix put GSV's maximum at 0.095% and concluded the delta was invisible everywhere; the production catalog says 0.329 pp for GSV, so the weaker claim is the true one — invisible in the overwhelming majority of runs, not in all of them.
+An earlier review of the fix put GSV's maximum at 0.095% and concluded the delta was invisible everywhere; production says up to 0.320 pp for GSV (0.329 at the first pass), so the weaker claim is the true one — invisible in the overwhelming majority of runs, not in all of them.
 (That paragraph also cited 2.73 pp for Mapillary, the figure withdrawn above.)
 
 ## Why the age median is the sharper problem
@@ -128,9 +137,10 @@ For most runs of either provider the field will read 100.0, which is the point �
 python scripts/undated_imagery_share_analyze.py --docs-dir docs/experiments --catalog-label makelab2-prod
 ```
 
-Run it **on makelab2**, against the production catalog, and **only after** `scripts/recompute_run_stats.py --only total_grid_points --provider <p> --execute` has backfilled `runs.total_grid_points` there, one provider per invocation and never with a plain `--execute` ([procedure](../operations.md#schema-v20-and-the-runstotal_grid_points-backfill-issue-289), [#289](https://github.com/jonfroehlich/streetscape-tracker/issues/289)).
+Run it **on makelab2**, against the production catalog.
+`runs.total_grid_points` was backfilled there on 2026-10-04 (`scripts/recompute_run_stats.py --only total_grid_points --provider <p> --execute`, one provider per invocation and never with a plain `--execute`; [procedure](../operations.md#schema-v20-and-the-runstotal_grid_points-backfill-issue-289), [#289](https://github.com/jonfroehlich/streetscape-tracker/issues/289)), and a newly cataloged run gets it from `calculate_run_stats`.
 Reads `runs.status_ok`/`status_no_date`/`total_grid_points` and `kartaview-shotdate-audit_metrics.json`; no network, no credentials, seconds to run.
-A run whose `total_grid_points` is still NULL is left out of every *of queried* figure and counted in `runs_without_grid_points`, so a regeneration before the backfill reports itself as incomplete rather than quietly measuring a subset; that count should be 0 before the numbers above are replaced.
+A run whose `total_grid_points` is still NULL is left out of every *of queried* figure and counted in `runs_without_grid_points`, so a regeneration before the backfill reports itself as incomplete rather than quietly measuring a subset; it is 0 for every provider in the committed file.
 Each provider's block now carries `of_queried_kind`: `upper_bound` for a census provider, for the reason the correction gives, and for any provider with a run holding more rows than grid points (`runs_with_more_rows_than_grid_points`); `exact` only otherwise.
 It also names the run behind each per-run maximum (`max_run_pct_of_present`, `max_run_pct_of_queried`), so a writeup naming the worst run traces the name to the file.
 `--catalog-label` is recorded in the metrics file and is not cosmetic — it is the only thing distinguishing this result from the dev-catalog run that concluded the opposite.

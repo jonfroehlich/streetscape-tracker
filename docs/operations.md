@@ -274,7 +274,7 @@ The fix is to add `--regenerate-json`; `--allow-unrebuilt-dates` overrides the r
 The `--only` dry run's summary line says no other column is read or written; if a plain dry run is what you are reading, it is the wrong command.
 
 Run it **per provider, in the daytime, never overlapping the 02:00 timer** — it shares the catalog with the batch, and a census provider's pass still reads millions of rows apiece.
-Nothing published reads `total_grid_points`, so the backfill republishes nothing; `scripts/undated_imagery_share_analyze.py` is its first reader, and that regeneration waits for the backfill (see [`experiments/undated-imagery-share.md`](experiments/undated-imagery-share.md)).
+Nothing published reads `total_grid_points`, so the backfill republishes nothing; `scripts/undated_imagery_share_analyze.py` is its first reader; the backfill ran on production on 2026-10-04 and that regeneration is committed (see [`experiments/undated-imagery-share.md`](experiments/undated-imagery-share.md)).
 
 ## Landing a laptop investigation in this catalog: `scheduler import-bundle` (issue #330)
 
