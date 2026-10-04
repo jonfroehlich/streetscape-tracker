@@ -238,6 +238,16 @@ In order:
 6. those uploaders' towns ahead of a cap of 30 rows, the rest by score — the cap does not bind.
 
 That leaves **11 rows**, in descending score, so `register_frame.py --limit N` registers the strongest first.
+Re-running the script reproduces both committed files byte for byte (no network; the snapshot is gitignored on the laptop that ran the screen):
+
+```bash
+git show origin/mapillary-discovery-screen-383:docs/experiments/mapillary-discovery-screen_candidates.csv > /tmp/candidates.csv
+git show origin/mapillary-discovery-screen-383:mapillary_discovery_cities.csv > /tmp/t1/mapillary_discovery_cities.csv
+python scripts/build_mapillary_discovery_tranche2.py --candidates /tmp/candidates.csv \
+    --catalog-snapshot experiments/mapillary-discovery-383/prod/prod_snapshot.csv \
+    --also-registered /tmp/t1/mapillary_discovery_cities.csv
+```
+
 Each row is the scored place itself, at the point its 2 km disc was measured around, so no row is admitted on a neighbour's imagery (the defect #428's review found in a cluster-anchored selection).
 
 **No GIS_ISG or UAS_ISG town made it.**
