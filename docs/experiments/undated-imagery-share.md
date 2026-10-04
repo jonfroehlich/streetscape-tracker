@@ -30,7 +30,7 @@ Read entirely out of the catalog and an already-committed metrics file: no netwo
 > KartaView has no *of queried* figure here at all: its number is the API audit's, which is *of present* only.
 >
 > The fix is [#289](https://github.com/jonfroehlich/streetscape-tracker/issues/289)'s `runs.total_grid_points` (schema v20), the de-duplicated grid-point count, which the script now divides by.
-> It cannot be regenerated from a development catalog, for the reason the next section records, and the production catalog's new column is NULL until `scripts/recompute_run_stats.py --execute` backfills it there.
+> It cannot be regenerated from a development catalog, for the reason the next section records, and the production catalog's new column is NULL until `scripts/recompute_run_stats.py --only total_grid_points --provider <p> --execute`, run one provider at a time, backfills it there ([procedure](../operations.md#schema-v20-and-the-runstotal_grid_points-backfill-issue-289)).
 > So no corrected number is quoted here, and none is estimated.
 > The metrics file is left byte-for-byte as the pre-#289 script (as of `d974fd4`) wrote it, as the record of that pass, until it is regenerated on makelab2 after the backfill.
 >
@@ -128,7 +128,7 @@ For most runs of either provider the field will read 100.0, which is the point â
 python scripts/undated_imagery_share_analyze.py --docs-dir docs/experiments --catalog-label makelab2-prod
 ```
 
-Run it **on makelab2**, against the production catalog, and **only after** `scripts/recompute_run_stats.py --execute` has backfilled `runs.total_grid_points` there ([#289](https://github.com/jonfroehlich/streetscape-tracker/issues/289)).
+Run it **on makelab2**, against the production catalog, and **only after** `scripts/recompute_run_stats.py --only total_grid_points --provider <p> --execute` has backfilled `runs.total_grid_points` there, one provider per invocation and never with a plain `--execute` ([procedure](../operations.md#schema-v20-and-the-runstotal_grid_points-backfill-issue-289), [#289](https://github.com/jonfroehlich/streetscape-tracker/issues/289)).
 Reads `runs.status_ok`/`status_no_date`/`total_grid_points` and `kartaview-shotdate-audit_metrics.json`; no network, no credentials, seconds to run.
 A run whose `total_grid_points` is still NULL is left out of every *of queried* figure and counted in `runs_without_grid_points`, so a regeneration before the backfill reports itself as incomplete rather than quietly measuring a subset; that count should be 0 before the numbers above are replaced.
 Each provider's block now carries `of_queried_kind`: `upper_bound` for a census provider, for the reason the correction gives, and for any provider with a run holding more rows than grid points (`runs_with_more_rows_than_grid_points`); `exact` only otherwise.

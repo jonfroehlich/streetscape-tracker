@@ -267,6 +267,8 @@ Backfill it with the column-restricted mode, which reads only `query_lat,query_l
 **Never backfill with a plain `--execute`.**
 It loads every CSV through the full loader (the PR #422 review put a 16.5M-row Mapillary census run at ~15 GiB resident, on the host that runs the batch), and it applies every OTHER pending definition change too.
 If one of those moves a capture-date column without `--regenerate-json`, that run's published JSON keeps the old dates and no later `--regenerate-json` pass can find it, because nothing moves any more.
+So a plain `--execute` that would move any capture-date column is **refused** (exit 64, nothing written), and the refusal lists each affected run as `city_id [provider] run_date`; a plain dry run prints the same list as a WARNING.
+The fix is to add `--regenerate-json`; `--allow-unrebuilt-dates` overrides the refusal only for an operator who will rebuild the listed runs' JSONs by hand.
 The `--only` dry run's summary line says no other column is read or written; if a plain dry run is what you are reading, it is the wrong command.
 
 Run it **per provider, in the daytime, never overlapping the 02:00 timer** — it shares the catalog with the batch, and a census provider's pass still reads millions of rows apiece.

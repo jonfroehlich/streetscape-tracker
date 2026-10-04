@@ -95,12 +95,20 @@ aggregate's age stats come from the per-run JSONs). Skipping it would leave
 driving.html showing the pre-repair dates — and the driven_unplanned verdicts
 derived from them — until some later unrelated `scheduler run-due`.
 
+--execute WITHOUT --regenerate-json is refused (exit 64, nothing written)
+when it would move any run's capture-date columns, and the refusal lists
+those runs by city_id, provider and run_date. Applying it would strand their
+published JSONs: the rebuild trigger keys on a date column MOVING, so once
+the catalog holds the new dates no later --regenerate-json pass can find
+them. A dry run prints the same list as a warning. --allow-unrebuilt-dates
+overrides the refusal for an operator who will rebuild those runs by hand.
+
 Idempotent: a run whose stored stats already match is left untouched. Runs
 whose CSV is missing (skipped, reported) keep their existing values.
 
 Usage:
     python scripts/recompute_run_stats.py                        # dry run
-    python scripts/recompute_run_stats.py --execute              # apply
+    python scripts/recompute_run_stats.py --execute              # apply (refused if dates move)
     python scripts/recompute_run_stats.py --provider gsv \\
         --regenerate-json --execute        # issue #213's and #226's repair on prod
     python scripts/recompute_run_stats.py --only total_grid_points   # #289 preview
@@ -372,6 +380,15 @@ def main() -> int:
         "else, so it applies no pending definition change and rebuilds no "
         "JSON. Not combinable with --regenerate-json",
     )
+    parser.add_argument(
+        "--allow-unrebuilt-dates",
+        action="store_true",
+        help="Let --execute without --regenerate-json move capture-date columns "
+        "anyway. By default that pass is refused (exit 64) before writing, "
+        "because those runs' published JSONs keep the old dates and no later "
+        "--regenerate-json pass can find them; with this flag, the listed runs "
+        "need a manual rebuild",
+    )
     args = parser.parse_args()
     if args.only and args.regenerate_json:
         parser.error(
@@ -401,9 +418,10 @@ def main() -> int:
     n_date_moved = 0  # of those repairs, how many were triggered by a moved date
     n_radius = 0  # of those repairs, how many hold a pano beyond the query radius
     # Runs whose capture-date columns this pass moves while --regenerate-json is
-    # off: applying them repairs the catalog but not the published JSON, and
-    # leaves no trace a later --regenerate-json pass could find (see the warning).
-    n_dates_unrebuilt = 0
+    # off, as "city_id [provider] run_date": applying them repairs the catalog
+    # but not the published JSON, and leaves no trace a later --regenerate-json
+    # pass could find -- so --execute refuses them (see the refusal below).
+    dates_unrebuilt = []
     missing = 0
     for r in rows:
         csv_path = os.path.join(args.data_dir, r["csv_filename"])
@@ -472,7 +490,7 @@ def main() -> int:
                 if radius_stale:
                     n_radius += 1
         if not args.regenerate_json and any(c in changed for c in DATE_COLUMNS):
-            n_dates_unrebuilt += 1
+            dates_unrebuilt.append(f"{r['city_id']} [{r['provider']}] {r['run_date']}")
         if changed:
             updates.append((r["run_id"], changed))
             nd = stats["status_no_date"]
@@ -498,17 +516,38 @@ def main() -> int:
             "rebuild the ones holding an impossible capture date, a pano beyond "
             "the query radius, or capture-date columns this pass would move"
         )
-        if n_dates_unrebuilt:
+        if dates_unrebuilt:
             # The trap the PR #422 review found: the JSON trigger keys on a date
             # column MOVING, so once this pass has written the new dates, no later
-            # --regenerate-json pass can see these runs' JSON is stale.
+            # --regenerate-json pass can see these runs' JSON is stale. A warning
+            # printed after the write cannot undo it, so --execute REFUSES here,
+            # before anything is written, unless the operator opts in by name.
+            listing = "".join(f"\n    {run}" for run in dates_unrebuilt)
+            consequence = (
+                "Their published per-run JSONs would keep the old dates, and a "
+                "later --regenerate-json pass will NOT find them (nothing moves "
+                "any more)."
+            )
+            if args.execute and not args.allow_unrebuilt_dates:
+                print(
+                    f"REFUSED: {len(dates_unrebuilt)} runs' capture-date columns "
+                    f"would be moved without --regenerate-json:{listing}\n"
+                    f"{consequence} Nothing was written. Add --regenerate-json to "
+                    "rebuild their JSONs in the same pass, or --allow-unrebuilt-dates "
+                    "to apply anyway and rebuild those runs by hand.",
+                    file=sys.stderr,
+                )
+                return 64
             print(
-                f"WARNING: {n_dates_unrebuilt} runs' capture-date columns "
-                f"{'were' if args.execute else 'would be'} moved without "
-                "--regenerate-json. Their published per-run JSONs keep the old "
-                "dates, and a later --regenerate-json pass will NOT find them "
-                "(nothing moves any more). Re-run with --regenerate-json"
-                + (" instead." if not args.execute else "; those runs need a manual rebuild.")
+                f"WARNING: {len(dates_unrebuilt)} runs' capture-date columns "
+                f"{'are being' if args.execute else 'would be'} moved without "
+                f"--regenerate-json:{listing}\n{consequence} "
+                + (
+                    "--allow-unrebuilt-dates was given, so those runs need a manual rebuild."
+                    if args.execute
+                    else "--execute will refuse this pass unless --regenerate-json "
+                    "or --allow-unrebuilt-dates is added."
+                )
             )
     elif json_repairs:
         total_bad = sum(n for _, _, n in json_repairs)
