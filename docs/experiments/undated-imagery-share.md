@@ -88,7 +88,9 @@ Note these are adjacent cities whose frozen grids overlap, and Mapillary is a *c
 That is a hypothesis from the geography, not something this measurement establishes; confirming it means comparing pano ids across the four snapshots.
 
 **GSV's is concentrated too, just less dramatically**: zero in 2,256 of 2,405 runs, with the pooled figure carried by 149 runs, largely the big metros (Los Angeles's two runs contribute 2,448 and 1,724, New York's 1,280 and 1,223).
-The same GSV runs' counts are lower here than at the first pass (Los Angeles 2025-01-03 read 2,670 then), which this measurement does not explain; a candidate is #367's query-radius rule, which moves a GSV row out of `status_no_date` into `status_out_of_radius` when `recompute_run_stats.py` re-derives a run, but whether that pass ran on these runs is not checked here.
+The same GSV runs' counts are lower here than at the first pass (Los Angeles 2025-01-03 read 2,670 then).
+That is #367's query-radius rule, not this measurement: between the two passes production's GSV catalog was re-derived under it (the #392 repair, 2026-10-02), which moves a row farther than the query radius out of `status_no_date` into `status_out_of_radius`.
+Checked on that Los Angeles run's catalog row, which carries a `query_radius_m` and a nonzero `status_out_of_radius`; the per-run counts themselves are in the metrics file, not re-derived here.
 
 So the shape generalizes across every provider with any undated imagery, and it is the transferable lesson here:
 **an undated population is a property of an upload batch, not of a provider.**
