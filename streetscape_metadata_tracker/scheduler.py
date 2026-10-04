@@ -5893,6 +5893,139 @@ def cmd_reconcile_walks(
 # ---------------------------------------------------------------------------
 
 
+# The module a scheduler process is launched as, and the nightly unit's name.
+# Both are matched EXACTLY (an argv token, a cgroup path component), never as
+# substrings: a substring test matched a `pgrep -f` loop and a `tail -f` of a
+# log named after the subcommand, and a substring over the joined argv would
+# match `scheduler --config run-due.toml status`.
+SCHEDULER_MODULE = "streetscape_metadata_tracker.scheduler"
+NIGHTLY_UNIT = "streetscape-tracker.service"
+# The nightly unit's second, independent identification (issue #412): the
+# unit file sets Environment=STREETSCAPE_NIGHTLY=1. Either it or the cgroup
+# path identifies the nightly, so a cgroup layout nobody verified on prod
+# cannot by itself refuse the night.
+NIGHTLY_ENV_VAR = "STREETSCAPE_NIGHTLY"
+# Where the kernel names this process's cgroup; a module constant so tests can
+# point it at a file (the nightly is identified from it, see _is_nightly_unit).
+_PROC_CGROUP = "/proc/self/cgroup"
+
+
+@dataclass(frozen=True)
+class RunDueProcess:
+    """Another ``run-due`` seen in ``ps``: its pid, raw command line, and argv."""
+
+    pid: int
+    args: str
+    argv: tuple[str, ...]
+
+
+def _split_ps_args(args: str) -> list[str]:
+    """
+    Tokenize one ``ps`` args column, on whitespace.
+
+    ``ps`` joins argv with spaces and quotes nothing, so there are no quotes to
+    honour: ``shlex`` read two apostrophes (``--config /x/o'neil.toml run-due
+    --city Coeur d'Alene``) as one quoted span and swallowed the ``run-due``
+    token, so a real batch went undetected. An argument that itself contains a
+    space splits into several tokens here, which can only ADD tokens, never
+    hide ``-m``, the module or ``run-due``.
+    """
+    return args.split()
+
+
+def _is_run_due_argv(argv: Sequence[str]) -> bool:
+    """
+    True for ``python … -m streetscape_metadata_tracker.scheduler … run-due …``.
+
+    argv[0] must be a python executable (``python``, ``python3``,
+    ``python3.11``, any directory, case-insensitively: a macOS framework build
+    re-execs as ``…/Python.app/Contents/MacOS/Python``, measured with the real
+    ``ps``), ``-m`` must be followed by the scheduler
+    module, and ``run-due`` must be a TOKEN after it. A shell wrapper
+    (``bash -c '…run-due…'``), ``timeout``, ``pgrep -f``, ``tail -f
+    logs/run-due.log`` and ``scheduler --config run-due.toml status`` all
+    fail one of those.
+
+    Exact ``run-due``/``--provider``/``--dry-run`` tokens are enough because
+    the ``run-due`` subparser sets ``allow_abbrev=False``: an abbreviated
+    ``--prov gsv`` is refused at parse time, so no live process carries one.
+
+    Example::
+
+        >>> _is_run_due_argv(["/v/bin/python", "-m", SCHEDULER_MODULE, "--config", "c.toml", "run-due"])
+        True
+        >>> _is_run_due_argv(["pgrep", "-af", "scheduler .*run-due"])
+        False
+    """
+    if not argv or not os.path.basename(argv[0]).lower().startswith("python"):
+        return False
+    for i in range(1, len(argv) - 1):
+        if argv[i] == "-m" and argv[i + 1] == SCHEDULER_MODULE:
+            return "run-due" in argv[i + 2 :]
+    return False
+
+
+def _ancestor_pids(parents: dict[int, int], pid: int) -> set[int]:
+    """``pid`` and every ancestor of it in a pid -> ppid table (cycle-safe)."""
+    chain: set[int] = set()
+    while pid > 0 and pid not in chain:
+        chain.add(pid)
+        pid = parents.get(pid, 0)
+    return chain
+
+
+def _scan_run_due_processes() -> list[RunDueProcess]:
+    """
+    Every OTHER ``run-due`` process on this host, from ``ps``.
+
+    This process and its whole ancestor chain are excluded, so a ``bash -c``,
+    ``timeout`` or ``nohup`` wrapper never reports its own child (or vice
+    versa), and a ``run-due`` with no other batch alive sees an empty list.
+    ``ww`` keeps long command lines whole: a truncated line would lose the
+    ``--provider`` flags the GSV guard reads.
+
+    A heuristic over ``ps`` rather than a lock the batch holds (a pidfile
+    written by ``run-due`` is the robust version, left to a follow-up). It is
+    per-HOST: a ``run-due`` on another machine is invisible to it. ``ps``
+    being unavailable returns ``[]`` -- advisory checks must never fail the
+    work they speak for -- so every caller fails OPEN.
+    """
+    try:
+        out = subprocess.run(
+            ["ps", "-ww", "-e", "-o", "pid=,ppid=,args="],
+            capture_output=True,
+            text=True,
+            # Any process's argv may hold bytes that are not UTF-8 (a city
+            # query in a legacy encoding); strict decoding raised out of the
+            # nightly's pre-flight. Replaced bytes cannot form `run-due`.
+            errors="replace",
+            timeout=20,
+        ).stdout
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return []
+    parents: dict[int, int] = {}
+    rows: list[tuple[int, str]] = []
+    for line in out.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) < 3:
+            continue
+        try:
+            pid, ppid = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        parents[pid] = ppid
+        rows.append((pid, parts[2].strip()))
+    mine = _ancestor_pids(parents, os.getpid()) | {os.getpid(), os.getppid()}
+    found = []
+    for pid, args in rows:
+        if pid in mine:
+            continue
+        argv = _split_ps_args(args)
+        if _is_run_due_argv(argv):
+            found.append(RunDueProcess(pid=pid, args=args, argv=tuple(argv)))
+    return found
+
+
 def _run_due_in_flight() -> str | None:
     """
     The command line of a ``run-due`` already running here, or None.
@@ -5902,32 +6035,14 @@ def _run_due_in_flight() -> str | None:
     this writes into, and a city registered halfway through a night can be
     picked up by a later channel query in the same run.
 
-    This is a heuristic and the caller says so. It reads `ps` rather than a lock
-    the batch holds, because there is no such lock yet — a pidfile written by
-    ``run-due`` itself is the robust version and is deliberately left to a
-    follow-up. Two failure modes are handled: `ps` being unavailable returns None
-    (advisory checks must never fail the work they speak for), and this process
-    and its parent are excluded, since a `pgrep`-shaped check run over SSH has
-    matched its own command line here before.
+    A thin view over :func:`_scan_run_due_processes`, whose docstring carries
+    the matching rules and the failure modes; any ``run-due`` counts here,
+    ``--dry-run`` included, because what these callers protect is the catalog.
     """
-    try:
-        out = subprocess.run(
-            ["ps", "-eo", "pid=,args="], capture_output=True, text=True, timeout=20
-        ).stdout
-    except (OSError, subprocess.SubprocessError):
+    found = _scan_run_due_processes()
+    if not found:
         return None
-    mine = {os.getpid(), os.getppid()}
-    for line in out.splitlines():
-        pid_str, _, args = line.strip().partition(" ")
-        try:
-            pid = int(pid_str)
-        except ValueError:
-            continue
-        if pid in mine:
-            continue
-        if "streetscape_metadata_tracker.scheduler" in args and "run-due" in args:
-            return f"pid {pid}: {args.strip()}"
-    return None
+    return f"pid {found[0].pid}: {found[0].args}"
 
 
 def _import_cadence_channel(
@@ -6610,6 +6725,7 @@ def cmd_assess_city(
     today: date | None = None,
     opt_in: bool = True,
     enroll_kartaview: bool = False,
+    force: bool = False,
 ) -> int:
     """
     Register a city if new, walk its streets on both providers, publish, and
@@ -6638,6 +6754,10 @@ def cmd_assess_city(
 
     It deliberately does NOT collect the GSV grid — see ASSESS_CHANNELS — and it
     deliberately does not record a channel failure; see ``_run_city_channels``.
+
+    Like ``run-due``, it refuses (``USAGE_EXIT_CODE``) to collect ``gsv_streets``
+    while a ``run-due`` on this host is collecting that key, unless ``force``
+    (issue #412); ``--estimate`` spends nothing and is never checked.
 
     ``today`` is injectable so tests can pin a date; production callers omit it.
     """
@@ -6669,6 +6789,13 @@ def cmd_assess_city(
         channels = _select_assess_channels(cfg, requested_providers)
     except _UsageError as e:
         logger.error(str(e))
+        return USAGE_EXIT_CODE
+    # The same GSV-key guard as run-due's (issue #412), before anything is
+    # registered or spent.
+    overlaps = [] if (estimate_only or force) else _gsv_key_overlaps(cfg, channels)
+    if overlaps:
+        for message in _gsv_overlap_refusal("assess-city", overlaps):
+            logger.error(message)
         return USAGE_EXIT_CODE
 
     conn = db.connect(cfg.db_path)
@@ -8606,6 +8733,178 @@ def _select_providers(cfg: SchedulerConfig, requested: list[str]) -> list[str]:
     return [p for p in enabled if p in set(names)]
 
 
+# The channels that spend a GSV key (issue #412). Each has its OWN key in its
+# own Cloud project, so the two never contend with each other -- the hazard is
+# a second process on the SAME key, which nothing serializes: GSV is metered
+# per project, not per IP, so CHANNEL_HOSTS gives 'gsv' no host lock at all.
+GSV_KEY_CHANNELS: frozenset[str] = frozenset({"gsv", "gsv_streets"})
+
+
+def _run_due_collecting_channels(argv: Sequence[str], default: Sequence[str]) -> frozenset[str]:
+    """
+    The channels another ``run-due``'s argv will collect, or none for a dry run.
+
+    ``--provider X`` and ``--provider=X``, repeated or comma-separated, are
+    unioned; no ``--provider`` at all means ``default`` -- this process's own
+    enabled set, on the assumption that the other process reads the same
+    config (true of the nightly and of every documented catch-up). A
+    ``--dry-run`` collects nothing, so it holds no key.
+
+    Example::
+
+        >>> sorted(_run_due_collecting_channels(["run-due", "--provider=gsv,mapillary"], ["gsv"]))
+        ['gsv', 'mapillary']
+    """
+    if "--dry-run" in argv:
+        return frozenset()
+    named: list[str] = []
+    flagged = False
+    for i, tok in enumerate(argv):
+        if tok == "--provider":
+            flagged = True
+            if i + 1 < len(argv):
+                named.append(argv[i + 1])
+        elif tok.startswith("--provider="):
+            flagged = True
+            named.append(tok.split("=", 1)[1])
+    if not flagged:
+        return frozenset(default)
+    return frozenset(n.strip() for value in named for n in value.split(",") if n.strip())
+
+
+def _gsv_key_overlaps(
+    cfg: SchedulerConfig, channels: Sequence[str]
+) -> list[tuple[RunDueProcess, list[str]]]:
+    """
+    The other ``run-due`` processes that would collect one of OUR GSV keys.
+
+    Each entry is the process and the GSV channels both of us would collect.
+    ``gsv`` and ``gsv_streets`` are separate keys, so a hand ``gsv_streets``
+    catch-up beside a ``gsv``-only one is no overlap. Empty -- WITHOUT
+    reading ``ps`` -- when ``channels`` holds no GSV channel, so a Mapillary
+    catch-up never even asks.
+    """
+    mine = [c for c in channels if c in GSV_KEY_CHANNELS]
+    if not mine:
+        return []
+    default = cfg.enabled_providers()
+    overlaps = []
+    for proc in _scan_run_due_processes():
+        theirs = _run_due_collecting_channels(proc.argv, default)
+        shared = [c for c in mine if c in theirs]
+        if shared:
+            overlaps.append((proc, shared))
+    return overlaps
+
+
+def _nightly_unit_signals() -> tuple[bool, str]:
+    """
+    Whether this process is the nightly unit, and the evidence read to decide.
+
+    Two independent signals, either of which identifies it:
+
+    - ``STREETSCAPE_NIGHTLY=1`` in the environment, which the unit file sets.
+      An INSTALLED unit is a copy, so this arm is live only once the copy is
+      refreshed and ``daemon-reload``ed (``deploy/README.md``).
+    - ``/proc/self/cgroup`` holding a path that ENDS in ``/streetscape-tracker.service``.
+      ``INVOCATION_ID`` would not do: every unit sets it (the prefreeze, screen
+      and backup ones too), and so does a ``systemd-run --user`` hand catch-up.
+      An ``OSError`` (macOS has no ``/proc``) is not a match.
+
+    Two because a misidentified nightly fails in the dangerous direction: it is
+    REFUSED as a hand run, and the night is lost. The evidence string goes into
+    that refusal so such a night explains itself in the scheduler log.
+    """
+    env_value = os.environ.get(NIGHTLY_ENV_VAR)
+    evidence = [f"{NIGHTLY_ENV_VAR}={env_value!r}"]
+    is_nightly = env_value == "1"
+    try:
+        with open(_PROC_CGROUP, encoding="utf-8", errors="replace") as fh:
+            lines = fh.read().splitlines()
+    except OSError as exc:
+        evidence.append(f"{_PROC_CGROUP} unreadable ({exc})")
+    else:
+        evidence.append(f"{_PROC_CGROUP}: " + (" | ".join(lines) if lines else "(empty)"))
+        is_nightly = is_nightly or any(line.rstrip().endswith("/" + NIGHTLY_UNIT) for line in lines)
+    return is_nightly, "; ".join(evidence)
+
+
+def _is_nightly_unit() -> bool:
+    """True when this process runs as the nightly ``streetscape-tracker.service``."""
+    return _nightly_unit_signals()[0]
+
+
+def _describe_gsv_overlaps(overlaps: Sequence[tuple[RunDueProcess, list[str]]]) -> str:
+    return "\n".join(
+        f"  pid {proc.pid} (shared key: {', '.join(shared)}): {proc.args}"
+        for proc, shared in overlaps
+    )
+
+
+def _gsv_overlap_refusal(
+    command: str,
+    overlaps: Sequence[tuple[RunDueProcess, list[str]]],
+    nightly_evidence: str | None = None,
+) -> list[str]:
+    """
+    The operator-facing refusal for a hand run on a GSV key already in use.
+
+    ``nightly_evidence`` (``run-due`` only) is what ``_nightly_unit_signals``
+    read: a NIGHTLY refused here was misidentified, and this line is how that
+    night explains itself in the scheduler log (no email follows an exit 64;
+    see docs/scheduler.md).
+    """
+    lines = [
+        f"REFUSED: {command} would collect a GSV key another run-due on this host is "
+        f"also collecting:",
+        _describe_gsv_overlaps(overlaps),
+        "  A second process on the same GSV key doubles the rate presented to that key's "
+        "per-project quota: requests answer OVER_QUERY_LIMIT and the run can abort having "
+        "spent its wall clock (issue #412). This command has no rate override. "
+        "Channels on other keys or providers are not affected.",
+        "  The check sees only that the other run-due is ALIVE, not which channel it is "
+        "on: it may already be past its GSV channels. Check the scheduler log "
+        "(logs/streetscape_scheduler.log) for whether it is still on gsv/gsv_streets "
+        "(its latest 'Collecting ... [gsv]' / '[gsv_streets]' launches, or a tail already "
+        "under way); if it is, wait for it, and if it is not, re-run with --force.",
+    ]
+    if nightly_evidence is not None:
+        lines.append(
+            f"  This process was NOT identified as the nightly unit ({NIGHTLY_UNIT}), "
+            f"which is never refused; read: {nightly_evidence}"
+        )
+    return lines
+
+
+def _alert_nightly_gsv_overlap(
+    cfg: SchedulerConfig, overlaps: Sequence[tuple[RunDueProcess, list[str]]]
+) -> None:
+    """
+    The nightly's answer to an overlap: proceed, and tell someone (issue #412).
+
+    The nightly is never refused -- that would lose every channel's night to
+    protect one key -- so the overlap it cannot prevent is reported instead,
+    naming the other process so it can be stopped. Best-effort: ``send_alert``
+    never raises, and a disabled ``[alerts]`` leaves the log line.
+    """
+    detail = _describe_gsv_overlaps(overlaps)
+    logger.warning(
+        "Nightly run-due is starting beside another run-due on the same GSV key; "
+        "proceeding (the nightly is never refused, issue #412):\n" + detail
+    )
+    send_alert(
+        cfg.alerts,
+        f"nightly run-due overlaps another GSV run on {socket.gethostname()}",
+        "The nightly run-due started while another run-due on this host was collecting "
+        "the same GSV key:\n\n"
+        f"{detail}\n\n"
+        "The nightly proceeded. Two processes on one key oversubscribe its per-project "
+        "quota, so expect OVER_QUERY_LIMIT retries, and possibly an aborted run, on the "
+        "shared channel(s) until the other process ends. Stop it if it was a hand "
+        "catch-up (issue #412).",
+    )
+
+
 def cmd_run_due(
     cfg: SchedulerConfig,
     dry_run: bool = False,
@@ -8613,6 +8912,7 @@ def cmd_run_due(
     today: date | None = None,
     requested_providers: list[str] | None = None,
     requested_cities: list[str] | None = None,
+    force: bool = False,
 ) -> int:
     """
     Collect all cities due today, within per-provider budgets, publish.
@@ -8641,6 +8941,11 @@ def cmd_run_due(
     It narrows the DUE list and never forces: a named city that is not due is
     reported and skipped. An unresolvable name exits ``USAGE_EXIT_CODE``
     before anything is collected or written.
+
+    A hand run that would collect a GSV key another ``run-due`` on this host is
+    also collecting is refused with ``USAGE_EXIT_CODE`` unless ``force``
+    (issue #412); ``dry_run`` is never checked. The NIGHTLY is never refused:
+    it proceeds and alerts (``_alert_nightly_gsv_overlap``).
     """
     # Validate BEFORE opening the catalog, so an operator typo costs nothing.
     # Returning rather than propagating is deliberate: main()'s run-due branch
@@ -8673,6 +8978,23 @@ def cmd_run_due(
     except _UsageError as e:
         logger.error(str(e))
         return USAGE_EXIT_CODE
+    # Before the catalog is opened, so a refused catch-up writes nothing -- not
+    # even the stagger assignments below. A dry run is exempt: it collects
+    # nothing, and it is how an operator previews a catch-up mid-batch.
+    overlaps = [] if dry_run else _gsv_key_overlaps(cfg, providers)
+    if overlaps:
+        if _is_nightly_unit():
+            _alert_nightly_gsv_overlap(cfg, overlaps)
+        elif force:
+            logger.warning(
+                "--force: starting beside another run-due on the same GSV key:\n"
+                + _describe_gsv_overlaps(overlaps)
+            )
+        else:
+            _nightly, evidence = _nightly_unit_signals()
+            for message in _gsv_overlap_refusal("run-due", overlaps, nightly_evidence=evidence):
+                logger.error(message)
+            return USAGE_EXIT_CODE
 
     conn = db.connect(cfg.db_path)
     # Resolved against the catalog, so it cannot precede the connect above; it
@@ -13375,7 +13697,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Snapshot date YYYY-MM-DD (default: today, UTC); use with --from-file for backfill",
     )
-    p_run = sub.add_parser("run-due", help="Collect today's due cities")
+    # allow_abbrev=False (issue #412): the GSV-key guard reads ANOTHER run-due's
+    # channels from its `ps` argv by exact token (--provider, --dry-run). With
+    # abbreviations allowed, a live `run-due --prov gsv` would hide its GSV key
+    # from that read; refused here, no running process can carry one.
+    p_run = sub.add_parser("run-due", help="Collect today's due cities", allow_abbrev=False)
     _add_global_flags(p_run)
     p_run.add_argument("--dry-run", action="store_true", help="Print what would run; no downloads")
     p_run.add_argument(
@@ -13412,6 +13738,14 @@ def build_parser() -> argparse.ArgumentParser:
         "city_id, resolved as enroll-city resolves one). Narrows the due list "
         "and never forces: a named city that is not due is reported and "
         f"skipped. An unknown name exits {USAGE_EXIT_CODE}.",
+    )
+    p_run.add_argument(
+        "--force",
+        action="store_true",
+        help="Collect a GSV channel even though another run-due on this host appears "
+        f"to be collecting the same key (otherwise a hand run exits {USAGE_EXIT_CODE}, "
+        "issue #412: a second process on one GSV key oversubscribes its quota; the "
+        "nightly unit proceeds and alerts instead). The check is a heuristic over `ps`.",
     )
     p_assess = sub.add_parser(
         "assess-city",
@@ -13461,6 +13795,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_assess.add_argument(
         "--no-publish", action="store_true", help="Regenerate the published JSON but do not rsync"
+    )
+    p_assess.add_argument(
+        "--force",
+        action="store_true",
+        help="Collect gsv_streets even though a run-due on this host appears to be "
+        f"collecting that key (otherwise exits {USAGE_EXIT_CODE}, issue #412).",
     )
     # A new city's opt-in channels are not collected here (ASSESS_CHANNELS);
     # they are ENROLLED, and arrive with the city's first nightly run.
@@ -13664,6 +14004,7 @@ def main() -> int:
             publish=not args.no_publish,
             opt_in=not args.no_opt_in,
             enroll_kartaview=args.enroll_kartaview,
+            force=args.force,
         )
     if args.command == "run-due":
         try:
@@ -13673,6 +14014,7 @@ def main() -> int:
                 limit=args.limit,
                 requested_providers=args.providers,
                 requested_cities=args.cities,
+                force=args.force,
             )
         except Exception as exc:
             # A DRY RUN whose stdout reader went away is the one crash here
