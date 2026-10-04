@@ -273,6 +273,94 @@ def test_a_row_that_recomputes_to_no_changes_loses_its_detail_file(conn, data_di
     assert f"remove these there:\n  {detail_name}" in out
 
 
+# ── the #367 query-radius re-diff (issue #394) ──────────────────────────────
+
+
+def _far_pano_series(conn, data_dir):
+    """A GSV pair across #367's 50 m rule, with a far pano on EACH side so
+    that skipping the rule on either load alone changes the result:
+
+    - point A held only a pano ~1.1 km from its query point on D1 and a near
+      one on D2 (far on the FROM side);
+    - point B holds the same near pano both times;
+    - point C held a near pano on D1 and only a far one on D2 (far on the TO
+      side).
+
+    The stale row is what the pre-#367 collector recorded, i.e. both sides
+    read RAW, so both far panos counted as coverage."""
+    city_id = _city(conn)
+    runs = []
+    for run_date, a, c in (
+        (D1, ("far_a", 0.01), ("near_c", 0.0001)),
+        (D2, ("near_a", 0.0001), ("far_c", 0.01)),
+    ):
+        name = generate_run_filename(city_id, 1000, 1000, 20, run_date, provider="gsv") + ".csv.gz"
+        df = make_city_df(
+            [(a[0], "2024-01-01"), ("keep_b", "2024-01-01"), (c[0], "2024-01-01")],
+            run_date=run_date,
+        )
+        df.loc[0, "pano_lat"] = df.loc[0, "query_lat"] + a[1]
+        df.loc[2, "pano_lat"] = df.loc[2, "query_lat"] + c[1]
+        write_city_csv_gz(df, os.path.join(data_dir, name))
+        run_id = db.register_run(
+            conn, city_id=city_id, run_date=run_date, csv_filename=name, provider="gsv"
+        )
+        runs.append((run_id, name))
+    (from_id, from_csv), (to_id, to_csv) = runs
+    stale = compute_run_diff(
+        load_city_csv_file(os.path.join(data_dir, from_csv), raw=True),
+        load_city_csv_file(os.path.join(data_dir, to_csv), raw=True),
+    )
+    detail = generate_diff_filename(city_id, D1.isoformat(), D2.isoformat())
+    write_diff_detail(stale, os.path.join(data_dir, detail))
+    diff_id = db.record_diff(
+        conn,
+        city_id=city_id,
+        from_run_id=from_id,
+        to_run_id=to_id,
+        grid_aligned=stale.grid_aligned,
+        panos_added=stale.panos_added,
+        panos_removed=stale.panos_removed,
+        panos_persisted=stale.panos_persisted,
+        capture_date_changed=stale.capture_date_changed,
+        points_gained_coverage=stale.points_gained_coverage,
+        points_lost_coverage=stale.points_lost_coverage,
+        coverage_delta_pct=stale.coverage_delta_pct,
+        detail_filename=detail,
+    )
+    return runs[1], diff_id, os.path.join(data_dir, detail)
+
+
+def test_a_gsv_rediff_applies_the_query_radius_rule(conn, data_dir):
+    """The script re-diffs through the loader's DEFAULT path, so #367's 50 m
+    rule reaches BOTH sides. Point A's far FROM-side pano stops being coverage
+    that was replaced and becomes coverage gained; point C's far TO-side pano
+    stops being a replacement and becomes coverage lost. Skipping
+    analysis.apply_query_radius on either load alone (raw=True on the from or
+    the to CSV) leaves a far pano in the counts and fails this test."""
+    later, diff_id, detail = _far_pano_series(conn, data_dir)
+    stale = _row(conn, diff_id)
+    # Guard the fixture: the stored row really is the pre-#367 reading.
+    assert (stale["panos_added"], stale["panos_removed"]) == (2, 2)
+    assert (stale["points_gained_coverage"], stale["points_lost_coverage"]) == (0, 0)
+    regenerate_run_json(conn, later[0], data_dir)
+    assert _published_change(conn, data_dir, later[0])["panos_removed"] == 2
+
+    assert (
+        _main(data_dir, "--provider", "gsv", "--execute", "--regenerate-json", "--no-publish-json")
+        == 0
+    )
+    row = _row(conn, diff_id)
+    assert (row["panos_added"], row["panos_removed"], row["panos_persisted"]) == (1, 1, 1)
+    assert (row["points_gained_coverage"], row["points_lost_coverage"]) == (1, 1)
+    assert _detail_rows(detail) == [
+        ("pano_added", "near_a", "", "2024-01-01"),
+        ("pano_removed", "near_c", "2024-01-01", ""),
+    ]
+    published = _published_change(conn, data_dir, later[0])
+    assert (published["panos_added"], published["panos_removed"]) == (1, 1)
+
+
 # ── idempotence and the detail file ─────────────────────────────────────────
 
 
