@@ -12,6 +12,7 @@ Usage (--config accepted on either side of the subcommand):
     python -m streetscape_metadata_tracker.scheduler [--config PATH] status
     python -m streetscape_metadata_tracker.scheduler [--config PATH] assign
     python -m streetscape_metadata_tracker.scheduler [--config PATH] run-due [--dry-run] [--limit N] [--provider CHANNEL] [--city CITY]...
+    python -m streetscape_metadata_tracker.scheduler [--config PATH] reset-failures CITY --channel C [--execute]
     python -m streetscape_metadata_tracker.scheduler [--config PATH] regenerate-aggregate [--publish]
     python -m streetscape_metadata_tracker.scheduler [--config PATH] reconcile-walks [--date D] [--dry-run]
     python -m streetscape_metadata_tracker.scheduler [--config PATH] import-bundle DIR [--execute] [--enable]
@@ -3864,8 +3865,23 @@ def cmd_status(cfg: SchedulerConfig) -> int:
     # ~1200 rows, so a last_error column there would be noise on every healthy
     # row; what an operator actually wants after a bad night is just this list
     # (issue #169).
+    #
+    # A QUARANTINED pair (issue #421) is marked in its own column and counted
+    # on its own line: it is the one failing pair run-due will never attempt
+    # again, so it is the one this list cannot leave to be inferred from a
+    # failure count the reader has to compare against the config. The set is
+    # `db.get_quarantined`'s -- the same query the nightly `Done:` line counts
+    # -- rather than `failures >= max` re-derived here, which would also mark a
+    # disabled city or a non-member that dueness never considers.
+    quarantined = {(r["city_id"], r["provider"]) for r in _quarantined_pairs(cfg, conn)}
     failing = [
-        [r["city_id"], r["provider"], r["consecutive_failures"], (r["last_error"] or "—")[:90]]
+        [
+            r["city_id"],
+            r["provider"],
+            r["consecutive_failures"],
+            "QUARANTINED" if (r["city_id"], r["provider"]) in quarantined else "",
+            (r["last_error"] or "—")[:90],
+        ]
         for r in rows
         if (r["consecutive_failures"] or 0) > 0 and (r["provider"] in providers)
     ]
@@ -3875,12 +3891,18 @@ def cmd_status(cfg: SchedulerConfig) -> int:
         print(
             tabulate(
                 failing[:_STATUS_MAX_FAILURES],
-                headers=["city", "provider", "failures", "last error"],
+                headers=["city", "provider", "failures", "", "last error"],
                 tablefmt="simple",
             )
         )
         if len(failing) > _STATUS_MAX_FAILURES:
             print(f"... and {len(failing) - _STATUS_MAX_FAILURES} more.")
+    if quarantined:
+        print(
+            f"{len(quarantined)} pair(s) QUARANTINED at [schedule].max_consecutive_failures = "
+            f"{cfg.max_consecutive_failures}: run-due skips them until cleared with "
+            f"`reset-failures CITY --channel C --execute`."
+        )
 
     n_cities = conn.execute("SELECT COUNT(*) FROM cities").fetchone()[0]
     due_str = ", ".join(f"{due_counts[p]} {p}" for p in providers)
@@ -5017,6 +5039,102 @@ def _regenerate_published_json(conn, cfg: SchedulerConfig) -> tuple[str, bool]:
     return summary, not (agg_err or man_err or plan_err or screen_err)
 
 
+def cmd_reset_failures(
+    cfg: SchedulerConfig, city_query: str | None, *, channel: str, execute: bool = False
+) -> int:
+    """Clear one (city, channel)'s ``consecutive_failures``, i.e. lift a quarantine (issue #421).
+
+    ``get_due_cities`` drops a pair once its counter reaches
+    ``[schedule].max_consecutive_failures``, and only a success resets it --
+    which a pair that is never attempted cannot have. Before this the only way
+    back was hand-written SQL against the live catalog, so the quarantine
+    alert's suggested fix is now this command instead.
+
+    DRY-RUN unless ``--execute``, like every other catalog-writing operator
+    command that is not a single deliberate setting: it prints the pair's
+    count, whether it is quarantined, and its ``last_error``, so the operator
+    reads the cause before clearing it. Only the counter moves (see
+    :func:`db.reset_consecutive_failures` for why ``last_success_at`` and
+    ``last_error`` are left alone).
+
+    Exits ``USAGE_EXIT_CODE`` (64), writing nothing, for an unknown channel, an
+    unresolvable city, and a pair with no failure to clear -- the last because
+    a reset that changes nothing and exits 0 is the silent no-op that
+    ``enroll-city --clear`` already refuses for the same reason. A disabled
+    city or a non-member is allowed and noted: the counter is still what will
+    gate the pair the moment it is enabled or enrolled.
+
+    Example::
+
+        python -m streetscape_metadata_tracker.scheduler \\
+            reset-failures krabi--krabi--thailand --channel kartaview          # preview
+        python -m streetscape_metadata_tracker.scheduler \\
+            reset-failures krabi--krabi--thailand --channel kartaview --execute
+    """
+    try:
+        # Before the catalog is opened, so a typo costs nothing.
+        if channel not in CHANNEL_DEFAULT_MEMBERSHIP:
+            raise _UsageError(
+                f"--channel {channel}: unknown channel. Known: "
+                f"{', '.join(sorted(CHANNEL_DEFAULT_MEMBERSHIP))}"
+            )
+        if not city_query:
+            raise _UsageError("CITY is required")
+    except _UsageError as e:
+        logger.error(str(e))
+        return USAGE_EXIT_CODE
+
+    conn = db.connect(cfg.db_path)
+    city = db.resolve_city(conn, city_query)
+    if city is None:
+        logger.error(
+            f"{city_query!r}: no such city in the catalog. A typo'd slug would otherwise "
+            f"be a silent zero-row success."
+        )
+        return USAGE_EXIT_CODE
+    row = conn.execute(
+        "SELECT consecutive_failures, last_error, last_attempt_at, member FROM schedule_state "
+        "WHERE city_id = ? AND provider = ?",
+        (city.city_id, channel),
+    ).fetchone()
+    failures = row["consecutive_failures"] if row is not None else 0
+    if not failures:
+        logger.error(
+            f"{city.city_id} [{channel}]: no consecutive failures recorded, so there is "
+            f"nothing to reset. Nothing was written."
+        )
+        return USAGE_EXIT_CODE
+
+    member = row["member"]
+    is_member = (CHANNEL_DEFAULT_MEMBERSHIP[channel] if member is None else member) == 1
+    state = (
+        f"QUARANTINED (at or over [schedule].max_consecutive_failures = "
+        f"{cfg.max_consecutive_failures}, so run-due skips it)"
+        if failures >= cfg.max_consecutive_failures
+        else f"not yet quarantined (that happens at {cfg.max_consecutive_failures})"
+    )
+    print(f"{city.city_id} [{channel}]: {failures} consecutive failure(s); {state}.")
+    print(f"  last attempt: {row['last_attempt_at'] or '—'}")
+    print(f"  last error:   {row['last_error'] or 'none recorded'}")
+    if not city.enabled:
+        print("  note: the city is disabled, so it is not due on any channel until enabled.")
+    elif not is_member:
+        print(f"  note: the city is not a member of {channel}, so it is not due there.")
+
+    if not execute:
+        print(
+            "DRY RUN: nothing written. Fix the cause first, then re-run with --execute "
+            "to reset the count to 0."
+        )
+        return 0
+    previous = db.reset_consecutive_failures(conn, city.city_id, channel)
+    print(
+        f"Reset {city.city_id} [{channel}]: consecutive_failures {previous} -> 0. "
+        f"It is due again on its usual clock (last success and last error are unchanged)."
+    )
+    return 0
+
+
 def cmd_regenerate(cfg: SchedulerConfig, publish: bool = False) -> int:
     """
     Rebuild the aggregate ``cities.json.gz`` from the catalog without collecting
@@ -5775,6 +5893,139 @@ def cmd_reconcile_walks(
 # ---------------------------------------------------------------------------
 
 
+# The module a scheduler process is launched as, and the nightly unit's name.
+# Both are matched EXACTLY (an argv token, a cgroup path component), never as
+# substrings: a substring test matched a `pgrep -f` loop and a `tail -f` of a
+# log named after the subcommand, and a substring over the joined argv would
+# match `scheduler --config run-due.toml status`.
+SCHEDULER_MODULE = "streetscape_metadata_tracker.scheduler"
+NIGHTLY_UNIT = "streetscape-tracker.service"
+# The nightly unit's second, independent identification (issue #412): the
+# unit file sets Environment=STREETSCAPE_NIGHTLY=1. Either it or the cgroup
+# path identifies the nightly, so a cgroup layout nobody verified on prod
+# cannot by itself refuse the night.
+NIGHTLY_ENV_VAR = "STREETSCAPE_NIGHTLY"
+# Where the kernel names this process's cgroup; a module constant so tests can
+# point it at a file (the nightly is identified from it, see _is_nightly_unit).
+_PROC_CGROUP = "/proc/self/cgroup"
+
+
+@dataclass(frozen=True)
+class RunDueProcess:
+    """Another ``run-due`` seen in ``ps``: its pid, raw command line, and argv."""
+
+    pid: int
+    args: str
+    argv: tuple[str, ...]
+
+
+def _split_ps_args(args: str) -> list[str]:
+    """
+    Tokenize one ``ps`` args column, on whitespace.
+
+    ``ps`` joins argv with spaces and quotes nothing, so there are no quotes to
+    honour: ``shlex`` read two apostrophes (``--config /x/o'neil.toml run-due
+    --city Coeur d'Alene``) as one quoted span and swallowed the ``run-due``
+    token, so a real batch went undetected. An argument that itself contains a
+    space splits into several tokens here, which can only ADD tokens, never
+    hide ``-m``, the module or ``run-due``.
+    """
+    return args.split()
+
+
+def _is_run_due_argv(argv: Sequence[str]) -> bool:
+    """
+    True for ``python … -m streetscape_metadata_tracker.scheduler … run-due …``.
+
+    argv[0] must be a python executable (``python``, ``python3``,
+    ``python3.11``, any directory, case-insensitively: a macOS framework build
+    re-execs as ``…/Python.app/Contents/MacOS/Python``, measured with the real
+    ``ps``), ``-m`` must be followed by the scheduler
+    module, and ``run-due`` must be a TOKEN after it. A shell wrapper
+    (``bash -c '…run-due…'``), ``timeout``, ``pgrep -f``, ``tail -f
+    logs/run-due.log`` and ``scheduler --config run-due.toml status`` all
+    fail one of those.
+
+    Exact ``run-due``/``--provider``/``--dry-run`` tokens are enough because
+    the ``run-due`` subparser sets ``allow_abbrev=False``: an abbreviated
+    ``--prov gsv`` is refused at parse time, so no live process carries one.
+
+    Example::
+
+        >>> _is_run_due_argv(["/v/bin/python", "-m", SCHEDULER_MODULE, "--config", "c.toml", "run-due"])
+        True
+        >>> _is_run_due_argv(["pgrep", "-af", "scheduler .*run-due"])
+        False
+    """
+    if not argv or not os.path.basename(argv[0]).lower().startswith("python"):
+        return False
+    for i in range(1, len(argv) - 1):
+        if argv[i] == "-m" and argv[i + 1] == SCHEDULER_MODULE:
+            return "run-due" in argv[i + 2 :]
+    return False
+
+
+def _ancestor_pids(parents: dict[int, int], pid: int) -> set[int]:
+    """``pid`` and every ancestor of it in a pid -> ppid table (cycle-safe)."""
+    chain: set[int] = set()
+    while pid > 0 and pid not in chain:
+        chain.add(pid)
+        pid = parents.get(pid, 0)
+    return chain
+
+
+def _scan_run_due_processes() -> list[RunDueProcess]:
+    """
+    Every OTHER ``run-due`` process on this host, from ``ps``.
+
+    This process and its whole ancestor chain are excluded, so a ``bash -c``,
+    ``timeout`` or ``nohup`` wrapper never reports its own child (or vice
+    versa), and a ``run-due`` with no other batch alive sees an empty list.
+    ``ww`` keeps long command lines whole: a truncated line would lose the
+    ``--provider`` flags the GSV guard reads.
+
+    A heuristic over ``ps`` rather than a lock the batch holds (a pidfile
+    written by ``run-due`` is the robust version, left to a follow-up). It is
+    per-HOST: a ``run-due`` on another machine is invisible to it. ``ps``
+    being unavailable returns ``[]`` -- advisory checks must never fail the
+    work they speak for -- so every caller fails OPEN.
+    """
+    try:
+        out = subprocess.run(
+            ["ps", "-ww", "-e", "-o", "pid=,ppid=,args="],
+            capture_output=True,
+            text=True,
+            # Any process's argv may hold bytes that are not UTF-8 (a city
+            # query in a legacy encoding); strict decoding raised out of the
+            # nightly's pre-flight. Replaced bytes cannot form `run-due`.
+            errors="replace",
+            timeout=20,
+        ).stdout
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return []
+    parents: dict[int, int] = {}
+    rows: list[tuple[int, str]] = []
+    for line in out.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) < 3:
+            continue
+        try:
+            pid, ppid = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        parents[pid] = ppid
+        rows.append((pid, parts[2].strip()))
+    mine = _ancestor_pids(parents, os.getpid()) | {os.getpid(), os.getppid()}
+    found = []
+    for pid, args in rows:
+        if pid in mine:
+            continue
+        argv = _split_ps_args(args)
+        if _is_run_due_argv(argv):
+            found.append(RunDueProcess(pid=pid, args=args, argv=tuple(argv)))
+    return found
+
+
 def _run_due_in_flight() -> str | None:
     """
     The command line of a ``run-due`` already running here, or None.
@@ -5784,32 +6035,14 @@ def _run_due_in_flight() -> str | None:
     this writes into, and a city registered halfway through a night can be
     picked up by a later channel query in the same run.
 
-    This is a heuristic and the caller says so. It reads `ps` rather than a lock
-    the batch holds, because there is no such lock yet — a pidfile written by
-    ``run-due`` itself is the robust version and is deliberately left to a
-    follow-up. Two failure modes are handled: `ps` being unavailable returns None
-    (advisory checks must never fail the work they speak for), and this process
-    and its parent are excluded, since a `pgrep`-shaped check run over SSH has
-    matched its own command line here before.
+    A thin view over :func:`_scan_run_due_processes`, whose docstring carries
+    the matching rules and the failure modes; any ``run-due`` counts here,
+    ``--dry-run`` included, because what these callers protect is the catalog.
     """
-    try:
-        out = subprocess.run(
-            ["ps", "-eo", "pid=,args="], capture_output=True, text=True, timeout=20
-        ).stdout
-    except (OSError, subprocess.SubprocessError):
+    found = _scan_run_due_processes()
+    if not found:
         return None
-    mine = {os.getpid(), os.getppid()}
-    for line in out.splitlines():
-        pid_str, _, args = line.strip().partition(" ")
-        try:
-            pid = int(pid_str)
-        except ValueError:
-            continue
-        if pid in mine:
-            continue
-        if "streetscape_metadata_tracker.scheduler" in args and "run-due" in args:
-            return f"pid {pid}: {args.strip()}"
-    return None
+    return f"pid {found[0].pid}: {found[0].args}"
 
 
 def _import_cadence_channel(
@@ -6492,6 +6725,7 @@ def cmd_assess_city(
     today: date | None = None,
     opt_in: bool = True,
     enroll_kartaview: bool = False,
+    force: bool = False,
 ) -> int:
     """
     Register a city if new, walk its streets on both providers, publish, and
@@ -6520,6 +6754,10 @@ def cmd_assess_city(
 
     It deliberately does NOT collect the GSV grid — see ASSESS_CHANNELS — and it
     deliberately does not record a channel failure; see ``_run_city_channels``.
+
+    Like ``run-due``, it refuses (``USAGE_EXIT_CODE``) to collect ``gsv_streets``
+    while a ``run-due`` on this host is collecting that key, unless ``force``
+    (issue #412); ``--estimate`` spends nothing and is never checked.
 
     ``today`` is injectable so tests can pin a date; production callers omit it.
     """
@@ -6551,6 +6789,13 @@ def cmd_assess_city(
         channels = _select_assess_channels(cfg, requested_providers)
     except _UsageError as e:
         logger.error(str(e))
+        return USAGE_EXIT_CODE
+    # The same GSV-key guard as run-due's (issue #412), before anything is
+    # registered or spent.
+    overlaps = [] if (estimate_only or force) else _gsv_key_overlaps(cfg, channels)
+    if overlaps:
+        for message in _gsv_overlap_refusal("assess-city", overlaps):
+            logger.error(message)
         return USAGE_EXIT_CODE
 
     conn = db.connect(cfg.db_path)
@@ -8488,6 +8733,178 @@ def _select_providers(cfg: SchedulerConfig, requested: list[str]) -> list[str]:
     return [p for p in enabled if p in set(names)]
 
 
+# The channels that spend a GSV key (issue #412). Each has its OWN key in its
+# own Cloud project, so the two never contend with each other -- the hazard is
+# a second process on the SAME key, which nothing serializes: GSV is metered
+# per project, not per IP, so CHANNEL_HOSTS gives 'gsv' no host lock at all.
+GSV_KEY_CHANNELS: frozenset[str] = frozenset({"gsv", "gsv_streets"})
+
+
+def _run_due_collecting_channels(argv: Sequence[str], default: Sequence[str]) -> frozenset[str]:
+    """
+    The channels another ``run-due``'s argv will collect, or none for a dry run.
+
+    ``--provider X`` and ``--provider=X``, repeated or comma-separated, are
+    unioned; no ``--provider`` at all means ``default`` -- this process's own
+    enabled set, on the assumption that the other process reads the same
+    config (true of the nightly and of every documented catch-up). A
+    ``--dry-run`` collects nothing, so it holds no key.
+
+    Example::
+
+        >>> sorted(_run_due_collecting_channels(["run-due", "--provider=gsv,mapillary"], ["gsv"]))
+        ['gsv', 'mapillary']
+    """
+    if "--dry-run" in argv:
+        return frozenset()
+    named: list[str] = []
+    flagged = False
+    for i, tok in enumerate(argv):
+        if tok == "--provider":
+            flagged = True
+            if i + 1 < len(argv):
+                named.append(argv[i + 1])
+        elif tok.startswith("--provider="):
+            flagged = True
+            named.append(tok.split("=", 1)[1])
+    if not flagged:
+        return frozenset(default)
+    return frozenset(n.strip() for value in named for n in value.split(",") if n.strip())
+
+
+def _gsv_key_overlaps(
+    cfg: SchedulerConfig, channels: Sequence[str]
+) -> list[tuple[RunDueProcess, list[str]]]:
+    """
+    The other ``run-due`` processes that would collect one of OUR GSV keys.
+
+    Each entry is the process and the GSV channels both of us would collect.
+    ``gsv`` and ``gsv_streets`` are separate keys, so a hand ``gsv_streets``
+    catch-up beside a ``gsv``-only one is no overlap. Empty -- WITHOUT
+    reading ``ps`` -- when ``channels`` holds no GSV channel, so a Mapillary
+    catch-up never even asks.
+    """
+    mine = [c for c in channels if c in GSV_KEY_CHANNELS]
+    if not mine:
+        return []
+    default = cfg.enabled_providers()
+    overlaps = []
+    for proc in _scan_run_due_processes():
+        theirs = _run_due_collecting_channels(proc.argv, default)
+        shared = [c for c in mine if c in theirs]
+        if shared:
+            overlaps.append((proc, shared))
+    return overlaps
+
+
+def _nightly_unit_signals() -> tuple[bool, str]:
+    """
+    Whether this process is the nightly unit, and the evidence read to decide.
+
+    Two independent signals, either of which identifies it:
+
+    - ``STREETSCAPE_NIGHTLY=1`` in the environment, which the unit file sets.
+      An INSTALLED unit is a copy, so this arm is live only once the copy is
+      refreshed and ``daemon-reload``ed (``deploy/README.md``).
+    - ``/proc/self/cgroup`` holding a path that ENDS in ``/streetscape-tracker.service``.
+      ``INVOCATION_ID`` would not do: every unit sets it (the prefreeze, screen
+      and backup ones too), and so does a ``systemd-run --user`` hand catch-up.
+      An ``OSError`` (macOS has no ``/proc``) is not a match.
+
+    Two because a misidentified nightly fails in the dangerous direction: it is
+    REFUSED as a hand run, and the night is lost. The evidence string goes into
+    that refusal so such a night explains itself in the scheduler log.
+    """
+    env_value = os.environ.get(NIGHTLY_ENV_VAR)
+    evidence = [f"{NIGHTLY_ENV_VAR}={env_value!r}"]
+    is_nightly = env_value == "1"
+    try:
+        with open(_PROC_CGROUP, encoding="utf-8", errors="replace") as fh:
+            lines = fh.read().splitlines()
+    except OSError as exc:
+        evidence.append(f"{_PROC_CGROUP} unreadable ({exc})")
+    else:
+        evidence.append(f"{_PROC_CGROUP}: " + (" | ".join(lines) if lines else "(empty)"))
+        is_nightly = is_nightly or any(line.rstrip().endswith("/" + NIGHTLY_UNIT) for line in lines)
+    return is_nightly, "; ".join(evidence)
+
+
+def _is_nightly_unit() -> bool:
+    """True when this process runs as the nightly ``streetscape-tracker.service``."""
+    return _nightly_unit_signals()[0]
+
+
+def _describe_gsv_overlaps(overlaps: Sequence[tuple[RunDueProcess, list[str]]]) -> str:
+    return "\n".join(
+        f"  pid {proc.pid} (shared key: {', '.join(shared)}): {proc.args}"
+        for proc, shared in overlaps
+    )
+
+
+def _gsv_overlap_refusal(
+    command: str,
+    overlaps: Sequence[tuple[RunDueProcess, list[str]]],
+    nightly_evidence: str | None = None,
+) -> list[str]:
+    """
+    The operator-facing refusal for a hand run on a GSV key already in use.
+
+    ``nightly_evidence`` (``run-due`` only) is what ``_nightly_unit_signals``
+    read: a NIGHTLY refused here was misidentified, and this line is how that
+    night explains itself in the scheduler log (no email follows an exit 64;
+    see docs/scheduler.md).
+    """
+    lines = [
+        f"REFUSED: {command} would collect a GSV key another run-due on this host is "
+        f"also collecting:",
+        _describe_gsv_overlaps(overlaps),
+        "  A second process on the same GSV key doubles the rate presented to that key's "
+        "per-project quota: requests answer OVER_QUERY_LIMIT and the run can abort having "
+        "spent its wall clock (issue #412). This command has no rate override. "
+        "Channels on other keys or providers are not affected.",
+        "  The check sees only that the other run-due is ALIVE, not which channel it is "
+        "on: it may already be past its GSV channels. Check the scheduler log "
+        "(logs/streetscape_scheduler.log) for whether it is still on gsv/gsv_streets "
+        "(its latest 'Collecting ... [gsv]' / '[gsv_streets]' launches, or a tail already "
+        "under way); if it is, wait for it, and if it is not, re-run with --force.",
+    ]
+    if nightly_evidence is not None:
+        lines.append(
+            f"  This process was NOT identified as the nightly unit ({NIGHTLY_UNIT}), "
+            f"which is never refused; read: {nightly_evidence}"
+        )
+    return lines
+
+
+def _alert_nightly_gsv_overlap(
+    cfg: SchedulerConfig, overlaps: Sequence[tuple[RunDueProcess, list[str]]]
+) -> None:
+    """
+    The nightly's answer to an overlap: proceed, and tell someone (issue #412).
+
+    The nightly is never refused -- that would lose every channel's night to
+    protect one key -- so the overlap it cannot prevent is reported instead,
+    naming the other process so it can be stopped. Best-effort: ``send_alert``
+    never raises, and a disabled ``[alerts]`` leaves the log line.
+    """
+    detail = _describe_gsv_overlaps(overlaps)
+    logger.warning(
+        "Nightly run-due is starting beside another run-due on the same GSV key; "
+        "proceeding (the nightly is never refused, issue #412):\n" + detail
+    )
+    send_alert(
+        cfg.alerts,
+        f"nightly run-due overlaps another GSV run on {socket.gethostname()}",
+        "The nightly run-due started while another run-due on this host was collecting "
+        "the same GSV key:\n\n"
+        f"{detail}\n\n"
+        "The nightly proceeded. Two processes on one key oversubscribe its per-project "
+        "quota, so expect OVER_QUERY_LIMIT retries, and possibly an aborted run, on the "
+        "shared channel(s) until the other process ends. Stop it if it was a hand "
+        "catch-up (issue #412).",
+    )
+
+
 def cmd_run_due(
     cfg: SchedulerConfig,
     dry_run: bool = False,
@@ -8495,6 +8912,7 @@ def cmd_run_due(
     today: date | None = None,
     requested_providers: list[str] | None = None,
     requested_cities: list[str] | None = None,
+    force: bool = False,
 ) -> int:
     """
     Collect all cities due today, within per-provider budgets, publish.
@@ -8523,6 +8941,11 @@ def cmd_run_due(
     It narrows the DUE list and never forces: a named city that is not due is
     reported and skipped. An unresolvable name exits ``USAGE_EXIT_CODE``
     before anything is collected or written.
+
+    A hand run that would collect a GSV key another ``run-due`` on this host is
+    also collecting is refused with ``USAGE_EXIT_CODE`` unless ``force``
+    (issue #412); ``dry_run`` is never checked. The NIGHTLY is never refused:
+    it proceeds and alerts (``_alert_nightly_gsv_overlap``).
     """
     # Validate BEFORE opening the catalog, so an operator typo costs nothing.
     # Returning rather than propagating is deliberate: main()'s run-due branch
@@ -8555,6 +8978,23 @@ def cmd_run_due(
     except _UsageError as e:
         logger.error(str(e))
         return USAGE_EXIT_CODE
+    # Before the catalog is opened, so a refused catch-up writes nothing -- not
+    # even the stagger assignments below. A dry run is exempt: it collects
+    # nothing, and it is how an operator previews a catch-up mid-batch.
+    overlaps = [] if dry_run else _gsv_key_overlaps(cfg, providers)
+    if overlaps:
+        if _is_nightly_unit():
+            _alert_nightly_gsv_overlap(cfg, overlaps)
+        elif force:
+            logger.warning(
+                "--force: starting beside another run-due on the same GSV key:\n"
+                + _describe_gsv_overlaps(overlaps)
+            )
+        else:
+            _nightly, evidence = _nightly_unit_signals()
+            for message in _gsv_overlap_refusal("run-due", overlaps, nightly_evidence=evidence):
+                logger.error(message)
+            return USAGE_EXIT_CODE
 
     conn = db.connect(cfg.db_path)
     # Resolved against the catalog, so it cannot precede the connect above; it
@@ -8899,6 +9339,15 @@ def cmd_run_due(
         print(f"Would also back up the catalog to {cfg.backup_dir} (issue #145).")
         return 0
 
+    # The quarantined set as the night found it (issue #421). Diffed against the
+    # same query after the fill, so a pair that reaches max_consecutive_failures
+    # tonight is reported exactly once -- "count >= max" would re-alert it every
+    # night forever, since a quarantined pair keeps its count until cleared.
+    # After the dry-run return: a preview writes no failure, so it has no
+    # transition to find. Guarded: this runs ahead of the pre-loop backup, so a
+    # raise here would lose the whole night (see _quarantine_snapshot).
+    quarantined_before, quarantine_before_error = _quarantine_snapshot(cfg, conn, "before")
+
     # Back up the catalog BEFORE the city loop, so the night has a verified
     # copy even if the process is SIGKILLed mid-loop (issue #145; the tail
     # can't be reached in that case). Repeated in the tail to capture the
@@ -9001,6 +9450,20 @@ def cmd_run_due(
         if fill_report is not None
         else ""
     )
+    # After the fill, so its failures count too (issue #421). Guarded, because
+    # a raise here would cost the whole tail (see _quarantine_snapshot).
+    quarantined, quarantine_after_error = _quarantine_snapshot(cfg, conn, "after")
+    quarantine_error = "; ".join(e for e in (quarantine_before_error, quarantine_after_error) if e)
+    if quarantined is None:
+        quarantined = []
+    # A failed BEFORE snapshot means the transition is UNKNOWN, not that every
+    # quarantined pair is new: diffing against an empty set would report the
+    # whole standing set as tonight's, and re-alert pairs already alerted on.
+    newly_quarantined = (
+        _newly_quarantined(quarantined_before, quarantined)
+        if quarantined_before is not None
+        else []
+    )
     summary = (
         f"run-due {today}{filter_note}: {succeeded}/{attempted} runs succeeded across "
         f"{processed} cities{cities_note} in {elapsed_h:.2f} h"
@@ -9070,6 +9533,11 @@ def cmd_run_due(
             else ""
         )
         + fill_note
+        # The STANDING set, on every night it is nonempty (issue #421): the
+        # transition alerts once, and this is what keeps the set from being
+        # forgotten after that one email.
+        + _quarantine_summary_note(quarantined, newly_quarantined)
+        + (f"; {quarantine_error}" if quarantine_error else "")
         + (f"; stopped early ({stop_reason})" if stop_reason else "")
         + (f"; {plan_error}" if plan_error else "")
     )
@@ -9088,6 +9556,8 @@ def cmd_run_due(
         blocked_hosts=blocked_hosts,
         busy_hosts=busy_hosts,
         rejected_argv=rejected_argv,
+        newly_quarantined=newly_quarantined,
+        quarantine_error=quarantine_error or None,
     )
 
 
@@ -12503,6 +12973,134 @@ def _stranded_alert_note(cfg: SchedulerConfig, breaker: HostBreaker, today: date
     )
 
 
+# ── Failure quarantine reporting (issue #421) ────────────────────────────────
+#
+# `get_due_cities` drops a (city, channel) once `consecutive_failures` reaches
+# `[schedule].max_consecutive_failures`, and nothing but a success lifts it. A
+# dropped pair is never attempted, so it never fails, so the per-failure alert
+# that covered nights 1-5 goes quiet exactly when the channel is permanently
+# broken -- a silence that reads as the problem having gone away.
+#
+# Two signals close it, deliberately of different weights:
+#
+# - the TRANSITION into quarantine alerts ONCE, as a part of the existing
+#   night-level email (its subject is what gets read at 03:00). It is detected
+#   by diffing the quarantined set before and after the night, never by
+#   "count >= max", which would re-alert every night forever;
+# - the STANDING set is counted on every `Done:` line while it is nonempty, so
+#   it cannot be forgotten once the one email has scrolled away.
+#
+# The amnestied exit-code families (blocked / busy / crawl-incomplete /
+# argv-rejected) and a child killed by the SIGTERM wind-down never increment
+# the counter, so none of them can reach either signal -- pinned by
+# test_an_amnestied_outcome_never_quarantines_a_pair_one_failure_from_the_cap.
+
+
+def _quarantined_pairs(cfg: SchedulerConfig, conn) -> list:
+    """Every enabled channel's quarantined (city, channel) rows, for the snapshot.
+
+    Over ``cfg.enabled_providers()`` rather than a filtered night's channels:
+    the standing count is about the catalog, and a ``--provider mapillary``
+    catch-up must not report a KartaView quarantine as having gone away.
+    """
+    return db.get_quarantined(
+        conn,
+        channels=cfg.enabled_providers(),
+        default_membership=CHANNEL_DEFAULT_MEMBERSHIP,
+        max_consecutive_failures=cfg.max_consecutive_failures,
+    )
+
+
+def _quarantine_snapshot(cfg: SchedulerConfig, conn, when: str) -> tuple[list | None, str | None]:
+    """``_quarantined_pairs``, guarded: ``(rows, None)``, or ``(None, error)`` on any exception.
+
+    Both of ``cmd_run_due``'s snapshots sit where a raise costs the most: the
+    BEFORE one ahead of the pre-loop backup (the whole night), the AFTER one
+    between the loop and ``_finish_batch`` (aggregate, manifests, backup,
+    publish and the alert). A reporting query must never cost either, so a
+    failure is logged and returned as a ``Done:``-line clause instead -- the
+    same posture as ``_tail_artifact``. ``when`` ("before"/"after") names the
+    snapshot in that clause.
+    """
+    try:
+        return _quarantined_pairs(cfg, conn), None
+    except Exception as exc:
+        logger.exception(f"Quarantine check ({when} the night) failed")
+        # The Done line is "; "-separated and parsed by splitting on ";"
+        # (scripts/night_length_analyze.py), so a ";" in the exception text
+        # would split this clause in two.
+        reason = f"{type(exc).__name__}: {exc}".replace(";", ",")
+        return None, f"quarantine check FAILED ({when} the night: {reason})"
+
+
+def _newly_quarantined(before: Sequence, after: Sequence) -> list:
+    """The rows of ``after`` whose (city, channel) was not quarantined in ``before``.
+
+    A set difference, so a pair quarantined on an earlier night is in both and
+    never reported again -- the property that keeps this to ONE email. A pair
+    that left quarantine during the night (a success, or a ``reset-failures``
+    run concurrently) is simply absent from ``after`` and reports nothing.
+    """
+    seen = {(r["city_id"], r["provider"]) for r in before}
+    return [r for r in after if (r["city_id"], r["provider"]) not in seen]
+
+
+def _quarantine_summary_note(quarantined: Sequence, newly: Sequence) -> str:
+    """The ``Done:`` line's quarantine clause, empty when nothing is quarantined.
+
+    Example: ``; quarantined: 3 (kartaview 2, panoramax 1, 1 new tonight)``.
+    The leading ``; `` is the only ``;`` in it: the ``Done:`` line is split
+    on ``;`` by ``scripts/night_length_analyze.py``.
+    """
+    if not quarantined:
+        return ""
+    per_channel = Counter(r["provider"] for r in quarantined)
+    detail = ", ".join(f"{ch} {n}" for ch, n in sorted(per_channel.items()))
+    if newly:
+        detail += f", {len(newly)} new tonight"
+    return f"; quarantined: {len(quarantined)} ({detail})"
+
+
+def _reset_failures_command(cfg: SchedulerConfig, city_id: str, channel: str) -> str:
+    """The pasteable ``reset-failures ... --execute`` that clears one quarantine.
+
+    Quoted and ``--config``-prefixed the same way as ``_recovery_command``, and
+    for the same reason: a ``city_id`` can carry an apostrophe, and production
+    does not read the repo-default config.
+    """
+    argv = ["python", "-m", "streetscape_metadata_tracker.scheduler"]
+    if cfg.config_path:
+        argv += ["--config", cfg.config_path]
+    argv += ["reset-failures", city_id, "--channel", channel, "--execute"]
+    return " ".join(shlex.quote(a) for a in argv)
+
+
+def _quarantine_alert_note(cfg: SchedulerConfig, newly: Sequence) -> str:
+    """The [alerts] paragraph naming each pair that entered quarantine tonight, or empty.
+
+    One line per pair -- city, channel, failure count, ``last_error`` and the
+    command that clears it -- because this is the only email the pair will ever
+    produce: from tomorrow it is not attempted, so it cannot fail again.
+    """
+    if not newly:
+        return ""
+    lines = [
+        f"{r['city_id']} [{r['provider']}]: {r['consecutive_failures']} consecutive "
+        f"failure(s); last error: {(r['last_error'] or 'none recorded')[:200]}\n"
+        f"    clear with: {_reset_failures_command(cfg, r['city_id'], r['provider'])}"
+        for r in newly
+    ]
+    return (
+        f"{len(newly)} (city, channel) pair(s) reached [schedule].max_consecutive_failures "
+        f"= {cfg.max_consecutive_failures} tonight and are now QUARANTINED: run-due will not "
+        "attempt them again, so this is the last email they produce -- every later night "
+        "counts them on its `Done:` line instead (issue #421). Fix the cause first (the "
+        "per-attempt logs/collect_<city>_<channel>_<date>.log holds each failure's full "
+        "output), then clear the quarantine; without --execute the command only previews.\n  "
+        + "\n  ".join(lines)
+    )
+
+
 def _rejected_argv_alert_note(rejected: ArgvRejections) -> str:
     """The [alerts] paragraph naming each argv our own CLI rejected, or empty.
 
@@ -12547,6 +13145,8 @@ def _finish_batch(
     busy_hosts: Counter[str] | None = None,
     rejected_argv: ArgvRejections | None = None,
     crashed: str = "LOOP",
+    newly_quarantined: Sequence | None = None,
+    quarantine_error: str | None = None,
 ) -> int:
     """Rebuild the published indexes, back up the catalog, publish, alert.
 
@@ -12592,6 +13192,20 @@ def _finish_batch(
     waiting or hunting a process. Optional here, unlike where it is FILLED
     (``_run_city_channels``): ``None`` means nothing was rejected, not a dropped
     count.
+
+    ``newly_quarantined`` holds the ``schedule_state`` rows that reached
+    ``max_consecutive_failures`` TONIGHT (issue #421) -- the transition, never
+    the standing set, which the ``Done:`` line counts instead. It alerts
+    regardless of ``failure_threshold``, as an ``N QUARANTINED`` subject part
+    with a paragraph naming each pair and its ``reset-failures`` command,
+    because it is the last email that pair can ever produce: from tomorrow it
+    is not attempted, so it cannot fail again.
+
+    ``quarantine_error`` is set when either quarantine snapshot raised
+    (``_quarantine_snapshot``). The ``summary`` already carries it as a clause;
+    it is passed separately because it alerts on its own, as ``QUARANTINE CHECK
+    FAILED``: a failed check is exactly the night a transition could go
+    unreported, and that transition's email is the only one the pair gets.
     """
     # Every index rebuild goes through _tail_artifact, which reports a failure
     # instead of propagating it — see there for why a lost tail is the worse
@@ -12765,6 +13379,8 @@ def _finish_batch(
     )
     rejected_argv = rejected_argv if rejected_argv is not None else ArgvRejections()
     rejected_note = _rejected_argv_alert_note(rejected_argv)
+    newly_quarantined = list(newly_quarantined or ())
+    quarantine_note = _quarantine_alert_note(cfg, newly_quarantined)
 
     failures = attempted - succeeded
     unhealthy = (
@@ -12777,6 +13393,12 @@ def _finish_batch(
         busy_hosts,
         busy_recovered,
         rejected_argv,
+        # The night a pair ENTERS quarantine (issue #421). Unconditional rather
+        # than left to failure_threshold: it is that pair's last email.
+        newly_quarantined,
+        # ...and the night the check that would have SEEN that transition
+        # failed, for the same reason.
+        quarantine_error,
         # Deliberately NOT `blocked_hosts.stranded` (issue #373): a host
         # stranding already alerts through its host condition, and a DEADLINE
         # stranding alone is routine once nights end on the deadline -- the
@@ -12826,6 +13448,10 @@ def _finish_batch(
             parts.append(f"{len(busy_recovered)} host(s) BUSY then recovered")
         if rejected_argv:
             parts.append(f"{sum(rejected_argv.values())} launch(es) REJECTED by our own CLI")
+        if newly_quarantined:
+            parts.append(f"{len(newly_quarantined)} QUARANTINED")
+        if quarantine_error:
+            parts.append("QUARANTINE CHECK FAILED")
         # The failure count is the subject on an ordinary bad night, and noise
         # ("0 failed collection(s)") when something above already carries it.
         if failures or not any(unhealthy):
@@ -12844,6 +13470,7 @@ def _finish_batch(
             + (f"\n\n{busy_note}" if busy_note else "")
             + (f"\n\n{busy_recovered_note}" if busy_recovered_note else "")
             + (f"\n\n{rejected_note}" if rejected_note else "")
+            + (f"\n\n{quarantine_note}" if quarantine_note else "")
         )
         send_alert(
             cfg.alerts,
@@ -12975,6 +13602,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="With --all, actually write. Without it --all only reports, because "
         "its blast radius is the whole catalog.",
     )
+    p_reset = sub.add_parser(
+        "reset-failures",
+        help="Clear one (city, channel)'s consecutive failures, lifting a quarantine (issue #421)",
+    )
+    _add_global_flags(p_reset)
+    p_reset.add_argument("city", nargs="?", default=None, help="City query or slug")
+    p_reset.add_argument(
+        "--channel", required=True, metavar="CHANNEL", help="The channel whose count to reset."
+    )
+    p_reset.add_argument(
+        "--execute",
+        action="store_true",
+        help="Actually reset the count. Without it the command only prints the pair's "
+        "count, quarantine state and last error.",
+    )
     p_regen = sub.add_parser(
         "regenerate-aggregate",
         help="Rebuild cities.json.gz from the catalog (no collection)",
@@ -13055,7 +13697,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Snapshot date YYYY-MM-DD (default: today, UTC); use with --from-file for backfill",
     )
-    p_run = sub.add_parser("run-due", help="Collect today's due cities")
+    # allow_abbrev=False (issue #412): the GSV-key guard reads ANOTHER run-due's
+    # channels from its `ps` argv by exact token (--provider, --dry-run). With
+    # abbreviations allowed, a live `run-due --prov gsv` would hide its GSV key
+    # from that read; refused here, no running process can carry one.
+    p_run = sub.add_parser("run-due", help="Collect today's due cities", allow_abbrev=False)
     _add_global_flags(p_run)
     p_run.add_argument("--dry-run", action="store_true", help="Print what would run; no downloads")
     p_run.add_argument(
@@ -13092,6 +13738,14 @@ def build_parser() -> argparse.ArgumentParser:
         "city_id, resolved as enroll-city resolves one). Narrows the due list "
         "and never forces: a named city that is not due is reported and "
         f"skipped. An unknown name exits {USAGE_EXIT_CODE}.",
+    )
+    p_run.add_argument(
+        "--force",
+        action="store_true",
+        help="Collect a GSV channel even though another run-due on this host appears "
+        f"to be collecting the same key (otherwise a hand run exits {USAGE_EXIT_CODE}, "
+        "issue #412: a second process on one GSV key oversubscribes its quota; the "
+        "nightly unit proceeds and alerts instead). The check is a heuristic over `ps`.",
     )
     p_assess = sub.add_parser(
         "assess-city",
@@ -13141,6 +13795,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_assess.add_argument(
         "--no-publish", action="store_true", help="Regenerate the published JSON but do not rsync"
+    )
+    p_assess.add_argument(
+        "--force",
+        action="store_true",
+        help="Collect gsv_streets even though a run-due on this host appears to be "
+        f"collecting that key (otherwise exits {USAGE_EXIT_CODE}, issue #412).",
     )
     # A new city's opt-in channels are not collected here (ASSESS_CHANNELS);
     # they are ENROLLED, and arrive with the city's first nightly run.
@@ -13278,6 +13938,8 @@ def main() -> int:
             limit=args.limit,
             execute=args.execute,
         )
+    if args.command == "reset-failures":
+        return cmd_reset_failures(cfg, args.city, channel=args.channel, execute=args.execute)
     if args.command == "regenerate-aggregate":
         return cmd_regenerate(cfg, publish=args.publish)
     if args.command == "notify-failure":
@@ -13342,6 +14004,7 @@ def main() -> int:
             publish=not args.no_publish,
             opt_in=not args.no_opt_in,
             enroll_kartaview=args.enroll_kartaview,
+            force=args.force,
         )
     if args.command == "run-due":
         try:
@@ -13351,6 +14014,7 @@ def main() -> int:
                 limit=args.limit,
                 requested_providers=args.providers,
                 requested_cities=args.cities,
+                force=args.force,
             )
         except Exception as exc:
             # A DRY RUN whose stdout reader went away is the one crash here
