@@ -512,7 +512,7 @@ def test_match_frame_tolerates_one_ulp_across_the_half_way_boundary():
     before = samples.copy()
     assert match_frame(samples, csv) == (2, 1)
     # Validation only: the samples are never moved onto the CSV's coordinates.
-    pd.testing.assert_frame_equal(samples, before)
+    pd.testing.assert_frame_equal(samples, before, check_exact=True)
 
 
 def test_match_frame_refuses_two_csv_locations_closer_than_twice_the_tolerance():
