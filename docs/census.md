@@ -83,6 +83,35 @@ The status vocabulary lives in `analysis.py` (`PRESENT_STATUSES` for 360°, `ANY
 Frontend: an "Any imagery" color-by metric (`streetscape-utils.js` `METRICS.coverage_any`), an overview-popup any-imagery line, and a toggleable flat-only marker layer on the city page (`city.js`).
 All fields fall back to the 360° rate for GSV/pre-v7 data, so old records read unchanged.
 
+## Mapillary `quality_score` is published as a distribution, beside the on-foot share (issue #321)
+
+Mapillary publishes a per-image `quality_score` — "predicted visual quality of the image in the range [0.0, 1.0]" — on the tiles the census already fetches, and every pano row has carried it since 2026-07-24.
+It is the only visual-quality signal any provider gives us.
+`json_summarizer.compute_mapillary_meta` used to reduce it to one median, which [`experiments/mapillary-image-quality.md`](experiments/mapillary-image-quality.md) measured as unable to rank cities (58.8% of 388 sit in one 0.07-wide band), and that median reached neither the aggregate nor the site.
+
+**The caveat is load-bearing, and it is why the on-foot counts live inside the block.**
+Paired within-city, Mapillary scores on-foot imagery **below** vehicle imagery in **84.5%** of the 58 cities holding both, and pedestrian capture is often exactly what a sidewalk assessment wants.
+So the score is a vendor's prediction of visual quality, never "useful for Sidewalk", and it never ranks a city alone: `grid.html` shows it only in a group that also carries the on-foot share.
+
+`mapillary_meta.quality` (built by `mapillary_quality.quality_block`) uses the study's definitions, so the published block reproduces the study's per-city row up to rounding (a test runs both on one census):
+
+| Key | Definition |
+|---|---|
+| `n_scored` | Pano rows (status OK or NO_DATE) with a finite score |
+| `p10` … `p90` | numpy linear-interpolation percentiles over those scores |
+| `pct_ge_good`, `pct_lt_poor` | % of scored panos `>= GOOD_THRESHOLD` (0.9) and `< POOR_THRESHOLD` (0.6) |
+| `n_sequences`, `seq_p25`/`seq_p50`/`seq_p75` | One median per `sequence_id`, then percentiles over drives; an image with no sequence drops out of **this cut only** |
+| `p50_on_foot`, `p50_vehicle` | Image-weighted medians of each capture mode's scored panos |
+| `n_on_foot`, `n_foot_known` | Pano rows captured on foot, and pano rows whose `on_foot` is known (scored or not) |
+
+The thresholds live **once**, in `streetscape_metadata_tracker/mapillary_quality.py`: `scripts/mapillary_image_quality_collect.py` imports them, and `www/js/grid.js` mirrors them in its headers under a test that reads them out of the JS source.
+The block is **absent** — never zeros or nulls — when the CSV has no `quality_score` column (every pre-2026-07-24 run, ~129 of them) or when no pano row is scored, so key presence means "measured".
+Within a present block a sub-statistic with no sample (no on-foot images, no sequenced images) is `null`.
+
+**It is columnar, under the #157 memory contract above.**
+The summarizer tail is the per-city memory high-water mark inside the nightly child (measured 0.914 GiB per million CSV rows), so the block is computed from three one-dimensional arrays: the pano mask is applied **one column at a time** (the old `df[mask]` copied the whole census frame and is gone), `sequence_id` goes through `pd.factorize`, and the per-sequence medians are a `np.lexsort` by (code, score) plus two gathers at each run's middle — no frame, no `groupby().apply`, no per-row loop.
+A test pins those medians equal to a `groupby().median()`.
+
 ## KartaView is the second census provider, and its primitive is a paginated radius sweep (issue #225)
 
 **KartaView is the second census provider, and its primitive is a paginated radius sweep (issue #225).** There is no bulk metadata endpoint: the coverage tiles carry geometry only, their `.json`/`.geojson` variants return empty at every tile tried (including the official docs' own example), and any unconstrained `/2.0/photo/?lat=&lng=&radius=` answers `apiCode 408 "Query timeout"`

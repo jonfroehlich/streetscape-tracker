@@ -240,6 +240,34 @@ The script checks for an in-flight `run-due` only when it starts (`--execute` is
 If step 2 might not finish before 02:00, disable the timer for the night (`systemctl --user disable --now streetscape-tracker.timer`, and `enable --now` after step 3; never `stop`, which the #369 watchdog re-arms).
 The publish never passes rsync `--delete`, so a detail file the pass REMOVES stays on the web server until removed there; the pass lists those names.
 
+## Backfilling the Mapillary quality block (issue #321)
+
+#321 adds a `quality` block to every Mapillary run's `mapillary_meta` (the `quality_score` distribution and its on-foot split; [`census.md`](census.md)), and `grid.html` builds its "Imagery quality" group from it.
+Runs collected after the deploy get the block on their own; every run summarized before it lacks the block until its per-run JSON is rebuilt, and the grid page shows em-dashes for those cities meanwhile.
+**This is optional and not urgent** — nothing is wrong in the published data, the block is simply missing — so it waits for a daytime ops window.
+
+```bash
+cd ~/streetscape-tracker
+# 1. Dry run: lists the runs it would rebuild and counts the rest. Reads one JSON and one CSV header line per run, never a census.
+.venv-makelab2/bin/python scripts/recompute_run_stats.py \
+    --data-dir /projects/makeabilitylab/streetscape-tracker/data \
+    --provider mapillary --regenerate-json-mapillary-meta
+# 2. Rebuild those runs' per-run JSON, then the aggregate.
+.venv-makelab2/bin/python scripts/recompute_run_stats.py \
+    --data-dir /projects/makeabilitylab/streetscape-tracker/data \
+    --provider mapillary --regenerate-json-mapillary-meta --execute >> logs/backfill_321.log 2>&1
+# 3. Publish.
+.venv-makelab2/bin/python -m streetscape_metadata_tracker.scheduler \
+    --config config/scheduler.makelab1.toml regenerate-aggregate --publish
+```
+
+It is a separate mode of `recompute_run_stats.py`: it runs no stats pass and writes no catalog row.
+It selects a run only when its JSON lacks `mapillary_meta.quality` AND its CSV header carries `quality_score`, so the ~129 runs collected before 2026-07-24 stay **absent, never zero**, and the report says how many it skipped for that reason; a second pass finds nothing to do.
+**The cost is one full census reload per selected run** (through `regenerate_run_json`, the live pipeline's own writer), and a Mapillary census is up to millions of rows: on production that is **hours**, at the summarizer's per-city memory peak (0.914 GiB per million CSV rows).
+So it belongs in the daytime window and **never inside a night**: `--execute` is refused while a `run-due` is in flight (`scheduler._run_due_in_flight`, the check `recompute_run_diffs.py` makes), but like that script it checks only when it starts, and the nightly batch never checks for it.
+If step 2 might not finish before 02:00, disable the timer for the night (`systemctl --user disable --now streetscape-tracker.timer`, and `enable --now` afterwards; never `stop`, which the #369 watchdog re-arms).
+Only this mode carries the in-flight gate; the stats pass keeps its existing behaviour.
+
 ## Landing a laptop investigation in this catalog: `scheduler import-bundle` (issue #330)
 
 **Added after the 2026-08-22 split.**
