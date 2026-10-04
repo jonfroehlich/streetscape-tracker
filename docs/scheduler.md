@@ -32,15 +32,26 @@ Since #304 each GSV process reaches its configured 48,000/min, so a hand catch-u
 `run-due` reads its rate from config and has no per-run override, so waiting is a hand run's only safe action; the direct CLIs can be slowed instead (the pre-run checklist in `docs/operations.md`).
 `assess-city` spends the `gsv_streets` key the same way and is refused the same way (not under `--estimate`).
 
-- **What counts as an overlap** (`_gsv_key_overlaps`): `_scan_run_due_processes` reads `ps -ww -e -o pid=,ppid=,args=` and keeps a line only when its argv is a python executable, then `-m streetscape_metadata_tracker.scheduler`, then a `run-due` token — so a `pgrep -f` loop, a `tail -f logs/run-due.log`, `timer-status`, a shell or `timeout` wrapper and a pytest `-k run-due` never match.
+- **What counts as an overlap** (`_gsv_key_overlaps`): `_scan_run_due_processes` reads `ps -ww -e -o pid=,ppid=,args=` and keeps a line only when its argv is a python executable, then `-m streetscape_metadata_tracker.scheduler`, then a `run-due` token — so a `pgrep -f` loop, a `tail -f logs/run-due.log`, `--config run-due.toml status`, a shell or `timeout` wrapper and a pytest `-k run-due` never match.
+  The args column is split on whitespace, never `shlex`: `ps` quotes nothing, and `shlex` read two apostrophes (a `--city Coeur d'Alene` beside an apostrophe in `--config`) as one quoted span that swallowed the `run-due` token.
+  `ps` output is decoded with `errors="replace"`, so a non-UTF-8 argv anywhere in the table cannot raise out of the pre-flight.
   This process and its whole ancestor chain are excluded.
   The other process's channels are read from its argv (`--provider X`, `--provider=X`, repeated or comma-separated; none means this config's enabled set; `--dry-run` means none), and only a shared GSV key refuses — `gsv` and `gsv_streets` are separate keys, so a `gsv_streets` walk beside a `gsv`-only catch-up is no overlap.
-- **The nightly is identified exactly**, from `/proc/self/cgroup` ending in `/streetscape-tracker.service` (`_is_nightly_unit`); `INVOCATION_ID` would not do, since every unit and any `systemd-run --user` sets it.
+  Exact tokens suffice because the `run-due` subparser sets `allow_abbrev=False`: `--prov gsv` or `--dry` exits 2 at parse time, so no live `run-due` can hide its channels behind an abbreviation.
+- **The nightly is identified by either of two independent signals** (`_is_nightly_unit`): `STREETSCAPE_NIGHTLY=1`, which the unit file sets, or `/proc/self/cgroup` holding a path that ends in `/streetscape-tracker.service`.
+  `INVOCATION_ID` would not do, since every unit and any `systemd-run --user` sets it.
+  Two because a misidentified nightly fails in the dangerous direction: it is refused as a hand run (exit 64) and the night is lost.
+  Neither had been read on prod when this shipped; the installed unit is a copy, so the variable is live only after the copy is refreshed and `daemon-reload`ed (`deploy/README.md`), and until then the cgroup check carries it alone.
+  A refused `run-due` says it was NOT identified as the nightly and prints the variable's value and the cgroup lines it read (or the `OSError`), so a misidentified night explains itself in the scheduler log.
   On an overlap the nightly logs a warning, sends one `[alerts]` email naming the other pid and command line, and proceeds on every channel — refusing it would lose all eight channels' night to protect one key.
-  No `/proc` (macOS) reads as "not nightly".
+  No `/proc` (macOS) and no variable reads as "not nightly".
 - **A refused hand run reports only to its terminal**, which is enough because its operator is the one watching it: `deploy/systemd/streetscape-tracker.service` ships with `OnFailure=` commented out, and the notify unit is not installed on makelab2, so no email follows an exit 64.
+  The same holds for a misidentified nightly: its refusal reaches the scheduler log and the unit's console log, and no email.
+- **It refuses for the other process's whole life, not just its GSV lanes.** The check sees that another `run-due` is alive, not which channel it is on, so a hand run is refused until the nightly exits (~12-14 h), even after the nightly can no longer reach that key.
+  The refusal says so: the other process may already be past its GSV channels, so check the scheduler log for whether it is still on `gsv`/`gsv_streets` (its latest `Collecting … [gsv]` / `[gsv_streets]` launches, or a tail already under way), and if it is not, re-run with `--force`.
+  Lane-state tracking that would answer this in code was deliberately not built; the operator's read of the log is the mechanism.
 - **Exempt:** `--dry-run` (a preview spends nothing) and any run holding no GSV key (`--provider mapillary --limit 5` never reads `ps`, since `host_lock` already serializes every per-IP host).
-  `--force` overrides a match known not to be collecting, with a warning naming it.
+  `--force` overrides a match known not to be collecting that key, with a warning naming it.
 - **Blind spots.** It is per-HOST: a same-key run on another machine (a laptop with the prod key) is invisible.
   It sees `run-due` only: a direct `streetscape_tracker.py` or `collect --provider gsv` run, or an `assess-city`, is invisible to a later `run-due`, and is not itself guarded — the checklist covers those.
   It assumes the other `run-due` reads the same config when it names no `--provider`.

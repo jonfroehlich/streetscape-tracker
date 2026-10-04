@@ -5777,10 +5777,16 @@ def cmd_reconcile_walks(
 
 # The module a scheduler process is launched as, and the nightly unit's name.
 # Both are matched EXACTLY (an argv token, a cgroup path component), never as
-# substrings: a substring test matched a `pgrep -f` loop, a `tail -f` of a log
-# named after the subcommand, and `scheduler --config x timer-status`.
+# substrings: a substring test matched a `pgrep -f` loop and a `tail -f` of a
+# log named after the subcommand, and a substring over the joined argv would
+# match `scheduler --config run-due.toml status`.
 SCHEDULER_MODULE = "streetscape_metadata_tracker.scheduler"
 NIGHTLY_UNIT = "streetscape-tracker.service"
+# The nightly unit's second, independent identification (issue #412): the
+# unit file sets Environment=STREETSCAPE_NIGHTLY=1. Either it or the cgroup
+# path identifies the nightly, so a cgroup layout nobody verified on prod
+# cannot by itself refuse the night.
+NIGHTLY_ENV_VAR = "STREETSCAPE_NIGHTLY"
 # Where the kernel names this process's cgroup; a module constant so tests can
 # point it at a file (the nightly is identified from it, see _is_nightly_unit).
 _PROC_CGROUP = "/proc/self/cgroup"
@@ -5797,17 +5803,16 @@ class RunDueProcess:
 
 def _split_ps_args(args: str) -> list[str]:
     """
-    Tokenize one ``ps`` args column.
+    Tokenize one ``ps`` args column, on whitespace.
 
-    ``ps`` joins argv with spaces and quotes nothing, so ``shlex`` is right for
-    the common case and wrong for an argument with an unbalanced quote (a
-    ``--city coeur-d'alene-…`` slug); that falls back to whitespace splitting
-    rather than dropping the line.
+    ``ps`` joins argv with spaces and quotes nothing, so there are no quotes to
+    honour: ``shlex`` read two apostrophes (``--config /x/o'neil.toml run-due
+    --city Coeur d'Alene``) as one quoted span and swallowed the ``run-due``
+    token, so a real batch went undetected. An argument that itself contains a
+    space splits into several tokens here, which can only ADD tokens, never
+    hide ``-m``, the module or ``run-due``.
     """
-    try:
-        return shlex.split(args)
-    except ValueError:
-        return args.split()
+    return args.split()
 
 
 def _is_run_due_argv(argv: Sequence[str]) -> bool:
@@ -5820,7 +5825,12 @@ def _is_run_due_argv(argv: Sequence[str]) -> bool:
     ``ps``), ``-m`` must be followed by the scheduler
     module, and ``run-due`` must be a TOKEN after it. A shell wrapper
     (``bash -c '…run-due…'``), ``timeout``, ``pgrep -f``, ``tail -f
-    logs/run-due.log`` and ``scheduler timer-status`` all fail one of those.
+    logs/run-due.log`` and ``scheduler --config run-due.toml status`` all
+    fail one of those.
+
+    Exact ``run-due``/``--provider``/``--dry-run`` tokens are enough because
+    the ``run-due`` subparser sets ``allow_abbrev=False``: an abbreviated
+    ``--prov gsv`` is refused at parse time, so no live process carries one.
 
     Example::
 
@@ -5867,9 +5877,13 @@ def _scan_run_due_processes() -> list[RunDueProcess]:
             ["ps", "-ww", "-e", "-o", "pid=,ppid=,args="],
             capture_output=True,
             text=True,
+            # Any process's argv may hold bytes that are not UTF-8 (a city
+            # query in a legacy encoding); strict decoding raised out of the
+            # nightly's pre-flight. Replaced bytes cannot form `run-due`.
+            errors="replace",
             timeout=20,
         ).stdout
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, ValueError, subprocess.SubprocessError):
         return []
     parents: dict[int, int] = {}
     rows: list[tuple[int, str]] = []
@@ -8665,23 +8679,41 @@ def _gsv_key_overlaps(
     return overlaps
 
 
-def _is_nightly_unit() -> bool:
+def _nightly_unit_signals() -> tuple[bool, str]:
     """
-    True when this process runs inside the nightly ``streetscape-tracker.service``.
+    Whether this process is the nightly unit, and the evidence read to decide.
 
-    Read from ``/proc/self/cgroup`` (a path ending in the unit's name), because
-    nothing else identifies the unit exactly: ``INVOCATION_ID`` is set by
-    every unit -- the prefreeze, screen and backup ones too -- and by a
-    ``systemd-run --user`` hand catch-up. An ``OSError`` (macOS has no
-    ``/proc``) is "not nightly", so a laptop never takes the nightly's
-    proceed-and-alert path.
+    Two independent signals, either of which identifies it:
+
+    - ``STREETSCAPE_NIGHTLY=1`` in the environment, which the unit file sets.
+      An INSTALLED unit is a copy, so this arm is live only once the copy is
+      refreshed and ``daemon-reload``ed (``deploy/README.md``).
+    - ``/proc/self/cgroup`` holding a path that ENDS in ``/streetscape-tracker.service``.
+      ``INVOCATION_ID`` would not do: every unit sets it (the prefreeze, screen
+      and backup ones too), and so does a ``systemd-run --user`` hand catch-up.
+      An ``OSError`` (macOS has no ``/proc``) is not a match.
+
+    Two because a misidentified nightly fails in the dangerous direction: it is
+    REFUSED as a hand run, and the night is lost. The evidence string goes into
+    that refusal so such a night explains itself in the scheduler log.
     """
+    env_value = os.environ.get(NIGHTLY_ENV_VAR)
+    evidence = [f"{NIGHTLY_ENV_VAR}={env_value!r}"]
+    is_nightly = env_value == "1"
     try:
-        with open(_PROC_CGROUP, encoding="utf-8") as fh:
+        with open(_PROC_CGROUP, encoding="utf-8", errors="replace") as fh:
             lines = fh.read().splitlines()
-    except OSError:
-        return False
-    return any(line.rstrip().endswith("/" + NIGHTLY_UNIT) for line in lines)
+    except OSError as exc:
+        evidence.append(f"{_PROC_CGROUP} unreadable ({exc})")
+    else:
+        evidence.append(f"{_PROC_CGROUP}: " + (" | ".join(lines) if lines else "(empty)"))
+        is_nightly = is_nightly or any(line.rstrip().endswith("/" + NIGHTLY_UNIT) for line in lines)
+    return is_nightly, "; ".join(evidence)
+
+
+def _is_nightly_unit() -> bool:
+    """True when this process runs as the nightly ``streetscape-tracker.service``."""
+    return _nightly_unit_signals()[0]
 
 
 def _describe_gsv_overlaps(overlaps: Sequence[tuple[RunDueProcess, list[str]]]) -> str:
@@ -8692,19 +8724,38 @@ def _describe_gsv_overlaps(overlaps: Sequence[tuple[RunDueProcess, list[str]]]) 
 
 
 def _gsv_overlap_refusal(
-    command: str, overlaps: Sequence[tuple[RunDueProcess, list[str]]]
+    command: str,
+    overlaps: Sequence[tuple[RunDueProcess, list[str]]],
+    nightly_evidence: str | None = None,
 ) -> list[str]:
-    """The operator-facing refusal for a hand run on a GSV key already in use."""
-    return [
+    """
+    The operator-facing refusal for a hand run on a GSV key already in use.
+
+    ``nightly_evidence`` (``run-due`` only) is what ``_nightly_unit_signals``
+    read: a NIGHTLY refused here was misidentified, and this line is how that
+    night explains itself in the scheduler log (no email follows an exit 64;
+    see docs/scheduler.md).
+    """
+    lines = [
         f"REFUSED: {command} would collect a GSV key another run-due on this host is "
         f"also collecting:",
         _describe_gsv_overlaps(overlaps),
         "  A second process on the same GSV key doubles the rate presented to that key's "
         "per-project quota: requests answer OVER_QUERY_LIMIT and the run can abort having "
-        "spent its wall clock (issue #412). This command has no rate override, so wait for "
-        "the other run to finish. Channels on other keys or providers are not affected. "
-        "Pass --force only if you are certain that process is not collecting.",
+        "spent its wall clock (issue #412). This command has no rate override. "
+        "Channels on other keys or providers are not affected.",
+        "  The check sees only that the other run-due is ALIVE, not which channel it is "
+        "on: it may already be past its GSV channels. Check the scheduler log "
+        "(logs/streetscape_scheduler.log) for whether it is still on gsv/gsv_streets "
+        "(its latest 'Collecting ... [gsv]' / '[gsv_streets]' launches, or a tail already "
+        "under way); if it is, wait for it, and if it is not, re-run with --force.",
     ]
+    if nightly_evidence is not None:
+        lines.append(
+            f"  This process was NOT identified as the nightly unit ({NIGHTLY_UNIT}), "
+            f"which is never refused; read: {nightly_evidence}"
+        )
+    return lines
 
 
 def _alert_nightly_gsv_overlap(
@@ -8822,7 +8873,8 @@ def cmd_run_due(
                 + _describe_gsv_overlaps(overlaps)
             )
         else:
-            for message in _gsv_overlap_refusal("run-due", overlaps):
+            _nightly, evidence = _nightly_unit_signals()
+            for message in _gsv_overlap_refusal("run-due", overlaps, nightly_evidence=evidence):
                 logger.error(message)
             return USAGE_EXIT_CODE
 
@@ -13325,7 +13377,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Snapshot date YYYY-MM-DD (default: today, UTC); use with --from-file for backfill",
     )
-    p_run = sub.add_parser("run-due", help="Collect today's due cities")
+    # allow_abbrev=False (issue #412): the GSV-key guard reads ANOTHER run-due's
+    # channels from its `ps` argv by exact token (--provider, --dry-run). With
+    # abbreviations allowed, a live `run-due --prov gsv` would hide its GSV key
+    # from that read; refused here, no running process can carry one.
+    p_run = sub.add_parser("run-due", help="Collect today's due cities", allow_abbrev=False)
     _add_global_flags(p_run)
     p_run.add_argument("--dry-run", action="store_true", help="Print what would run; no downloads")
     p_run.add_argument(

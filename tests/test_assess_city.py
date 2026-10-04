@@ -1970,6 +1970,10 @@ def test_assess_city_refuses_gsv_streets_beside_a_run_due_on_that_key(
     assert rc == _sched.USAGE_EXIT_CODE
     assert connected == []
     assert "pid 4242 (shared key: gsv_streets)" in caplog.text
+    assert "may already be past its GSV channels" in caplog.text
+    assert "re-run with --force" in caplog.text
+    # assess-city is never the nightly, so it has no identification to explain.
+    assert "nightly unit" not in caplog.text
 
 
 @pytest.mark.parametrize(

@@ -1802,11 +1802,21 @@ def test_provider_filter_rejects_a_value_naming_no_channel(conn, monkeypatch, va
 _REAL_SCAN = _sched._scan_run_due_processes
 _REAL_IS_NIGHTLY = _sched._is_nightly_unit
 
-_PY = "/homes/gws/jonf/streetscape-tracker/.venv-makelab2/bin/python"
-_NIGHTLY_ARGS = (
-    f"{_PY} -m streetscape_metadata_tracker.scheduler --config "
-    "/homes/gws/jonf/streetscape-tracker/config/scheduler.makelab1.toml run-due"
-)
+# The nightly's command line is READ from the unit file it runs from, with %h
+# substituted as systemd would, never hand-copied: a copy is what lets the unit
+# change while every test here keeps matching the old line.
+_NIGHTLY_UNIT_PATH = Path(_PROJECT_ROOT, "deploy", "systemd", _sched.NIGHTLY_UNIT)
+_UNIT_HOME = "/homes/gws/jonf"
+
+
+def _nightly_exec_start() -> str:
+    text = _NIGHTLY_UNIT_PATH.read_text()
+    (line,) = re.findall(r"^ExecStart=(.+)$", text, re.M)
+    return line.replace("%h", _UNIT_HOME)
+
+
+_NIGHTLY_ARGS = _nightly_exec_start()
+_PY = _NIGHTLY_ARGS.split()[0]
 _HAND = f"{_PY} -m streetscape_metadata_tracker.scheduler run-due"
 
 
@@ -1857,6 +1867,45 @@ def test_the_gsv_refusal_names_the_other_process_and_the_shared_key(conn, monkey
     assert "pid 4242 (shared key: gsv)" in caplog.text
     assert "scheduler.makelab1.toml run-due" in caplog.text
     assert "--force" in caplog.text
+    # The other run-due may be past its GSV lanes already; the operator is
+    # told where to look and what to do then, not just to wait ~12 h.
+    assert "may already be past its GSV channels" in caplog.text
+    assert "still on gsv/gsv_streets" in caplog.text
+    assert "re-run with --force" in caplog.text
+
+
+def test_a_refused_run_due_says_it_was_not_identified_as_the_nightly(
+    conn, monkeypatch, tmp_path, caplog
+):
+    """
+    A misidentified NIGHTLY is refused like a hand run and loses the night, so
+    the refusal must explain itself: it says the process was not identified as
+    the nightly unit, and prints both signals as read.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    cgroup = tmp_path / "cgroup"
+    cgroup.write_text("0::/user.slice/user-1000.slice/session-7.scope\n")
+    monkeypatch.setattr(sched, "_PROC_CGROUP", str(cgroup))
+    monkeypatch.delenv(sched.NIGHTLY_ENV_VAR, raising=False)
+    _others(monkeypatch, (4242, _NIGHTLY_ARGS))
+    with caplog.at_level(logging.ERROR):
+        rc = sched.cmd_run_due(_mly_cfg(), today=date(2026, 7, 2), requested_providers=["gsv"])
+
+    assert rc == sched.USAGE_EXIT_CODE
+    assert f"NOT identified as the nightly unit ({sched.NIGHTLY_UNIT})" in caplog.text
+    assert f"{sched.NIGHTLY_ENV_VAR}=None" in caplog.text
+    assert "/user.slice/user-1000.slice/session-7.scope" in caplog.text
+
+
+def test_the_nightly_evidence_names_an_unreadable_cgroup(monkeypatch, tmp_path):
+    """No /proc (or a permission error) is shown as the OSError, not as silence."""
+    monkeypatch.setattr(_sched, "_PROC_CGROUP", str(tmp_path / "missing"))
+    monkeypatch.setenv(_sched.NIGHTLY_ENV_VAR, "0")
+    is_nightly, evidence = _sched._nightly_unit_signals()
+    assert is_nightly is False
+    assert f"{_sched.NIGHTLY_ENV_VAR}='0'" in evidence
+    assert "unreadable" in evidence and "No such file" in evidence
 
 
 def test_force_runs_a_hand_gsv_run_due_past_an_overlap(conn, monkeypatch):
@@ -2061,10 +2110,12 @@ def _fake_ps(monkeypatch, rows):
 
 def test_the_scan_matches_only_real_run_due_processes(monkeypatch):
     """
-    Every line here but 4242 must be ignored, and each is ignored for its own
-    reason: the substring test this replaced matched a pgrep loop, a tail of a
-    log named after the subcommand, `timer-status`, a pytest `-k run-due`, a
-    wrapper AND its child (one batch counted twice), and its own ancestors.
+    Every line here but 4242, 4244 and 58 must be ignored. The substring test
+    this replaced matched a pgrep loop, a tail of a log named after the
+    subcommand, a pytest `-k run-due`, a wrapper AND its child (one batch
+    counted twice), and its own ancestors. `timer-status` never held `run-due`
+    at all, so it pins only "another subcommand"; the `--config run-due.toml
+    status` line is the one that tells a token from a substring of the argv.
     """
     me, parent = os.getpid(), os.getppid()
     calls = _fake_ps(
@@ -2089,6 +2140,11 @@ def test_the_scan_matches_only_real_run_due_processes(monkeypatch):
                 51,
                 1,
                 f"{_PY} -m streetscape_metadata_tracker.scheduler --config x timer-status --rearm",
+            ),
+            (
+                59,
+                1,
+                f"{_PY} -m streetscape_metadata_tracker.scheduler --config run-due.toml status",
             ),
             (52, 1, "tail -f logs/run-due.log"),
             (53, 1, "bash -c while pgrep -af '[s]cheduler .*run-due'; do sleep 60; done"),
@@ -2132,6 +2188,87 @@ def test_the_scan_never_reports_this_process_or_its_ancestors(monkeypatch):
         [(me, parent, _NIGHTLY_ARGS), (parent, 1, "/usr/lib/systemd/systemd --user")],
     )
     assert _REAL_SCAN() == []
+
+
+def test_the_scan_reads_a_run_due_whose_argv_holds_apostrophes(monkeypatch):
+    """
+    ps quotes nothing, so a quote in a path or a city is literal. shlex read
+    two apostrophes as one quoted span and swallowed the `run-due` token
+    between them, so this live GSV batch went undetected.
+    """
+    args = (
+        f"{_PY} -m streetscape_metadata_tracker.scheduler --config /homes/o'neil/c.toml "
+        "run-due --city Coeur d'Alene, Idaho --provider gsv"
+    )
+    _fake_ps(monkeypatch, [(4242, 1, args)])
+    monkeypatch.setattr(_sched, "_scan_run_due_processes", _REAL_SCAN)
+
+    overlaps = _sched._gsv_key_overlaps(_mly_cfg(), ["gsv"])
+
+    assert [(proc.pid, shared) for proc, shared in overlaps] == [(4242, ["gsv"])]
+
+
+def test_the_scan_survives_an_argv_that_is_not_utf8(monkeypatch):
+    """
+    Any process's argv may hold bytes that are not UTF-8, and strict decoding
+    raised UnicodeDecodeError out of the nightly's pre-flight. Run through the
+    REAL subprocess.run (only the command is swapped), so the decoding
+    arguments the scan passes are what is exercised; the batch on the next
+    line must still be found, not dropped by a fail-open.
+    """
+    import sys as _sys
+
+    real_run = subprocess.run
+    payload = (
+        b"     70      1 /usr/bin/caf\xe9 --x\n   4242      1 " + _NIGHTLY_ARGS.encode() + b"\n"
+    )
+    script = f"import sys; sys.stdout.buffer.write({payload!r})"
+
+    def run(cmd, *a, **kw):
+        return real_run([_sys.executable, "-c", script], *a, **kw)
+
+    monkeypatch.setattr(_sched.subprocess, "run", run)
+    assert [p.pid for p in _REAL_SCAN()] == [4242]
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        pytest.param(["run-due", "--prov", "gsv"], id="provider"),
+        pytest.param(["run-due", "--provider", "mapillary", "--dry"], id="dry-run"),
+        pytest.param(["run-due", "--prov=gsv"], id="provider-equals"),
+    ],
+)
+def test_run_due_refuses_an_abbreviated_option(argv):
+    """
+    The GSV-key guard reads another run-due's --provider and --dry-run from
+    its argv by exact token. argparse would otherwise accept `--prov gsv`, and
+    that live process would read as collecting the default set (or `--dry` as
+    collecting at all) -- so run-due refuses abbreviations outright.
+    """
+    with pytest.raises(SystemExit) as exc:
+        _sched.build_parser().parse_args(argv)
+    assert exc.value.code == 2
+
+
+def test_run_due_still_accepts_its_full_option_spellings():
+    args = _sched.build_parser().parse_args(
+        ["--config", "x.toml", "run-due", "--provider=gsv", "--provider", "mapillary", "--dry-run"]
+    )
+    assert args.providers == ["gsv", "mapillary"] and args.dry_run is True
+
+
+def test_the_nightly_unit_file_is_what_the_guard_identifies():
+    """
+    NIGHTLY_UNIT names a real unit file, that unit's own ExecStart is a run-due
+    the scan matches (a unit whose command line the scan cannot see would let
+    a hand run start beside it unrefused), and the unit sets the environment
+    signal that identifies it as the nightly.
+    """
+    assert _NIGHTLY_UNIT_PATH.is_file()
+    assert _sched._is_run_due_argv(_sched._split_ps_args(_nightly_exec_start()))
+    unit = _NIGHTLY_UNIT_PATH.read_text()
+    assert re.search(rf"^Environment={_sched.NIGHTLY_ENV_VAR}=1$", unit, re.M)
 
 
 def test_the_scan_fails_open_when_ps_is_unavailable(monkeypatch):
@@ -2209,19 +2346,41 @@ def test_the_real_scan_finds_a_real_run_due_shaped_process():
             id="systemd-run-hand-catch-up",
         ),
         pytest.param("0::/user.slice/user-1000.slice/session-7.scope\n", False, id="ssh-shell"),
+        # The OnFailure notify instance carries the nightly's name inside its
+        # own: only a path-component SUFFIX match tells the two apart.
+        pytest.param(
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/"
+            "streetscape-tracker-notify@streetscape-tracker.service.service\n",
+            False,
+            id="the-notify-unit",
+        ),
     ],
 )
 def test_the_nightly_is_identified_by_its_cgroup(monkeypatch, tmp_path, content, expected):
     path = tmp_path / "cgroup"
     path.write_text(content)
     monkeypatch.setattr(_sched, "_PROC_CGROUP", str(path))
+    monkeypatch.delenv(_sched.NIGHTLY_ENV_VAR, raising=False)
     assert _REAL_IS_NIGHTLY() is expected
 
 
 def test_no_proc_is_never_the_nightly(monkeypatch, tmp_path):
     """macOS has no /proc: fail closed to "not nightly", i.e. the hand-run path."""
     monkeypatch.setattr(_sched, "_PROC_CGROUP", str(tmp_path / "missing"))
+    monkeypatch.delenv(_sched.NIGHTLY_ENV_VAR, raising=False)
     assert _REAL_IS_NIGHTLY() is False
+
+
+@pytest.mark.parametrize(("value", "expected"), [("1", True), ("0", False), ("", False)])
+def test_the_nightly_is_identified_by_its_environment_alone(monkeypatch, tmp_path, value, expected):
+    """
+    The second, independent signal: the unit sets STREETSCAPE_NIGHTLY=1, so a
+    cgroup layout nobody verified on prod (here: none at all) cannot by itself
+    refuse the night.
+    """
+    monkeypatch.setattr(_sched, "_PROC_CGROUP", str(tmp_path / "missing"))
+    monkeypatch.setenv(_sched.NIGHTLY_ENV_VAR, value)
+    assert _REAL_IS_NIGHTLY() is expected
 
 
 def test_select_providers_never_hands_back_a_none_sentinel():
