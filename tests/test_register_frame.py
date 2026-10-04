@@ -171,6 +171,24 @@ def test_execute_registers_new_city_disabled(tmp_path, catalog, fake_geocode):
     conn.close()
 
 
+def test_execute_freezes_the_capped_dimensions(tmp_path, catalog, fake_geocode):
+    """
+    register_frame_city freezes resolve_frame_geometry's CAPPED dimensions, the
+    ones scripts/vet_manifest_geometry.py previews — not the boundary's raw
+    ones, which the shared geometry tuple also carries (#406).
+    """
+    fake_geocode["dims"] = (55_000.0, 6000.0)
+    manifest = tmp_path / "frame.csv"
+    write_manifest(manifest, [frame_row()])
+
+    assert rf.main(["--manifest", str(manifest), "--db-path", catalog, "--execute"]) == 0
+
+    conn = db.connect(catalog)
+    row = db.resolve_city(conn, "Testville, Testland")
+    assert (row.grid_width_m, row.grid_height_m) == (40_000, 6000)
+    conn.close()
+
+
 def test_notes_label_identifies_the_manifest_batch(tmp_path, catalog, fake_geocode):
     """
     cities.notes carries the batch label, so a later reader (and the enable
