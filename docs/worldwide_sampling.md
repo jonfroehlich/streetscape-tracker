@@ -256,7 +256,7 @@ python scripts/build_mapillary_discovery_tranche2.py --candidates /tmp/candidate
 
 Each row is the scored place itself, scored at its own GeoNames point (the 2 km disc was measured around the manifest's own lat/lon), so no row is admitted on a neighbour's imagery (the defect #428's review found in a cluster-anchored selection).
 Registration centres the grid on the geocode, not on that point — 0.1 to 5.5 km away in the vetting runs below — so the test also requires the scored point inside each vetted grid and at least three quarters of the scored disc's area with it.
-By area the minimum is 77% (Como; Delavan Lake 79%, Phoenixville 82%, Atwater 99.7%, the other ten 100%), because a narrow grid or an offset centre clips the disc's edge; the imagery-weighted share is higher, but measuring it needs the screen's raw segments, which are not committed.
+By area the minimum is 77% (Como; Delavan Lake 79%, Phoenixville 81%, Atwater 99.7%, the other ten 100%, on the test's 200 x 200 lattice), because a narrow grid or an offset centre clips the disc's edge; the imagery-weighted share is higher, but measuring it needs the screen's raw segments, which are not committed.
 
 **All three GIS_ISG / UAS_ISG towns are in, by operator exception.**
 Laurens, Iowa's uploader and its sibling account have three candidates, and the rule alone drops all three; each exception is pinned by the test with the geometry below, and "operator decision" is its whole provenance.

@@ -74,7 +74,7 @@ SCORE_FLOOR = 3.0
 REUSE_RADIUS_KM = 25.0
 CAP = 30
 SCORE_DISC_KM = 2.0  # the screen scored recent-360° km within 2 km of the point
-MIN_DISC_INSIDE_GRID = 0.75  # measured minimum 0.774 (Como); see the test
+MIN_DISC_INSIDE_GRID = 0.75  # measured minimum 0.771 (Como, n=200 lattice); see the test
 
 # This tranche's joinable set is cities15000 plus exactly these supplement
 # rows (Fergus Falls, Delavan Lake, Como). The supplement is shared, and a
@@ -435,8 +435,8 @@ def test_each_rows_scored_disc_lies_inside_its_vetted_grid(manifest_rows, vetted
 
     Area, not imagery: the imagery-weighted share (92-100%, measured from the
     screen's raw segments) needs data the repo does not hold. By area the
-    measured minimum is 0.774 (Como), with Delavan Lake 0.790 and
-    Phoenixville 0.817 — narrow grids or offset centres — Atwater 0.997, and
+    measured minimum is 0.771 (Como), with Delavan Lake 0.790 and
+    Phoenixville 0.814 — narrow grids or offset centres — Atwater 0.997, and
     1.0 for the other ten.
     """
     for row in manifest_rows:
