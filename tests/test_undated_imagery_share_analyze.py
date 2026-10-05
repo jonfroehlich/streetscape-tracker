@@ -7,13 +7,23 @@ a visibly different answer, and carries one census run with no
 ``total_grid_points`` (cataloged before v20) to pin that NULL is "not measured".
 """
 
+import json
+import os
 from datetime import date
 
 import pytest
 
-from scripts.undated_imagery_share_analyze import measure_catalog, of_queried_kind
+from scripts.undated_imagery_share_analyze import (
+    DOCS_DIR_DEFAULT,
+    TOPIC,
+    docs_generated_by,
+    measure_catalog,
+    of_queried_kind,
+)
 from streetscape_metadata_tracker import db
 from streetscape_metadata_tracker.checkpointing import CENSUS_PROVIDERS
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def _city(conn):
@@ -128,3 +138,41 @@ def test_the_run_behind_each_maximum_is_named(conn):
     }
     assert m["per_run_pct_of_present"]["max"] == m["max_run_pct_of_present"]["pct"]
     assert m["per_run_pct_of_queried"]["max"] == m["max_run_pct_of_queried"]["pct"]
+
+
+# ── The committed record (docs/experiments/undated-imagery-share_metrics.json) ──
+#
+# The JSON was generated on the production catalog, which a test cannot reach,
+# so its numbers are not re-derived here. What CAN be pinned is provenance: the
+# stamp must be one this script's own `docs_generated_by` produces, so a renamed
+# flag or script cannot leave the committed file naming a command that no
+# longer reproduces it (the grid-density and KartaView precedents).
+
+
+def _committed_record():
+    path = os.path.join(PROJECT_ROOT, "docs", "experiments", f"{TOPIC}_metrics.json")
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def test_the_committed_record_names_its_producer():
+    about = _committed_record()["_about"]
+    assert about["experiment"] == TOPIC
+    assert about["writeup"] == f"docs/experiments/{TOPIC}.md"
+    assert about["issue"] == 257
+    # The catalog label is the one thing separating this result from the
+    # dev-catalog run that concluded the opposite, so it is pinned literally.
+    assert about["catalog_label"] == "makelab2-prod"
+    assert about["generated_by"] == docs_generated_by(DOCS_DIR_DEFAULT, "makelab2-prod")
+    assert about["generated_by"] == (
+        "python scripts/undated_imagery_share_analyze.py "
+        "--docs-dir docs/experiments --catalog-label makelab2-prod"
+    )
+
+
+def test_the_writeup_replicates_with_the_committed_stamp():
+    stamp = _committed_record()["_about"]["generated_by"]
+    with open(
+        os.path.join(PROJECT_ROOT, "docs", "experiments", f"{TOPIC}.md"), encoding="utf-8"
+    ) as fh:
+        assert stamp in fh.read()

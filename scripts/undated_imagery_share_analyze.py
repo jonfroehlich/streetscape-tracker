@@ -20,9 +20,10 @@ them would be meaningless:
 
   catalog   Our own dated grid snapshots, per (provider, run), from the
             ``runs`` table's ``status_ok``/``status_no_date`` counters. This is
-            a census of what WE collected — 1,000+ GSV runs — but we hold no
-            KartaView runs: ``kartaview`` became a scheduler channel in #248,
-            but an opt-in one, so it collects only enrolled cities.
+            a census of what WE collected — 1,000+ GSV runs — and a thin one
+            for KartaView: ``kartaview`` became a scheduler channel in #248,
+            but an opt-in one, so it collects only enrolled cities, and few
+            of those runs hold any imagery.
   audit     ``kartaview-shotdate-audit_metrics.json``, already committed beside
             ``kartaview-feasibility.md``: 48 sequences sampled from KartaView's
             API and tested against the ``shot_date >= date_added`` invariant.
@@ -50,7 +51,8 @@ of_queried's denominator is the GRID size, ``runs.total_grid_points`` (issue
 ROW counts, and a census provider writes one row per IMAGE plus one per empty
 point, so ``no_date / total_points`` divided images by a mixture of images and
 points. That is what the first version of this script did, and it is why the
-committed Mapillary ``pct_of_queried`` figures are wrong by construction.
+Mapillary ``pct_of_queried`` figures it committed (preserved at ``d974fd4``)
+were wrong by construction; the committed file now carries the regeneration.
 
 The denominator is fixed; the NUMERATOR is still the catalog's ``status_no_date``
 and so still counts rows. For an ordinary gsv run a row is a point, so
@@ -109,14 +111,16 @@ KARTAVIEW_AUDIT = "kartaview-shotdate-audit_metrics.json"
 def docs_generated_by(docs_dir: str, label: str) -> str:
     """The exact command that reproduces the committed metrics file.
 
-    A constant rather than a literal in the JSON, so a test can assert the
+    A function rather than a literal in the JSON, so
+    ``tests/test_undated_imagery_share_analyze.py`` can assert the committed
     stamp names a run the repo can actually make (the grid-density precedent).
 
     `--catalog-label` is part of it because WHICH catalog was read is the
     single biggest determinant of these numbers and cannot be recovered from
     them afterwards: a dev laptop holds a handful of Mapillary runs against
-    production's 1,200, which is the difference between "Mapillary never emits
-    NO_DATE" and "Mapillary emits 17x GSV's rate". A label rather than a path,
+    production's 1,200 at the first pass, which is the difference between
+    "Mapillary never emits NO_DATE" and "Mapillary emits 12-17x GSV's rate"
+    (17x at the first production pass, 12x at the regeneration). A label rather than a path,
     so no machine's directory layout lands in a committed file.
     """
     return (

@@ -293,7 +293,9 @@ It is still not sufficient for the public server: the publish rsync never passes
 Note also that the artifact cannot repair itself — its per-edge aggregates were already computed under the old definition, so the dropped `NO_DATE` samples are simply not in it, which rules out the cheap artifact-reading design `backfill_streetwalk_coverage.py` and `backfill_streetwalk_length.py` both use.
 Until `recompute_streetwalk_stats.py --execute` runs on production, the affected deltas are the FIRST walk diff of each series after 2026-08-24.
 Most will be exactly 0.0 — only 149 of 2,429 GSV runs and 19 of 1,959 Mapillary runs hold any undated imagery at all — but the tail can render.
-These are **upper bounds** on the shift, never the shift: undated images over grid points, where several images can share a point that may also hold a dated one (see the writeup's correction).
+These are **upper bounds** on the shift, never the shift, for a different reason per provider (see the writeup's correction).
+For Mapillary the figure is undated images over grid points, where several images can share a point that may also hold a dated one.
+A GSV row is one point, so GSV's bound comes only from the 13 of its 2,429 runs that hold more rows than grid points, where a repeated undated row counts twice.
 Production's worst GSV run (East Hollywood, 2026-08-09) bounds at **0.32** percentage points and its worst Mapillary run (Commerce City, Colorado, 2026-07-31) at **3.00**, both above the 0.05 that rounds away, so a visible delta is possible there and not established.
 The 2.7-point Mapillary figure that stood here divided undated images by a ROW count and is withdrawn ([#289](https://github.com/jonfroehlich/streetscape-tracker/issues/289)); the 3.00 replaces it, measured after the `runs.total_grid_points` backfill on production.
 

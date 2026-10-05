@@ -11,8 +11,11 @@ whether that is invisible noise or the largest change a city's series has ever r
 
 **Answer, and it is not the one the pooled averages suggest.**
 Undated imagery does not arrive as diffuse noise that a mean can describe.
-It arrives in **batches**, and we now have three independent instances of that shape: KartaView's single 2025-11-19 Grab ingest, Mapillary's Denver-metro uploads, and GSV's handful of big-baseline metros.
-So the number that matters for any decision is the **per-run maximum**, not the pooled share — they differ by three orders of magnitude within a single provider.
+It arrives in **batches**, and that shape now shows up in every provider with more than one undated run:
+KartaView's single 2025-11-19 Grab ingest in the API audit, and two catalog runs holding all of KartaView's undated photos;
+Mapillary's Denver-metro uploads, plus a second, unrelated Jefferson City batch;
+and GSV's handful of big metros.
+So the number that matters for any decision is the **per-run maximum**, not the pooled share — they differ by up to two orders of magnitude within a single provider (from the file's unrounded figures, Mapillary's worst run is over 200× its pooled share, GSV's about 38×, KartaView's catalog about 4.5×).
 
 Numbers below come from [`undated-imagery-share_metrics.json`](undated-imagery-share_metrics.json), written by `scripts/undated_imagery_share_analyze.py` against the **makelab2 production catalog** (`catalog_label: makelab2-prod`).
 Read entirely out of the catalog and an already-committed metrics file: no network, no credentials, no collection.
@@ -32,7 +35,9 @@ Read entirely out of the catalog and an already-committed metrics file: no netwo
 >
 > **Every *of queried* figure is an upper bound on the phantom shift, not the shift itself** (`of_queried_kind: upper_bound` for all four providers).
 > For a census provider the numerator counts undated *images*, several of which can share a point, at points that may also hold a dated image; the exact census shift needs the per-point join, which only the CSV holds.
-> GSV is an upper bound too, for a narrower reason: 13 of its 2,429 production runs hold more rows than grid points (`runs_with_more_rows_than_grid_points`, legacy runs that repeated a point), and in such a run an undated row counted twice still counts twice in the numerator.
+> GSV is an upper bound too, for a narrower reason: 13 of its 2,429 production runs hold more rows than grid points (`runs_with_more_rows_than_grid_points`), and in such a run an undated row counted twice still counts twice in the numerator.
+> That they are legacy runs that repeated a point is an inference: the file records only the count.
+> Whether any of the 13 carries a `NO_DATE` row is not measured either, so GSV's *of queried* figure may in fact be exact; it is labelled a bound because nothing here can show it is not one.
 > So an *of queried* figure settles visibility in one direction only: a bound under 0.05 pp means invisible, and a bound above it settles nothing.
 
 ## Read the production catalog, not a dev one — the answer inverts
@@ -58,7 +63,7 @@ A per-provider question cannot be answered from a catalog that is only well-popu
 "Runs with any" is out of the runs holding any present imagery (`per_run_pct_of_present.n`), since a run with none has no share to take.
 The catalog rows are a census of what we collected; the audit row is a sample of what the provider serves, lifted from [`kartaview-shotdate-audit_metrics.json`](kartaview-shotdate-audit_metrics.json) rather than re-probed, since that number already has a writeup and caveats of its own ([`kartaview-feasibility.md`](kartaview-feasibility.md)).
 They are not a controlled comparison.
-KartaView's catalog row is new since the first pass, and it is thin: the channel is opt-in (#248), and only **6** of its 527 runs hold any imagery at all, so it is two cities rather than a rate.
+KartaView's catalog row is new since the first pass, and it is thin: the channel is opt-in (#248), and only **6** of its 527 runs hold any imagery at all, of which 2 hold undated imagery, so its undated population is two runs rather than a rate.
 Its 7.24% sits beside the audit's 9.56%, which its own writeup calls Grab-heavy and a lower bound; the two frames agree in order and are still not pooled.
 
 **And all three are proxies for the quantity actually at issue, which is the ROAD-WALK undated share.**
@@ -114,7 +119,9 @@ For the overwhelming majority of runs the Δ column will read exactly 0.0, and n
 The tail is where the bound stops settling anything.
 A GSV city can shift at most a third of a point, which is still visible at one decimal.
 A Mapillary city can shift **at most 3.00 points** — the claim that stood here was *"a Denver-metro Mapillary walk can shift 2.7 points"*, which rested on the withdrawn row-count figure and named a run the file did not record; the corrected bound belongs to Commerce City, and it is a ceiling rather than the shift.
-Because every bound in the tail is above 0.05 pp, the measurement says a visible shift is *possible* for those few runs, not that it happens; the exact census shift needs the per-point join.
+GSV's, Mapillary's and KartaView's worst bounds (0.320, 3.00 and 0.97 pp) are above 0.05 pp, so for those providers' worst runs the measurement says a visible shift is *possible*, not that it happens; the exact census shift needs the per-point join.
+The file does not count how many runs bound above 0.05 pp, only the percentiles, and GSV's p95 (0.0010 pp) is well under it.
+Panoramax's worst bound, ≤ 0.0005 pp, is under 0.05, which settles every Panoramax run as invisible.
 That is the case the dated note in [`../street-coverage.md`](../street-coverage.md) exists for.
 
 An earlier review of the fix put GSV's maximum at 0.095% and concluded the delta was invisible everywhere; production says up to 0.320 pp for GSV (0.329 at the first pass), so the weaker claim is the true one — invisible in the overwhelming majority of runs, not in all of them.
@@ -131,7 +138,7 @@ A KartaView city could refresh substantially and have its published median age m
 The batch shape found here for Mapillary suggests the same hazard applies wherever a batch lands, since a single upload is a single point in time by construction — whether it biases old or young depends on when that batch was captured, which is precisely what an undated batch does not tell you.
 
 This is why `dated_pct_of_covered` had to go into the artifact rather than being left inferable: an age over 100% of an edge's coverage and an age over 3% of it are different measurements, and before #257 nothing recorded which one you were reading.
-For most runs of either provider the field will read 100.0, which is the point — the number is only interesting where it is not.
+For most runs of every provider the field will read 100.0, which is the point — the number is only interesting where it is not.
 
 ## Replicating
 

@@ -153,7 +153,7 @@ Three things generalize.
 **(3) A per-provider question cannot be answered from a catalog that is well-populated for only one provider** — and this one nearly shipped wrong because of it.
 The first pass ran against a dev laptop holding 1,144 GSV cities but **three** Mapillary runs, and concluded Mapillary emits no undated imagery at all; production's 1,201 runs said 0.150%, about 17× GSV's rate (1,959 runs and 0.109%, about 12×, at the 2026-10 regeneration).
 Hence `--catalog-label`, recorded in the metrics file: it is the only thing separating that result from its opposite.
-The catalog half is a census and the KartaView half is an API sample read from `kartaview-shotdate-audit_metrics.json`; the two frames are reported side by side and never pooled.
+KartaView appears in both frames — the catalog (a census of our runs, 6 of them holding imagery) and an API sample read from `kartaview-shotdate-audit_metrics.json` — and the two are reported side by side and never pooled.
 Both are proxies for the road-walk share, which no walk recorded until #257 added `dated_covered_samples`.
 
 The generating code is `scripts/{topic}_{collect,analyze,common}.py` (kept so the result can be reproduced, not because it runs routinely) and its test pins the sampling invariant.
