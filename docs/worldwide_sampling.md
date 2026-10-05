@@ -173,8 +173,12 @@ scheduler host (makelab2), after the merged code is deployed there.
 2. **Vet boundaries before collecting.** International OSM boundary quality
    varies, so run the boundary-audit workflow on the newly registered cities
    before enabling them: `scripts/audit_city_boundaries.py` →
-   `scripts/build_boundary_review.py` → human review →
-   `scripts/apply_decisions.py`. Swap rejects from `worldwide_candidates.csv`.
+   `scripts/reregister_boundaries.py` (dry run) → `scripts/build_boundary_review.py`
+   → human review → `scripts/apply_decisions.py`. The dry run of
+   `reregister_boundaries.py` is not optional: it writes the
+   `reregister_plan.csv` and `manual_review.csv` that `build_boundary_review.py`
+   renders, and without them the review page is empty, so the gate passes
+   having checked nothing. Swap rejects from `worldwide_candidates.csv`.
 3. **Enable in the scheduler.** `scheduler enable-city CITY` for each vetted
    city (issue #374), which also enrols it on the opt-in channels behind their
    gates (`docs/operations.md`). Default-membership channels stay global (GSV
@@ -225,6 +229,12 @@ It geocodes through Nominatim only (the library's 1.1 s limiter), opens no catal
 **Selection.**
 The rows are the new clusters of [`experiments/panoramax-world-screen_clusters.csv`](experiments/panoramax-world-screen_clusters.csv) (not within 25 km of the screen's 2026-10-01 catalog snapshot) whose 360° upper bound is at least 100,000, or 10,000 in the US and Canada, plus Kilkenny (73,765) by name for its city-completion camera grant.
 A row is the cluster's NAME point — its most populous GeoNames place — so Strasbourg is the row even though its bound was summed around the Lingolsheim anchor.
+Every row's OWN 10 km bound (its name point's, from [`experiments/panoramax-world-screen_places.csv`](experiments/panoramax-world-screen_places.csv)) also clears its floor, with one named exception the test pins, so a future row cannot be admitted on an off-centre anchor's imagery without a decision:
+
+- Kortrijk — its own bound is 2,725, 2.7% of the floor.
+  The cluster's 109,576 was summed around the anchor Wevelgem, about 7.6 km west-south-west and outside Kortrijk's 11,159 m-wide grid, so most of that imagery lies outside what Kortrijk will collect.
+  It is kept as an operator decision, because #406's table names it; expect its Panoramax series to measure close to empty while it costs 445,842 GSV points per cycle.
+
 The rows are ordered by descending bound, so `register_frame.py --limit N` registers the richest N first.
 Excluded, each with its reason in `tests/test_panoramax_360_cities_manifest.py`:
 
@@ -233,12 +243,13 @@ Excluded, each with its reason in `tests/test_panoramax_360_cities_manifest.py`:
 - Vienne — 24.9 km from Lyon, and its bound was summed around Givors, between the two.
 - Waterloo, Iowa — 9 km from Cedar Falls, enabled on production on 2026-10-02, after the screen's snapshot.
 
-The test also checks every row against the cities registered since the snapshot (the 25 towns of `mapillary_discovery_cities.csv` on PR #419's branch, and Montréal) and against the two committed manifests; nothing else is within 25 km.
+The test also checks every row against the cities registered since the snapshot (the 25 towns of `mapillary_discovery_cities.csv` on PR #419's branch, and Montréal) and against the two committed manifests (Ottawa, enabled since, is a `mapillary_360_cities.csv` row); nothing else is within 25 km.
 
 **Identity.**
 The slugs follow the GeoNames rule unchanged, which has two visible consequences.
-French admin-1 names are GeoNames' PRE-2016 regions (`lyon--rhone-alpes--france`, `besancon--bourgogne--france`), not today's Auvergne-Rhône-Alpes or Bourgogne-Franche-Comté.
-Marseille's slug carries an apostrophe, `marseille--provence-alpes-cote-d'azur--france`, as `Ust'-Ilimsk`'s already does; the scheduler's printed commands `shlex`-quote such an id.
+French admin-1 names are GeoNames' post-2016 regions, two of them under GeoNames' truncated names: `FR.84 Rhone-Alpes` is Auvergne-Rhône-Alpes and `FR.27 Bourgogne` is Bourgogne-Franche-Comté.
+So `besancon--bourgogne--france` and `lons-le-saunier--bourgogne--france` carry a region name neither city was in (both are in Franche-Comté), and the public label will read "Besancon, Bourgogne, France"; the identity rule is accepted as is rather than adding an admin-name override, a kind the repo does not have.
+Marseille's slug carries an apostrophe, `marseille--provence-alpes-cote-d'azur--france`, as the registered `coeur-d'alene--idaho--united-states` and `rancagua--o'higgins-region--chile` already do; the scheduler's printed commands `shlex`-quote such an id.
 
 **Vetting (2026-10-04, from a laptop, 49 Nominatim requests in two runs).**
 The first run covered all 40 rows as first written; the second re-ran the four calls on the two query overrides it led to (and on two rejected alternatives).

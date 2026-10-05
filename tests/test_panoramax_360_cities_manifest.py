@@ -42,6 +42,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = REPO_ROOT / "panoramax_360_cities.csv"
 DATA_SOURCES = REPO_ROOT / "data_sources"
 CLUSTERS = REPO_ROOT / "docs" / "experiments" / "panoramax-world-screen_clusters.csv"
+PLACES = REPO_ROOT / "docs" / "experiments" / "panoramax-world-screen_places.csv"
 OTHER_MANIFESTS = [REPO_ROOT / "mapillary_360_cities.csv", REPO_ROOT / "worldwide_frame.csv"]
 
 # The selection rule (#406): a NEW cluster whose 360° upper bound clears this
@@ -51,6 +52,20 @@ BOUND_FLOOR_US_CA = 10_000
 # Below the floor, admitted by name: #406's table lists it for an EU camera
 # grant aimed at completing the city on foot.
 NAMED_EXCEPTIONS = {"2963398": "Kilkenny"}
+
+# The rule reads a CLUSTER's bound, summed around its anchor, but a row
+# registers the cluster's NAME point. Where the anchor is far off, the name
+# point's OWN 10 km bound can sit far below the floor, and the grid frozen
+# there holds little of the imagery that admitted the cluster. Every row's own
+# bound must clear its floor, or be listed here with what it actually is, so a
+# future row cannot be admitted that way without someone deciding it.
+# Values are (place name, own 10 km bound, anchor name, anchor's cluster bound).
+OWN_BOUND_EXCEPTIONS = {
+    # Kept by operator decision (#406's table names it). Its own bound is 2.7%
+    # of the floor; the 109,576 was summed around Wevelgem, about 7 km WSW and
+    # outside Kortrijk's ~11 km-wide grid. Expect a near-empty Panoramax series.
+    "2794055": ("Kortrijk", 2_725, "Wevelgem", 109_576),
+}
 
 # Clusters the rule admits that are NOT in the manifest, keyed by the screen's
 # cluster name, each with the reason. A new screen record that admits a cluster
@@ -137,8 +152,12 @@ QUERY_OVERRIDES = {
 }
 
 # Permanent slugs, frozen at registration. Order matches the manifest. The
-# admin component is GeoNames' admin-1 ASCII name, which for France is the
-# pre-2016 region (Rhone-Alpes, Bourgogne) — the identity rule, kept as is.
+# admin component is GeoNames' admin-1 ASCII name, kept as is (the identity
+# rule). For France those are the post-2016 regions, two under GeoNames'
+# truncated names: FR.84 "Rhone-Alpes" is Auvergne-Rhone-Alpes and FR.27
+# "Bourgogne" is Bourgogne-Franche-Comte. So Besancon and Lons-le-Saunier,
+# both in Franche-Comte, carry "bourgogne", and the public label reads
+# "Besancon, Bourgogne, France".
 EXPECTED_CITY_IDS = {
     "2973783": "strasbourg--grand-est--france",
     "2996944": "lyon--rhone-alpes--france",
@@ -210,6 +229,12 @@ def manifest_rows():
 @pytest.fixture(scope="module")
 def clusters():
     with open(CLUSTERS, encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+@pytest.fixture(scope="module")
+def places():
+    with open(PLACES, encoding="utf-8") as f:
         return list(csv.DictReader(f))
 
 
@@ -323,6 +348,47 @@ def test_every_row_is_an_admitted_new_cluster_of_the_screen(manifest_rows, clust
             assert not _admitted(cluster)  # else the exception is stale
         else:
             assert _admitted(cluster), row["geonameid"]
+
+
+def _place_of(row, places):
+    """The screen's per-place record at this row's GeoNames point."""
+    lat, lon = float(row["lat"]), float(row["lon"])
+    matches = [
+        p
+        for p in places
+        if p["cc"] == row["iso2"]
+        and abs(float(p["lat"]) - lat) < 1e-4
+        and abs(float(p["lon"]) - lon) < 1e-4
+    ]
+    assert len(matches) == 1, (row["geonameid"], [m["name"] for m in matches])
+    return matches[0]
+
+
+def test_every_row_clears_the_floor_on_its_own_bound(manifest_rows, places):
+    """
+    A row's own name-point bound clears its floor, or it is a named exception:
+    the cluster bound alone admitted Kortrijk on imagery summed around
+    Wevelgem, outside Kortrijk's grid.
+    """
+    for row in manifest_rows:
+        gid = row["geonameid"]
+        if gid in NAMED_EXCEPTIONS:
+            continue  # admitted by name below the floor on every reading
+        place = _place_of(row, places)
+        own = int(place["ub_360_10km"])
+        floor = BOUND_FLOOR_US_CA if row["iso2"] in ("US", "CA") else BOUND_FLOOR
+        if gid not in OWN_BOUND_EXCEPTIONS:
+            assert own >= floor, (row["city"], own, floor)
+            continue
+        name, own_bound, anchor_name, anchor_bound = OWN_BOUND_EXCEPTIONS[gid]
+        assert own < floor, row["city"]  # else the exception is stale
+        assert (row["city"], own) == (name, own_bound)
+        anchor = [
+            p
+            for p in places
+            if p["cluster_rank"] == place["cluster_rank"] and p["is_anchor"] == "yes"
+        ]
+        assert [(a["name"], int(a["ub_360_10km"])) for a in anchor] == [(anchor_name, anchor_bound)]
 
 
 def test_selection_is_complete(manifest_rows, clusters):

@@ -367,8 +367,8 @@ The selection, the vetting table and every query override are in [`worldwide_sam
 Every path below is production's `[paths]` from `config/scheduler.makelab1.toml`; run from the production checkout.
 
 **1. Deploy `main` first.**
-On 2026-10-04 production runs `f1885f5`, 53 commits behind `main`, with the catalog at schema v17 against `main`'s v19.
-Those commits carry PR #411's fill, PR #408's Panoramax stage-1 raise (60/min, 8,000/day per channel — the budget the pricing below assumes) and the manifest itself; `enable-city` (#374) is already on production.
+When this runbook was written (2026-10-04, branching from `9da8911`) production ran `f1885f5`, 53 commits behind that `main`, with the catalog at schema v17 against v19; `main` has moved since, so compare the production checkout's `git log -1` with `origin/main` on the day rather than trusting either count.
+The commits it needs carry PR #411's fill, PR #408's Panoramax stage-1 raise (60/min, 8,000/day per channel — the budget the pricing below assumes) and the manifest itself; `enable-city` (#374) is already on production.
 Deploy per `deploy/README.md` and let the catalog migrate on connect before registering anything, so the new rows are written by the code that will collect them.
 
 **2. Register, disabled, then audit the boundaries.**
@@ -377,25 +377,42 @@ Deploy per `deploy/README.md` and let the catalog migrate on connect before regi
 python scripts/register_frame.py --manifest panoramax_360_cities.csv \
     --db-path /projects/makeabilitylab/streetscape-tracker/data/streetscape_tracker.db \
     --notes-label "panoramax 360 programmes" --overlap-km 5 --max-center-km 10
-# read the dry run: expect NEW=40, reused-existing=0, already-registered=0; then the same with --execute
+# read the dry run: expect newly-registered=40 (each row marked -> NEW), reused-existing=0, already-registered=0; then the same with --execute
 ```
 
-- `--overlap-km 5`, not the default 25, because the default silently ALIASES a genuine neighbour onto an existing city instead of registering it (PR #298's lesson: Johns Creek and Sandusky were 16–17 km from cities already registered). The manifest's own test already holds every row more than 25 km from every other row and every city registered since the screen, so a nonzero `reused-existing` in the dry run means the catalog holds a city this record does not know about; stop and find it.
-- `--max-center-km 10` because the vetting split cleanly there: every row's geocode landed within 7.5 km of its GeoNames point. `--center-from-geonames` is deliberately NOT passed — a row that geocodes differently on the day should be skipped and listed for review, not quietly recentered.
+- `--overlap-km 5`, not the default 25, because the default silently ALIASES a genuine neighbour onto an existing city instead of registering it (PR #298's lesson: Johns Creek and Sandusky were 16–17 km from cities already registered).
+  The manifest's own test already holds every row more than 25 km from every other row and every city registered since the screen, so a nonzero `reused-existing` in the dry run means the catalog holds a city this record does not know about; stop and find it.
+- `--max-center-km 10` because the vetting split cleanly there: every row's geocode landed within 7.5 km of its GeoNames point.
+  `--center-from-geonames` is deliberately NOT passed — a row that geocodes differently on the day should be skipped and listed for review, not quietly recentered.
 - `--notes-label` is what makes the batch selectable later: without it all 40 claim to be worldwide-frame cities in `cities.notes`.
 - Each `--execute` line prints the frozen W x H; compare it with the vetting table and stop on any difference — Nominatim can answer differently than it did on 2026-10-04.
 
 Cities register with `enabled = 0`, so nothing is collected yet.
-Then run the boundary-audit chain (`audit_city_boundaries.py` → `build_boundary_review.py` → human review → `apply_decisions.py`, `docs/worldwide_sampling.md` step 2) over this batch only, in its own audit directory so the catalog-wide report is not overwritten:
+Then run the boundary-audit chain (`audit_city_boundaries.py` → `reregister_boundaries.py` dry run → `build_boundary_review.py` → human review → `apply_decisions.py`, `docs/worldwide_sampling.md` step 2) over this batch only, in its own audit directory so the catalog-wide report is not overwritten.
+The batch is selected by its notes label, so no id can be dropped by hand:
 
 ```bash
 DATA=/projects/makeabilitylab/streetscape-tracker/data
+CITY_ARGS=()
+while read -r id; do CITY_ARGS+=(--city "$id"); done < <(python -c '
+import sqlite3, sys
+conn = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+for (cid,) in conn.execute("SELECT city_id FROM cities WHERE notes LIKE ? ORDER BY city_id", ("panoramax 360 programmes (geonameid %",)):
+    print(cid)
+' "$DATA/streetscape_tracker.db")
+echo "${#CITY_ARGS[@]}"   # expect 80: 40 ids, two words each
 python scripts/audit_city_boundaries.py --data-dir "$DATA" \
     --cache audit/pmx406/nominatim_boundary_cache.jsonl --report audit/pmx406/boundary_audit_report.csv \
-    --city strasbourg--grand-est--france --city lyon--rhone-alpes--france ...   # all 40 ids, pinned in tests/test_panoramax_360_cities_manifest.py
+    "${CITY_ARGS[@]}"
+python scripts/reregister_boundaries.py --data-dir "$DATA" \
+    --report audit/pmx406/boundary_audit_report.csv --out-dir audit/pmx406   # DRY RUN only: writes the plan CSVs below
 python scripts/build_boundary_review.py --data-dir "$DATA" --audit-dir audit/pmx406
 python scripts/apply_decisions.py --data-dir "$DATA" --decisions <the exported boundary_decisions.csv>   # dry run, then --execute
 ```
+
+`build_boundary_review.py` renders only the cities in `reregister_plan.csv` and `manual_review.csv`, which the `reregister_boundaries.py` dry run writes; without that step the page is empty and the gate passes having checked nothing.
+Never pass `--execute` to `reregister_boundaries.py` here — the human decision is applied by `apply_decisions.py`.
+A city with an `OK` verdict appears on neither list, so an empty page is a pass only when the report's `verdict` column says every city is `OK`.
 
 The audit geocodes one structured query per city through Nominatim (about 40 requests), never a provider.
 
@@ -409,7 +426,14 @@ python -m streetscape_metadata_tracker.scheduler enable-city lons-le-saunier--bo
     --config config/scheduler.makelab1.toml --dry-run
 ```
 
-Then freeze the tranche's OSM networks during the day, so the gsv_streets walks never contact Overpass at night (#341): `python scripts/prefreeze_street_networks.py --config config/scheduler.makelab1.toml --nights 1`.
+Then freeze the tranche's OSM networks during the day, so the gsv_streets walks never contact Overpass at night (#341).
+The script is a dry run unless given `--execute`, so read the listing first and then freeze:
+
+```bash
+python scripts/prefreeze_street_networks.py --config config/scheduler.makelab1.toml --nights 1             # lists only
+python scripts/prefreeze_street_networks.py --config config/scheduler.makelab1.toml --nights 1 --execute   # freezes
+```
+
 Before the next tranche, read the night's log: every tranche city collected (or paused at a cap, exit 83, which resumes), no Mapillary block (exit 75), no Panoramax 403/429 (a refusal reverts #405's stage), no Overpass latch.
 
 **4. Pricing and the enable order.**

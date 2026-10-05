@@ -218,3 +218,43 @@ def test_a_bad_candidates_file_is_a_usage_error(tmp_path, body):
     path = tmp_path / "c.csv"
     path.write_text(body, encoding="utf-8")
     assert probe.main([str(path)]) == probe.USAGE_EXIT
+
+
+@pytest.mark.parametrize("explicit_log", [True, False])
+def test_main_passes_every_flag_through_to_the_run(tmp_path, monkeypatch, explicit_log):
+    """
+    ``--min-interval``, ``--limit``, ``--out`` and ``--request-log`` must reach
+    ``run`` and the Pacer as given: the other tests drive ``run`` directly, so a
+    ``main`` that dropped one for its default would pass them all.
+    """
+    from streetscape_metadata_tracker import config as cfg
+
+    path = tmp_path / "c.csv"
+    path.write_text("name,lat,lon\nAlpha,48.0,2.0\n", encoding="utf-8")
+    out = tmp_path / "o.csv"
+    log = tmp_path / "custom.jsonl"
+    monkeypatch.setattr(socket, "gethostname", lambda: "laptop")
+    monkeypatch.setattr("dotenv.load_dotenv", lambda *a, **k: None)
+    monkeypatch.setattr(cfg, "warn_if_credentials_world_readable", lambda *a, **k: None)
+    monkeypatch.setattr(cfg, "load_config", lambda channel: {"access_token": "TOKEN"})
+    sentinel = object()
+    monkeypatch.setattr(probe, "make_requests_fetch", lambda token: (sentinel, token))
+    seen = {}
+
+    def fake_run(candidates, **kw):
+        seen.update(kw, candidates=candidates)
+        return probe.EXIT_OK
+
+    monkeypatch.setattr(probe, "run", fake_run)
+    argv = [str(path), "--execute", "--out", str(out), "--min-interval", "7.5", "--limit", "50"]
+    if explicit_log:
+        argv += ["--request-log", str(log)]
+
+    assert probe.main(argv) == probe.EXIT_OK
+    assert seen["fetch"] == (sentinel, "TOKEN")
+    assert isinstance(seen["pacer"], mua.Pacer)
+    assert seen["pacer"].min_interval_s == 7.5
+    assert seen["limit"] == 50
+    assert seen["out_path"] == str(out)
+    assert seen["log_path"] == (str(log) if explicit_log else f"{out}.requests.jsonl")
+    assert [c["name"] for c in seen["candidates"]] == ["Alpha"]
