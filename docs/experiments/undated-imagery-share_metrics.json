@@ -5,81 +5,156 @@
     "generated_by": "python scripts/undated_imagery_share_analyze.py --docs-dir docs/experiments --catalog-label makelab2-prod",
     "issue": 257,
     "catalog_label": "makelab2-prod",
-    "generated_at": "2026-08-25T12:15:38+00:00",
+    "generated_at": "2026-10-04T18:58:58+00:00",
     "note": "Share of present imagery carrying no usable capture date, per provider. `catalog` is a census of our own GRID runs; `kartaview_audit` is a sample of KartaView's API, read from its own committed metrics file. The two are different sampling frames and are never pooled. Both are proxies for the ROAD-WALK undated share, which no walk recorded until #257 added dated_covered_samples. No data_dir is recorded: an absolute path would put one machine's layout into a committed file -- `catalog_label` names which catalog was read instead, since a dev catalog and production give materially different answers for the same provider."
   },
   "catalog": {
     "gsv": {
-      "runs": 1766,
-      "panos_present": 242499345,
-      "panos_no_date": 20968,
-      "points_queried": 996053847,
-      "runs_with_any_no_date": 119,
-      "pooled_pct_of_present": 0.008647,
-      "pooled_pct_of_queried": 0.002105,
+      "runs": 2429,
+      "panos_present": 309923570,
+      "panos_no_date": 28426,
+      "points_queried": 1269967772,
+      "runs_without_grid_points": 0,
+      "runs_with_more_rows_than_grid_points": 13,
+      "of_queried_kind": "upper_bound",
+      "runs_with_any_no_date": 149,
+      "pooled_pct_of_present": 0.009172,
+      "pooled_pct_of_queried": 0.002238,
       "per_run_pct_of_present": {
-        "n": 1749,
+        "n": 2405,
         "min": 0.0,
         "p25": 0.0,
         "p50": 0.0,
         "p75": 0.0,
         "p90": 0.0,
-        "p95": 0.00455,
-        "max": 0.335802
+        "p95": 0.002538,
+        "max": 0.344787
       },
       "per_run_pct_of_queried": {
-        "n": 1766,
+        "n": 2429,
         "min": 0.0,
         "p25": 0.0,
         "p50": 0.0,
         "p75": 0.0,
         "p90": 0.0,
-        "p95": 0.002849,
-        "max": 0.329362
+        "p95": 0.001019,
+        "max": 0.319675
+      },
+      "max_run_pct_of_present": {
+        "city_id": "del-mar--california--united-states",
+        "run_date": "2025-01-22",
+        "pct": 0.344787
+      },
+      "max_run_pct_of_queried": {
+        "city_id": "east-hollywood--california--united-states",
+        "run_date": "2026-08-09",
+        "pct": 0.319675
       },
       "top_no_date_runs": [
         {
           "city_id": "los-angeles--california--united-states",
           "run_date": "2025-01-03",
-          "no_date": 2670
+          "no_date": 2448
+        },
+        {
+          "city_id": "los-angeles--california--united-states",
+          "run_date": "2026-08-28",
+          "no_date": 1724
         },
         {
           "city_id": "new-york--new-york--united-states",
           "run_date": "2025-02-02",
-          "no_date": 1359
+          "no_date": 1280
+        },
+        {
+          "city_id": "new-york--new-york--united-states",
+          "run_date": "2026-09-04",
+          "no_date": 1223
         },
         {
           "city_id": "phoenix--arizona--united-states",
           "run_date": "2025-01-11",
-          "no_date": 1282
-        },
-        {
-          "city_id": "san-jose--california--united-states",
-          "run_date": "2025-01-14",
-          "no_date": 893
-        },
-        {
-          "city_id": "chicago--illinois--united-states",
-          "run_date": "2026-07-30",
-          "no_date": 864
+          "no_date": 1098
         }
       ],
       "largest_run_by_present_panos": {
         "city_id": "houston--texas--united-states",
         "run_date": "2025-02-06",
-        "panos_present": 6838813
+        "panos_present": 6160598
+      }
+    },
+    "kartaview": {
+      "runs": 527,
+      "panos_present": 89548,
+      "panos_no_date": 6480,
+      "points_queried": 10591143,
+      "runs_without_grid_points": 0,
+      "runs_with_more_rows_than_grid_points": 6,
+      "of_queried_kind": "upper_bound",
+      "runs_with_any_no_date": 2,
+      "pooled_pct_of_present": 7.236343,
+      "pooled_pct_of_queried": 0.061183,
+      "per_run_pct_of_present": {
+        "n": 6,
+        "min": 0.0,
+        "p25": 0.0,
+        "p50": 0.0,
+        "p75": 1.970358,
+        "p90": 1.970358,
+        "p95": 32.229646,
+        "max": 32.229646
+      },
+      "per_run_pct_of_queried": {
+        "n": 527,
+        "min": 0.0,
+        "p25": 0.0,
+        "p50": 0.0,
+        "p75": 0.0,
+        "p90": 0.0,
+        "p95": 0.0,
+        "max": 0.966488
+      },
+      "max_run_pct_of_present": {
+        "city_id": "yogyakarta--special-region-of-yogyakarta--indonesia",
+        "run_date": "2026-08-28",
+        "pct": 32.229646
+      },
+      "max_run_pct_of_queried": {
+        "city_id": "yogyakarta--special-region-of-yogyakarta--indonesia",
+        "run_date": "2026-08-28",
+        "pct": 0.966488
+      },
+      "top_no_date_runs": [
+        {
+          "city_id": "yogyakarta--special-region-of-yogyakarta--indonesia",
+          "run_date": "2026-08-28",
+          "no_date": 5451
+        },
+        {
+          "city_id": "krabi-town-municipality--mueang-krabi-district--thailand",
+          "run_date": "2026-08-28",
+          "no_date": 1029
+        }
+      ],
+      "largest_run_by_present_panos": {
+        "city_id": "krabi-town-municipality--mueang-krabi-district--thailand",
+        "run_date": "2026-08-28",
+        "panos_present": 52224
       }
     },
     "mapillary": {
-      "runs": 1201,
-      "panos_present": 68280653,
-      "panos_no_date": 102733,
-      "points_queried": 359372123,
-      "runs_with_any_no_date": 11,
-      "pooled_pct_of_present": 0.150457,
-      "pooled_pct_of_queried": 0.028587,
+      "runs": 1959,
+      "panos_present": 95590478,
+      "panos_no_date": 104668,
+      "points_queried": 619476502,
+      "runs_without_grid_points": 0,
+      "runs_with_more_rows_than_grid_points": 763,
+      "of_queried_kind": "upper_bound",
+      "runs_with_any_no_date": 19,
+      "pooled_pct_of_present": 0.109496,
+      "pooled_pct_of_queried": 0.016896,
       "per_run_pct_of_present": {
-        "n": 453,
+        "n": 789,
         "min": 0.0,
         "p25": 0.0,
         "p50": 0.0,
@@ -89,14 +164,24 @@
         "max": 23.272308
       },
       "per_run_pct_of_queried": {
-        "n": 1201,
+        "n": 1959,
         "min": 0.0,
         "p25": 0.0,
         "p50": 0.0,
         "p75": 0.0,
         "p90": 0.0,
         "p95": 0.0,
-        "max": 2.729452
+        "max": 3.00192
+      },
+      "max_run_pct_of_present": {
+        "city_id": "commerce-city--colorado--united-states",
+        "run_date": "2026-07-31",
+        "pct": 23.272308
+      },
+      "max_run_pct_of_queried": {
+        "city_id": "commerce-city--colorado--united-states",
+        "run_date": "2026-07-31",
+        "pct": 3.00192
       },
       "top_no_date_runs": [
         {
@@ -120,15 +205,69 @@
           "no_date": 1810
         },
         {
-          "city_id": "ho-chi-minh-city--vietnam",
-          "run_date": "2026-07-23",
-          "no_date": 17
+          "city_id": "jefferson-city--missouri--united-states",
+          "run_date": "2026-09-29",
+          "no_date": 1453
         }
       ],
       "largest_run_by_present_panos": {
         "city_id": "detroit--michigan--united-states",
         "run_date": "2026-08-17",
         "panos_present": 15433401
+      }
+    },
+    "panoramax": {
+      "runs": 32,
+      "panos_present": 2628610,
+      "panos_no_date": 3,
+      "points_queried": 37044915,
+      "runs_without_grid_points": 0,
+      "runs_with_more_rows_than_grid_points": 25,
+      "of_queried_kind": "upper_bound",
+      "runs_with_any_no_date": 1,
+      "pooled_pct_of_present": 0.000114,
+      "pooled_pct_of_queried": 8e-06,
+      "per_run_pct_of_present": {
+        "n": 27,
+        "min": 0.0,
+        "p25": 0.0,
+        "p50": 0.0,
+        "p75": 0.0,
+        "p90": 0.0,
+        "p95": 0.0,
+        "max": 0.000842
+      },
+      "per_run_pct_of_queried": {
+        "n": 32,
+        "min": 0.0,
+        "p25": 0.0,
+        "p50": 0.0,
+        "p75": 0.0,
+        "p90": 0.0,
+        "p95": 0.0,
+        "max": 0.000532
+      },
+      "max_run_pct_of_present": {
+        "city_id": "paris--ile-de-france--france",
+        "run_date": "2026-10-01",
+        "pct": 0.000842
+      },
+      "max_run_pct_of_queried": {
+        "city_id": "paris--ile-de-france--france",
+        "run_date": "2026-10-01",
+        "pct": 0.000532
+      },
+      "top_no_date_runs": [
+        {
+          "city_id": "paris--ile-de-france--france",
+          "run_date": "2026-10-01",
+          "no_date": 3
+        }
+      ],
+      "largest_run_by_present_panos": {
+        "city_id": "des-moines--iowa--united-states",
+        "run_date": "2026-09-21",
+        "panos_present": 547964
       }
     }
   },
