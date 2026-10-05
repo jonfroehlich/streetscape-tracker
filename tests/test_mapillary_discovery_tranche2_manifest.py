@@ -375,6 +375,8 @@ def test_supplement_holds_only_rows_a_manifest_needs(manifest_rows, geonames):
     """
     manifest_ids = {row["geonameid"] for row in manifest_rows}
     assert geonames.supplement, "the supplement is empty"
+    raw = (DATA_SOURCES / "geonames_supplement.txt").read_text(encoding="utf-8").splitlines()
+    assert len(raw) == len(geonames.supplement), "a duplicated or unparseable line"
     for gid in geonames.supplement:
         assert gid not in geonames.cities15000, gid
         assert gid in manifest_ids, gid
