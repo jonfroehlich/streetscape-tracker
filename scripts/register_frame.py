@@ -55,6 +55,7 @@ import logging
 import math
 import os
 import sys
+from typing import NamedTuple
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -136,22 +137,43 @@ def geocode_queries(row):
     return [query] if fallback == query else [query, fallback]
 
 
-def register_frame_city(conn, row, step, use_geonames_center, max_center_km, notes_label):
+class FrameGeometry(NamedTuple):
     """
-    Register one manifest city with GeoNames ASCII identity + geocoded geometry.
+    The geometry ``register_frame_city`` freezes for one manifest row.
 
-    Mirrors cli._resolve_geometry's new-city branch (center from the OSM bbox,
-    dimensions from the boundary, clamped to MAX_GRID_DIM_M) but pins the
-    city/state/country names to the vendored GeoNames ASCII values so the
-    canonical city_id is stable and ASCII. The city is registered disabled
-    (kept out of the scheduler until boundary-vetted). Returns the registered
-    CityRow.
+    ``geocoded_offset_km`` is the distance from the chosen geocode's center to
+    the GeoNames point even when ``center_from_geonames`` replaced that center,
+    because the offset is what vetting reads (docs/worldwide_sampling.md).
+    ``uncapped_width_m``/``uncapped_height_m`` are the boundary's dimensions
+    before the MAX_GRID_DIM_M clamp, so a reader can tell a clamped grid.
+    """
+
+    geocode_query: str
+    center_lat: float
+    center_lon: float
+    geocoded_offset_km: float
+    center_from_geonames: bool
+    width_m: float
+    height_m: float
+    uncapped_width_m: float
+    uncapped_height_m: float
+
+
+def resolve_frame_geometry(row, use_geonames_center, max_center_km):
+    """
+    The geometry registration would freeze for one manifest row, with NO
+    catalog write — the four calls ``register_frame_city`` makes
+    (``get_city_location_data`` -> ``resolve_center`` ->
+    ``get_search_dimensions`` -> ``cap_dimensions``), factored out so
+    ``scripts/vet_manifest_geometry.py`` previews exactly what ``--execute``
+    would freeze rather than a re-implementation of it.
 
     Tries each candidate from ``geocode_queries`` until one geocodes AND its
     center passes the GeoNames distance guard. Raises ValueError when nothing
     geocodes, or when every geocode lands more than ``max_center_km`` from the
-    GeoNames coordinates (unless ``use_geonames_center``, which registers the
-    first geocoded candidate with the GeoNames coordinates as center).
+    GeoNames coordinates (unless ``use_geonames_center``, which keeps the
+    first geocoded candidate's dimensions with the GeoNames coordinates as
+    center).
     """
     query = row["query_string"]
     geo_lat, geo_lon = float(row["lat"]), float(row["lon"])
@@ -182,14 +204,47 @@ def register_frame_city(conn, row, step, use_geonames_center, max_center_km, not
                 f"centroid; re-run with --center-from-geonames or fix by hand"
             )
         logger.warning(f"{query}: using GeoNames coordinates ({geo_lat}, {geo_lon}) as center")
-        chosen = (best[0], geo_lat, geo_lon, 0.0)
-
-    geocode_query, center_lat, center_lon, _ = chosen
+        geocode_query, center_lat, center_lon = best[0], geo_lat, geo_lon
+        geocoded_offset_km, from_geonames = best[3], True
+    else:
+        geocode_query, center_lat, center_lon, geocoded_offset_km = chosen
+        from_geonames = False
     if geocode_query != query:
         logger.info(f"{query}: geocoded via fallback query '{geocode_query}'")
 
-    grid_width, grid_height = get_search_dimensions(geocode_query, 1000, 1000)
-    grid_width, grid_height = _cap_dimensions(grid_width, grid_height, geocode_query)
+    uncapped_w, uncapped_h = get_search_dimensions(geocode_query, 1000, 1000)
+    grid_width, grid_height = _cap_dimensions(uncapped_w, uncapped_h, geocode_query)
+    return FrameGeometry(
+        geocode_query=geocode_query,
+        center_lat=center_lat,
+        center_lon=center_lon,
+        geocoded_offset_km=geocoded_offset_km,
+        center_from_geonames=from_geonames,
+        width_m=grid_width,
+        height_m=grid_height,
+        uncapped_width_m=uncapped_w,
+        uncapped_height_m=uncapped_h,
+    )
+
+
+def register_frame_city(conn, row, step, use_geonames_center, max_center_km, notes_label):
+    """
+    Register one manifest city with GeoNames ASCII identity + geocoded geometry.
+
+    Mirrors cli._resolve_geometry's new-city branch (center from the OSM bbox,
+    dimensions from the boundary, clamped to MAX_GRID_DIM_M) but pins the
+    city/state/country names to the vendored GeoNames ASCII values so the
+    canonical city_id is stable and ASCII. The city is registered disabled
+    (kept out of the scheduler until boundary-vetted). Returns the registered
+    CityRow.
+
+    The geometry is ``resolve_frame_geometry``'s, which raises ValueError when
+    nothing geocodes or every geocode fails the center guard.
+    """
+    query = row["query_string"]
+    geometry = resolve_frame_geometry(row, use_geonames_center, max_center_km)
+    center_lat, center_lon = geometry.center_lat, geometry.center_lon
+    grid_width, grid_height = geometry.width_m, geometry.height_m
 
     city_name, state_name, country_name = frame_identity(row)
     city_id = db.register_city(

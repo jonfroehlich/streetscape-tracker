@@ -1,0 +1,162 @@
+rank,geonameid,name,admin1,cc,lat,lon,pop,score_km_per_km2,recent_360_km_2km,top_creator_id,top_creator_username,top_creator_share,median_captured,nearest_known,nearest_known_km,in_cities15000,decision
+1,5323525,Altadena,CA,US,34.18973,-118.13118,42777,25.658,322.43,107708041466249,uwrapid,1.0,2025-02-18,bradbury--california--united-states,15.5,yes,within 25 km of a known city
+2,5776715,Kaysville,UT,US,41.03522,-111.93855,30472,17.445,219.22,100380679425438,flug32,1.0,2025-08-16,mapillary_discovery_cities.csv:Kaysville,0.0,yes,within 25 km of a known city
+3,4769339,Lexington,VA,US,37.78402,-79.44282,7262,16.785,210.93,2594900967557296,TimmonsPavement,1.0,2026-04-08,mapillary_discovery_cities.csv:Lexington,0.0,no,within 25 km of a known city
+4,4778626,Petersburg,VA,US,37.22793,-77.40193,32477,16.155,203.01,2594900967557296,TimmonsPavement,0.944,2025-10-21,mapillary_discovery_cities.csv:Petersburg,0.0,yes,within 25 km of a known city
+5,4880889,Waterloo,IA,US,42.49276,-92.34296,68460,15.601,196.05,1217125923851741,FeetAndInches,0.864,2026-08-06,mapillary_discovery_cities.csv:Cedar Falls,9.3,yes,within 25 km of a known city
+6,5349803,Foothill Farms,CA,US,38.67877,-121.35114,33121,13.974,175.6,713819173436997,marker_geo1,1.0,2026-03-11,mapillary_discovery_cities.csv:Foothill Farms,0.0,yes,within 25 km of a known city
+7,4737676,Trophy Club,TX,US,32.9979,-97.18362,11759,13.814,173.59,1520840613058761,GIStrophyclub,1.0,2026-08-25,mapillary_discovery_cities.csv:Trophy Club,0.0,no,within 25 km of a known city
+8,5379566,Orangevale,CA,US,38.67851,-121.22578,33960,13.595,170.85,713819173436997,marker_geo1,1.0,2026-02-09,mapillary_discovery_cities.csv:Orangevale,0.0,yes,within 25 km of a known city
+9,5385941,Rancho Cordova,CA,US,38.58907,-121.30273,71017,13.415,168.58,713819173436997,marker_geo1,1.0,2026-04-17,mapillary_discovery_cities.csv:Foothill Farms,10.8,yes,within 25 km of a known city
+10,5403191,Tracy,CA,US,37.73987,-121.42618,87075,13.305,167.2,713819173436997,marker_geo1,1.0,2026-07-10,san-jose--california--united-states,60.3,yes,selected
+11,5854718,Waipi'o Acres,HI,US,21.46485,-158.01331,5531,13.271,166.77,100186595565848,hmhtb,1.0,2025-09-08,mapillary_discovery_cities.csv:Waipio Acres,0.0,no,within 25 km of a known city
+12,5380748,Palo Alto,CA,US,37.44188,-122.14302,66853,13.16,165.37,1073094253999318,pixelpete,0.981,2025-01-22,mapillary_discovery_cities.csv:Los Altos,6.8,yes,within 25 km of a known city
+13,5086321,Francestown,NH,US,42.98758,-71.81258,1571,12.637,158.8,1139817854492667,Lanka6359,1.0,2025-08-30,mapillary_discovery_cities.csv:Francestown,0.0,no,within 25 km of a known city
+14,5375480,Mountain View,CA,US,37.38605,-122.08385,80435,12.548,157.68,1073094253999318,pixelpete,0.712,2025-05-24,mapillary_discovery_cities.csv:Los Altos,2.7,yes,within 25 km of a known city
+15,5090096,New Boston,NH,US,42.97619,-71.69396,4934,12.153,152.72,1139817854492667,Lanka6359,1.0,2025-09-12,mapillary_discovery_cities.csv:New Boston,0.0,no,within 25 km of a known city
+16,5855070,'Ewa Gentry,HI,US,21.33999,-158.03039,22690,12.016,150.99,100186595565848,hmhtb,1.0,2025-09-04,mapillary_discovery_cities.csv:Ewa Gentry,0.0,yes,within 25 km of a known city
+17,7262791,Royal Kunia,HI,US,21.39392,-158.0267,14525,11.886,149.37,100186595565848,hmhtb,1.0,2025-09-11,mapillary_discovery_cities.csv:Ewa Gentry,6.0,no,within 25 km of a known city
+18,4764826,Hopewell,VA,US,37.30432,-77.2872,22378,11.673,146.68,2594900967557296,TimmonsPavement,1.0,2025-12-11,mapillary_discovery_cities.csv:Hopewell,0.0,yes,within 25 km of a known city
+19,5253352,Fond du Lac,WI,US,43.775,-88.43883,42933,11.34,142.5,1766048554791666,FDL_Engineering,0.998,2025-07-01,mapillary_discovery_cities.csv:Fond du Lac,0.0,yes,within 25 km of a known city
+20,5347287,Fair Oaks,CA,US,38.64463,-121.27217,30912,11.261,141.52,713819173436997,marker_geo1,1.0,2026-03-06,mapillary_discovery_cities.csv:Orangevale,5.5,yes,within 25 km of a known city
+21,5400065,Sunnyslope,CA,US,34.01196,-117.43338,5153,11.124,139.79,1432009608267357,inlandurbanist,0.997,2026-07-15,mapillary_discovery_cities.csv:Sunnyslope,0.0,no,within 25 km of a known city
+22,4850699,Cedar Falls,IA,US,42.52776,-92.44547,41255,11.123,139.77,1217125923851741,FeetAndInches,0.888,2026-08-18,mapillary_discovery_cities.csv:Cedar Falls,0.0,yes,within 25 km of a known city
+23,4930183,Bedford,MA,US,42.49065,-71.27617,12502,11.095,139.43,100515802193182,mapillary01730,1.0,2025-10-17,mapillary_discovery_cities.csv:Bedford,0.0,no,within 25 km of a known city
+24,5386834,Redwood City,CA,US,37.48522,-122.23635,85288,10.765,135.27,1073094253999318,pixelpete,0.981,2025-07-04,mapillary_discovery_cities.csv:Foster City,8.7,yes,within 25 km of a known city
+25,5773304,Cottonwood Heights,UT,US,40.61967,-111.81021,34343,10.566,132.78,104273298482293,rking,0.812,2026-07-14,mapillary_discovery_cities.csv:Cottonwood Heights,0.0,yes,within 25 km of a known city
+26,5127835,Mount Vernon,NY,US,40.9126,-73.83708,68628,10.512,132.1,104273298482293,rking,1.0,2025-04-16,city-of-rye--new-york--united-states,13.9,yes,within 25 km of a known city
+27,5511077,Reno,NV,US,39.52963,-119.8138,264165,10.316,129.63,713819173436997,marker_geo1,1.0,2025-08-01,carson-city--nevada--united-states,40.3,yes,selected
+28,7261418,Heber-Overgaard,AZ,US,34.41414,-110.56956,2822,10.299,129.42,100515802193182,mapillary01730,1.0,2025-07-30,mapillary_discovery_cities.csv:Heber-Overgaard,0.0,no,within 25 km of a known city
+29,5563397,Eureka,CA,US,40.80207,-124.16367,27017,9.998,125.64,713819173436997,marker_geo1,1.0,2026-05-26,mapillary_discovery_cities.csv:Eureka,0.0,yes,within 25 km of a known city
+30,5089746,Mont Vernon,NH,US,42.89453,-71.67424,2166,9.918,124.63,1139817854492667,Lanka6359,1.0,2025-09-04,mapillary_discovery_cities.csv:Mont Vernon,0.0,no,within 25 km of a known city
+31,4838633,Middletown,CT,US,41.56232,-72.65065,46756,9.746,122.47,102956495281411,ctroadway360,0.962,2025-01-02,meriden--connecticut--united-states,13.3,yes,within 25 km of a known city
+32,4452808,Apex,NC,US,35.73265,-78.85029,45585,9.298,116.85,697526486672885,connormckinnis,1.0,2025-09-29,mapillary_discovery_cities.csv:Apex,0.0,yes,within 25 km of a known city
+33,4760232,Front Royal,VA,US,38.91817,-78.19444,15070,9.148,114.96,2594900967557296,TimmonsPavement,0.951,2026-08-15,boyce--virginia--united-states,22.7,yes,within 25 km of a known city
+34,7262761,Makakilo,HI,US,21.35237,-158.08655,18248,9.133,114.77,100186595565848,hmhtb,1.0,2025-09-04,mapillary_discovery_cities.csv:Ewa Gentry,6.0,yes,within 25 km of a known city
+35,5350159,Foster City,CA,US,37.55855,-122.27108,33477,9.131,114.75,1073094253999318,pixelpete,1.0,2025-11-10,mapillary_discovery_cities.csv:Foster City,0.0,yes,within 25 km of a known city
+36,4106458,Conway,AR,US,35.0887,-92.4421,64980,8.951,112.48,1587142233032939,noahheffron,1.0,2026-08-10,menifee--arkansas--united-states,12.0,yes,within 25 km of a known city
+37,5597955,Kuna,ID,US,43.49183,-116.42012,17226,8.706,109.41,713819173436997,marker_geo1,1.0,2026-07-27,meridian--idaho--united-states,13.2,yes,within 25 km of a known city
+38,4902754,Morton,IL,US,40.61282,-89.45926,16306,8.663,108.86,104273298482293,rking,1.0,2025-07-23,mapillary_discovery_cities.csv:Morton,0.0,yes,within 25 km of a known city
+39,5777332,Lindon,UT,US,40.34329,-111.72076,10810,8.636,108.52,104273298482293,rking,0.827,2025-09-23,mapillary_discovery_cities.csv:Lindon,0.0,no,within 25 km of a known city
+40,4237767,Eldorado,IL,US,37.81366,-88.4381,4064,8.611,108.21,102816358629821,Dale_Hat,1.0,2026-04-05,henderson--kentucky--united-states,74.9,no,cities500 only
+41,5703670,Elko,NV,US,40.83242,-115.76312,20279,8.607,108.16,104273298482293,rking,1.0,2026-03-17,hollister--idaho--united-states,195.5,yes,failed geometry vetting
+42,5410430,Woodland,CA,US,38.67852,-121.7733,58567,8.269,103.91,713819173436997,marker_geo1,1.0,2025-10-22,sacramento--california--united-states,30.1,yes,selected
+43,4385835,Eureka,MO,US,38.50255,-90.6279,10602,8.112,101.94,104273298482293,rking,0.964,2025-10-01,crestwood--missouri--united-states,22.1,no,within 25 km of a known city
+44,7176039,Vineyard,CA,US,38.46449,-121.34692,24836,8.02,100.78,713819173436997,marker_geo1,1.0,2026-01-23,sacramento--california--united-states,14.7,yes,within 25 km of a known city
+45,5582392,Sterling,CO,US,40.62554,-103.20771,14104,7.986,100.35,104273298482293,rking,1.0,2025-03-18,iliff--colorado--united-states,18.8,no,within 25 km of a known city
+46,4933743,Concord,MA,US,42.46037,-71.34895,16810,7.643,96.05,100515802193182,mapillary01730,0.789,2025-10-18,mapillary_discovery_cities.csv:Bedford,6.9,yes,within 25 km of a known city
+47,5387687,Rio Linda,CA,US,38.69101,-121.44857,15106,7.585,95.32,713819173436997,marker_geo1,1.0,2026-02-10,mapillary_discovery_cities.csv:Foothill Farms,8.6,yes,within 25 km of a known city
+48,5082636,Amherst,NH,US,42.86147,-71.62535,613,7.495,94.19,1139817854492667,Lanka6359,1.0,2025-09-04,mapillary_discovery_cities.csv:Mont Vernon,5.4,no,within 25 km of a known city
+49,5387854,Riverdale,CA,US,36.43106,-119.85958,3153,7.433,93.4,713819173436997,marker_geo1,1.0,2025-05-30,hanford--california--united-states,22.3,no,within 25 km of a known city
+50,5382146,Perris,CA,US,33.78252,-117.22865,74971,7.36,92.49,104273298482293,rking,1.0,2025-03-12,mapillary_discovery_cities.csv:Sunnyslope,31.7,yes,selected
+51,5213681,State College,PA,US,40.79339,-77.86,42161,7.359,92.48,397575076604285,mcox16801,1.0,2025-03-30,mapillary_discovery_cities.csv:State College,0.0,yes,within 25 km of a known city
+52,4206502,Locust Grove,GA,US,33.34595,-84.10908,5790,7.218,90.7,1254163303570318,CM-FDC,1.0,2026-07-21,williamson--georgia--united-states,29.7,no,cities500 only
+53,5338783,Colton,CA,US,34.0739,-117.31365,54621,7.15,89.85,1432009608267357,inlandurbanist,1.0,2026-08-04,mapillary_discovery_cities.csv:Sunnyslope,13.0,yes,within 25 km of a known city
+54,5388319,Rocklin,CA,US,38.79073,-121.23578,61213,7.113,89.38,713819173436997,marker_geo1,1.0,2026-01-09,mapillary_discovery_cities.csv:Orangevale,12.5,yes,within 25 km of a known city
+55,5779548,Payson,UT,US,40.0444,-111.73215,19548,7.098,89.2,104273298482293,rking,1.0,2025-06-19,mapillary_discovery_cities.csv:Lindon,33.2,yes,selected
+56,5512862,Sparks,NV,US,39.53491,-119.75269,96094,7.075,88.91,713819173436997,marker_geo1,1.0,2025-08-03,carson-city--nevada--united-states,40.9,yes,within 25 km of selected Reno
+57,5778352,Millcreek,UT,US,40.68689,-111.87549,62139,7.046,88.55,104273298482293,rking,0.907,2025-08-05,mapillary_discovery_cities.csv:Cottonwood Heights,9.3,yes,within 25 km of a known city
+58,5118693,Glens Falls,NY,US,43.30952,-73.64401,14291,7.034,88.39,108818314681901,giblet,0.992,2025-11-11,town-of-lake-george--new-york--united-states,14.1,no,within 25 km of a known city
+59,4636442,Lewisburg,TN,US,35.44924,-86.78889,11480,6.994,87.89,104273298482293,rking,1.0,2026-08-12,petersburg--tennessee--united-states,19.9,no,within 25 km of a known city
+60,5368233,Loomis,CA,US,38.82129,-121.193,6836,6.934,87.13,713819173436997,marker_geo1,1.0,2025-08-14,mapillary_discovery_cities.csv:Orangevale,16.1,no,within 25 km of a known city
+61,5367314,Live Oak,CA,US,36.98356,-121.98052,17158,6.809,85.57,713819173436997,marker_geo1,1.0,2025-05-11,monte-sereno--california--united-states,28.5,yes,failed geometry vetting
+62,13117920,Kalaheo Hillside,HI,US,21.4162,-157.75255,3256,6.805,85.52,100186595565848,hmhtb,1.0,2025-09-15,honolulu--hawaii--united-states,12.3,no,within 25 km of a known city
+63,5558953,Arcata,CA,US,40.86652,-124.08284,17843,6.716,84.4,713819173436997,marker_geo1,1.0,2026-05-28,mapillary_discovery_cities.csv:Eureka,9.9,yes,within 25 km of a known city
+64,4710963,Mexia,TX,US,31.67989,-96.4822,7406,6.587,82.77,1178503163952549,MEW-Utilities,1.0,2026-07-24,hubbard--texas--united-states,35.7,no,cities500 only
+65,4855806,Evansdale,IA,US,42.46915,-92.28102,4812,6.564,82.48,1217125923851741,FeetAndInches,0.942,2026-08-27,mapillary_discovery_cities.csv:Cedar Falls,15.0,no,within 25 km of a known city
+66,5583997,Ammon,ID,US,43.46964,-111.96664,14960,6.507,81.77,104273298482293,rking,1.0,2026-05-13,shelley--idaho--united-states,16.4,no,within 25 km of a known city
+67,4130430,Searcy,AR,US,35.25064,-91.73625,24196,6.33,79.54,104273298482293,rking,1.0,2025-05-06,mount-vernon--arkansas--united-states,35.3,yes,failed geometry vetting
+68,5567770,McKinleyville,CA,US,40.94652,-124.10062,15177,6.268,78.76,713819173436997,marker_geo1,1.0,2026-05-29,mapillary_discovery_cities.csv:Eureka,16.9,yes,within 25 km of a known city
+69,5854189,Waianae,HI,US,21.43785,-158.18555,13177,6.26,78.67,100186595565848,hmhtb,1.0,2025-09-11,mapillary_discovery_cities.csv:Waipio Acres,18.1,no,within 25 km of a known city
+70,4556165,Yukon,OK,US,35.50672,-97.76254,25892,6.183,77.7,104273298482293,rking,0.955,2025-09-10,warr-acres--oklahoma--united-states,13.1,yes,within 25 km of a known city
+71,5324400,Aptos,CA,US,36.97717,-121.8994,6220,6.097,76.61,713819173436997,marker_geo1,1.0,2025-05-21,monte-sereno--california--united-states,30.2,no,cities500 only
+72,5290663,Coolidge,AZ,US,32.97784,-111.51762,12297,6.078,76.38,104273298482293,rking,1.0,2025-08-26,casa-grande--arizona--united-states,26.0,no,cities500 only
+73,5366375,Lincoln,CA,US,38.89156,-121.29301,49757,6.007,75.48,4367263200177747,CycleMaster,0.982,2026-06-17,mapillary_discovery_cities.csv:Foothill Farms,24.2,yes,within 25 km of a known city
+74,4932328,Carlisle,MA,US,42.52926,-71.3495,4799,6.001,75.41,100515802193182,mapillary01730,1.0,2025-10-10,mapillary_discovery_cities.csv:Bedford,7.4,no,within 25 km of a known city
+75,5793832,Ephrata,WA,US,47.31764,-119.55365,8047,5.923,74.44,104273298482293,rking,1.0,2025-03-18,coulee-city--washington--united-states,38.5,no,cities500 only
+76,5778601,Mount Olympus,UT,US,40.6855,-111.78854,6748,5.883,73.92,104273298482293,rking,0.9,2025-08-07,mapillary_discovery_cities.csv:Cottonwood Heights,7.5,no,within 25 km of a known city
+77,5856516,'Ahuimanu,HI,US,21.44472,-157.83778,8810,5.875,73.82,100186595565848,hmhtb,1.0,2025-09-12,honolulu--hawaii--united-states,12.6,no,within 25 km of a known city
+78,4893392,Galesburg,IL,US,40.94782,-90.37124,31273,5.706,71.7,109472691287712,galesburggis,1.0,2025-05-07,bay-view-gardens--illinois--united-states,72.6,yes,selected
+79,5329408,Bloomington,CA,US,34.07029,-117.39588,23851,5.69,71.5,1432009608267357,inlandurbanist,1.0,2026-08-15,mapillary_discovery_cities.csv:Sunnyslope,7.3,yes,within 25 km of a known city
+80,5205849,Phoenixville,PA,US,40.13038,-75.51491,16658,5.645,70.93,882263693611401,DTadd24-Hopeworks,1.0,2025-03-12,red-hill--pennsylvania--united-states,27.7,yes,selected
+81,7315230,Horizon West,FL,US,28.43383,-81.6227,14000,5.542,69.64,104273298482293,rking,1.0,2025-01-09,orlando--florida--united-states,30.6,no,cities500 only
+82,5978126,Hudson,10,CA,45.45008,-74.14922,5088,5.475,68.81,103793315269003,zombiegraph,1.0,2025-11-25,montreal--quebec--canada,45.6,no,cities500 only
+83,5563839,Fortuna,CA,US,40.59819,-124.15728,12000,5.414,68.03,713819173436997,marker_geo1,1.0,2026-05-10,mapillary_discovery_cities.csv:Eureka,22.7,no,within 25 km of a known city
+84,5247214,Burlington,WI,US,42.67807,-88.2762,10650,5.41,67.99,104273298482293,rking,1.0,2026-03-19,big-bend--wisconsin--united-states,24.8,no,within 25 km of a known city
+85,5385793,Ramona,CA,US,33.04171,-116.86808,20292,5.397,67.81,713819173436997,marker_geo1,1.0,2025-01-03,santee--california--united-states,23.2,yes,within 25 km of a known city
+86,5026416,Fergus Falls,MN,US,46.28302,-96.07756,13281,5.379,67.6,1361362982257515,GIS_ISG,1.0,2026-04-07,elizabeth--minnesota--united-states,11.5,no,selected (operator exception)
+87,4481150,Moyock,NC,US,36.5246,-76.17827,3759,5.33,66.97,104214208486349,vorpalblade,1.0,2025-05-18,elizabeth-city--north-carolina--united-states,25.1,no,cities500 only
+88,5851889,Pacific Palisades,HI,US,21.42562,-157.95349,6997,5.17,64.97,100186595565848,hmhtb,1.0,2025-08-26,mapillary_discovery_cities.csv:Waipio Acres,7.6,no,within 25 km of a known city
+89,5330427,Boyes Hot Springs,CA,US,38.3138,-122.48193,6656,5.152,64.74,713819173436997,marker_geo1,1.0,2025-09-04,napa--california--united-states,15.6,no,within 25 km of a known city
+90,5325187,Atwater,CA,US,37.34772,-120.60908,29237,5.083,63.88,102105792034485,technodino,1.0,2026-09-18,fresno--california--united-states,95.7,yes,selected
+91,4612862,Chattanooga,TN,US,35.04563,-85.30968,181099,5.057,63.55,2341374186295825,jarielj,1.0,2026-07-24,signal-mountain--tennessee--united-states,11.5,yes,within 25 km of a known city
+92,4270269,De Soto,KS,US,38.97917,-94.96858,6074,4.995,62.77,104273298482293,rking,1.0,2026-03-31,bonner-springs--kansas--united-states,13.3,no,within 25 km of a known city
+93,5082292,Wymore,NE,US,40.12222,-96.66252,1414,4.947,62.17,1413045892697651,1335,1.0,2025-01-03,liberty--nebraska--united-states,15.9,no,within 25 km of a known city
+94,4839822,Norwalk,CT,US,41.1176,-73.4079,88485,4.942,62.1,102956495281411,ctroadway360,0.939,2025-04-03,stamford--connecticut--united-states,14.1,yes,within 25 km of a known city
+95,5594956,Hailey,ID,US,43.51963,-114.31532,8134,4.94,62.07,104273298482293,rking,1.0,2025-05-13,castleford--idaho--united-states,120.0,no,cities500 only
+96,5004188,Oak Park,MI,US,42.45948,-83.18271,29752,4.905,61.64,104740425095586,codgis,1.0,2026-02-16,hamtramck--michigan--united-states,12.5,yes,within 25 km of a known city
+97,5088262,Keene,NH,US,42.93369,-72.27814,23265,4.894,61.5,104774341764404,henryu,0.969,2025-07-16,newfane--vermont--united-states,34.9,yes,selected
+98,5851349,Nanakuli,HI,US,21.39362,-158.15429,12666,4.857,61.04,100186595565848,hmhtb,1.0,2025-09-12,mapillary_discovery_cities.csv:Ewa Gentry,14.1,no,within 25 km of a known city
+99,4782691,Rocky Mount,VA,US,36.99764,-79.89198,4799,4.776,60.01,104273298482293,rking,1.0,2025-07-23,roanoke--virginia--united-states,31.4,no,cities500 only
+100,5008278,Saint Johns,MI,US,43.00114,-84.55915,7865,4.756,59.76,107426641493478,treestryder,1.0,2026-06-28,laingsburg--michigan--united-states,21.0,no,within 25 km of a known city
+101,5277142,Verona,WI,US,42.99083,-89.53318,12540,4.684,58.86,101433775432524,vgxhc,0.731,2025-11-14,madison--wisconsin--united-states,15.0,no,within 25 km of a known city
+102,5571188,Shelter Cove,CA,US,40.03042,-124.07309,693,4.495,56.49,713819173436997,marker_geo1,1.0,2026-05-01,mapillary_discovery_cities.csv:Eureka,86.1,no,cities500 only
+103,5218853,West Pittston,PA,US,41.32758,-75.79297,4772,4.427,55.63,104273298482293,rking,1.0,2026-04-08,vandling--pennsylvania--united-states,43.3,no,cities500 only
+104,4350049,California,MD,US,38.3004,-76.50745,11857,4.386,55.11,840811535511279,stmaryscounty1,0.827,2026-04-14,church-creek--maryland--united-states,38.2,no,cities500 only
+105,5093821,Troy,NH,US,42.82397,-72.18119,1221,4.356,54.74,104774341764404,henryu,1.0,2025-06-21,mapillary_discovery_cities.csv:Francestown,35.1,no,cities500 only
+106,5019588,Buffalo,MN,US,45.17191,-93.87469,16026,4.344,54.59,4145640949091364,ablevi202,1.0,2026-05-11,new-hope--minnesota--united-states,41.3,yes,selected
+107,6155721,St. Catharines,08,CA,43.17126,-79.24267,136803,4.337,54.5,1459245085093841,dfoden,1.0,2025-07-22,city-of-niagara-falls--new-york--united-states,20.6,yes,within 25 km of a known city
+108,5284202,Clinton,CT,US,41.27871,-72.52759,3368,4.323,54.32,104273298482293,rking,0.683,2025-07-16,fenwick--connecticut--united-states,14.5,no,within 25 km of a known city
+109,4839704,North Haven,CT,US,41.39093,-72.85954,24093,4.265,53.6,102956495281411,ctroadway360,0.896,2025-08-20,new-haven--connecticut--united-states,10.7,yes,within 25 km of a known city
+110,4373426,White Marsh,MD,US,39.38372,-76.43218,9513,4.221,53.04,1532803437981226,Rossitransportationgroup,0.929,2026-09-24,port-deposit--maryland--united-states,37.7,no,cities500 only
+111,5854857,Whitmore Village,HI,US,21.51429,-158.02464,4499,4.134,51.95,100186595565848,hmhtb,1.0,2025-09-07,mapillary_discovery_cities.csv:Waipio Acres,5.6,no,within 25 km of a known city
+112,5323401,Alpine,CA,US,32.83505,-116.76641,14236,4.103,51.56,713819173436997,marker_geo1,1.0,2025-01-24,santee--california--united-states,20.9,no,within 25 km of a known city
+113,5250402,Delavan Lake,WI,US,42.58418,-88.6326,2649,4.08,51.27,1006984308465014,UAS_ISG,1.0,2026-08-17,clinton--wisconsin--united-states,19.1,no,selected (operator exception)
+114,5574093,Yreka,CA,US,41.73542,-122.63447,7597,4.074,51.19,713819173436997,marker_geo1,0.956,2025-08-12,talent--oregon--united-states,57.2,no,cities500 only
+115,5284283,Colchester,CT,US,41.57565,-72.33203,4781,4.044,50.81,102956495281411,ctroadway360,1.0,2025-12-09,norwich--connecticut--united-states,20.3,no,within 25 km of a known city
+116,5377266,North Auburn,CA,US,38.93129,-121.08189,13022,4.003,50.3,713819173436997,marker_geo1,1.0,2025-07-21,mapillary_discovery_cities.csv:Orangevale,30.7,no,cities500 only
+117,4157092,Gotha,FL,US,28.52778,-81.52313,1915,3.996,50.22,104273298482293,rking,1.0,2025-01-15,orlando--florida--united-states,19.8,no,within 25 km of a known city
+118,4945055,Needham,MA,US,42.28343,-71.23283,28886,3.958,49.74,1139817854492667,Lanka6359,0.891,2025-11-04,waltham--massachusetts--united-states,10.2,yes,within 25 km of a known city
+119,4462759,Currituck,NC,US,36.44988,-76.01548,0,3.941,49.52,104214208486349,vorpalblade,1.0,2025-05-18,elizabeth-city--north-carolina--united-states,24.7,no,within 25 km of a known city
+120,5249259,Como,WI,US,42.61224,-88.48232,2631,3.94,49.51,1361362982257515,GIS_ISG,0.829,2025-12-02,clinton--wisconsin--united-states,31.8,no,selected (operator exception)
+121,5334320,Carmel-by-the-Sea,CA,US,36.55524,-121.92329,3897,3.9,49.01,1073094253999318,pixelpete,1.0,2026-03-10,monte-sereno--california--united-states,76.3,no,cities500 only
+122,4926613,South Haven,IN,US,41.54198,-87.13726,5282,3.869,48.62,1243749034432301,ZachJ_POCO,1.0,2025-10-21,gary--indiana--united-states,16.6,no,within 25 km of a known city
+123,4367417,Rossmoor,MD,US,39.10372,-77.07109,8453,3.866,48.58,1532803437981226,Rossitransportationgroup,0.783,2026-07-13,laytonsville--maryland--united-states,13.2,no,within 25 km of a known city
+124,5328724,Biola,CA,US,36.80217,-120.01627,1623,3.85,48.38,713819173436997,marker_geo1,1.0,2025-06-10,fresno--california--united-states,20.0,no,within 25 km of a known city
+125,4922501,Lake Dalecarlia,IN,US,41.33087,-87.39476,1355,3.842,48.28,577870925372666,tnugent,1.0,2026-08-10,schererville--indiana--united-states,17.2,no,within 25 km of a known city
+126,7728581,Shorewood Forest,IN,US,41.46315,-87.14472,2708,3.823,48.04,1243749034432301,ZachJ_POCO,1.0,2025-11-03,gary--indiana--united-states,20.5,no,within 25 km of a known city
+127,4930577,Billerica,MA,US,42.55843,-71.26895,39904,3.813,47.92,100515802193182,mapillary01730,0.99,2025-10-01,mapillary_discovery_cities.csv:Bedford,7.6,yes,within 25 km of a known city
+128,5410125,Winters,CA,US,38.52491,-121.9708,7034,3.792,47.65,104273298482293,rking,1.0,2026-02-03,napa--california--united-states,39.3,no,cities500 only
+129,5375938,Muscoy,CA,US,34.15418,-117.34421,10644,3.765,47.31,1432009608267357,inlandurbanist,0.916,2026-08-30,mapillary_discovery_cities.csv:Sunnyslope,17.8,no,within 25 km of a known city
+130,4167533,Palm Beach Shores,FL,US,26.77812,-80.0356,1208,3.693,46.4,644361521792978,eyoung_wsb,1.0,2025-10-14,west-palm-beach--florida--united-states,10.1,no,within 25 km of a known city
+131,6077251,Montreal-Est,10,CA,45.63202,-73.5075,3850,3.684,46.3,401411729320080,VdM,0.784,2025-07-04,montreal--quebec--canada,15.1,no,within 25 km of a known city
+132,4177617,Wedgefield,FL,US,28.48778,-81.07729,6705,3.682,46.27,104273298482293,rking,1.0,2025-01-07,orlando--florida--united-states,24.0,no,within 25 km of a known city
+133,5356864,Highgrove,CA,US,34.01585,-117.33338,3988,3.615,45.42,1432009608267357,inlandurbanist,1.0,2026-07-31,mapillary_discovery_cities.csv:Sunnyslope,9.2,no,within 25 km of a known city
+134,5414264,Blende,CO,US,38.24584,-104.56858,878,3.554,44.66,713819173436997,marker_geo1,1.0,2025-07-05,colorado-springs--colorado--united-states,71.9,no,cities500 only
+135,5854171,Waialua,HI,US,21.57688,-158.13154,3860,3.521,44.25,100186595565848,hmhtb,1.0,2025-06-25,mapillary_discovery_cities.csv:Waipio Acres,17.5,no,within 25 km of a known city
+136,4504476,Toms River,NJ,US,39.95373,-74.19792,88791,3.504,44.03,106180081621374,DrivingRoundTown,0.933,2025-11-18,interlaken--new-jersey--united-states,34.7,yes,selected
+137,5306523,New River,AZ,US,33.91587,-112.13599,14952,3.434,43.15,100515802193182,mapillary01730,1.0,2026-01-04,carefree--arizona--united-states,22.6,no,within 25 km of a known city
+138,5364192,Ladera,CA,US,37.39994,-122.1983,1426,3.372,42.37,1073094253999318,pixelpete,1.0,2025-04-30,mapillary_discovery_cities.csv:Los Altos,7.6,no,within 25 km of a known city
+139,5127315,Monsey,NY,US,41.11121,-74.06848,18412,3.365,42.29,1536223904740965,ramapogis,1.0,2026-07-16,waldwick--new-jersey--united-states,11.9,yes,within 25 km of a known city
+140,4353084,Derwood,MD,US,39.11733,-77.16109,2381,3.36,42.23,100679358847088,GEdwardJohnson,0.632,2026-06-13,laytonsville--maryland--united-states,10.3,no,within 25 km of a known city
+141,5784731,White City,UT,US,40.56578,-111.86438,5407,3.336,41.92,3562572504050839,jburtonmsd,1.0,2025-06-09,mapillary_discovery_cities.csv:Cottonwood Heights,7.5,no,within 25 km of a known city
+142,5771826,Bountiful,UT,US,40.88939,-111.88077,43784,3.288,41.32,1351157065439574,dknelson9876,0.69,2025-09-28,salt-lake-city--utah--united-states,13.0,yes,within 25 km of a known city
+143,4845926,Windsor Locks,CT,US,41.92926,-72.62731,12498,3.267,41.05,102956495281411,ctroadway360,1.0,2025-03-24,hartford--connecticut--united-states,19.1,no,within 25 km of a known city
+144,5345171,Easton,CA,US,36.65023,-119.7907,2083,3.256,40.92,713819173436997,marker_geo1,0.966,2025-06-03,fresno--california--united-states,15.0,no,within 25 km of a known city
+145,4931737,Burlington,MA,US,42.50482,-71.19561,24498,3.252,40.86,100515802193182,mapillary01730,1.0,2025-10-23,mapillary_discovery_cities.csv:Bedford,6.8,yes,within 25 km of a known city
+146,5100381,Leisure Knoll,NJ,US,40.01901,-74.29209,2490,3.245,40.78,106180081621374,DrivingRoundTown,1.0,2026-03-06,interlaken--new-jersey--united-states,33.5,no,cities500 only
+147,5356868,Highland,CA,US,34.12834,-117.20865,54854,3.234,40.64,1432009608267357,inlandurbanist,1.0,2026-08-24,mapillary_discovery_cities.csv:Sunnyslope,24.4,yes,within 25 km of a known city
+148,5086911,Greenfield,NH,US,42.95064,-71.8723,1765,3.232,40.62,1139817854492667,Lanka6359,1.0,2025-09-04,mapillary_discovery_cities.csv:Francestown,6.4,no,within 25 km of a known city
+149,5094329,Weare,NH,US,43.0948,-71.73063,8583,3.227,40.56,1139817854492667,Lanka6359,1.0,2026-01-02,mapillary_discovery_cities.csv:New Boston,13.5,no,within 25 km of a known city
+150,4335096,New Roads,LA,US,30.70157,-91.43622,4697,3.206,40.28,104273298482293,rking,1.0,2025-02-25,krotz-springs--louisiana--united-states,35.4,no,cities500 only
+151,4148012,Bithlo,FL,US,28.55472,-81.10645,8268,3.19,40.08,104273298482293,rking,1.0,2025-01-11,orlando--florida--united-states,21.6,no,within 25 km of a known city
+152,5380883,Palos Verdes Estates,CA,US,33.80105,-118.39245,13682,3.182,39.99,100438652206281,GoProMAX3M,1.0,2025-01-15,paramount--california--united-states,23.2,no,within 25 km of a known city
+153,4350831,Cedonia,MD,US,39.33221,-76.53206,3168,3.17,39.83,1532803437981226,Rossitransportationgroup,1.0,2026-09-24,annapolis--maryland--united-states,39.5,no,cities500 only
+154,5364937,Lanare,CA,US,36.43051,-119.93097,589,3.101,38.97,713819173436997,marker_geo1,1.0,2025-05-30,hanford--california--united-states,27.9,no,cities500 only
+155,4881096,Webster City,IA,US,42.46942,-93.81605,7814,3.101,38.97,108891598508567,Hopen111,1.0,2026-09-04,dows--iowa--united-states,33.3,no,cities500 only
+156,5027943,Gilbert,MN,US,47.48882,-92.46491,1792,3.101,38.97,1259166012234566,RS-EH-MAPR-1,1.0,2025-06-26,grand-rapids--minnesota--united-states,85.0,no,cities500 only
+157,5347903,Felton,CA,US,37.05134,-122.0733,4057,3.078,38.68,713819173436997,marker_geo1,1.0,2025-05-10,monte-sereno--california--united-states,22.3,no,within 25 km of a known city
+158,5091002,Peterborough,NH,US,42.87064,-71.95175,3103,3.051,38.34,1139817854492667,Lanka6359,0.865,2026-06-30,mapillary_discovery_cities.csv:Francestown,17.2,no,within 25 km of a known city
+159,5048496,Stacy,MN,US,45.39802,-92.98744,1470,3.049,38.32,645084397752674,quickness805,1.0,2025-04-19,lexington--minnesota--united-states,32.2,no,cities500 only
+160,5782320,Sunset,UT,US,41.13633,-112.03105,5183,3.04,38.21,104273298482293,rking,0.744,2025-07-30,ogden--utah--united-states,10.7,no,within 25 km of a known city
+161,5848280,Kapa'a,HI,US,22.07521,-159.31895,10699,3.014,37.87,24387967214162256,KauaiGIS,1.0,2025-08-06,mapillary_discovery_cities.csv:Waipio Acres,150.9,no,cities500 only
