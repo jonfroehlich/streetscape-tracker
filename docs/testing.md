@@ -1433,3 +1433,35 @@ the solar day keeping an American afternoon and evening on its own date, cells a
 the catalog match inside / outside / disabled / never-collected, the SMALLEST of two overlapping bboxes winning with the other in `also_in`, the latest Mapillary run (not a newer gsv one) read, and `after_last_run` and `newer_than_seen` each shown true without the other (the 2026-08-26 Spokane case) — including a NULL newest capture — against a catalog opened read-only;
 a missing catalog reported and never created, a catalog at schema 0 or newer than `db.SCHEMA_VERSION` exiting 64, the GeoJSON's properties, exits 64 / 75 / 83, a block on page 2 still reporting page 1, the default `--since` derived from `--until`, catalog paths committed without a home directory, the metrics upsert replacing a window rather than appending it, and a `makelab*` host refused.
 Every mutation of the script listed in the PR (#368) was run after commit and fails at least one test.
+
+## The Mapillary discovery screen (issue #383)
+
+**Added after the 2026-08-22 split.**
+
+`tests/test_mapillary_discovery.py`, offline: tiles are built with `mapbox_vector_tile.encode`, never fetched.
+It pins the sampling frame (the 2026-10-02 regions are exactly 97 z6 tiles, no duplicates), so a change to `REGIONS` or the tile math cannot silently change the population the committed numbers describe;
+the y-up tile-local mapping (a tile's (0, 4096) is its NORTH-west corner — a flipped y moves a town's sweep a tile south) and an empty or layerless tile decoding to nothing;
+`split_samples` conserving a polyline's length exactly, bounding each piece at `SAMPLE_KM`, and spreading a long segment along its length;
+`place_scores` counting a sample 1.9 km away and not one 2.1 km away, the score as km / (pi r^2), the top uploader's length share, the on-foot share, and the LENGTH-weighted median capture date, with empty and below-`min_km` discs skipped;
+`thin_by_distance` keeping the first of a cluster; `inside_grid` as rectangle membership (15 km off-centre inside a 40 km-wide grid, 12 km off-centre outside a 20 km-tall one), never centre distance;
+the manifest dropping apostrophes and applying `GEOCODE_OVERRIDES`, and writing an empty admin rather than NaN when GeoNames has none; and the jittered pacer's mean and floor.
+
+Added after the PR's first review, which found twelve mutations surviving:
+
+- **The fetcher's stop rules**, through a fake session (the template a standing `screen-provider mapillary` would copy): a 302, a 200 with an HTML body, or a 403 stops the run, is logged with its `host`, is never cached, and is never followed as a redirect; a 204 caches as an empty tile and a cached tile costs no request; `--max-requests` is never exceeded.
+- **`catalog-snapshot` exporting each city's LATEST Mapillary drive walk**, never an older one, a non-drive network or another provider's.
+- **`apply_rules` applying every candidate and tranche rule where it is applied** — the grid, the 10 km centre distance, the date, the score, the uploader share, population, on-foot share, thinning, the per-uploader cap and the size — one failing row per rule; `grid_rule_effect` counting the places the grid rule removes rather than the net change (a removal that readmits a thinned neighbour nets to 0).
+- **`build_samples` keeping only recent panos**, `spearman` being rank correlation (a monotone outlier keeps it at 1.0), `nearest_km` picking the nearest, `inside_grid` bounding the WIDTH at half, and the weighted median landing on OLDER imagery when it holds most of the length (so `median = newest` fails).
+- **The validation population is the scanned TILES**, never the bounding box: Mexico City and Kodiak sit in the box and in no scanned tile, and are dropped rather than scored 0; `scan_tiles` derives the tiles from the manifest's own regions.
+- **The analyzer refuses a scan that stopped early** (`scan_manifest.json` `stopped` set), writing nothing, since an unscanned tile would otherwise read as one with no imagery.
+
+All 39 mutations run after this change, the review's survivors included, fail at least one test.
+
+Added after the final review, which found seven more surviving:
+
+- **`grid_rule_effect` counts by place id, not by subtraction**: in a G/B/A chain (B 4 km from the in-grid G, A 4 km from B) removing G readmits B, which then thins A away, so the expected counts are 1 removed, 1 readmitted and 1 cascade-dropped — a constant or net-difference `readmitted` fails; duplicate `geonameid`s are refused, since set difference would miscount them.
+- **The validation's edges**: in one scanned tile, a point at tile fraction 15.9 is kept and one at 14.6 dropped (so `round()` for `int()` fails both ways), a scanned city with no samples is kept at score 0 rather than as NaN, a city with no walk is dropped (an inner join), and walks at 49.9% coverage or 2.01 yr median age are not "good".
+- **`collect scan`'s half of the stopped-scan contract**, through a fake session over Hawaii's four tiles: a 204 then a 302 stops after two requests, exits nonzero, records the stop in `scan_manifest.json`, and `load_scan_manifest` refuses that manifest.
+- **The metrics JSON is strict**: `strict_json` writes NaN (numpy's included) as `null`, parsed with a `parse_constant` that refuses `NaN`, and raises on infinity rather than writing it.
+
+The final review's 48 mutations (its two against the replaced subtraction re-aimed at the set-difference code) and eight more against this round's fixes, run after this change, all fail at least one test.

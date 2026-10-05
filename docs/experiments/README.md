@@ -83,6 +83,17 @@ Issue #312 — why every KartaView pano link on the site opens an error page, an
 The deep-link format is **theirs, not our guess**: their own SPA writes `details/{sequence_id}/{sequence_index}` into the address bar.
 What fails is the one v1 call that page depends on (`POST /details` → `osv: null`), for **every sequence probed including KartaView's own documented example** — which is the control that makes this a statement about their service rather than about our data, and the reason nobody should "fix" the URL builder.
 Generalizes past this provider: when a third-party page breaks on a link we build, probe **their** canonical example through the identical call before touching our code, and prefer a fallback keyed on geometry — the map link covers rows the photo link never could, since it needs only a position.
+
+### `mapillary-discovery-screen.md`
+
+Issue #383 — finding fresh, systematic 360° Mapillary capture OUTSIDE the catalog, since road walks can only evaluate cities already in it.
+The coarsest sequence-tile zoom (z6) is enough: 97 tiles screen North America, and a place's recent-360° length within 2 km, per km², has Spearman 0.666 against measured walk coverage over 1,111 catalog cities, with 11 of the 14 "good" cities (≥ 50% street-km, ≤ 2 yr) among the 40 scoring ≥ 3.
+Three things generalize.
+**(1) Validate a screen against the measurement it stands in for, over the whole catalog**, not against the handful of towns that motivated it: the eight calibration towns showed the score works, the 1,111 walks showed how often.
+**(2) Distance to a centre is not membership.** A frozen grid can be 40 km across; 37 places on the thinned list the 10 km rule admitted were already inside one.
+**(3) Score the unit you will act on.** Connected-cell clusters merged a statewide sweep into one 10,687 km blob; scoring each place from its own point is what ranks towns.
+It also registered its first 25 candidates on production and enabled them the same day, and found that the uploader, not the town, is the unit that generalizes.
+
 ### `mapillary-image-quality.md`
 
 Whether Mapillary's per-image `quality_score` — the only visual-quality prediction any provider we collect publishes — can rank Sidewalk candidate cities.
