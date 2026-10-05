@@ -215,6 +215,11 @@ Every published JSON artifact carries a `schema_version`; the frontend's `adaptC
 The per-run summary stays at 2 across #367's additions to its `coverage` block (`num_points_out_of_radius`, and `query_radius_m`, which is null for census providers): both are additive, and no existing key changed shape.
 A summary written before #367 simply lacks them, and its coverage figures are the old definition until the run's JSON is rebuilt.
 
+Both stay put across #321 too, which publishes Mapillary's `quality_score` as a distribution.
+The per-run summary's `mapillary_meta` gains a `quality` block (`n_scored`, `p10`…`p90`, `pct_ge_good`, `pct_lt_poor`, `n_sequences`, `seq_p25`/`seq_p50`/`seq_p75`, `p50_on_foot`, `p50_vehicle`, `n_on_foot`, `n_foot_known`; definitions in [`census.md`](census.md)), **absent** — never zeros or nulls — when the CSV has no `quality_score` column (every Mapillary run before 2026-07-24) or no pano is scored.
+The aggregate's per-provider `latest` block gains `mapillary_meta`, copied whole from the latest run's JSON and **absent** when that JSON has none, so every GSV, KartaView and Panoramax block, and every legacy Mapillary one, is byte-identical to its pre-#321 form.
+Key presence therefore means "measured": a run summarized before #321 deployed lacks the block until `scripts/recompute_run_stats.py --provider mapillary --regenerate-json-mapillary-meta` splices it in ([`operations.md`](operations.md)).
+
 The provider screen stays at 1 across #406's measured cell (v19's `provider_screen_cells`).
 `instrument.cell` is still a string — its value is now derived from the latest pass's decoded hexagon ids instead of the literal "H3 resolution 6 (~36 km²)", which the ids contradicted (resolution 7) — and every other change is a new key: `instrument.cell_resolutions` (null for a screen that predates the measurement), `instrument.cell_area_source`, the absent-unless-unexpected `instrument.cell_warning`, and a per-date `cell_resolutions` on each `series` point.
 The `caveat` text changed meaning but not shape.

@@ -1318,6 +1318,9 @@ function adaptCityRecord(rec, provider = "gsv") {
       // undefined.
       total_search_points: null,
       grid: null,
+      // v1 is gsv-only and predates Mapillary's metadata block (#321).
+      mapillary_meta: null,
+      quality: null,
       pano_count: v1Counts.unique_google_panos ?? v1Counts.unique_panos,
       pano_age_stats: rec.google_panos_age_stats ?? rec.all_panos_age_stats,
       capture_year_histogram: v1Histograms.google_panos ?? v1Histograms.all_panos,
@@ -1380,6 +1383,14 @@ function adaptCityRecord(rec, provider = "gsv") {
     any_imagery_coverage_rate_percent:
       latest.any_imagery_coverage_rate_percent ?? latest.coverage_rate_percent,
     num_flat_images: latest.num_flat_images ?? null,
+    // Issue #321. The per-run `mapillary_meta` block, carried into the
+    // aggregate only when the run's JSON has it, and its `quality` sub-block:
+    // Mapillary's quality_score DISTRIBUTION plus the on-foot counts that must
+    // travel with it, since the score marks pedestrian capture down. Gated on
+    // PRESENCE in the record, never on the provider name or the registry
+    // (#334): a legacy run, and every other provider, reads null here.
+    mapillary_meta: latest.mapillary_meta ?? null,
+    quality: latest.mapillary_meta?.quality ?? null,
     panorama_counts: counts,
     all_panos_age_stats: latest.all_panos_age_stats,
     google_panos_age_stats: latest.google_panos_age_stats,

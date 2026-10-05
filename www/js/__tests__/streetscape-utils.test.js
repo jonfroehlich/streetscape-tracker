@@ -253,6 +253,81 @@ test("adaptCityRecord: v3 per-provider block, null when provider missing", () =>
   assert.equal(adaptCityRecord(v3, "mapillary"), null);
 });
 
+// --- Mapillary quality pass-through (issue #321) ----------------------------
+
+const QUALITY_BLOCK = {
+  n_scored: 1200,
+  p10: 0.61,
+  p25: 0.74,
+  p50: 0.83,
+  p75: 0.88,
+  p90: 0.92,
+  pct_ge_good: 14.2,
+  pct_lt_poor: 9.8,
+  n_sequences: 18,
+  seq_p25: 0.7,
+  seq_p50: 0.81,
+  seq_p75: 0.87,
+  p50_on_foot: 0.71,
+  p50_vehicle: 0.85,
+  n_on_foot: 300,
+  n_foot_known: 1000,
+};
+
+function mapillaryV4(latestExtra = {}) {
+  return {
+    city_id: "bend--or",
+    city: { name: "Bend", state: "OR", country: "USA" },
+    providers: {
+      mapillary: {
+        latest: {
+          run_date: "2026-09-01",
+          panorama_counts: { unique_panos: 1200 },
+          histogram_of_capture_dates_by_year: { all_panos: {} },
+          all_panos_age_stats: { median_pano_age_years: 2 },
+          coverage_rate_percent: 40,
+          search_area_km2: 25,
+          data_file: "c",
+          json_file: "d",
+          ...latestExtra,
+        },
+        runs: [],
+        change: null,
+      },
+    },
+  };
+}
+
+test("adaptCityRecord: the Mapillary quality block passes through as `quality`", () => {
+  const meta = { n_images: 1200, median_quality_score: 0.83, quality: QUALITY_BLOCK };
+  const rec = adaptCityRecord(mapillaryV4({ mapillary_meta: meta }), "mapillary");
+  assert.deepEqual(rec.quality, QUALITY_BLOCK);
+  assert.deepEqual(rec.mapillary_meta, meta);
+});
+
+test("adaptCityRecord: `quality` is null when absent -- never undefined, never a zero block", () => {
+  // A run predating the quality_score column carries a mapillary_meta with no
+  // block, and an even older one carries no mapillary_meta at all; both read
+  // as one shape, null.
+  const noBlock = adaptCityRecord(
+    mapillaryV4({ mapillary_meta: { n_images: 5, median_quality_score: null } }),
+    "mapillary"
+  );
+  assert.equal(noBlock.quality, null);
+  const noMeta = adaptCityRecord(mapillaryV4(), "mapillary");
+  assert.equal(noMeta.quality, null);
+  assert.equal(noMeta.mapillary_meta, null);
+  assert.equal(adaptCityRecord(V1_RECORD, "gsv").quality, null);
+});
+
+test("adaptCityRecord: `quality` is gated on PRESENCE, not on the provider name", () => {
+  // The registry is not the payload (#334): a block on any provider's record
+  // passes through, and the name "mapillary" alone conjures nothing.
+  const other = mapillaryV4({ mapillary_meta: { quality: QUALITY_BLOCK } });
+  other.providers = { thirdparty: other.providers.mapillary };
+  assert.deepEqual(adaptCityRecord(other, "thirdparty").quality, QUALITY_BLOCK);
+});
+
 // --- the registry is the authority, not a two-provider `if` ----------------
 //
 // These drive a THIRD provider that is not in PROVIDERS today. Every one of

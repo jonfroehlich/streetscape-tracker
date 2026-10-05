@@ -573,3 +573,29 @@ def test_every_committed_artifact_is_byte_reproducible():
                 f"{path.name} carries a wall-clock generated_at; it should be "
                 "build_fixture.FIXTURE_GENERATED_AT."
             )
+
+
+def test_every_fixture_mapillary_record_carries_a_quality_block():
+    """Issue #321: grid.html builds its "Imagery quality" group only for a
+    provider whose records carry `mapillary_meta.quality`, so a fixture whose
+    Mapillary runs lack it would leave the browser suite blind to the group.
+
+    The values are pinned too, not just the presence: the builder cycles
+    MAPILLARY_FIXTURE_QUALITY (one good, one poor) and MAPILLARY_FIXTURE_ON_FOOT
+    over the pano rows, and a committed block reading the shared builder's
+    constant 0.75 everywhere would be a fixture regenerated without that step.
+    """
+    with gzip.open(FIXTURE_DIR / "cities.json.gz", "rt", encoding="utf-8") as fh:
+        cities = json.load(fh)["cities"]
+    blocks = [
+        rec["providers"]["mapillary"]["latest"].get("mapillary_meta", {}).get("quality")
+        for rec in cities
+        if "mapillary" in rec.get("providers", {})
+    ]
+    assert blocks, "the fixture carries no Mapillary record at all"
+    for block in blocks:
+        assert block is not None, "a fixture Mapillary record has no quality block"
+        assert block["n_scored"] == 2
+        assert block["pct_ge_good"] == 50.0 and block["pct_lt_poor"] == 50.0
+        assert block["p50_on_foot"] == 0.92 and block["p50_vehicle"] == 0.58
+        assert (block["n_on_foot"], block["n_foot_known"]) == (1, 2)

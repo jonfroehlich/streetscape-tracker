@@ -27,7 +27,8 @@
  * escapeHtml, fetchProviderScreen, screenedProviders, lookupScreen,
  * screenVerdict — from table-utils.js: cityDisplayLabel, sortRowsBy,
  * formatCellNumber, coverageCellHtml, providerShortLabel, deltaCellHtml,
- * providerColumnGroup, rowHtmlFromColumns, createSortableTable — and from
+ * providerColumnGroup, providerCellHtml, rowHtmlFromColumns,
+ * createSortableTable — and from
  * table-controls.js: createTableControls.
  */
 
@@ -133,6 +134,138 @@ function gridLabelCellHtml(row) {
     ? `<a class="streets-view-link" href="city.html?file=${encodeURIComponent(row.filename)}">${label}</a>`
     : label;
   return `<th scope="row" title="${title}">${content}</th>`;
+}
+
+// ── Imagery quality (issue #321) ──────────────────────────────
+
+/**
+ * The two cut-offs the published tail shares were taken at. Mirrors
+ * `streetscape_metadata_tracker/mapillary_quality.py` (GOOD_THRESHOLD,
+ * POOR_THRESHOLD); a Python test reads these two lines out of this file, so
+ * the header can never name a cut the numbers were not taken at.
+ */
+const QUALITY_GOOD_THRESHOLD = 0.9;
+const QUALITY_POOR_THRESHOLD = 0.6;
+
+/**
+ * The caveat every quality header carries. It is not decoration: the score is
+ * a vendor's PREDICTION of visual quality, and it marks pedestrian capture
+ * down -- on-foot imagery scored lower than vehicle imagery in 84.5% of the
+ * paired cities measured (docs/experiments/mapillary-image-quality.md) -- so a
+ * ranking on it alone deprioritizes exactly the imagery a sidewalk assessment
+ * often wants.
+ */
+const QUALITY_CAVEAT =
+  "A vendor's prediction of visual quality on a 0–1 scale, not a measure of usefulness " +
+  "for a sidewalk assessment. It scores on-foot imagery lower than vehicle imagery in " +
+  "84.5% of paired cities, so never rank a city on it alone — read the on-foot share beside it.";
+
+/**
+ * The leaves each quality provider gets, in header order. The on-foot share is
+ * MANDATORY and lives in the same group, so the quality figures can never be
+ * shown without it (a column picker that hides it is the reader's choice; no
+ * preset of ours omits it).
+ */
+const QUALITY_LEAVES = [
+  {
+    suffix: "p50",
+    label: "median",
+    initial: "desc",
+    digits: 2,
+    title: "Median quality_score of the latest snapshot's scored 360° panoramas (0–1)",
+  },
+  {
+    suffix: "ge_good",
+    label: `≥ ${QUALITY_GOOD_THRESHOLD}`,
+    initial: "desc",
+    unit: "%",
+    digits: 1,
+    title: `Share of scored panoramas with quality_score ≥ ${QUALITY_GOOD_THRESHOLD}`,
+  },
+  {
+    suffix: "lt_poor",
+    label: `< ${QUALITY_POOR_THRESHOLD}`,
+    initial: "asc",
+    unit: "%",
+    digits: 1,
+    title: `Share of scored panoramas with quality_score < ${QUALITY_POOR_THRESHOLD}`,
+  },
+  {
+    suffix: "on_foot",
+    label: "on foot",
+    initial: "desc",
+    unit: "%",
+    digits: 1,
+    title:
+      "Share of panoramas captured on foot, of those whose capture mode is known. The " +
+      "quality score marks this imagery DOWN, so a high share pulls the figures beside it lower",
+  },
+];
+
+/**
+ * The "Imagery quality" group, built only for providers whose records carry a
+ * quality block somewhere in the payload (`pivotGridRows` computes that set).
+ * Gated on presence, never on a provider name: in practice that is Mapillary,
+ * and only its runs collected since 2026-07-24.
+ *
+ * @param {string[]} qualityProviders
+ * @returns {Object[]} Column descriptors, four leaves per provider.
+ */
+function gridQualityColumns(qualityProviders) {
+  if (qualityProviders.length === 0) return [];
+  const group = {
+    id: "quality",
+    label: "Imagery quality (Mapillary's prediction)",
+    title: `Mapillary's per-image quality_score over each provider's latest snapshot. ${QUALITY_CAVEAT}`,
+  };
+  return qualityProviders.flatMap((p) => {
+    const link = gridProviderLink(p);
+    const name = providerShortLabel(p);
+    return QUALITY_LEAVES.map((leaf) => {
+      const key = `quality_${p}_${leaf.suffix}`;
+      return {
+        key,
+        label: `${name} ${leaf.label}`,
+        pickerLabel: `${group.label} — ${name} ${leaf.label}`,
+        type: "number",
+        initial: leaf.initial,
+        unit: leaf.unit,
+        digits: leaf.digits,
+        title: `${name}: ${leaf.title}. ${QUALITY_CAVEAT}`,
+        group,
+        cell: (row) =>
+          providerCellHtml(
+            {
+              html:
+                row[key] == null
+                  ? "—"
+                  : `${formatCellNumber(row[key], leaf.digits)}${leaf.unit ?? ""}`,
+            },
+            link(row)
+          ),
+      };
+    });
+  });
+}
+
+/**
+ * The quality row fields one adapted record contributes, or all-null.
+ *
+ * The on-foot share is derived from the block's own counts rather than read
+ * from `mapillary_meta.pct_on_foot`, so it always describes the same census
+ * the quality figures beside it do.
+ *
+ * @param {?Object} quality - `adaptCityRecord(...).quality`.
+ * @returns {Object} `{p50, ge_good, lt_poor, on_foot}`.
+ */
+function qualityFields(quality) {
+  if (!quality) return { p50: null, ge_good: null, lt_poor: null, on_foot: null };
+  return {
+    p50: quality.p50 ?? null,
+    ge_good: quality.pct_ge_good ?? null,
+    lt_poor: quality.pct_lt_poor ?? null,
+    on_foot: quality.n_foot_known ? (100 * quality.n_on_foot) / quality.n_foot_known : null,
+  };
 }
 
 // ── The growth screen (issue #349) ────────────────────────────
@@ -285,9 +418,13 @@ function gridScreenColumns(screenDoc) {
  *   is the whole registry, which is what a caller with no payload wants.
  * @param {?Object} [screenDoc] - Parsed provider_screen.json.gz. Null (the
  *   default) builds exactly the columns the page had before #349.
+ * @param {string[]} [qualityProviders] - Providers whose records carry a
+ *   quality block somewhere in the payload (issue #321). Empty by default, so
+ *   the static full-registry build has no quality group: whether one exists is
+ *   a fact about the payload, not the registry.
  * @returns {Object[]}
  */
-function buildGridColumns(providers = gridProviders(), screenDoc = null) {
+function buildGridColumns(providers = gridProviders(), screenDoc = null, qualityProviders = []) {
   const pair = gridDeltaPair(providers);
   const [ahead, behind] = pair ?? [];
   const pairNames = pair ? `${providerShortLabel(ahead)} − ${providerShortLabel(behind)}` : "";
@@ -368,6 +505,8 @@ function buildGridColumns(providers = gridProviders(), screenDoc = null) {
         title: `${pairNames}, in years. NEGATIVE means Mapillary is fresher.`,
       },
     }),
+    // Issue #321. No Δ: only one provider publishes a quality prediction.
+    ...gridQualityColumns(qualityProviders),
     // No Δ here, ever: GSV samples the nearest pano per grid point while
     // Mapillary is a census of every 360° pano, so the two counts answer
     // different questions and their difference answers none.
@@ -599,6 +738,23 @@ function buildGridPresets(columns = GRID_COLUMNS) {
         ...groupKeys("panos"),
       ],
     },
+    // Issue #321. Present only when the payload carries a quality block, and
+    // deliberately NOT the default: the score is a vendor's prediction that
+    // marks on-foot capture down, so it is offered beside coverage and the
+    // collection date -- with the on-foot share inside its own group -- rather
+    // than as a headline a reader ranks on.
+    ...(groupKeys("quality").length > 0
+      ? [
+          {
+            id: "quality",
+            label: "Mapillary quality",
+            title:
+              "Mapillary's predicted image quality beside coverage and collection date, with " +
+              "the on-foot share the score marks down — never rank on quality alone",
+            columns: [...metricKeys("cov"), ...groupKeys("quality"), ...groupKeys("collected")],
+          },
+        ]
+      : []),
     // Only when a screen was built into `columns`. Never the default: the
     // screen is a hint, not a measure. Beside the coverage a collection run
     // MEASURED and when that was, so "worth measuring" reads against "already
@@ -626,9 +782,11 @@ function buildGridPresets(columns = GRID_COLUMNS) {
  *   whole registry.
  * @param {string[]} [screened] - Providers the screen document carries; one
  *   select each. Empty (the default) adds none.
+ * @param {string[]} [qualityProviders] - Providers carrying a quality block
+ *   (issue #321); each gets a quality-median and an on-foot-share slider.
  * @returns {Object[]}
  */
-function buildGridFilters(providers = gridProviders(), screened = []) {
+function buildGridFilters(providers = gridProviders(), screened = [], qualityProviders = []) {
   return [
     {
       key: "provider",
@@ -713,6 +871,38 @@ function buildGridFilters(providers = gridProviders(), screened = []) {
           },
         ]
       : []),
+    // Issue #321. Named for their provider rather than scoped by "Collected
+    // by": a quality block exists for one provider only, so a scope pointing
+    // these at another provider would select an all-null field. Fixed domains
+    // (0–1 and 0–100, `fixedDomain`, so the descriptor's range IS the axis
+    // rather than a clamp on the rows' extent; see histogramAxisDomain),
+    // because both are bounded scales and a self-scaling axis would spread a
+    // narrow band of medians across the whole track and hide where a city
+    // sits on the scale. The on-foot slider ships with the quality one, for
+    // the same reason the column does.
+    ...qualityProviders.flatMap((p) => [
+      {
+        key: `quality_${p}`,
+        label: `${providerShortLabel(p)} quality median (0–1)`,
+        type: "histogram-range",
+        field: `quality_${p}_p50`,
+        min: 0,
+        max: 1,
+        fixedDomain: true,
+        digits: 2,
+      },
+      {
+        key: `onfoot_${p}`,
+        label: `${providerShortLabel(p)} on-foot share %`,
+        type: "histogram-range",
+        field: `quality_${p}_on_foot`,
+        min: 0,
+        max: 100,
+        fixedDomain: true,
+        unit: "%",
+        digits: 1,
+      },
+    ]),
     // One per screened provider (issue #349). A select, not a slider: the
     // screen's number is a bound, and a window over bounds ("between 100 and
     // 500") asks a question the instrument cannot answer. The readings it CAN
@@ -809,8 +999,11 @@ function bestAcrossProviders(row, providers, keyFor, lowest = false) {
  * @param {?Object} rawCities - Parsed cities.json.gz, or null.
  * @param {?Object} [screenDoc] - Parsed provider_screen.json.gz, or null.
  * @returns {{rows: Object[], generatedAt: ?string, providers: string[],
- *            screened: string[], screenUnlisted: Object<string, number>}}
+ *            qualityProviders: string[], screened: string[],
+ *            screenUnlisted: Object<string, number>}}
  *   `providers` is registry order, narrowed to those the payload contains;
+ *   `qualityProviders` narrows it again to those with a quality block on at
+ *   least one record (issue #321) -- the only ones that get quality keys;
  *   `screened` is the screen document's own provider list.
  */
 function pivotGridRows(rawCities, screenDoc = null) {
@@ -828,6 +1021,11 @@ function pivotGridRows(rawCities, screenDoc = null) {
     if (cities.length > 0) adapted.push([provider, cities]);
   }
   const providers = adapted.map(([provider]) => provider);
+  // Presence in the payload, never the provider name (#334): a provider gets
+  // the quality group iff one of its records actually carries the block.
+  const qualityProviders = adapted
+    .filter(([, cities]) => cities.some((city) => city.quality != null))
+    .map(([provider]) => provider);
 
   // Folding is keyed on city_id, so a record without one cannot be folded with
   // anything — including another record without one. Sharing a "" key merged
@@ -878,6 +1076,11 @@ function pivotGridRows(rawCities, screenDoc = null) {
           row[`snapshots_${p}`] = null;
           row[`filename_${p}`] = null;
         }
+        for (const p of qualityProviders) {
+          for (const [suffix, value] of Object.entries(qualityFields(null))) {
+            row[`quality_${p}_${suffix}`] = value;
+          }
+        }
         byCity.set(key, row);
       }
 
@@ -892,6 +1095,11 @@ function pivotGridRows(rawCities, screenDoc = null) {
       row[`collected_${provider}`] = city.latest_run_date ?? null;
       row[`snapshots_${provider}`] = (city.runs ?? []).length || null;
       row[`filename_${provider}`] = city.data_file?.filename ?? null;
+      if (qualityProviders.includes(provider)) {
+        for (const [suffix, value] of Object.entries(qualityFields(city.quality))) {
+          row[`quality_${provider}_${suffix}`] = value;
+        }
+      }
 
       // Shared frozen-grid facts: first provider to report each one wins. They
       // describe the city, not the series, so a later provider cannot
@@ -944,7 +1152,7 @@ function pivotGridRows(rawCities, screenDoc = null) {
       (record) => !byCity.has(record?.city_id)
     ).length;
   }
-  return { rows, generatedAt, providers, screened, screenUnlisted };
+  return { rows, generatedAt, providers, qualityProviders, screened, screenUnlisted };
 }
 
 /**
@@ -973,7 +1181,7 @@ function renderGridRuns(rawCities, screenDoc = null) {
   const statusEl = document.getElementById("grid-status");
   const wrapEl = document.getElementById("grid-table-wrap");
 
-  const { rows, generatedAt, providers, screened, screenUnlisted } = pivotGridRows(
+  const { rows, generatedAt, providers, qualityProviders, screened, screenUnlisted } = pivotGridRows(
     rawCities,
     screenDoc
   );
@@ -988,7 +1196,7 @@ function renderGridRuns(rawCities, screenDoc = null) {
   // every metric group (six more columns and three more default-preset ones
   // for KartaView alone), all of them em-dashes, plus a scope option that
   // matches no rows and points every slider at an all-null field.
-  const columns = buildGridColumns(providers, screenDoc);
+  const columns = buildGridColumns(providers, screenDoc, qualityProviders);
   gridTable ??= createSortableTable({
     columns,
     defaultSort: GRID_DEFAULT_SORT,
@@ -1000,7 +1208,7 @@ function renderGridRuns(rawCities, screenDoc = null) {
     table: gridTable,
     columns,
     presets: buildGridPresets(columns),
-    filters: buildGridFilters(providers, screened),
+    filters: buildGridFilters(providers, screened, qualityProviders),
     searchFields: GRID_SEARCH_FIELDS,
     onChange: (shown, all) =>
       updateGridCaption(shown, all, generatedAt, gridScreenCaption(screenDoc, screenUnlisted)),
@@ -1193,5 +1401,7 @@ if (typeof module !== "undefined" && module.exports) {
     GRID_SEARCH_FIELDS,
     GRID_DEFAULT_SORT,
     GRID_DELTA_PAIRS,
+    QUALITY_GOOD_THRESHOLD,
+    QUALITY_POOR_THRESHOLD,
   };
 }

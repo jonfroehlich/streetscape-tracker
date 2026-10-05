@@ -238,6 +238,26 @@ All four keys are **indexed, not `.get()`-guarded**, matching the `search_area_k
 Guarding would also publish `{width: null, height: null, step: null}` — a *truthy* all-null block that no `if (rec.grid)` consumer can reject, the exact failure the absent-not-null convention exists to prevent.
 It is the **latest run's** grid, not the city's current frozen geometry: the two diverge for cities resized catalog-only by `scripts/cap_oversized_grids.py` (#166) until their next collection, and pairing the run's denominator with the run's geometry is the correct half — label it as the run's grid in any UI.
 `adaptCityRecord` surfaces both normalized (null on v1/v2 records, which will never carry them).
+
+## Mapillary's quality prediction on grid.html, never without the on-foot share (issue #321)
+
+`_build_provider_summary` carries the per-run `mapillary_meta` into the aggregate's `latest` block when the run's JSON has it, and `adaptCityRecord` passes it through as `mapillary_meta` plus a normalized `quality` (the `mapillary_meta.quality` block, [`census.md`](census.md)), **null** when absent on any record shape.
+It is gated on PRESENCE in the record, never on the provider name or the registry (#334).
+`grid.js:pivotGridRows` returns `qualityProviders`, the collected providers with a block on at least one record, and only those get the group, the preset, the sliders and the `quality_${p}_*` row keys — so a payload with no block anywhere renders exactly as before, and a city whose run predates the column reads em-dashes, never zero.
+
+**The group is "Imagery quality (Mapillary's prediction)", and its fourth leaf is the on-foot share.**
+Per provider: the median (`p50`, 2 decimals), the share ≥ 0.9, the share < 0.6, and the share of panoramas captured on foot (from the block's own `n_on_foot / n_foot_known`, so it describes the same census; null, not 0%, when no capture mode is known).
+The on-foot leaf is mandatory and lives in the same group because Mapillary's score marks pedestrian capture **down** — lower than vehicle imagery in 84.5% of paired cities — so a quality figure read without it ranks against exactly the imagery a sidewalk assessment often wants.
+Every leaf title and the group title say what the number is (a vendor's prediction of visual quality, 0–1) and carry that caveat.
+The thresholds in the headers (`QUALITY_GOOD_THRESHOLD`, `QUALITY_POOR_THRESHOLD`) mirror `mapillary_quality.py`, pinned by a Python test that reads them out of `grid.js`.
+
+**It is NOT in the default preset.**
+The "Mapillary quality" preset (coverage leaves without the Δ, the quality group, "Last collected") exists only when the group does.
+Two histogram sliders come with it per quality provider — the median over a fixed 0–1 axis and the on-foot share over a fixed 0–100 one — named for their provider rather than scoped by "Collected by", because a block exists for one provider and a scope pointing them at another would select an all-null field.
+**A descriptor's `min`/`max` are only a CLAMP on the rows' extent; `fixedDomain: true` is what makes them the axis** (`table-controls.js` `histogramAxisDomain`).
+Without it, a slider labelled "(0–1)" drew 0.75–1.75 on the fixture (every median there is 0.75, and the one-unit widening of a degenerate extent ran past the clamp) and would spread production's narrow band of medians (58.8% of 388 measured cities sit in one 0.07-wide band) across the whole track.
+The widening is now clamped too, so no axis on any page exceeds its descriptor's `max`.
+
 ## The basemap needs a CARTO key, and a bad key looks like a styling bug
 
 *Written after the split.*

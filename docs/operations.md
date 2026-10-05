@@ -276,6 +276,39 @@ The `--only` dry run's summary line says no other column is read or written; if 
 Run it **per provider, in the daytime, never overlapping the 02:00 timer** — it shares the catalog with the batch, and a census provider's pass still reads millions of rows apiece.
 Nothing published reads `total_grid_points`, so the backfill republishes nothing; `scripts/undated_imagery_share_analyze.py` is its first reader; the backfill ran on production on 2026-10-04 and that regeneration is committed (see [`experiments/undated-imagery-share.md`](experiments/undated-imagery-share.md)).
 
+## Backfilling the Mapillary quality block (issue #321)
+
+#321 adds a `quality` block to every Mapillary run's `mapillary_meta` (the `quality_score` distribution and its on-foot split; [`census.md`](census.md)), and `grid.html` builds its "Imagery quality" group from it.
+Runs collected after the deploy get the block on their own; every run summarized before it lacks the block until this backfill splices it in, and the grid page shows em-dashes for those cities meanwhile.
+**This is optional and not urgent** — nothing is wrong in the published data, the block is simply missing — so it waits for a daytime ops window.
+
+```bash
+cd ~/streetscape-tracker
+# 1. Dry run: lists the runs it would update and counts the rest. Reads one per-run JSON per run, never a census.
+.venv-makelab2/bin/python scripts/recompute_run_stats.py \
+    --data-dir /projects/makeabilitylab/streetscape-tracker/data \
+    --provider mapillary --regenerate-json-mapillary-meta
+# 2. Splice the block into those runs' per-run JSON, then rebuild the aggregate.
+.venv-makelab2/bin/python scripts/recompute_run_stats.py \
+    --data-dir /projects/makeabilitylab/streetscape-tracker/data \
+    --provider mapillary --regenerate-json-mapillary-meta --execute >> logs/backfill_321.log 2>&1
+# 3. Publish.
+.venv-makelab2/bin/python -m streetscape_metadata_tracker.scheduler \
+    --config config/scheduler.makelab1.toml regenerate-aggregate --publish
+```
+
+It is a separate mode of `recompute_run_stats.py`: it runs no stats pass.
+**It selects from each run's JSON alone**: a run whose `mapillary_meta` has a non-null `median_quality_score` (so at least one pano is scored) and no `quality` block.
+Everything else stays **absent, never zero**, and the report counts each reason separately: every pre-2026-07-24 run (no `mapillary_meta` at all; 129 of the latest runs, and more across the history the pass scans), every run with no pano row, and every run with the `quality_score` column but no scored pano.
+That is what makes **a second pass select nothing**: a selection read off the CSV header re-chose the column-but-unscored runs on every pass, since a rebuild can never give them a block.
+**A selected run's block is spliced into its existing JSON**: only the four columns the block needs (`mapillary_quality.BLOCK_COLUMNS`) are read from the census, no other key of the JSON is rewritten, and no catalog row is written.
+So a backfilled run's summary is its old summary plus one block, never a re-derivation under today's other definitions (which would mix two JSON forms inside one city's series).
+The one exception is a run whose JSON is missing or unreadable: the CSV header decides, and a run whose CSV carries `quality_score` is rebuilt whole through `regenerate_run_json`, which also sets `runs.json_filename`; the report lists these separately.
+**Even four columns of a Mapillary census are up to millions of rows per run**, so on production this is a daytime job and **never inside a night**: `--execute` is refused while a `run-due` is in flight (`scheduler._run_due_in_flight`, the check `recompute_run_diffs.py` makes), but like that script it checks only when it starts, and the nightly batch never checks for it.
+If step 2 might not finish before 02:00, disable the timer for the night (`systemctl --user disable --now streetscape-tracker.timer`, and `enable --now` afterwards; never `stop`, which the #369 watchdog re-arms).
+Only this mode carries the in-flight gate; the stats pass keeps its existing behaviour.
+It is not combinable with `--only` or `--regenerate-json` (exit 2): it returns before either would run.
+
 ## Landing a laptop investigation in this catalog: `scheduler import-bundle` (issue #330)
 
 **Added after the 2026-08-22 split.**

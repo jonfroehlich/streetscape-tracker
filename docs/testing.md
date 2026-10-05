@@ -837,6 +837,21 @@ and `hosts_unavailable` is anchored to the blocked-host note's own `; `-delimite
   the commit's durability pin now reads the part rename in `_commit_checkpoint` and the state rename in the shared `_write_json_durable`, since the state record goes through the one writer both providers and the cache marker share;
   that a `SweepIncompleteError` pause never promotes; and **that a failed `finally` commit never promotes** — the KartaView-specific trap, set up so the last periodic commit HAS landed, which isolates the `final_commit_ok` clause from the other three.
   For #272: `created_at` is stamped once and carried forward while `updated_at` moves, a night that sweeps nothing cannot restamp it, and a v1 record is discarded rather than read forward.
+- Mapillary `quality_score` distribution (`tests/test_mapillary_quality.py`, issue #321):
+  the study script's thresholds ARE the package's (identity, so a re-declared literal fails), and `grid.js`'s header thresholds are read out of the JS source and compared;
+  percentiles and tail shares over pano rows only, with FLAT_ONLY/ZERO_RESULTS rows carrying scores that would move them; a score exactly at 0.9 counting as good and exactly at 0.6 not as poor (`>=`/`<`);
+  sequence medians giving each drive one vote while three sequence-less images stay in the image-weighted median and out of the sequence cut; the on-foot split and counts over every pano, scored or not;
+  the columnar per-sequence medians equal to a `groupby().median()`; the block ABSENT for a legacy frame, a frame without the column and an all-unscored census;
+  a census without a `sequence_id` column KEEPING its block with an empty sequence cut (zero drives, null `seq_*`);
+  `_foot_codes` coding the typed nullable-bool column and every text spelling a dtype-less read produces (`True`/`true`/`FALSE`, `1`/`0`, `1.0`/`0.0`, empty) alike;
+  and the published block reproducing the study's `measure_run` row on one randomized census written to disk, every key paired.
+  `_build_provider_summary` carries `mapillary_meta` iff present (no key, not a null, when absent), and carries a meta WITHOUT a block too, since the carry keys on the meta.
+  The `--regenerate-json-mapillary-meta` backfill over a six-run catalog, one run per selection outcome (legacy column-less, column but no pano row, column but every score missing, block already present, block missing, JSON missing):
+  the dry run lists exactly the last two, counts each reason and writes nothing; a removed CSV counts as missing, never as legacy;
+  `--execute` gives exactly those two the block, asserted on inode and nanosecond mtime rather than bytes for the rest, because a same-second regeneration of the legacy JSON is byte-identical, and with `publish=False` writes no aggregate;
+  **a second `--execute` selects nothing** (the column-but-unscored runs were re-selected on every pass when selection read the CSV header);
+  the spliced JSON equals the old JSON plus the block — including a key and a value planted to stand in for an older summarizer, which a whole-JSON rebuild would drop — the catalog row is unchanged, and the block equals the one `compute_mapillary_meta` builds from the full census;
+  `--execute` is refused while `run-due` is in flight; and the flag without `--provider mapillary` exits 2.
 
 ## Catalog backups (issue #145)
 
@@ -1351,6 +1366,16 @@ Three smaller pins: a grouped leaf's header button carrying `pickerLabel` as `ar
 and `updateStreetsCaption` formatting its counts at a scale where the separator shows, since the fixture's own counts are single digits and would pass either way.
 And that aggregate records with no `city_id` stay DISTINCT rows with a warning rather than collapsing into one shared "Unknown" — latent, since the published v3 aggregate always carries one, which is exactly why it needed a test rather than a reader's trust.
 
+### Mapillary's quality prediction on grid.html (issue #321)
+
+`streetscape-utils.test.js` pins `adaptCityRecord`'s pass-through: the block arrives as `quality`, reads `null` (never undefined) for a meta without a block, a record without a meta and a v1 record, and passes through on a provider that is not Mapillary — presence, not name.
+`grid.test.js` pins the gating from both sides: a payload with no block anywhere gets no group, no preset, no slider and no `quality_*` row key, and a block on one provider gives THAT provider the four leaves (median, ≥ 0.9, < 0.6, on foot) and nobody else;
+the name "mapillary" without a block conjures nothing.
+Also: the row's on-foot share is computed from the block's counts, and is null rather than 0% when no capture mode is known; a city without the block renders em-dashes beside one that has it;
+every header and the group title carry "prediction of visual quality", "0–1", "84.5%" and "never rank a city on it alone"; the default preset holds no quality leaf, and the "Mapillary quality" preset is exactly cov (no Δ) + quality + collected.
+The two sliders' AXES, not just their descriptors, are pinned: fed through `histogramAxisDomain` with all-equal, banded and empty values they come out 0–1 and 0–100, because a descriptor's `min`/`max` alone are only a clamp and the descriptor-shape test passed while the "(0–1)" slider drew 0.75–1.75.
+`table-controls.test.js` pins `histogramAxisDomain` itself: the clamped row extent by default, `fixedDomain` overriding it only when both ends are declared, and a degenerate extent widening one unit without passing the descriptor's `max` (a lone 100 on a 0–100 slider widens downwards).
+
 ### driving.html joined the sidebar (issue #188 follow-up)
 
 **The four shared layout e2e tests are parametrized over all three table pages** — that parametrization is described with the rest of the #250 e2e list above, and this is the entry that says WHY driving.html is in it: the pages are one shape, and a page that drifts off it now fails a test another page wrote.
@@ -1468,6 +1493,10 @@ A pivoted cell is identified by nothing but its position, and all three census w
 So two of the three census walks now carry a few 360° samples (`_add_streetwalk(..., n_pano_samples=N)`), giving 85.1 / 0.0 / 16.0 / 42.7 across the four providers, and the swap fails.
 The Mapillary walk is the one that keeps no 360° samples at all, because `test_streets_page_separates_360_and_any_imagery_coverage` reads it for the widest version of #116's split.
 The grid page's equivalents were discriminating from the start (75.0 / 66.7 / 60.0 / 50.0); only the streets ones looked like it.
+
+**The Mapillary runs carry a real quality distribution (issue #321).**
+`build_fixture._add_mapillary_run` cycles `MAPILLARY_FIXTURE_QUALITY` (0.92, 0.58) and `MAPILLARY_FIXTURE_ON_FOOT` over the pano rows, because the shared builder's constant 0.75 and all-vehicle capture would make every percentile, both tail shares and the on-foot share indistinguishable from a broken reduction.
+`test_every_fixture_mapillary_record_carries_a_quality_block` reads the committed `cities.json.gz` and pins both the presence of the block on every Mapillary record and its values, so a fixture regenerated without the cycle fails in the fast suite.
 
 ## The Mapillary user-activity tool
 

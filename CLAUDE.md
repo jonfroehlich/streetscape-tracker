@@ -181,6 +181,7 @@ The out-of-band GSV capture-history harvester (#2) is documented there too.
 The census pipeline — record → rows → grid assignment → written CSV — lives **once** in `census.py`, parameterized per provider; never copy it into a provider module, because the contracts it enforces are invisible in a review of the second copy.
 It is columnar (a memory contract, #157), pinned byte-identical by a golden fixture (a formatting drift reads as phantom imagery churn in every diff), and the `image_columns` contract is enforced rather than documented.
 `is_pano` is read through `census.census_is_pano`, never as a raw array; imagery-type stratification (#116) yields **two** coverage numbers — 360° and any-imagery — which are never conflated.
+**Mapillary's `quality_score` penalises on-foot capture (lower than vehicle imagery in 84.5% of paired cities), so it is published as a distribution (`mapillary_meta.quality`, #321) with the on-foot share beside it and never ranks a city alone.**
 Three Panoramax rules that must survive without a read (#316):
 
 - **The census is the v1 `pictures` layer at z15, never `/api/search`** — search does not paginate, reports no `numberMatched` and SILENTLY IGNORES its own `datetime` filter (measured: 5,045 pictures that the requested windows should have excluded all came back), so an incremental fetch built on it would re-read the whole history and report it as new.

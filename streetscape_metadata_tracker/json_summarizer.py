@@ -12,7 +12,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from . import db, driving_plan, panoramax_screen, plan_match
+from . import db, driving_plan, mapillary_quality, panoramax_screen, plan_match
 from .analysis import (
     GSV_QUERY_RADIUS_M,
     PRESENT_STATUSES,
@@ -268,27 +268,44 @@ def compute_mapillary_meta(df: pd.DataFrame) -> dict[str, Any] | None:
         pct_with_org        % of panos attributed to an organization
         pct_on_foot         % of panos captured on foot (vs vehicle)
         median_quality_score median Mapillary quality_score (0-1)
+        quality             the quality_score DISTRIBUTION (issue #321), see
+                            compute_mapillary_quality. Absent -- never zeros
+                            or nulls -- when the CSV has no quality_score
+                            column or no pano is scored. A census without a
+                            sequence_id column still gets the block, with
+                            its sequence-weighted cut null (no drives).
 
     Returns None for a legacy Mapillary file that predates the enriched schema
     (the extra columns are absent) or a run with no pano rows, so callers can
     simply omit the block.
+
+    Columnar (issue #157): the pano mask is applied one COLUMN at a time, never
+    as ``df[mask]``, and the quality block is built from one-dimensional
+    arrays. That is not a memory saving: the block's arrays (factorize codes,
+    on_foot codes, the sort order and its gathers) roughly replace the dropped
+    frame copy, and a tracemalloc spot check (PR #427) put the peak within
+    ~2% of the pre-#321 code. What the shape buys is that the cost stays
+    linear -- no groupby().apply, no per-row Python.
     """
     if "organization_id" not in df.columns:
         return None
-    panos = df[df["status"].isin(("OK", "NO_DATE"))]
-    n = int(len(panos))
+    pano_mask = df["status"].isin(PRESENT_STATUSES).to_numpy(dtype=bool)
+    n = int(pano_mask.sum())
     if n == 0:
         return None
 
-    org = panos["organization_id"]
-    on_foot = panos["on_foot"]
-    quality = panos["quality_score"]
+    org = df["organization_id"][pano_mask]
+    on_foot = df["on_foot"][pano_mask]
+    # Every enriched census carries quality_score beside organization_id (they
+    # arrived in one commit), but a frame without it must lose the score, not
+    # raise and take the per-run JSON down with it.
+    quality = df["quality_score"][pano_mask] if "quality_score" in df.columns else None
 
     n_with_org = int(org.notna().sum())
     n_foot_known = int(on_foot.notna().sum())
-    median_quality = quality.median()  # skips NA; NA if all missing
+    median_quality = quality.median() if quality is not None else None  # skips NA
 
-    return {
+    meta: dict[str, Any] = {
         "n_images": n,
         "n_distinct_orgs": int(org.nunique(dropna=True)),
         "pct_with_org": round(100.0 * n_with_org / n, 1),
@@ -301,6 +318,94 @@ def compute_mapillary_meta(df: pd.DataFrame) -> dict[str, Any] | None:
             None if pd.isna(median_quality) else round(float(median_quality), 3)
         ),
     }
+    if quality is not None:
+        block = compute_mapillary_quality(df, pano_mask, quality=quality, on_foot=on_foot)
+        if block is not None:
+            meta["quality"] = block
+    return meta
+
+
+def compute_mapillary_quality(
+    df: pd.DataFrame,
+    pano_mask: np.ndarray | None = None,
+    *,
+    quality: pd.Series | None = None,
+    on_foot: pd.Series | None = None,
+) -> dict[str, Any] | None:
+    """
+    The ``mapillary_meta.quality`` block (issue #321) for one run's census.
+
+    The one place a frame becomes the three arrays
+    ``mapillary_quality.quality_block`` takes, so the live summarizer and the
+    backfill (``scripts/recompute_run_stats.py
+    --regenerate-json-mapillary-meta``, which reads only the four columns this
+    needs) cannot build the block two ways.
+
+    Args:
+        df: A census frame carrying at least ``status`` and ``quality_score``;
+            ``sequence_id`` and ``on_foot`` are optional (absent reads as "no
+            sequence" and "unknown" for every image).
+        pano_mask: The pano-row mask (status OK or NO_DATE), when the caller
+            already holds it.
+        quality, on_foot: The two columns already masked, when the caller
+            already holds them (``compute_mapillary_meta`` does).
+
+    Returns:
+        The block, or None when there is no ``quality_score`` column or no
+        pano row is scored -- the caller then OMITS the key.
+
+    Example::
+
+        block = compute_mapillary_quality(
+            pd.read_csv(path, usecols=mapillary_quality.BLOCK_COLUMNS, ...)
+        )
+    """
+    if mapillary_quality.QUALITY_COLUMN not in df.columns:
+        return None
+    if pano_mask is None:
+        pano_mask = df["status"].isin(PRESENT_STATUSES).to_numpy(dtype=bool)
+    if quality is None:
+        quality = df[mapillary_quality.QUALITY_COLUMN][pano_mask]
+    n = len(quality)
+    if "sequence_id" in df.columns:
+        # factorize, not a dict walk: NA -> -1, which is the "no sequence" the
+        # sequence-weighted cut drops. int32 is ample for the drives in one city.
+        codes = pd.factorize(df["sequence_id"][pano_mask])[0].astype(np.int32)
+    else:
+        codes = np.full(n, -1, dtype=np.int32)
+    if on_foot is None and "on_foot" in df.columns:
+        on_foot = df["on_foot"][pano_mask]
+    foot = (
+        _foot_codes(on_foot)
+        if on_foot is not None
+        else np.full(n, mapillary_quality.FOOT_UNKNOWN, dtype="int8")
+    )
+    return mapillary_quality.quality_block(
+        pd.to_numeric(quality, errors="coerce").to_numpy(dtype="float64", na_value=np.nan),
+        codes,
+        foot,
+    )
+
+
+def _foot_codes(on_foot: pd.Series) -> np.ndarray:
+    """``on_foot`` as int8 in ``mapillary_quality``'s encoding (1/0/-1).
+
+    The loader hands back a nullable bool, which is read numerically (True 1,
+    False 0, NA NaN) without building a string per row: the string view costs
+    ~57 B per pano under pandas 2.x's Python string storage. A column read
+    WITHOUT the Mapillary dtypes is text ("True", "1.0", "false", ...), and
+    only that takes the study's lower-cased string normalization.
+    """
+    codes = np.full(len(on_foot), mapillary_quality.FOOT_UNKNOWN, dtype="int8")
+    if pd.api.types.is_bool_dtype(on_foot.dtype):
+        values = on_foot.to_numpy(dtype="float64", na_value=np.nan)
+        codes[values == 1.0] = mapillary_quality.FOOT_ON
+        codes[values == 0.0] = mapillary_quality.FOOT_VEHICLE
+        return codes
+    text = on_foot.astype("string").str.lower()
+    codes[text.isin(["true", "1", "1.0"]).to_numpy(dtype=bool)] = mapillary_quality.FOOT_ON
+    codes[text.isin(["false", "0", "0.0"]).to_numpy(dtype=bool)] = mapillary_quality.FOOT_VEHICLE
+    return codes
 
 
 def generate_city_metadata_summary_as_json(
@@ -733,6 +838,15 @@ def _build_provider_summary(
         ]
         latest_block["google_panos_age_stats"] = google_panos["age_stats"]
         histograms_by_year["google_panos"] = google_panos["histogram_of_capture_dates_by_year"]
+    # Mapillary's free per-image metadata summary, including the quality_score
+    # distribution and the on-foot counts that must travel with it (issue
+    # #321). Present only when the per-run JSON carries it, so every other
+    # provider's block -- and a Mapillary run predating the enriched schema --
+    # is byte-identical to its pre-#321 form and the aggregate keeps
+    # schema_version 4 (the additive-field rule).
+    mapillary_meta = latest_json.get("mapillary_meta")
+    if mapillary_meta:
+        latest_block["mapillary_meta"] = mapillary_meta
 
     # Change summary vs the previous run (None for the first run)
     change = None
