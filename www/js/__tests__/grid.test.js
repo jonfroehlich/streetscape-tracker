@@ -980,12 +980,28 @@ test("quality: a block on one provider's record gives THAT provider the group, a
   assert.ok(!Object.keys(row).some((k) => k.startsWith("quality_gsv")));
   const qualityFilters = filters
     .filter((f) => f.key.startsWith("quality_") || f.key.startsWith("onfoot_"))
-    .map((f) => [f.key, f.field, f.type, f.min, f.max]);
+    .map((f) => [f.key, f.field, f.type, f.min, f.max, f.fixedDomain]);
   assert.deepEqual(qualityFilters, [
-    ["quality_mapillary", "quality_mapillary_p50", "histogram-range", 0, 1],
-    ["onfoot_mapillary", "quality_mapillary_on_foot", "histogram-range", 0, 100],
+    ["quality_mapillary", "quality_mapillary_p50", "histogram-range", 0, 1, true],
+    ["onfoot_mapillary", "quality_mapillary_on_foot", "histogram-range", 0, 100, true],
   ]);
   for (const f of filters) assert.ok(f.key === "provider" || f.field in row, f.key);
+});
+
+test("quality: the sliders' AXES are 0–1 and 0–100 whatever the rows hold", () => {
+  // The descriptor's min/max alone are only a clamp on the rows' extent, so
+  // the shape test above could pass while the slider labelled "(0–1)" drew
+  // 0.75–1.75 (every fixture median is 0.75) or spread a 0.62–0.81 band over
+  // the whole track. What draws the axis is histogramAxisDomain.
+  const { histogramAxisDomain } = require("../table-controls.js");
+  const { filters } = qualityBuildFor(payload(SEATTLE_GSV, SEATTLE_MAPILLARY_Q), "seattle--wa");
+  const byKey = Object.fromEntries(filters.map((f) => [f.key, f]));
+  for (const values of [[0.75, 0.75], [0.62, 0.81], []]) {
+    assert.deepEqual(histogramAxisDomain(values, byKey.quality_mapillary), { min: 0, max: 1 });
+  }
+  for (const values of [[50, 50], [12.5, 30], [100]]) {
+    assert.deepEqual(histogramAxisDomain(values, byKey.onfoot_mapillary), { min: 0, max: 100 });
+  }
 });
 
 test("quality: presence is read from the payload, not the provider name", () => {

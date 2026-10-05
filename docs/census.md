@@ -105,11 +105,16 @@ So the score is a vendor's prediction of visual quality, never "useful for Sidew
 | `n_on_foot`, `n_foot_known` | Pano rows captured on foot, and pano rows whose `on_foot` is known (scored or not) |
 
 The thresholds live **once**, in `streetscape_metadata_tracker/mapillary_quality.py`: `scripts/mapillary_image_quality_collect.py` imports them, and `www/js/grid.js` mirrors them in its headers under a test that reads them out of the JS source.
-The block is **absent** — never zeros or nulls — when the CSV has no `quality_score` column (every pre-2026-07-24 run, ~129 of them) or when no pano row is scored, so key presence means "measured".
+The block is **absent** — never zeros or nulls — when the CSV has no `quality_score` column (every pre-2026-07-24 run; 129 of the latest runs) or when no pano row is scored, so key presence means "measured".
 Within a present block a sub-statistic with no sample (no on-foot images, no sequenced images) is `null`.
 
 **It is columnar, under the #157 memory contract above.**
-The summarizer tail is the per-city memory high-water mark inside the nightly child (measured 0.914 GiB per million CSV rows), so the block is computed from three one-dimensional arrays: the pano mask is applied **one column at a time** (the old `df[mask]` copied the whole census frame and is gone), `sequence_id` goes through `pd.factorize`, and the per-sequence medians are a `np.lexsort` by (code, score) plus two gathers at each run's middle — no frame, no `groupby().apply`, no per-row loop.
+The summarizer tail is the per-city memory high-water mark inside the nightly child (measured 0.914 GiB per million CSV rows), so the block is computed from three one-dimensional arrays: the pano mask is applied **one column at a time** (never `df[mask]`), `sequence_id` goes through `pd.factorize` (as `int32`), `on_foot` is read numerically from its nullable-bool column rather than through a string per row, and the per-sequence medians are a `np.lexsort` by (code, score) plus two gathers at each run's middle — no frame, no `groupby().apply`, no per-row loop.
+That keeps the cost **linear, and about where it was** — not a memory saving: the block's arrays roughly replace the frame copy the old `df[mask]` made.
+A `tracemalloc` spot check on a synthetic census during PR #427's review (figures in that PR, not committed as an experiment) put `compute_mapillary_meta`'s peak within about 2% of the pre-#321 code.
+The first version built one Python string per row to read `on_foot` and peaked measurably ABOVE the old code; reading the nullable bool numerically is what removed that, so keep the string path for text columns only.
+`json_summarizer.compute_mapillary_quality` is the one place a frame becomes those arrays, shared by the summarizer and the backfill ([`operations.md`](operations.md)).
+A census without a `sequence_id` column still gets the block; only its sequence-weighted cut is empty (`n_sequences` 0, `seq_*` null).
 A test pins those medians equal to a `groupby().median()`.
 
 ## KartaView is the second census provider, and its primitive is a paginated radius sweep (issue #225)

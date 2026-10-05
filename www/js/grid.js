@@ -715,9 +715,12 @@ function buildGridFilters(providers = gridProviders(), qualityProviders = []) {
     // Issue #321. Named for their provider rather than scoped by "Collected
     // by": a quality block exists for one provider only, so a scope pointing
     // these at another provider would select an all-null field. Fixed domains
-    // (0–1 and 0–100), because both are bounded scales and a self-scaling axis
-    // would hide where a city sits on them. The on-foot slider ships with the
-    // quality one, for the same reason the column does.
+    // (0–1 and 0–100, `fixedDomain`, so the descriptor's range IS the axis
+    // rather than a clamp on the rows' extent; see histogramAxisDomain),
+    // because both are bounded scales and a self-scaling axis would spread a
+    // narrow band of medians across the whole track and hide where a city
+    // sits on the scale. The on-foot slider ships with the quality one, for
+    // the same reason the column does.
     ...qualityProviders.flatMap((p) => [
       {
         key: `quality_${p}`,
@@ -726,6 +729,7 @@ function buildGridFilters(providers = gridProviders(), qualityProviders = []) {
         field: `quality_${p}_p50`,
         min: 0,
         max: 1,
+        fixedDomain: true,
         digits: 2,
       },
       {
@@ -735,6 +739,7 @@ function buildGridFilters(providers = gridProviders(), qualityProviders = []) {
         field: `quality_${p}_on_foot`,
         min: 0,
         max: 100,
+        fixedDomain: true,
         unit: "%",
         digits: 1,
       },

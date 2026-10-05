@@ -25,6 +25,7 @@ const {
   defaultFilterValues,
   parseTableState,
   serializeTableState,
+  histogramAxisDomain,
   histogramBuckets,
   controlsHtml,
   syncSidebarDisclosure,
@@ -429,6 +430,40 @@ test("rowsExceptFilter: the free-text query still narrows the bars", () => {
     "cov"
   );
   assert.deepEqual(out.map((r) => r.cityId), ["b"]);
+});
+
+// --- histogramAxisDomain (issue #321 review) --------------------------------
+
+test("histogramAxisDomain: by default the rows' extent, clamped by the descriptor", () => {
+  assert.deepEqual(histogramAxisDomain([12, 47.6, null, NaN], { min: 0, max: 100 }), {
+    min: 12,
+    max: 47.6,
+  });
+  assert.deepEqual(histogramAxisDomain([-5, 140], { min: 0, max: 100 }), { min: 0, max: 100 });
+  // No rows: the descriptor's range, or 0–1 when it declares none.
+  assert.deepEqual(histogramAxisDomain([], { min: 0, max: 100 }), { min: 0, max: 100 });
+  assert.deepEqual(histogramAxisDomain([], {}), { min: 0, max: 1 });
+});
+
+test("histogramAxisDomain: fixedDomain makes the descriptor's range the axis", () => {
+  const filter = { min: 0, max: 1, fixedDomain: true };
+  assert.deepEqual(histogramAxisDomain([0.62, 0.81], filter), { min: 0, max: 1 });
+  assert.deepEqual(histogramAxisDomain([0.75, 0.75], filter), { min: 0, max: 1 });
+  // Without both ends there is no range to fix, so it falls back to the extent.
+  assert.deepEqual(histogramAxisDomain([0.62, 0.81], { min: 0, fixedDomain: true }), {
+    min: 0.62,
+    max: 0.81,
+  });
+});
+
+test("histogramAxisDomain: a degenerate extent widens without passing the descriptor's max", () => {
+  // Unbounded above: one unit up, as before.
+  assert.deepEqual(histogramAxisDomain([50, 50], { min: 0 }), { min: 50, max: 51 });
+  assert.deepEqual(histogramAxisDomain([50, 50], { min: 0, max: 100 }), { min: 50, max: 51 });
+  // Bounded: the widening is clamped, so a "(0–1)" slider never draws 0.75–1.75.
+  assert.deepEqual(histogramAxisDomain([0.75, 0.75], { min: 0, max: 1 }), { min: 0, max: 1 });
+  assert.deepEqual(histogramAxisDomain([100], { min: 0, max: 100 }), { min: 99, max: 100 });
+  assert.deepEqual(histogramAxisDomain([100], { max: 100 }), { min: 99, max: 100 });
 });
 
 // --- histogramBuckets: fixed domain -----------------------------------------

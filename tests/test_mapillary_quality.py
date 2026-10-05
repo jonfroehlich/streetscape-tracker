@@ -26,6 +26,7 @@ from streetscape_metadata_tracker.config import MAPILLARY_METADATA_DTYPES, METAD
 from streetscape_metadata_tracker.fileutils import load_city_csv_file
 from streetscape_metadata_tracker.json_summarizer import (
     _build_provider_summary,
+    _foot_codes,
     compute_mapillary_meta,
     generate_city_metadata_summary_as_json,
 )
@@ -174,6 +175,36 @@ def test_the_existing_keys_are_unchanged():
     assert meta["n_images"] == 3
     assert meta["median_quality_score"] == 0.7
     assert meta["pct_on_foot"] == pytest.approx(66.7)
+
+
+def test_on_foot_read_as_text_is_coded_like_the_typed_column():
+    """A CSV read WITHOUT the Mapillary dtypes hands on_foot back as text, in
+    every spelling pandas and the writer produce; the typed (nullable bool)
+    column takes a numeric path. Both must code alike: 1 on foot, 0 vehicle,
+    -1 unknown."""
+    typed = pd.Series([True, False, None, True, False], dtype="boolean")
+    expected = [1, 0, -1, 1, 0]
+    assert _foot_codes(typed).tolist() == expected
+    assert _foot_codes(pd.Series([True, False], dtype=bool)).tolist() == [1, 0]
+    for spelling in (
+        ["True", "False", None, "true", "FALSE"],
+        ["1", "0", "", "1", "0"],
+        ["1.0", "0.0", None, "1.0", "0.0"],
+    ):
+        assert _foot_codes(pd.Series(spelling, dtype=object)).tolist() == expected, spelling
+
+
+def test_a_census_without_sequence_ids_still_gets_its_block():
+    """sequence_id is not one of the two absence conditions: without it the
+    image-weighted numbers and the on-foot split still stand, and only the
+    sequence-weighted cut is empty (null, with zero drives)."""
+    rows = [("OK", 0.9, True, "s"), ("OK", 0.5, False, "s"), ("NO_DATE", 0.7, False, "s")]
+    meta = compute_mapillary_meta(_census(rows).drop(columns=["sequence_id"]))
+    block = meta["quality"]
+    assert block["n_scored"] == 3 and block["p50"] == 0.7
+    assert block["n_on_foot"] == 1 and block["n_foot_known"] == 3
+    assert block["n_sequences"] == 0
+    assert (block["seq_p25"], block["seq_p50"], block["seq_p75"]) == (None, None, None)
 
 
 def test_per_sequence_medians_match_a_groupby():
@@ -333,6 +364,16 @@ def test_the_aggregate_carries_mapillary_meta_when_present(conn, data_dir):
     assert block["latest"]["mapillary_meta"] == meta
 
 
+def test_the_aggregate_carries_a_meta_that_has_no_quality_block(conn, data_dir):
+    """The carry is keyed on the META, not on its block: a run summarized
+    before #321 deployed publishes its meta as it stands (the frontend gates on
+    the block), rather than nothing until it is backfilled."""
+    meta = {"n_images": 1, "median_quality_score": 0.7}
+    runs, latest_json = _register_mapillary_run(conn, data_dir, meta)
+    block = _build_provider_summary(runs, latest_json, data_dir, conn, frozenset())
+    assert block["latest"]["mapillary_meta"] == meta
+
+
 def test_a_run_without_mapillary_meta_is_byte_identical_to_before(conn, data_dir):
     """Absent stays absent: no key, not a null -- so every GSV, KartaView and
     Panoramax block, and every legacy Mapillary one, is unchanged by #321."""
@@ -344,17 +385,23 @@ def test_a_run_without_mapillary_meta_is_byte_identical_to_before(conn, data_dir
 # ── the backfill handle ───────────────────────────────────────────────────────
 
 
-def _three_run_catalog(conn, data_dir):
-    """Three Mapillary runs, one per selection outcome:
+# One run per selection outcome.
+#   legacy   -- CSV predates the enriched schema: no mapillary_meta (stays absent)
+#   nopano   -- the column, but zero pano rows: no mapillary_meta (stays absent)
+#   unscored -- the meta, every score missing: median null (stays absent)
+#   done     -- JSON already carries the block (left alone)
+#   stale    -- the meta with a scored median, no block (the block is spliced in)
+#   nojson   -- the column, no JSON at all (rebuilt whole)
+BACKFILL_RUNS = ("legacy", "nopano", "unscored", "done", "stale", "nojson")
 
-    * `legacy` -- CSV predates the quality_score column (stays absent)
-    * `done`   -- JSON already carries the block (left alone)
-    * `stale`  -- CSV carries the column, JSON lacks the block (rebuilt)
+
+def _backfill_catalog(conn, data_dir):
+    """Six Mapillary runs, one per BACKFILL_RUNS outcome.
 
     Returns {name: (run_id, json_path)}.
     """
     out = {}
-    for name in ("legacy", "done", "stale"):
+    for name in BACKFILL_RUNS:
         cid = db.register_city(
             conn,
             city_name=name.title(),
@@ -374,9 +421,12 @@ def _three_run_catalog(conn, data_dir):
             + ".csv.gz"
         )
         csv_path = os.path.join(data_dir, csv_name)
-        df = make_mapillary_city_df([("a", "2025-01-01"), ("b", "2025-06-01")], run_date=run_date)
+        panos = [] if name == "nopano" else [("a", "2025-01-01"), ("b", "2025-06-01")]
+        df = make_mapillary_city_df(panos, run_date=run_date, n_empty=2)
         if name == "legacy":
             df = df[COLUMNS]
+        if name == "unscored":
+            df["quality_score"] = np.nan
         write_city_csv_gz(df, csv_path)
         json_path = generate_city_metadata_summary_as_json(
             csv_path,
@@ -393,18 +443,21 @@ def _three_run_catalog(conn, data_dir):
         )
         with gzip.open(json_path, "rt", encoding="utf-8") as fh:
             payload = json.load(fh)
-        if name == "stale":
+        if name in ("stale", "nojson"):
             # A JSON summarized before #321 deployed: the meta, without its block.
             del payload["mapillary_meta"]["quality"]
             with gzip.open(json_path, "wt", encoding="utf-8") as fh:
                 json.dump(payload, fh)
         assert ("quality" in payload.get("mapillary_meta", {})) == (name == "done")
+        assert ("mapillary_meta" in payload) == (name not in ("legacy", "nopano"))
+        if name == "nojson":
+            os.remove(json_path)
         run_id = db.register_run(
             conn,
             city_id=cid,
             run_date=run_date,
             csv_filename=csv_name,
-            json_filename=os.path.basename(json_path),
+            json_filename=None if name == "nojson" else os.path.basename(json_path),
             provider="mapillary",
         )
         out[name] = (run_id, json_path)
@@ -424,9 +477,25 @@ def _bytes(path):
         return fh.read(), stat.st_ino, stat.st_mtime_ns
 
 
-def _has_block(json_path):
+def _payload(json_path):
     with gzip.open(json_path, "rt", encoding="utf-8") as fh:
-        return "quality" in json.load(fh).get("mapillary_meta", {})
+        return json.load(fh)
+
+
+def _has_block(json_path):
+    return "quality" in _payload(json_path).get("mapillary_meta", {})
+
+
+def _existing(runs):
+    """Snapshot every per-run JSON that exists on disk."""
+    return {name: _bytes(path) for name, (_, path) in runs.items() if os.path.exists(path)}
+
+
+def _listed(out):
+    """The city slugs' first token of every run the backfill listed."""
+    return sorted(
+        line.split()[0].split("--")[0] for line in out.splitlines() if "[mapillary]" in line
+    )
 
 
 @pytest.fixture
@@ -435,49 +504,115 @@ def no_batch(monkeypatch):
     monkeypatch.setattr(scheduler, "_run_due_in_flight", lambda: None)
 
 
-def test_the_backfill_dry_run_selects_only_the_stale_run_and_writes_nothing(
+def test_the_backfill_dry_run_selects_only_runs_that_can_gain_a_block(
     conn, data_dir, no_batch, capsys
 ):
-    runs = _three_run_catalog(conn, data_dir)
-    before = {name: _bytes(path) for name, (_, path) in runs.items()}
+    runs = _backfill_catalog(conn, data_dir)
+    before = _existing(runs)
 
     assert rrs.backfill_mapillary_quality(data_dir, execute=False, publish=True) == 0
 
-    listed = [line for line in capsys.readouterr().out.splitlines() if "[mapillary]" in line]
-    assert len(listed) == 1 and listed[0].lstrip().startswith("stale")
-    assert {name: _bytes(path) for name, (_, path) in runs.items()} == before
+    assert _listed(capsys.readouterr().out) == ["nojson", "stale"]
+    assert _existing(runs) == before
+    assert not os.path.exists(runs["nojson"][1])
     assert not os.path.exists(os.path.join(data_dir, "cities.json.gz"))
 
 
 def test_the_backfill_report_counts_each_reason(conn, data_dir, no_batch, capsys):
-    _three_run_catalog(conn, data_dir)
+    _backfill_catalog(conn, data_dir)
     rrs.backfill_mapillary_quality(data_dir, execute=False, publish=True)
     out = capsys.readouterr().out
-    assert "3 Mapillary runs scanned" in out
+    assert "6 Mapillary runs scanned" in out
     assert "1 already carry the quality block" in out
-    assert "1 predate the quality_score column and stay absent" in out
-    assert "1 would be rebuilt" in out
+    assert "2 predate the enriched schema or hold no pano and stay absent" in out
+    assert "1 have the quality_score column but no scored pano and stay absent" in out
+    assert "0 skipped (missing CSV)" in out
+    assert "1 would gain the block" in out
+    assert "1 would be rebuilt whole" in out
 
 
-def test_the_backfill_execute_rebuilds_exactly_the_stale_run(conn, data_dir, no_batch):
-    runs = _three_run_catalog(conn, data_dir)
-    untouched = {name: _bytes(runs[name][1]) for name in ("legacy", "done")}
+def test_the_backfill_counts_a_missing_csv_as_missing_not_absent(conn, data_dir, no_batch, capsys):
+    """A run whose CSV is gone is SKIPPED and says so -- it is not one of the
+    runs that predate the column, and the operator needs to tell them apart."""
+    runs = _backfill_catalog(conn, data_dir)
+    row = conn.execute(
+        "SELECT csv_filename FROM runs WHERE run_id = ?", (runs["stale"][0],)
+    ).fetchone()
+    os.remove(os.path.join(data_dir, row["csv_filename"]))
+    rrs.backfill_mapillary_quality(data_dir, execute=False, publish=True)
+    out = capsys.readouterr().out
+    assert "1 skipped (missing CSV)" in out
+    assert "2 predate the enriched schema or hold no pano and stay absent" in out
+    assert _listed(out) == ["nojson"]
+
+
+def test_the_backfill_execute_gives_exactly_the_selected_runs_the_block(conn, data_dir, no_batch):
+    runs = _backfill_catalog(conn, data_dir)
+    untouched = {n: _bytes(runs[n][1]) for n in ("legacy", "nopano", "unscored", "done")}
 
     assert rrs.backfill_mapillary_quality(data_dir, execute=True, publish=False) == 0
 
     assert _has_block(runs["stale"][1])
-    assert not _has_block(runs["legacy"][1]), "a pre-column run stays ABSENT, never zero"
-    assert {name: _bytes(runs[name][1]) for name in ("legacy", "done")} == untouched
+    assert _has_block(runs["nojson"][1]), "a missing JSON is rebuilt whole"
+    for name in ("legacy", "nopano", "unscored"):
+        assert not _has_block(runs[name][1]), f"{name} stays ABSENT, never zero"
+    assert {n: _bytes(runs[n][1]) for n in untouched} == untouched
+    # publish=False means no aggregate.
+    assert not os.path.exists(os.path.join(data_dir, "cities.json.gz"))
+
+
+def test_a_second_backfill_pass_selects_nothing(conn, data_dir, no_batch, capsys):
+    """Idempotent: a run with the column but no scored pano can never gain a
+    block, so a selection that keeps choosing it re-reads its census forever."""
+    runs = _backfill_catalog(conn, data_dir)
+    rrs.backfill_mapillary_quality(data_dir, execute=True, publish=True)
+    capsys.readouterr()
+    after_first = _existing(runs)
+
+    rrs.backfill_mapillary_quality(data_dir, execute=True, publish=True)
+    out = capsys.readouterr().out
+    assert _listed(out) == []
+    assert "0 will gain the block" in out and "0 will be rebuilt whole" in out
+    assert "3 already carry the quality block" in out
+    assert _existing(runs) == after_first
+
+
+def test_the_backfill_splices_the_block_and_rewrites_nothing_else(conn, data_dir, no_batch):
+    """The spliced run's JSON is its old JSON plus one block: no other key is
+    re-derived under today's definitions, the catalog row is not written, and
+    the block equals the one the live summarizer builds from the full census."""
+    runs = _backfill_catalog(conn, data_dir)
+    run_id, json_path = runs["stale"]
+    # Stand in for an older summarizer: a key and a value today's would not
+    # write. A whole-JSON rebuild drops both; a splice must keep them.
+    before = _payload(json_path)
+    before["written_by_an_older_summarizer"] = True
+    before["mapillary_meta"]["n_images"] = 999
+    with gzip.open(json_path, "wt", encoding="utf-8") as fh:
+        json.dump(before, fh)
+    before_row = dict(conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone())
+
+    rrs.backfill_mapillary_quality(data_dir, execute=True, publish=False)
+
+    after = _payload(json_path)
+    block = after["mapillary_meta"].pop("quality")
+    assert after == before
+    assert dict(conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()) == (
+        before_row
+    )
+    csv_path = os.path.join(data_dir, before_row["csv_filename"])
+    assert block == compute_mapillary_meta(load_city_csv_file(csv_path))["quality"]
 
 
 def test_the_backfill_refuses_execute_while_run_due_is_in_flight(conn, data_dir, monkeypatch):
-    runs = _three_run_catalog(conn, data_dir)
+    runs = _backfill_catalog(conn, data_dir)
     before = _bytes(runs["stale"][1])
     monkeypatch.setattr(scheduler, "_run_due_in_flight", lambda: "4242 run-due")
 
     status = rrs.backfill_mapillary_quality(data_dir, execute=True, publish=True)
     assert status == scheduler.USAGE_EXIT_CODE
     assert _bytes(runs["stale"][1]) == before
+    assert not os.path.exists(runs["nojson"][1])
 
 
 def test_the_backfill_flag_requires_the_mapillary_provider(data_dir):

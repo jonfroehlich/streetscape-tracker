@@ -49,6 +49,10 @@ import numpy as np
 
 QUALITY_COLUMN = "quality_score"
 
+# Every column the block is built from. The backfill reads only these, so
+# splicing a block into an old JSON costs four columns of a census, not all.
+BLOCK_COLUMNS = ("status", QUALITY_COLUMN, "on_foot", "sequence_id")
+
 # The two tail shares. The median compresses most cities into one 0.07-wide
 # band (58.8% of 388 measured); these are where cities actually separate.
 # The study script imports them from here, so the study and the published

@@ -431,6 +431,54 @@ function serializeTableState(state, { filters, defaultPreset }) {
 // ── Histogram bucketing ───────────────────────────────────────
 
 /**
+ * The raw axis a histogram-slider is seeded with, before the slider snaps it.
+ *
+ * By default the axis is the extent of the row values, CLAMPED by the
+ * descriptor's `min`/`max` (a coverage slider never runs past 100%, but a
+ * 0–47.6% Mapillary population is drawn over 0–47.6, not 0–100).
+ * `fixedDomain: true` (with both `min` and `max`) makes the descriptor's range
+ * the axis itself, whatever the rows hold: a bounded scale such as a 0–1
+ * quality prediction (issue #321) has to show WHERE a city sits on it, and a
+ * self-scaled axis spreads a narrow band of medians across the whole track.
+ *
+ * A degenerate extent (no rows, or every row the same value) widens by one
+ * unit, and the widening is clamped too, so no axis ever exceeds `filter.max`:
+ * a lone value AT the maximum widens downwards instead.
+ *
+ * @param {Array<*>} values - The field's values over every row; non-numbers
+ *   and non-finite numbers are ignored.
+ * @param {{min?: ?number, max?: ?number, fixedDomain?: boolean}} filter -
+ *   Filter descriptor.
+ * @returns {{min: number, max: number}} With `max > min` whenever the
+ *   descriptor's own range allows it.
+ *
+ * @example
+ *   histogramAxisDomain([0.75, 0.75], { min: 0, max: 1 });                    // {min: 0, max: 1}
+ *   histogramAxisDomain([0.62, 0.81], { min: 0, max: 1 });                    // {min: 0.62, max: 0.81}
+ *   histogramAxisDomain([0.62, 0.81], { min: 0, max: 1, fixedDomain: true }); // {min: 0, max: 1}
+ */
+function histogramAxisDomain(values, filter) {
+  const lower = filter.min ?? null;
+  const upper = filter.max ?? null;
+  if (filter.fixedDomain && lower != null && upper != null) {
+    return { min: lower, max: upper };
+  }
+  const nums = values.filter((v) => typeof v === "number" && Number.isFinite(v));
+  let min = nums.length ? Math.min(...nums) : (lower ?? 0);
+  let max = nums.length ? Math.max(...nums) : (upper ?? 1);
+  if (lower != null) min = Math.max(min, lower);
+  if (upper != null) max = Math.min(max, upper);
+  if (max > min) return { min, max };
+  // Degenerate: widen one unit, then clamp the widening as well.
+  max = min + 1;
+  if (upper != null && max > upper) {
+    max = upper;
+    min = lower != null ? Math.max(lower, max - 1) : max - 1;
+  }
+  return { min, max };
+}
+
+/**
  * Bucket numeric values into a histogram, over an axis the CALLER fixes.
  *
  * Nulls are dropped rather than bucketed as zero (see rowPassesFilter). A
@@ -855,19 +903,16 @@ function createTableControls({
       if (!force && entry.field === filter.field) continue;
       const changed = entry.field !== null;
       entry.field = filter.field;
-      const values = allRows
-        .map((row) => row[filter.field])
-        .filter((v) => typeof v === "number" && Number.isFinite(v));
-      let min = values.length ? Math.min(...values) : (filter.min ?? 0);
-      let max = values.length ? Math.max(...values) : (filter.max ?? 1);
-      if (filter.min != null) min = Math.max(min, filter.min);
-      if (filter.max != null) max = Math.min(max, filter.max);
+      const raw = histogramAxisDomain(
+        allRows.map((row) => row[filter.field]),
+        filter
+      );
       if (changed && clearOnChange) {
         delete state.values[entry.key];
         writeRangeInputs(entry.key, null);
       }
       // The SNAPPED axis, which is the one histogramBuckets has to bucket over.
-      entry.domain = entry.slider.setDomain({ min, max: max > min ? max : min + 1 });
+      entry.domain = entry.slider.setDomain(raw);
       entry.slider.setValue(state.values[entry.key]);
       entry.slider.setLabel(filter.label);
     }
@@ -1220,6 +1265,7 @@ if (typeof module !== "undefined" && module.exports) {
     defaultFilterValues,
     parseTableState,
     serializeTableState,
+    histogramAxisDomain,
     histogramBuckets,
     controlsHtml,
     createTableControls,

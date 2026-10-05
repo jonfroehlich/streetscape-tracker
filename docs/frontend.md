@@ -253,7 +253,10 @@ The thresholds in the headers (`QUALITY_GOOD_THRESHOLD`, `QUALITY_POOR_THRESHOLD
 
 **It is NOT in the default preset.**
 The "Mapillary quality" preset (coverage leaves without the Δ, the quality group, "Last collected") exists only when the group does.
-Two histogram sliders come with it per quality provider — the median over a fixed 0–1 domain and the on-foot share over 0–100 — named for their provider rather than scoped by "Collected by", because a block exists for one provider and a scope pointing them at another would select an all-null field.
+Two histogram sliders come with it per quality provider — the median over a fixed 0–1 axis and the on-foot share over a fixed 0–100 one — named for their provider rather than scoped by "Collected by", because a block exists for one provider and a scope pointing them at another would select an all-null field.
+**A descriptor's `min`/`max` are only a CLAMP on the rows' extent; `fixedDomain: true` is what makes them the axis** (`table-controls.js` `histogramAxisDomain`).
+Without it, a slider labelled "(0–1)" drew 0.75–1.75 on the fixture (every median there is 0.75, and the one-unit widening of a degenerate extent ran past the clamp) and would spread production's narrow band of medians (58.8% of 388 measured cities sit in one 0.07-wide band) across the whole track.
+The widening is now clamped too, so no axis on any page exceeds its descriptor's `max`.
 
 ## The basemap needs a CARTO key, and a bad key looks like a styling bug
 

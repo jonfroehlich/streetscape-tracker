@@ -77,24 +77,32 @@ whose CSV is missing (skipped, reported) keep their existing values.
 
 THE MAPILLARY QUALITY BACKFILL (issue #321)
 --regenerate-json-mapillary-meta is a separate mode, and it skips everything
-above: no stats pass, no catalog write. Issue #321 added a `quality` block
-(the quality_score distribution and its on-foot split) to every Mapillary
-run's `mapillary_meta`, and a run summarized before that deploy lacks it. The
-mode, which requires --provider mapillary, rebuilds the per-run JSON of
-exactly the runs whose JSON lacks `mapillary_meta.quality` AND whose CSV
-header carries `quality_score` -- the header line only, never a census load,
-decides. The ~129 runs collected before 2026-07-24 have no such column and
-stay ABSENT, never zero; the report counts them.
+above: no stats pass. Issue #321 added a `quality` block (the quality_score
+distribution and its on-foot split) to every Mapillary run's
+`mapillary_meta`, and a run summarized before that deploy lacks it. The mode,
+which requires --provider mapillary, selects from each run's JSON ALONE: a
+run whose `mapillary_meta` has a non-null `median_quality_score` (so at least
+one pano is scored) and no `quality` block. That makes it idempotent -- a
+second pass selects nothing -- and it leaves ABSENT, never zero, every run
+that cannot have a block: every pre-2026-07-24 run (129 of the LATEST runs
+alone; the backfill scans every historical run, so its count is larger), and
+every run with the column but no scored pano. The report counts each reason.
 
-Its cost is one full census reload per selected run (regenerate_run_json,
-the live pipeline's own writer), and a Mapillary census is up to millions of
-rows: on production that is HOURS. Run it in the daytime ops window, never
-inside a night: --execute is refused while a `run-due` is in flight on this
-machine (`scheduler._run_due_in_flight`, as recompute_run_diffs.py does),
-because the nightly tail writes cities.json.gz through the same temp name and
-the summarizer tail is the per-city memory high-water mark. Only this mode is
-gated; the stats pass above keeps its existing behaviour. A dry run proceeds
-and says a batch is running.
+A selected run's block is SPLICED into its existing JSON: only the four
+columns the block needs are read from the census, and no other key of the
+JSON is rewritten, so a backfilled summary never mixes in today's other
+definitions. A run whose JSON is missing or unreadable falls back to the CSV
+header, and when that carries quality_score the JSON is rebuilt whole
+(regenerate_run_json, which also sets runs.json_filename -- the only catalog
+write this mode makes).
+
+Even four columns of a Mapillary census are up to millions of rows per run,
+so on production it is a daytime job, never one inside a night: --execute is
+refused while a `run-due` is in flight on this machine
+(`scheduler._run_due_in_flight`, as recompute_run_diffs.py does), because the
+nightly tail writes cities.json.gz through the same temp name. Only this mode
+is gated; the stats pass above keeps its existing behaviour. A dry run
+proceeds and says a batch is running.
 
 Usage:
     python scripts/recompute_run_stats.py                        # dry run
@@ -104,7 +112,7 @@ Usage:
     python scripts/recompute_run_stats.py --provider mapillary \\
         --regenerate-json-mapillary-meta   # issue #321's backfill: list only
     python scripts/recompute_run_stats.py --provider mapillary \\
-        --regenerate-json-mapillary-meta --execute   # ...and rebuild (daytime)
+        --regenerate-json-mapillary-meta --execute   # ...and apply (daytime)
 
 --provider gsv is not just a filter there: --regenerate-json re-reads every
 rebuilt run's CSV, and a Mapillary census run is millions of rows.
@@ -130,13 +138,19 @@ from streetscape_metadata_tracker.analysis import (  # noqa: E402
     implausible_capture_date_count,
     out_of_radius_count,
 )
+from streetscape_metadata_tracker.config import MAPILLARY_METADATA_DTYPES  # noqa: E402
 from streetscape_metadata_tracker.fileutils import load_city_csv_file  # noqa: E402
 from streetscape_metadata_tracker.json_summarizer import (  # noqa: E402
+    _write_json_gz_atomic,
+    compute_mapillary_quality,
     generate_aggregate_v2,
     generate_driving_plan_summary,
     regenerate_run_json,
 )
-from streetscape_metadata_tracker.mapillary_quality import has_quality_column  # noqa: E402
+from streetscape_metadata_tracker.mapillary_quality import (  # noqa: E402
+    BLOCK_COLUMNS,
+    has_quality_column,
+)
 from streetscape_metadata_tracker.naming import KNOWN_PROVIDERS  # noqa: E402
 from streetscape_metadata_tracker.paths import get_default_data_dir  # noqa: E402
 
@@ -258,33 +272,86 @@ def _age_delta_note(row, stats, n_implausible: int, n_out_of_radius: int = 0) ->
     return f"; {', '.join(parts)}" if parts else ""
 
 
-def _json_has_quality_block(data_dir: str, json_filename: str | None) -> bool:
-    """
-    True when a run's published JSON already carries `mapillary_meta.quality`.
-
-    What keeps the #321 backfill idempotent. A file that is missing, unreadable
-    or predates the block reads False, i.e. a candidate -- the CSV header then
-    decides whether there is anything to build it from.
-    """
+def _read_run_json(data_dir: str, json_filename: str | None) -> dict | None:
+    """A run's published JSON, or None when it is unset, missing or unreadable."""
     if not json_filename:
-        return False
+        return None
     try:
         with gzip.open(os.path.join(data_dir, json_filename), "rt", encoding="utf-8") as fh:
-            meta = json.load(fh).get("mapillary_meta") or {}
+            payload = json.load(fh)
     except (OSError, EOFError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _quality_backfill_reason(payload: dict) -> str:
+    """Why a readable per-run JSON is, or is not, a #321 backfill candidate.
+
+    Decided from the JSON ALONE, which is what makes the backfill idempotent
+    (a second pass selects nothing): ``median_quality_score`` is non-null
+    exactly when at least one pano row is scored, and that is the condition
+    ``quality_block`` needs. A run whose CSV has the column but no scored pano
+    -- zero pano rows, or every score missing -- can never gain a block, so a
+    selection read off the CSV header re-selected it on every pass.
+
+    Returns one of "has_block", "stale" (the candidate), "no_meta" (no
+    ``mapillary_meta``: a CSV that predates the enriched schema, or a run with
+    no pano rows) or "unscored" (the meta, but no scored pano).
+    """
+    meta = payload.get("mapillary_meta")
+    if not isinstance(meta, dict):
+        return "no_meta"
+    if "quality" in meta:
+        return "has_block"
+    if meta.get("median_quality_score") is None:
+        return "unscored"
+    return "stale"
+
+
+def _splice_quality_block(data_dir: str, csv_filename: str, json_filename: str, payload) -> bool:
+    """Compute the quality block from four census columns and insert it.
+
+    Every other key of the JSON is left exactly as it was written, so a
+    backfilled run's summary is its old summary plus one block -- never a
+    re-derivation under today's other definitions, which would mix two JSON
+    forms inside one city's series. Reads only
+    ``mapillary_quality.BLOCK_COLUMNS``, not the whole census. Writes through
+    the summarizer's atomic writer and touches no catalog row.
+
+    Returns False (nothing written) when the CSV yields no block after all.
+    """
+    csv_path = os.path.join(data_dir, csv_filename)
+    df = pd.read_csv(
+        csv_path,
+        usecols=lambda c: c in BLOCK_COLUMNS,
+        dtype={c: t for c, t in MAPILLARY_METADATA_DTYPES.items() if c in BLOCK_COLUMNS},
+        keep_default_na=True,
+        low_memory=False,
+    )
+    block = compute_mapillary_quality(df)
+    del df
+    if block is None:
         return False
-    return "quality" in meta
+    payload["mapillary_meta"]["quality"] = block
+    _write_json_gz_atomic(os.path.join(data_dir, json_filename), payload)
+    return True
 
 
 def backfill_mapillary_quality(data_dir: str, *, execute: bool, publish: bool) -> int:
     """
-    Issue #321's backfill: rebuild the per-run JSON of every Mapillary run
-    that lacks `mapillary_meta.quality` but whose CSV carries `quality_score`.
+    Issue #321's backfill: give every Mapillary run whose JSON could carry
+    `mapillary_meta.quality`, and does not, its block.
 
-    Selection reads one JSON and one CSV header line per run, never a census.
+    Selection reads one per-run JSON per run, never a census (see
+    `_quality_backfill_reason`). A selected run's block is SPLICED into its
+    existing JSON from four CSV columns (`_splice_quality_block`). A run whose
+    JSON is missing or unreadable falls back to the CSV header: when it carries
+    `quality_score`, the JSON is rebuilt whole through `regenerate_run_json`
+    (there is nothing to splice into); that path also sets
+    `runs.json_filename`, the one catalog write this mode can make.
+
     Dry run (the default) lists the selection and writes nothing; `execute`
-    rebuilds each through `regenerate_run_json` (one census reload apiece, so
-    hours on production) and then the aggregate, unless `publish` is False.
+    applies it and then rebuilds the aggregate, unless `publish` is False.
 
     Returns the process exit status: 0, or `USAGE_EXIT_CODE` when `execute`
     is refused because a `run-due` is in flight on this machine.
@@ -298,7 +365,7 @@ def backfill_mapillary_quality(data_dir: str, *, execute: bool, publish: bool) -
         if execute:
             logger.error(
                 f"A run-due is in flight on this machine ({in_flight}); refusing --execute: "
-                "this backfill reloads whole censuses and rewrites cities.json.gz, so it "
+                "this backfill reads censuses and rewrites cities.json.gz, so it "
                 "belongs in the daytime ops window. Wait for the night to finish."
             )
             return USAGE_EXIT_CODE
@@ -311,40 +378,58 @@ def backfill_mapillary_quality(data_dir: str, *, execute: bool, publish: bool) -
             ORDER BY city_id, run_date"""
     ).fetchall()
 
-    targets = []
-    n_has_block = n_legacy = n_missing = 0
+    splice = []  # (row, payload)
+    rebuild = []  # rows whose JSON is missing: rebuilt whole
+    counts = dict.fromkeys(("has_block", "no_meta", "unscored", "missing_csv", "legacy"), 0)
     for r in rows:
-        if _json_has_quality_block(data_dir, r["json_filename"]):
-            n_has_block += 1
+        payload = _read_run_json(data_dir, r["json_filename"])
+        reason = _quality_backfill_reason(payload) if payload is not None else None
+        if reason in ("has_block", "no_meta", "unscored"):
+            counts[reason] += 1
             continue
         csv_path = os.path.join(data_dir, r["csv_filename"])
         if not os.path.exists(csv_path):
             logger.warning(f"CSV missing, skipping: {r['csv_filename']}")
-            n_missing += 1
+            counts["missing_csv"] += 1
             continue
-        if not has_quality_column(csv_path):
-            n_legacy += 1
-            continue
-        targets.append(r)
-        print(f"  {r['city_id']} [mapillary] {r['run_date']}: {r['csv_filename']}")
+        if payload is not None:
+            splice.append((r, payload))
+            print(f"  {r['city_id']} [mapillary] {r['run_date']}: {r['csv_filename']}")
+        elif has_quality_column(csv_path):
+            rebuild.append(r)
+            print(
+                f"  {r['city_id']} [mapillary] {r['run_date']}: {r['csv_filename']} "
+                "(JSON missing: rebuilt whole)"
+            )
+        else:
+            counts["legacy"] += 1
 
+    verb = "will" if execute else "would"
     print(
-        f"\n{len(rows)} Mapillary runs scanned: {n_has_block} already carry the quality "
-        f"block, {n_legacy} predate the quality_score column and stay absent, "
-        f"{n_missing} skipped (missing CSV), {len(targets)} "
-        f"{'will' if execute else 'would'} be rebuilt (one census reload each)"
+        f"\n{len(rows)} Mapillary runs scanned: {counts['has_block']} already carry the "
+        f"quality block, {counts['no_meta'] + counts['legacy']} predate the enriched schema "
+        f"or hold no pano and stay absent, {counts['unscored']} have the quality_score "
+        f"column but no scored pano and stay absent, {counts['missing_csv']} skipped "
+        f"(missing CSV), {len(splice)} {verb} gain the block (four census columns read "
+        f"each), {len(rebuild)} {verb} be rebuilt whole (JSON missing; one census reload "
+        "each)"
     )
     if not execute:
         print("\nDry run complete. Re-run with --execute to apply (daytime only).")
         return 0
 
-    rebuilt = 0
-    for r in targets:
+    done = 0
+    for r, payload in splice:
+        if _splice_quality_block(data_dir, r["csv_filename"], r["json_filename"], payload):
+            done += 1
+        else:
+            logger.warning(f"No quality block from {r['csv_filename']}; JSON left as it was")
+    for r in rebuild:
         if regenerate_run_json(conn, r["run_id"], data_dir) is None:
             logger.warning(f"Could not rebuild JSON for run {r['run_id']} ({r['csv_filename']})")
         else:
-            rebuilt += 1
-    print(f"Rebuilt {rebuilt} of {len(targets)} per-run JSON summaries.")
+            done += 1
+    print(f"Updated {done} of {len(splice) + len(rebuild)} per-run JSON summaries.")
     if publish:
         generate_aggregate_v2(conn, data_dir)
         print(f"Regenerated aggregate: {os.path.join(data_dir, 'cities.json.gz')}")
@@ -392,10 +477,11 @@ def main() -> int:
         "--regenerate-json-mapillary-meta",
         action="store_true",
         help="Issue #321's backfill, a SEPARATE mode that skips the stats pass: "
-        "rebuild the per-run JSON of every Mapillary run that lacks "
-        "mapillary_meta.quality but whose CSV header carries quality_score. "
-        "Requires --provider mapillary. One census reload per run (hours on "
-        "production); --execute is refused while run-due is in flight",
+        "splice mapillary_meta.quality into the per-run JSON of every Mapillary "
+        "run whose JSON has a scored median but no block (selected from the "
+        "JSON alone, so a second pass finds nothing). Requires --provider "
+        "mapillary. Reads four census columns per selected run (a daytime job "
+        "on production); --execute is refused while run-due is in flight",
     )
     args = parser.parse_args()
 

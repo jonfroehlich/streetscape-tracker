@@ -731,9 +731,15 @@ and `hosts_unavailable` is anchored to the blocked-host note's own `; `-delimite
   percentiles and tail shares over pano rows only, with FLAT_ONLY/ZERO_RESULTS rows carrying scores that would move them; a score exactly at 0.9 counting as good and exactly at 0.6 not as poor (`>=`/`<`);
   sequence medians giving each drive one vote while three sequence-less images stay in the image-weighted median and out of the sequence cut; the on-foot split and counts over every pano, scored or not;
   the columnar per-sequence medians equal to a `groupby().median()`; the block ABSENT for a legacy frame, a frame without the column and an all-unscored census;
+  a census without a `sequence_id` column KEEPING its block with an empty sequence cut (zero drives, null `seq_*`);
+  `_foot_codes` coding the typed nullable-bool column and every text spelling a dtype-less read produces (`True`/`true`/`FALSE`, `1`/`0`, `1.0`/`0.0`, empty) alike;
   and the published block reproducing the study's `measure_run` row on one randomized census written to disk, every key paired.
-  `_build_provider_summary` carries `mapillary_meta` iff present (no key, not a null, when absent).
-  The `--regenerate-json-mapillary-meta` backfill over a three-run catalog (legacy column-less, block already present, block missing): the dry run lists exactly the stale run, counts each reason and writes nothing; `--execute` rebuilds only it, asserted on inode and nanosecond mtime rather than bytes, because a same-second regeneration of the legacy JSON is byte-identical;
+  `_build_provider_summary` carries `mapillary_meta` iff present (no key, not a null, when absent), and carries a meta WITHOUT a block too, since the carry keys on the meta.
+  The `--regenerate-json-mapillary-meta` backfill over a six-run catalog, one run per selection outcome (legacy column-less, column but no pano row, column but every score missing, block already present, block missing, JSON missing):
+  the dry run lists exactly the last two, counts each reason and writes nothing; a removed CSV counts as missing, never as legacy;
+  `--execute` gives exactly those two the block, asserted on inode and nanosecond mtime rather than bytes for the rest, because a same-second regeneration of the legacy JSON is byte-identical, and with `publish=False` writes no aggregate;
+  **a second `--execute` selects nothing** (the column-but-unscored runs were re-selected on every pass when selection read the CSV header);
+  the spliced JSON equals the old JSON plus the block — including a key and a value planted to stand in for an older summarizer, which a whole-JSON rebuild would drop — the catalog row is unchanged, and the block equals the one `compute_mapillary_meta` builds from the full census;
   `--execute` is refused while `run-due` is in flight; and the flag without `--provider mapillary` exits 2.
 
 ## Catalog backups (issue #145)
@@ -1232,6 +1238,8 @@ And that aggregate records with no `city_id` stay DISTINCT rows with a warning r
 the name "mapillary" without a block conjures nothing.
 Also: the row's on-foot share is computed from the block's counts, and is null rather than 0% when no capture mode is known; a city without the block renders em-dashes beside one that has it;
 every header and the group title carry "prediction of visual quality", "0–1", "84.5%" and "never rank a city on it alone"; the default preset holds no quality leaf, and the "Mapillary quality" preset is exactly cov (no Δ) + quality + collected.
+The two sliders' AXES, not just their descriptors, are pinned: fed through `histogramAxisDomain` with all-equal, banded and empty values they come out 0–1 and 0–100, because a descriptor's `min`/`max` alone are only a clamp and the descriptor-shape test passed while the "(0–1)" slider drew 0.75–1.75.
+`table-controls.test.js` pins `histogramAxisDomain` itself: the clamped row extent by default, `fixedDomain` overriding it only when both ends are declared, and a degenerate extent widening one unit without passing the descriptor's `max` (a lone 100 on a 0–100 slider widens downwards).
 
 ### driving.html joined the sidebar (issue #188 follow-up)
 

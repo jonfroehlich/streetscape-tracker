@@ -243,16 +243,16 @@ The publish never passes rsync `--delete`, so a detail file the pass REMOVES sta
 ## Backfilling the Mapillary quality block (issue #321)
 
 #321 adds a `quality` block to every Mapillary run's `mapillary_meta` (the `quality_score` distribution and its on-foot split; [`census.md`](census.md)), and `grid.html` builds its "Imagery quality" group from it.
-Runs collected after the deploy get the block on their own; every run summarized before it lacks the block until its per-run JSON is rebuilt, and the grid page shows em-dashes for those cities meanwhile.
+Runs collected after the deploy get the block on their own; every run summarized before it lacks the block until this backfill splices it in, and the grid page shows em-dashes for those cities meanwhile.
 **This is optional and not urgent** — nothing is wrong in the published data, the block is simply missing — so it waits for a daytime ops window.
 
 ```bash
 cd ~/streetscape-tracker
-# 1. Dry run: lists the runs it would rebuild and counts the rest. Reads one JSON and one CSV header line per run, never a census.
+# 1. Dry run: lists the runs it would update and counts the rest. Reads one per-run JSON per run, never a census.
 .venv-makelab2/bin/python scripts/recompute_run_stats.py \
     --data-dir /projects/makeabilitylab/streetscape-tracker/data \
     --provider mapillary --regenerate-json-mapillary-meta
-# 2. Rebuild those runs' per-run JSON, then the aggregate.
+# 2. Splice the block into those runs' per-run JSON, then rebuild the aggregate.
 .venv-makelab2/bin/python scripts/recompute_run_stats.py \
     --data-dir /projects/makeabilitylab/streetscape-tracker/data \
     --provider mapillary --regenerate-json-mapillary-meta --execute >> logs/backfill_321.log 2>&1
@@ -261,10 +261,14 @@ cd ~/streetscape-tracker
     --config config/scheduler.makelab1.toml regenerate-aggregate --publish
 ```
 
-It is a separate mode of `recompute_run_stats.py`: it runs no stats pass and writes no catalog row.
-It selects a run only when its JSON lacks `mapillary_meta.quality` AND its CSV header carries `quality_score`, so the ~129 runs collected before 2026-07-24 stay **absent, never zero**, and the report says how many it skipped for that reason; a second pass finds nothing to do.
-**The cost is one full census reload per selected run** (through `regenerate_run_json`, the live pipeline's own writer), and a Mapillary census is up to millions of rows: on production that is **hours**, at the summarizer's per-city memory peak (0.914 GiB per million CSV rows).
-So it belongs in the daytime window and **never inside a night**: `--execute` is refused while a `run-due` is in flight (`scheduler._run_due_in_flight`, the check `recompute_run_diffs.py` makes), but like that script it checks only when it starts, and the nightly batch never checks for it.
+It is a separate mode of `recompute_run_stats.py`: it runs no stats pass.
+**It selects from each run's JSON alone**: a run whose `mapillary_meta` has a non-null `median_quality_score` (so at least one pano is scored) and no `quality` block.
+Everything else stays **absent, never zero**, and the report counts each reason separately: every pre-2026-07-24 run (no `mapillary_meta` at all; 129 of the latest runs, and more across the history the pass scans), every run with no pano row, and every run with the `quality_score` column but no scored pano.
+That is what makes **a second pass select nothing**: a selection read off the CSV header re-chose the column-but-unscored runs on every pass, since a rebuild can never give them a block.
+**A selected run's block is spliced into its existing JSON**: only the four columns the block needs (`mapillary_quality.BLOCK_COLUMNS`) are read from the census, no other key of the JSON is rewritten, and no catalog row is written.
+So a backfilled run's summary is its old summary plus one block, never a re-derivation under today's other definitions (which would mix two JSON forms inside one city's series).
+The one exception is a run whose JSON is missing or unreadable: the CSV header decides, and a run whose CSV carries `quality_score` is rebuilt whole through `regenerate_run_json`, which also sets `runs.json_filename`; the report lists these separately.
+**Even four columns of a Mapillary census are up to millions of rows per run**, so on production this is a daytime job and **never inside a night**: `--execute` is refused while a `run-due` is in flight (`scheduler._run_due_in_flight`, the check `recompute_run_diffs.py` makes), but like that script it checks only when it starts, and the nightly batch never checks for it.
 If step 2 might not finish before 02:00, disable the timer for the night (`systemctl --user disable --now streetscape-tracker.timer`, and `enable --now` afterwards; never `stop`, which the #369 watchdog re-arms).
 Only this mode carries the in-flight gate; the stats pass keeps its existing behaviour.
 
