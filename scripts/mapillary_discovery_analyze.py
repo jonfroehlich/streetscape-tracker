@@ -219,22 +219,54 @@ def apply_rules(df: pd.DataFrame, rules: dict) -> pd.DataFrame:
 
 def grid_rule_effect(scored: pd.DataFrame, rules: dict) -> dict:
     """
-    What the grid-membership rule does to a ranked list, as counts rather than
-    a net difference: removing in-grid places also readmits places that
-    thinning had suppressed in their favour, so ``without - with`` undercounts
-    the places it removed.
+    What the grid-membership rule does to a ranked list, as counts of places
+    rather than a net difference. Removing in-grid places changes which places
+    thinning keeps, in both directions: a place an in-grid one had suppressed
+    is READMITTED, and a readmitted place can in turn suppress a survivor
+    (greedy thinning cascades) -- so both are counted by ``geonameid`` set
+    difference, and ``with = without - removed + readmitted - cascade_dropped``.
+
+    Example: G is in a grid, B is 4 km from G and A is 4 km from B (5 km
+    thinning). Without the rule the list is G, A; with it, B, and A is gone.
+    That is 1 removed, 1 readmitted and 1 cascade-dropped -- a net difference
+    would report 0 readmitted.
     """
+    if scored.geonameid.duplicated().any():
+        raise ValueError("grid_rule_effect needs one row per geonameid")
     without = apply_rules(
         scored.assign(_in_grid=scored.inside_catalog_grid, inside_catalog_grid=""), rules
     )
-    removed = int((without._in_grid != "").sum())
-    kept = len(apply_rules(scored, rules))
+    in_grid = without._in_grid != ""
+    survivors = set(without.geonameid[~in_grid])
+    kept = apply_rules(scored, rules)
+    kept_ids = set(kept.geonameid)
     return {
         "thinned_list_without_the_rule": int(len(without)),
-        "of_which_inside_a_catalog_grid": removed,
-        "readmitted_once_those_are_removed": int(kept - (len(without) - removed)),
-        "thinned_list_with_the_rule": int(kept),
+        "of_which_inside_a_catalog_grid": int(in_grid.sum()),
+        "readmitted_once_those_are_removed": len(kept_ids - survivors),
+        "cascade_dropped_once_those_are_removed": len(survivors - kept_ids),
+        "thinned_list_with_the_rule": int(len(kept)),
     }
+
+
+def _nan_to_none(obj):
+    """``obj`` with every float NaN (numpy's included) replaced by None."""
+    if isinstance(obj, dict):
+        return {k: _nan_to_none(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_nan_to_none(v) for v in obj]
+    if isinstance(obj, float) and np.isnan(obj):
+        return None
+    return obj
+
+
+def strict_json(obj) -> str:
+    """
+    ``obj`` as STRICT JSON: a NaN becomes null, and any other non-finite float
+    raises rather than being written as the bare ``NaN``/``Infinity`` that
+    Python accepts and ``jq`` and ``JSON.parse`` reject.
+    """
+    return json.dumps(_nan_to_none(obj), indent=1, default=str, allow_nan=False)
 
 
 def manifest_rows(tranche: pd.DataFrame) -> pd.DataFrame:
@@ -464,7 +496,7 @@ def main(argv=None) -> int:
         "top_creators_by_recent_pano_km": top_creators,
     }
     out = docs / f"{EXPERIMENT}_metrics.json"
-    out.write_text(json.dumps(metrics, indent=1, default=str) + "\n")
+    out.write_text(strict_json(metrics) + "\n")
     print(f"wrote {out}, {len(cand)} candidates, tranche of {len(tranche)} -> {args.manifest_out}")
     return 0
 

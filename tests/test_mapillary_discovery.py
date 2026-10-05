@@ -321,16 +321,42 @@ def test_grid_rule_effect_counts_removals_not_the_net_change():
     # "a" is inside a grid and suppresses its neighbour "b" by thinning;
     # removing "a" readmits "b", so the net change (0) hides one removal.
     rows = [
-        _scored(name="a", lat=40.0, km_per_km2=9.0, inside_catalog_grid="g"),
-        _scored(name="b", lat=40.01, km_per_km2=8.0),
-        _scored(name="c", lat=45.0, km_per_km2=7.0),
+        _scored(name="a", geonameid=1, lat=40.0, km_per_km2=9.0, inside_catalog_grid="g"),
+        _scored(name="b", geonameid=2, lat=40.01, km_per_km2=8.0),
+        _scored(name="c", geonameid=3, lat=45.0, km_per_km2=7.0),
     ]
     assert mda.grid_rule_effect(pd.DataFrame(rows), mda.CANDIDATE_RULES) == {
         "thinned_list_without_the_rule": 2,
         "of_which_inside_a_catalog_grid": 1,
         "readmitted_once_those_are_removed": 1,
+        "cascade_dropped_once_those_are_removed": 0,
         "thinned_list_with_the_rule": 2,
     }
+
+
+def test_grid_rule_effect_counts_a_cascade_rather_than_netting_it_out():
+    # G is in a grid; B is 4 km east of G, A 8 km east of G and so 4 km from B.
+    # Without the rule thinning keeps G and A; with it, B is readmitted and
+    # then thins A away. The net change (2 - 1 + 0 = 1) would hide both.
+    d = 4 / (111.32 * math.cos(math.radians(40.0)))
+    rows = [
+        _scored(name="G", geonameid=1, lon=-100.0, km_per_km2=9.0, inside_catalog_grid="g"),
+        _scored(name="B", geonameid=2, lon=-100.0 + d, km_per_km2=8.0),
+        _scored(name="A", geonameid=3, lon=-100.0 + 2 * d, km_per_km2=7.0),
+    ]
+    assert mda.grid_rule_effect(pd.DataFrame(rows), mda.CANDIDATE_RULES) == {
+        "thinned_list_without_the_rule": 2,
+        "of_which_inside_a_catalog_grid": 1,
+        "readmitted_once_those_are_removed": 1,
+        "cascade_dropped_once_those_are_removed": 1,
+        "thinned_list_with_the_rule": 1,
+    }
+
+
+def test_grid_rule_effect_refuses_duplicate_geonameids():
+    rows = [_scored(name="x", lat=40.0), _scored(name="y", lat=45.0)]  # both geonameid 1
+    with pytest.raises(ValueError, match="geonameid"):
+        mda.grid_rule_effect(pd.DataFrame(rows), mda.CANDIDATE_RULES)
 
 
 def test_build_samples_keeps_only_recent_panos():
@@ -458,3 +484,214 @@ def test_analyzer_refuses_a_scan_that_stopped(tmp_path):
             ]
         )
     assert not (tmp_path / "m.csv").exists()
+
+
+def test_validation_keeps_scanned_zero_sample_cities_and_tile_edges_and_only_walked_ones():
+    # One scanned tile, (15, 23) at z6. Points are placed by tile FRACTION:
+    # 15.9 is inside it (int) but rounds into 16; 14.6 is outside but rounds into 15.
+    tiles = {(15, 23)}
+
+    def at(fx, fy):
+        lon, lat = tile_frac_to_lonlat(fx, fy, mdc.SCREEN_ZOOM)
+        return lat, lon
+
+    places = {
+        "laurens": (42.8468, -94.8515),
+        "no_samples": at(15.5, 23.2),
+        "edge_in": at(15.9, 23.5),
+        "edge_out": at(14.6, 23.5),
+        "unwalked": at(15.3, 23.8),
+        "thin_walk": at(15.7, 23.3),
+        "stale_walk": at(15.4, 23.4),
+    }
+    cat = pd.DataFrame(
+        {
+            "city_id": list(places),
+            "lat": [ll[0] for ll in places.values()],
+            "lon": [ll[1] for ll in places.values()],
+        }
+    )
+    walked = ["laurens", "no_samples", "edge_in", "edge_out", "thin_walk", "stale_walk"]
+    cov = {"thin_walk": 49.9, "stale_walk": 60.0}
+    age = {"stale_walk": 2.01}
+    walks = pd.DataFrame(
+        {
+            "city_id": walked,
+            "coverage_pct_by_length": [cov.get(c, 91.6) for c in walked],
+            "median_covered_age_years": [age.get(c, 0.81) for c in walked],
+        }
+    )
+    samples = _samples([(-94.8515, 42.8468, 3.0, 1, 0, False)])
+    val = mda.build_validation(samples, cat, walks, tiles, mdc.SCREEN_ZOOM).set_index("city_id")
+    # edge_out is in no scanned tile, unwalked has no walk to validate against
+    assert sorted(val.index) == sorted(
+        ["laurens", "no_samples", "edge_in", "thin_walk", "stale_walk"]
+    )
+    # a scanned city with no samples scored 0 -- it was observed, and holds nothing
+    assert val.km_per_km2["no_samples"] == 0.0
+    assert val.km_per_km2["laurens"] > 0
+    assert val.good.to_dict() == {
+        "laurens": True,
+        "no_samples": True,
+        "edge_in": True,
+        "thin_walk": False,
+        "stale_walk": False,
+    }
+
+
+def test_scan_records_a_stop_exits_nonzero_and_the_analyzer_refuses_it(tmp_path, monkeypatch):
+    # The producer half of the stopped-scan contract: collect scan still writes
+    # sequences.parquet after a stop, so the manifest's `stopped` is all that
+    # tells the analyzer an unscanned tile is not an empty one.
+    session = _FakeSession([_FakeResponse(204, "", b""), _FakeResponse(302, "text/html")])
+    session.headers = {}
+    monkeypatch.setattr(mdcol.requests, "Session", lambda: session)
+    monkeypatch.setenv("MAPILLARY_ACCESS_TOKEN", "test-token")
+    monkeypatch.setattr(mdcol.time, "sleep", lambda s: None)
+    rc = mdcol.main(["scan", "--out-dir", str(tmp_path), "--regions", "hawaii", "--seed", "0"])
+    assert rc != 0
+    assert len(session.calls) == 2  # stopped at the refusal; hawaii is 4 tiles
+    manifest = json.loads((tmp_path / "scan_manifest.json").read_text())
+    assert manifest["stopped"].startswith("STOP at 6/")
+    assert "302" in manifest["stopped"]
+    with pytest.raises(SystemExit, match="partial scan"):
+        mda.load_scan_manifest(tmp_path)
+
+
+def test_metrics_json_is_strict_with_nan_as_null():
+    import numpy as np
+
+    text = mda.strict_json({"a": float("nan"), "b": [np.float64("nan"), 1.5], "c": "x"})
+
+    def refuse(const):
+        raise AssertionError(f"non-strict JSON constant {const}")
+
+    assert json.loads(text, parse_constant=refuse) == {"a": None, "b": [None, 1.5], "c": "x"}
+    with pytest.raises(ValueError):
+        mda.strict_json({"inf": float("inf")})
+
+
+def test_grid_rule_effect_counts_every_readmission():
+    # two in-grid places, each suppressing its own neighbour: 2 readmitted
+    rows = [
+        _scored(name="a", geonameid=1, lat=40.0, km_per_km2=9.0, inside_catalog_grid="g"),
+        _scored(name="b", geonameid=2, lat=40.01, km_per_km2=8.0),
+        _scored(name="c", geonameid=3, lat=45.0, km_per_km2=7.0, inside_catalog_grid="h"),
+        _scored(name="d", geonameid=4, lat=45.01, km_per_km2=6.0),
+    ]
+    effect = mda.grid_rule_effect(pd.DataFrame(rows), mda.CANDIDATE_RULES)
+    assert effect["of_which_inside_a_catalog_grid"] == 2
+    assert effect["readmitted_once_those_are_removed"] == 2
+    assert effect["thinned_list_with_the_rule"] == 2
+
+
+def test_analyzer_writes_strict_metrics_when_a_reference_town_has_no_score(tmp_path):
+    # End to end over synthetic inputs. Wasta is a reference town in a scanned
+    # tile with no samples near it, so its top_creator/top_share/median_captured
+    # are NaN -- which main() must write as null, never as a bare NaN.
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    (raw / "scan_manifest.json").write_text(
+        json.dumps({"regions": {"hawaii": mdc.REGIONS["hawaii"]}, "zoom": 6, "tiles": 4, "rows": 1})
+    )
+    lat, lon = 21.30, -157.85  # Honolulu
+    t = pd.Timestamp("2026-01-15").value // 10**6
+    zigzag = [(lon + (0.015 if i % 2 else 0.0), lat) for i in range(7)]  # ~9 km in a 2 km disc
+    pd.DataFrame(
+        [
+            {
+                "seq": "s1",
+                "tile": "4_28",
+                "creator_id": 7,
+                "organization_id": None,
+                "captured_at": t,
+                "is_pano": True,
+                "foot": False,
+                "image_id": 1,
+                "quality_score": 0.5,
+                "pts": zigzag,
+            }
+        ]
+    ).to_parquet(raw / "sequences.parquet")
+    (raw / "calibration.json").write_text("{}")
+    (raw / "request_log.jsonl").write_text(json.dumps({"host": "tiles", "status": 200}) + "\n")
+    place = ["1", "Testville", "", "", str(lat), str(lon + 0.0075), "P", "PPL", "US", "", "HI"]
+    place += ["", "", "", "1000", "", "", "", ""]
+    (tmp_path / "places.txt").write_text("\t".join(place) + "\n")
+    (tmp_path / "admin1.txt").write_text("US.HI\tHawaii\tHawaii\t1\n")
+    snap = pd.DataFrame(
+        [
+            {
+                "table": "cities",
+                "city_id": "honolulu--hawaii--united-states",
+                "lat": lat,
+                "lon": lon + 0.0075,
+                "enabled": 1,
+                "grid_width_m": 1000,
+                "grid_height_m": 1000,
+            },
+            {
+                "table": "cities",
+                "city_id": "wasta--south-dakota--united-states",
+                "lat": 19.7,
+                "lon": -155.1,
+                "enabled": 1,
+                "grid_width_m": 1000,
+                "grid_height_m": 1000,
+            },
+            {
+                "table": "walk",
+                "city_id": "honolulu--hawaii--united-states",
+                "run_date": "2026-09-01",
+                "coverage_pct_by_length": 90.0,
+                "median_covered_age_years": 0.5,
+                "length_km": 10.0,
+            },
+            {
+                "table": "walk",
+                "city_id": "wasta--south-dakota--united-states",
+                "run_date": "2026-09-26",
+                "coverage_pct_by_length": 56.3,
+                "median_covered_age_years": 6.49,
+                "length_km": 5.0,
+            },
+        ]
+    )
+    snap.to_csv(tmp_path / "snap.csv", index=False)
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    rc = mda.main(
+        [
+            "--raw-dir",
+            str(raw),
+            "--places",
+            str(tmp_path / "places.txt"),
+            "--admin1",
+            str(tmp_path / "admin1.txt"),
+            "--prod-snapshot",
+            str(tmp_path / "snap.csv"),
+            "--catalog-label",
+            "t",
+            "--docs-dir",
+            str(docs),
+            "--manifest-out",
+            str(tmp_path / "m.csv"),
+        ]
+    )
+    assert rc == 0
+
+    def refuse(const):
+        raise AssertionError(f"non-strict JSON constant {const}")
+
+    metrics = json.loads(
+        (docs / "mapillary-discovery-screen_metrics.json").read_text(), parse_constant=refuse
+    )
+    refs = {r["city_id"]: r for r in metrics["validation"]["reference_towns"]}
+    wasta = refs["wasta--south-dakota--united-states"]
+    assert (wasta["top_creator"], wasta["top_share"], wasta["median_captured"]) == (
+        None,
+        None,
+        None,
+    )
+    assert wasta["km_per_km2"] == 0.0
+    assert refs["honolulu--hawaii--united-states"]["top_creator"] == 7

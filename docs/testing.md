@@ -1221,3 +1221,12 @@ Added after the PR's first review, which found twelve mutations surviving:
 - **The analyzer refuses a scan that stopped early** (`scan_manifest.json` `stopped` set), writing nothing, since an unscanned tile would otherwise read as one with no imagery.
 
 All 39 mutations run after this change, the review's survivors included, fail at least one test.
+
+Added after the final review, which found seven more surviving:
+
+- **`grid_rule_effect` counts by place id, not by subtraction**: in a G/B/A chain (B 4 km from the in-grid G, A 4 km from B) removing G readmits B, which then thins A away, so the expected counts are 1 removed, 1 readmitted and 1 cascade-dropped — a constant or net-difference `readmitted` fails; duplicate `geonameid`s are refused, since set difference would miscount them.
+- **The validation's edges**: in one scanned tile, a point at tile fraction 15.9 is kept and one at 14.6 dropped (so `round()` for `int()` fails both ways), a scanned city with no samples is kept at score 0 rather than as NaN, a city with no walk is dropped (an inner join), and walks at 49.9% coverage or 2.01 yr median age are not "good".
+- **`collect scan`'s half of the stopped-scan contract**, through a fake session over Hawaii's four tiles: a 204 then a 302 stops after two requests, exits nonzero, records the stop in `scan_manifest.json`, and `load_scan_manifest` refuses that manifest.
+- **The metrics JSON is strict**: `strict_json` writes NaN (numpy's included) as `null`, parsed with a `parse_constant` that refuses `NaN`, and raises on infinity rather than writing it.
+
+The final review's 48 mutations (its two against the replaced subtraction re-aimed at the set-difference code) and eight more against this round's fixes, run after this change, all fail at least one test.

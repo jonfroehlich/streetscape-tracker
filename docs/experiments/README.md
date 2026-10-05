@@ -92,7 +92,7 @@ Three things generalize.
 **(1) Validate a screen against the measurement it stands in for, over the whole catalog**, not against the handful of towns that motivated it: the eight calibration towns showed the score works, the 1,111 walks showed how often.
 **(2) Distance to a centre is not membership.** A frozen grid can be 40 km across; 37 places on the thinned list the 10 km rule admitted were already inside one.
 **(3) Score the unit you will act on.** Connected-cell clusters merged a statewide sweep into one 10,687 km blob; scoring each place from its own point is what ranks towns.
-It also registered its first 25 candidates on production (disabled), and found that the uploader, not the town, is the unit that generalizes.
+It also registered its first 25 candidates on production and enabled them the same day, and found that the uploader, not the town, is the unit that generalizes.
 
 ### `mapillary-image-quality.md`
 

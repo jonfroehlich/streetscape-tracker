@@ -12,7 +12,7 @@ Ranked candidates are in [`mapillary-discovery-screen_candidates.csv`](mapillary
 
 - **The coarsest sequence-layer zoom (z6) is a sufficient discovery instrument.** 97 tiles cover the contiguous US, southern Canada, Hawaii and two Alaskan regions, and the score they produce predicts measured street coverage (below).
 - **Score places, not clusters.** Each GeoNames place gets the recent-360° sequence length within 2 km of its point, per km² of that disc.
-- **25 uncatalogued towns were registered on production the same day** (disabled; see "What was done on production").
+- **25 uncatalogued towns were registered on production the same day, and enabled that afternoon** (see "What was done on production").
 - The screen is worth building as a standing `screen-provider mapillary` subcommand (#383's second acceptance item); that design is a separate plan.
 
 ## The instrument
@@ -139,6 +139,7 @@ That leaves **161**.
 The grid-membership test matters: distance to a centre is not membership, since a frozen grid can be 40 km across.
 Without it, the thinned list holds 193 places, **37** of them inside a catalog grid, e.g. Lower Pearl City inside Honolulu's grid and Dedham inside a neighbour's (`grid_rule_effect`).
 Removing those 37 readmits 5 places that thinning had dropped in their favour, so the list shrinks by only 32 (193 − 37 + 5 = 161); 32 is the net change, not the count removed.
+A readmitted place can in turn thin away one of the 156 survivors, so `grid_rule_effect` counts both by place id rather than by subtraction; here none was (`cascade_dropped_once_those_are_removed`: 0), so 5 is exact.
 Those places are tracked on the grid, though not walked as towns of their own.
 
 ## What was done on production
@@ -155,7 +156,8 @@ Two needed fixes, both now recorded in the analysis code:
 The other 23 geocoded 0.0–4.6 km from their GeoNames point.
 On 2026-10-02 the tranche was registered on makelab2 (`--overlap-km 5 --notes-label "mapillary discovery screen 2026-10-02"`): **25 new, 0 reused, 0 failed**, all **disabled**, every grid identical to the pre-computation to the metre.
 Together they are **3,959,917 GSV grid points** (1,588 km²; largest Apex, NC at 474,512), summed from the registered dimensions in the registration log on makelab2 (`logs/register_mapillary_discovery_2026-10-02.log`).
-Enabling them, which puts them on every default channel the same night, is a separate operator decision.
+**All 25 were enabled on 2026-10-02 at 15:20 PDT** with `scheduler enable-city`, 0 failures, which put them on every default channel from that night and enrolled them on the opt-in channels whose screen found imagery: both KartaView channels for all 25, both Panoramax channels for 12.
+That is recorded from the project's operating notes for that day, not from a query of the production catalog made for this writeup.
 
 ## Caveats
 
@@ -188,6 +190,6 @@ python scripts/mapillary_discovery_collect.py resolve-creators --out-dir experim
 python scripts/mapillary_discovery_analyze.py ...   # again, to attach usernames
 ```
 
-`tests/test_mapillary_discovery.py` pins the sampling frame (97 tiles), the y-up tile-coordinate mapping, length conservation through sample splitting, the disc membership and weighted median of the score, grid-rectangle membership, the manifest's name and geocode overrides, every candidate and tranche rule where `apply_rules` applies it, the validation population's tile membership, the analyzer's refusal of a scan that stopped early, and the fetcher's stop rules and request cap.
+`tests/test_mapillary_discovery.py` pins the sampling frame (97 tiles), the y-up tile-coordinate mapping, length conservation through sample splitting, the disc membership and weighted median of the score, grid-rectangle membership, the manifest's name and geocode overrides, every candidate and tranche rule where `apply_rules` applies it, the validation population's tile membership (tile edges, zero-sample cities, walked cities only, and the "good" thresholds), `grid_rule_effect`'s counts under a thinning cascade, the analyzer's refusal of a scan that stopped early and `collect scan` recording that stop, strict JSON with NaN as null, and the fetcher's stop rules and request cap.
 
 Related: #383 (this screen), #406 (the 2026-10-01 web-research pass that preceded it), `mapillary-user-activity.md` (per-uploader enumeration), `mapillary-image-quality.md` (why `quality_score` ranks against on-foot imagery, and so is not used here).

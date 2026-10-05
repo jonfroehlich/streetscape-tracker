@@ -5,7 +5,7 @@
   "generated_by": "python scripts/mapillary_discovery_analyze.py --raw-dir experiments/mapillary-discovery-383 --places experiments/mapillary-discovery-383/cities500.txt --prod-snapshot experiments/mapillary-discovery-383/prod/prod_snapshot.csv --catalog-label makelab2-prod-f1885f5 --docs-dir docs/experiments --manifest-out mapillary_discovery_cities.csv",
   "collected_by": "python scripts/mapillary_discovery_collect.py {scan,calibrate,resolve-creators} --out-dir experiments/mapillary-discovery-383",
   "catalog_label": "makelab2-prod-f1885f5",
-  "generated_at": "2026-10-05T13:54:09+00:00",
+  "generated_at": "2026-10-05T14:16:43+00:00",
   "note": "Screening signals from z6 vector tiles, never coverage. 'recent' means captured on or after 2024-10-02. A place's score is recent-360 km within 2.0 km of its point per km^2 of that disc, from samples <= 0.5 km along simplified z6 geometry."
  },
  "requests": {
@@ -463,9 +463,9 @@
    {
     "city_id": "wasta--south-dakota--united-states",
     "km_per_km2": 0.0,
-    "top_creator": NaN,
-    "top_share": NaN,
-    "median_captured": NaN,
+    "top_creator": null,
+    "top_share": null,
+    "median_captured": null,
     "coverage_pct_by_length": 56.3,
     "median_covered_age_years": 6.49,
     "run_date": "2026-09-26"
@@ -494,6 +494,7 @@
    "thinned_list_without_the_rule": 193,
    "of_which_inside_a_catalog_grid": 37,
    "readmitted_once_those_are_removed": 5,
+   "cascade_dropped_once_those_are_removed": 0,
    "thinned_list_with_the_rule": 161
   },
   "candidates_by_top_creator": {
