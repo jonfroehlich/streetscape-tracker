@@ -530,7 +530,8 @@
   color: #333;
 }
 
-.page-about > summary {
+.page-about > summary,
+.screen-series > summary {
   display: inline-block;
   cursor: pointer;
   color: #1a6b1d;
@@ -538,9 +539,48 @@
   font-size: 13px;
 }
 
-.page-about > summary:focus-visible {
+.page-about > summary:focus-visible,
+.screen-series > summary:focus-visible {
   outline: 2px solid #1a73e8;
   outline-offset: 2px;
+}
+
+/* The growth screen's series (issue #349): a small plain table under the
+   page lead, one row per screen date. */
+.screen-series {
+  margin-top: 4px;
+}
+
+.screen-series-table {
+  margin-top: 8px;
+  border-collapse: collapse;
+  font-size: 13px;
+  color: #333;
+}
+
+.screen-series-table caption {
+  max-width: 78ch;
+  text-align: left;
+  color: #555;
+  padding-bottom: 6px;
+}
+
+.screen-series-table th,
+.screen-series-table td {
+  padding: 3px 10px;
+  border-bottom: 1px solid #e3e3e3;
+  text-align: right;
+}
+
+.screen-series-table th[scope="row"],
+.screen-series-table thead th:first-child {
+  text-align: left;
+}
+
+/* A zero is a fact and a positive bound is a hint; the zero is muted so a
+   column of "0 · none" does not read as a column of data to sort by. */
+.screen-cell.screen-none {
+  color: #666; /* 5.7:1 on white, AA for body text */
 }
 
 .page-about-body {

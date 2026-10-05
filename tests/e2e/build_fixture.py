@@ -14,6 +14,8 @@ Everything lands in ``tests/e2e/fixture/`` and is tiny enough to commit:
   * ``<city_id>_..._<date>.csv.gz`` + sibling ``.json.gz`` per run
   * ``streetwalks.json.gz``         road-walk manifest (#155), 1 walk
   * ``<city_id>_..._streetwalk_sp15_<date>_coverage.json.gz``
+  * ``provider_screen.json.gz``     Panoramax growth screen (#316), read by
+                                    grid.html since #349
 
 The three cities cover the render paths the smoke test asserts on:
 
@@ -69,6 +71,7 @@ from streetscape_metadata_tracker.json_summarizer import (  # noqa: E402
     generate_aggregate_v2,
     generate_city_metadata_summary_as_json,
     generate_driving_plan_summary,
+    generate_provider_screen_summary,
     generate_streetwalk_manifest,
 )
 from tests.conftest import (  # noqa: E402
@@ -489,6 +492,17 @@ def _add_streetwalk(
         length_km_covered_any=totals["length_km_covered_any"],
         median_covered_age_years=totals["median_covered_age_years"],
     )
+
+
+def _screen_row(city_id, *, cells, pictures_360, pictures_flat):
+    """One city's row for ``db.record_provider_screen``; the total is the sum."""
+    return {
+        "city_id": city_id,
+        "cells": cells,
+        "pictures_upper_bound": pictures_360 + pictures_flat,
+        "pictures_360_upper_bound": pictures_360,
+        "pictures_flat_upper_bound": pictures_flat,
+    }
 
 
 def _normalize_for_commit():
@@ -946,12 +960,46 @@ def build():
             ],
         )
 
-        # 6) Aggregate → cities.json.gz (schema v3), the streetwalk sidecar
-        # manifest and the driving-plan join, all written into FIXTURE_DIR (as
-        # the real pipeline does).
+        # 6) Two weekly Panoramax growth screens (#316), so grid.html's screen
+        # column, filter, caption and series table (#349) render something an
+        # assertion can see. Three of the readings that column has to keep apart
+        # (the fourth, flat-only "0 · flat only", is pinned in grid.test.js):
+        #   - Alpha City: a POSITIVE upper bound (a hint, printed "≤ N"),
+        #     first positive at the SECOND screen, so it is a genuine arrival
+        #     rather than "positive since we started looking".
+        #   - Zero City: a ZERO at both screens (conclusive, "0 · none").
+        #   - Map Ville: never screened ("—"), as a city registered after the
+        #     last screen would be.
+        # Through the real writer, like everything else here, so the fixture
+        # carries the published shape (caveat, series, first_positive_date).
+        db.record_provider_screen(
+            conn,
+            provider="panoramax",
+            screen_date=date(2026, 4, 13),
+            rows=[
+                _screen_row(alpha, cells=2, pictures_360=0, pictures_flat=0),
+                _screen_row(zero, cells=1, pictures_360=0, pictures_flat=0),
+            ],
+            cell_resolutions={7: 3},
+        )
+        db.record_provider_screen(
+            conn,
+            provider="panoramax",
+            screen_date=date(2026, 4, 20),
+            rows=[
+                _screen_row(alpha, cells=2, pictures_360=1234, pictures_flat=56),
+                _screen_row(zero, cells=1, pictures_360=0, pictures_flat=0),
+            ],
+            cell_resolutions={7: 3},
+        )
+
+        # 7) Aggregate → cities.json.gz (schema v3), the streetwalk sidecar
+        # manifest, the driving-plan join and the provider screen, all written
+        # into FIXTURE_DIR (as the real pipeline does).
         summary = generate_aggregate_v2(conn, FIXTURE_DIR)
         generate_streetwalk_manifest(conn, FIXTURE_DIR)
         generate_driving_plan_summary(conn, FIXTURE_DIR)
+        generate_provider_screen_summary(conn, FIXTURE_DIR)
     finally:
         conn.close()
         shutil.rmtree(db_tmp, ignore_errors=True)
