@@ -21,10 +21,11 @@ script applies the second tranche's rule to the same record:
    whose own rows are candidates and so drop out here at distance 0) plus
    ``EXTRA_KNOWN`` (cities registered after the snapshot that are in no
    manifest);
-3. the place is in the vendored ``data_sources/cities15000.txt``, because a
-   manifest row is a join against vendored GeoNames data and only cities15000
-   is vendored — a cities500-only town is reported, never joined;
-   and its geometry resolved in the one pre-registration vetting run
+3. the place is in the vendored ``data_sources/cities15000.txt`` or the
+   one-row-per-town ``data_sources/geonames_supplement.txt``, because a
+   manifest row is a join against vendored GeoNames data and the screen's
+   cities500 frame is not vendored — any other cities500-only town is
+   reported, never joined; and its geometry resolved in the one pre-registration vetting run
    (``VETTING_FAILED`` lists the three that did not);
 4. greedily, in rank order, more than ``REUSE_RADIUS_KM`` from every row
    already kept, where rank is (favoured creator first, then score
@@ -32,6 +33,9 @@ script applies the second tranche's rule to the same record:
    neighbour;
 5. every favoured-creator row is kept, then the rest up to ``CAP`` rows in
    total.
+
+``OPERATOR_EXCEPTIONS`` waives rule 2 (and only rule 2) for a named town; the
+reason is recorded beside it and the record's decision says so.
 
 The rows are written in descending score, so ``register_frame.py --limit N``
 registers the strongest first. Every candidate's decision is written to
@@ -96,6 +100,17 @@ VETTING_FAILED = {
     "try 'Searcy, White County, Arkansas, United States'",
 }
 
+# Towns admitted although rule 2 drops them: an operator decision, each with
+# the geometric reason the reuse radius (a duplicate guard) does not apply.
+OPERATOR_EXCEPTIONS = {
+    "5026416": "Fergus Falls MN: its only known city within 25 km is "
+    "elizabeth--minnesota--united-states, 11.5 km away, whose frozen grid is "
+    "1,624 x 812 m; Fergus Falls' vetted grid is 11,551 x 8,879 m, so the two "
+    "rectangles cannot overlap and there is no duplicate to guard against; "
+    "registration uses --overlap-km 5, which admits it",
+}
+EXCEPTION_DECISION = "selected (operator exception)"
+
 RECORD_COLUMNS = [
     "rank",
     "geonameid",
@@ -143,12 +158,13 @@ def load_known(snapshot_path, also_registered):
     return known
 
 
-def select(candidates, known, vendored_ids):
+def select(candidates, known, vendored_ids, supplement_ids=frozenset()):
     """
     Annotate each candidate dict with ``nearest_known``, ``nearest_known_km``,
     ``in_cities15000`` and ``decision``; return the selected rows in
-    descending score. ``decision`` is ``selected`` or the first rule that
-    dropped the row.
+    descending score. ``decision`` is ``selected`` (or ``EXCEPTION_DECISION``)
+    or the first rule that dropped the row. ``vendored_ids`` is cities15000;
+    ``supplement_ids`` the supplement rows, which are joinable too.
     """
     for c in candidates:
         lat, lon = float(c["lat"]), float(c["lon"])
@@ -160,9 +176,9 @@ def select(candidates, known, vendored_ids):
         c["in_cities15000"] = "yes" if c["geonameid"] in vendored_ids else "no"
         if float(c["km_per_km2"]) < SCORE_FLOOR:
             c["decision"] = "below score floor"
-        elif c["nearest_known_km"] <= REUSE_RADIUS_KM:
+        elif c["nearest_known_km"] <= REUSE_RADIUS_KM and c["geonameid"] not in OPERATOR_EXCEPTIONS:
             c["decision"] = "within 25 km of a known city"
-        elif c["in_cities15000"] == "no":
+        elif c["in_cities15000"] == "no" and c["geonameid"] not in supplement_ids:
             c["decision"] = "cities500 only"
         elif c["geonameid"] in VETTING_FAILED:
             c["decision"] = "failed geometry vetting"
@@ -190,7 +206,8 @@ def select(candidates, known, vendored_ids):
     for c in others[room:]:
         c["decision"] = "over the cap"
     for c in chosen:
-        c["decision"] = "selected"
+        exception = c["geonameid"] in OPERATOR_EXCEPTIONS
+        c["decision"] = EXCEPTION_DECISION if exception else "selected"
     return sorted(chosen, key=lambda c: -float(c["km_per_km2"]))
 
 
@@ -268,13 +285,16 @@ def parse_args(argv=None):
 def main(argv=None) -> int:
     args = parse_args(argv)
     cities = {c.geonameid: c for c in load_cities(os.path.join(DATA_SOURCES, "cities15000.txt"))}
+    supplement = {
+        c.geonameid: c for c in load_cities(os.path.join(DATA_SOURCES, "geonames_supplement.txt"))
+    }
     admin = load_admin1(os.path.join(DATA_SOURCES, "admin1CodesASCII.txt"))
     countries = load_countries(os.path.join(DATA_SOURCES, "countryInfo.txt"))
     with open(args.candidates, encoding="utf-8") as f:
         candidates = list(csv.DictReader(f))
     known = load_known(args.catalog_snapshot, args.also_registered)
 
-    chosen = select(candidates, known, set(cities))
+    chosen = select(candidates, known, set(cities), set(supplement))
     candidates.sort(key=lambda c: -float(c["km_per_km2"]))
     with open(args.record, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=RECORD_COLUMNS)
@@ -285,7 +305,7 @@ def main(argv=None) -> int:
         w = csv.DictWriter(f, fieldnames=_MANIFEST_HEADER)
         w.writeheader()
         for c in chosen:
-            w.writerow(manifest_row(c, cities, admin, countries))
+            w.writerow(manifest_row(c, {**supplement, **cities}, admin, countries))
     print(f"{len(chosen)} selected of {len(candidates)} candidates", file=sys.stderr)
     return 0
 

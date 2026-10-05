@@ -15,8 +15,9 @@ again, independently of the script, plus the GeoNames join run in reverse:
 * the selection is re-derived from the record: score >= 3, more than 25 km
   from every city the catalog knows (the 2026-10-02 production snapshot, whose
   distance is a committed column, plus the 25 tranche-1 towns registered the
-  same day, re-checked here from literals), joinable from the vendored
-  cities15000, geometry resolved at vetting, no two rows within 25 km (greedy,
+  same day, re-checked here from literals) unless named in
+  OPERATOR_EXCEPTIONS, joinable from the vendored cities15000 or the
+  data_sources/geonames_supplement.txt rows, geometry resolved at vetting, no two rows within 25 km (greedy,
   GIS_ISG / UAS_ISG towns first), at most 30 rows with those towns ahead of
   the cap, in descending score;
 * each row's score is the score OF THAT PLACE, at the very point registered —
@@ -108,13 +109,27 @@ VETTING_FAILED = {
 # untested override is not committed (docs/worldwide_sampling.md).
 QUERY_OVERRIDES: dict[str, str] = {}
 
-# The favoured uploaders' candidates and why none is a row. The owner's
-# priority is more towns like Laurens, Iowa (GIS_ISG); this pins that the
-# tranche does NOT deliver them, and why, so it cannot be read as an oversight.
+# Operator decision: towns admitted although they are within 25 km of a known
+# city. The reuse radius is a duplicate guard, and here the geometry proves
+# there is no duplicate: (known city, recorded km, its frozen grid W x H m from
+# the 2026-10-02 production snapshot, this town's vetted grid W x H m, the
+# vetted geocode's offset from the GeoNames point in km — the grid is centred
+# on the geocode, not on the point the distance was measured from).
+# Registration uses --overlap-km 5.
+OPERATOR_EXCEPTIONS = {
+    "5026416": ("elizabeth--minnesota--united-states", 11.5, (1624, 812), (11551, 8879), 1.4),
+}
+REGISTRATION_OVERLAP_KM = 5.0
+EXCEPTION_DECISION = "selected (operator exception)"
+
+# The favoured uploaders' candidates and what became of each. The priority is
+# more towns like Laurens, Iowa (GIS_ISG): Fergus Falls is in by exception;
+# the other two are pinned with the reason they are not, so their absence
+# cannot be read as an oversight.
 FAVOURED_CANDIDATE_DECISIONS = {
     "Como": "cities500 only",
     "Delavan Lake": "within 25 km of a known city",
-    "Fergus Falls": "within 25 km of a known city",
+    "Fergus Falls": EXCEPTION_DECISION,
 }
 
 # Permanent slugs, frozen at registration. Order matches the manifest.
@@ -126,6 +141,7 @@ EXPECTED_CITY_IDS = {
     "5779548": "payson--utah--united-states",
     "4893392": "galesburg--illinois--united-states",
     "5205849": "phoenixville--pennsylvania--united-states",
+    "5026416": "fergus-falls--minnesota--united-states",
     "5325187": "atwater--california--united-states",
     "5088262": "keene--new-hampshire--united-states",
     "5019588": "buffalo--minnesota--united-states",
@@ -157,10 +173,16 @@ def record():
 
 @pytest.fixture(scope="module")
 def geonames():
-    """The vendored GeoNames join: cities by id, admin-1 names, countries."""
-    cities = {c.geonameid: c for c in load_cities(DATA_SOURCES / "cities15000.txt")}
+    """
+    The vendored GeoNames join: cities15000 plus the supplement's verbatim
+    cities500 rows (``cities``), cities15000 alone, admin-1 names, countries.
+    """
+    cities15000 = {c.geonameid: c for c in load_cities(DATA_SOURCES / "cities15000.txt")}
+    supplement = {c.geonameid: c for c in load_cities(DATA_SOURCES / "geonames_supplement.txt")}
     return SimpleNamespace(
-        cities=cities,
+        cities={**supplement, **cities15000},
+        cities15000=cities15000,
+        supplement=supplement,
         admin=load_admin1(DATA_SOURCES / "admin1CodesASCII.txt"),
         countries=load_countries(DATA_SOURCES / "countryInfo.txt"),
     )
@@ -177,7 +199,7 @@ def _rederive(record, vendored_ids):
         gid = r["geonameid"]
         if float(r["score_km_per_km2"]) < SCORE_FLOOR:
             decisions[gid] = "below score floor"
-        elif float(r["nearest_known_km"]) <= REUSE_RADIUS_KM:
+        elif float(r["nearest_known_km"]) <= REUSE_RADIUS_KM and gid not in OPERATOR_EXCEPTIONS:
             decisions[gid] = "within 25 km of a known city"
         elif gid not in vendored_ids:
             decisions[gid] = "cities500 only"
@@ -204,7 +226,12 @@ def _rederive(record, vendored_ids):
     others = [r for r in kept if r["top_creator_id"] not in FAVOURED_CREATORS]
     chosen = favoured + others[: max(0, CAP - len(favoured))]
     for r in kept:
-        decisions[r["geonameid"]] = "selected" if r in chosen else "over the cap"
+        if r not in chosen:
+            decisions[r["geonameid"]] = "over the cap"
+        elif r["geonameid"] in OPERATOR_EXCEPTIONS:
+            decisions[r["geonameid"]] = EXCEPTION_DECISION
+        else:
+            decisions[r["geonameid"]] = "selected"
     chosen.sort(key=lambda r: -float(r["score_km_per_km2"]))
     return decisions, [r["geonameid"] for r in chosen]
 
@@ -278,7 +305,7 @@ def test_frame_only_columns_are_blank(manifest_rows):
 def test_record_flags_cities15000_membership_truthfully(record, geonames):
     """The one record column the test can recompute from vendored data, it does."""
     for r in record:
-        expected = "yes" if r["geonameid"] in geonames.cities else "no"
+        expected = "yes" if r["geonameid"] in geonames.cities15000 else "no"
         assert r["in_cities15000"] == expected, r["name"]
 
 
@@ -320,7 +347,45 @@ def test_vetting_failures_are_named_and_agree_with_the_generator(record):
     assert failed == set(VETTING_FAILED)
 
 
-def test_favoured_creators_candidates_and_why_none_is_a_row(record):
+def test_supplement_holds_only_rows_a_manifest_needs(manifest_rows, geonames):
+    """
+    The supplement is verbatim cities500 lines for towns cities15000 lacks,
+    and nothing else: every row is absent from cities15000 and is a row of
+    this manifest, so it cannot grow into an unreviewed copy of cities500.
+    """
+    manifest_ids = {row["geonameid"] for row in manifest_rows}
+    assert geonames.supplement, "the supplement is empty"
+    for gid in geonames.supplement:
+        assert gid not in geonames.cities15000, gid
+        assert gid in manifest_ids, gid
+
+
+def test_operator_exceptions_cannot_duplicate_their_neighbour(manifest_rows, record):
+    """
+    The reuse radius guards against one place registered twice. For each
+    exception the record's nearest known city is the named one at the named
+    distance, the two grids' half-diagonals plus the geocode's offset sum to
+    less than that distance (so the rectangles cannot overlap whatever their
+    orientation, even with the grid centred off the GeoNames point), and the
+    distance clears the --overlap-km registration actually uses.
+    """
+    assert set(gen.OPERATOR_EXCEPTIONS) == set(OPERATOR_EXCEPTIONS)
+    assert gen.EXCEPTION_DECISION == EXCEPTION_DECISION
+    by_id = {r["geonameid"]: r for r in record}
+    in_manifest = {row["geonameid"] for row in manifest_rows}
+    for gid, (neighbour, km, (nw, nh), (w, h), offset_km) in OPERATOR_EXCEPTIONS.items():
+        r = by_id[gid]
+        assert gid in in_manifest
+        assert r["decision"] == EXCEPTION_DECISION
+        assert r["nearest_known"] == neighbour
+        assert float(r["nearest_known_km"]) == km
+        assert km <= REUSE_RADIUS_KM  # else the exception is stale
+        half_diagonals_km = (math.hypot(nw, nh) + math.hypot(w, h)) / 2 / 1000
+        assert half_diagonals_km + offset_km < km, gid
+        assert km > REGISTRATION_OVERLAP_KM, gid
+
+
+def test_favoured_creators_candidates_and_what_became_of_each(record):
     favoured = {
         r["name"]: r["decision"] for r in record if r["top_creator_id"] in FAVOURED_CREATORS
     }
@@ -337,7 +402,9 @@ def test_no_two_rows_are_within_the_reuse_radius(manifest_rows):
 
 def test_no_row_is_within_the_reuse_radius_of_a_known_registration(manifest_rows, record):
     """
-    The record's nearest_known_km saw the production snapshot; this re-checks
+    The record's nearest_known_km saw the production snapshot (an
+    OPERATOR_EXCEPTIONS row is exempt from its 25 km floor, and is checked in
+    its own test); this re-checks
     each row against what was registered after it (tranche 1) and the committed
     manifests. It also holds that column to be no larger than the distance to
     the nearest tranche-1 town, i.e. that the record was built WITH tranche 1
@@ -359,7 +426,9 @@ def test_no_row_is_within_the_reuse_radius_of_a_known_registration(manifest_rows
         assert nearest > REUSE_RADIUS_KM, row["city"]
         recorded = float(by_id[row["geonameid"]]["nearest_known_km"])
         nearest_t1 = min(_haversine_km(lat, lon, olat, olon) for olat, olon in tranche1.values())
-        assert REUSE_RADIUS_KM < recorded <= round(nearest_t1, 1) + 0.05, row["city"]
+        assert recorded <= round(nearest_t1, 1) + 0.05, row["city"]
+        if row["geonameid"] not in OPERATOR_EXCEPTIONS:
+            assert recorded > REUSE_RADIUS_KM, row["city"]
 
 
 # --- the generator's rule on synthetic candidates ----------------------------
@@ -393,6 +462,20 @@ def test_generator_puts_favoured_towns_ahead_of_the_cap(monkeypatch):
     chosen = gen.select(cands, far, {c["geonameid"] for c in cands})
     assert [c["geonameid"] for c in chosen] == ["0", "9"]  # descending score
     assert cands[1]["decision"] == cands[2]["decision"] == "over the cap"
+
+
+def test_generator_exception_waives_only_the_known_city_radius():
+    known = {"tiny": (46.0, -96.0)}
+    exc = _cand("5026416", 46.1, -96.0, 5.4)  # ~11 km from a known city
+    plain = _cand("7", 46.0, -96.1, 6.0)  # ~8 km from it, no exception
+    chosen = gen.select([exc, plain], known, set(), {"5026416", "7"})
+    assert [c["geonameid"] for c in chosen] == ["5026416"]
+    assert exc["decision"] == gen.EXCEPTION_DECISION
+    assert plain["decision"] == "within 25 km of a known city"
+    # an exception does not waive the GeoNames join
+    unjoinable = _cand("5026416", 46.1, -96.0, 5.4)
+    assert gen.select([unjoinable], known, set()) == []
+    assert unjoinable["decision"] == "cities500 only"
 
 
 def test_generator_reports_cities500_known_and_vetting_drops():

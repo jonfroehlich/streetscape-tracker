@@ -13,12 +13,14 @@ published to the web server. (`data/` is rsynced and git-ignored;
 | `cities15000.txt` | GeoNames | All cities with population > 15,000 (~34k rows). Columns per the GeoNames "geoname" schema (tab-separated, no header). We use: `asciiname`, `country code` (ISO-3166 alpha-2), `admin1 code`, `population`, `latitude`, `longitude`. |
 | `countryInfo.txt` | GeoNames | ISO-2 → country name and continent code (`AF/AS/EU/NA/SA/OC/AN`). Leading `#` comment lines describe the columns. |
 | `admin1CodesASCII.txt` | GeoNames | `"<iso2>.<admin1code>"` → admin-1 (state/province/region) name, for building human-readable geocoding queries. |
+| `geonames_supplement.txt` | GeoNames `cities500.txt`, downloaded 2026-10-02 | Single rows copied verbatim from cities500 (same schema as `cities15000.txt`) for purposive-manifest towns too small to be in cities15000, so a manifest test can still join them by geonameid. **Only the rows a committed manifest needs** (the full cities500 file is ~40 MB and is not vendored). Currently: Fergus Falls, MN (5026416), for `mapillary_discovery_cities_tranche2.csv`. Add a row by copying its line, never by typing one. |
 | `gsv_coverage_regime.csv` | Hand-maintained (this repo) | Per-country GSV coverage regime (`present`/`sparse`/`absent`). Force-includes the cross-provider (GSV-absent, Mapillary-present) story into the frame. Edit as coverage changes. |
 | `geocode_overrides.csv` | Hand-maintained (this repo) | Replacement `register_frame.py` manifest rows for frame cities whose `worldwide_frame.csv` query Nominatim cannot geocode under any Latin transliteration (currently Al Jammaliyah, Egypt — needs the Arabic "الجمالية, الدقهلية" query; the bare Arabic name matches Cairo's Gamaliya district instead). Register with `python scripts/register_frame.py --manifest data_sources/geocode_overrides.csv --execute`; identity columns stay GeoNames-pinned, only `query_string` differs. |
 
 ## Attribution / license
 
-GeoNames data (`cities15000.txt`, `countryInfo.txt`, `admin1CodesASCII.txt`) is
+GeoNames data (`cities15000.txt`, `countryInfo.txt`, `admin1CodesASCII.txt`,
+`geonames_supplement.txt`) is
 © GeoNames, licensed under **Creative Commons Attribution 4.0**
 (<https://creativecommons.org/licenses/by/4.0/>). Source:
 <https://download.geonames.org/export/dump/>.

@@ -84,7 +84,7 @@ rank,geonameid,name,admin1,cc,lat,lon,pop,score_km_per_km2,recent_360_km_2km,top
 83,5563839,Fortuna,CA,US,40.59819,-124.15728,12000,5.414,68.03,713819173436997,marker_geo1,1.0,2026-05-10,mapillary_discovery_cities.csv:Eureka,22.7,no,within 25 km of a known city
 84,5247214,Burlington,WI,US,42.67807,-88.2762,10650,5.41,67.99,104273298482293,rking,1.0,2026-03-19,big-bend--wisconsin--united-states,24.8,no,within 25 km of a known city
 85,5385793,Ramona,CA,US,33.04171,-116.86808,20292,5.397,67.81,713819173436997,marker_geo1,1.0,2025-01-03,santee--california--united-states,23.2,yes,within 25 km of a known city
-86,5026416,Fergus Falls,MN,US,46.28302,-96.07756,13281,5.379,67.6,1361362982257515,GIS_ISG,1.0,2026-04-07,elizabeth--minnesota--united-states,11.5,no,within 25 km of a known city
+86,5026416,Fergus Falls,MN,US,46.28302,-96.07756,13281,5.379,67.6,1361362982257515,GIS_ISG,1.0,2026-04-07,elizabeth--minnesota--united-states,11.5,no,selected (operator exception)
 87,4481150,Moyock,NC,US,36.5246,-76.17827,3759,5.33,66.97,104214208486349,vorpalblade,1.0,2025-05-18,elizabeth-city--north-carolina--united-states,25.1,no,cities500 only
 88,5851889,Pacific Palisades,HI,US,21.42562,-157.95349,6997,5.17,64.97,100186595565848,hmhtb,1.0,2025-08-26,mapillary_discovery_cities.csv:Waipio Acres,7.6,no,within 25 km of a known city
 89,5330427,Boyes Hot Springs,CA,US,38.3138,-122.48193,6656,5.152,64.74,713819173436997,marker_geo1,1.0,2025-09-04,napa--california--united-states,15.6,no,within 25 km of a known city
