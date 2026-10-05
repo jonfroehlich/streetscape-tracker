@@ -31,9 +31,12 @@ Per CLAUDE.md, the docs and forum were read first.
 The documented tile limit is 50,000/day per app; a staff reply in the [forum thread on that limit's scope](https://forum.mapillary.com/t/50-000-requests-day-rate-limit-scope/10644) adds that a "sudden spike" from one IP can be blocked earlier, which is the per-IP layer behind our four production blocks (see `docs/provider-access.md`).
 So the collector runs serially at the production channels' jittered 40/min under the Mapillary tile host lock, caches every tile, and stops at the first response that is not 200/204.
 
-**All 195 requests returned 200**: 106 tile requests (97 for the scan, 9 for calibration) and 89 Graph API lookups 3 s apart.
+**All 195 requests returned 200**: 106 tile requests (97 z6 tiles for the scan, 8 z10 tiles for calibration and one exploratory z8 tile) and 89 Graph API lookups 3 s apart.
 They came from a laptop, never from makelab2, so none of it counts against production's per-IP sum.
-Re-running any step over the cached tiles makes zero requests, which is how the committed numbers were regenerated.
+**The committed collector did not make them.**
+Exploratory scripts that preceded it (uncommitted, in the gitignored raw directory) made every request, with the same jittered 40/min pacing and the same stop-at-first-refusal rule but without the host lock; their log entries are the ones without a `host` key.
+The committed `collect scan` and `collect calibrate` were then run over the cached tiles and made zero requests (`scan_manifest.json`: 0 requests, 97 cache hits), which is also how the committed numbers are regenerated.
+The committed fetcher's stop rules — a 302, a non-200, or an HTML or JSON body stops the run, is logged and is never cached, and `--max-requests` is never exceeded — are pinned by fake-session tests rather than by this run.
 
 ## Zoom calibration: does z6 keep a one-town sweep?
 
@@ -67,22 +70,23 @@ The committed analysis scores each place from its own point instead.
 For each place, recent-360° sequence length (captured on or after 2024-10-02, two years before the scan) within **2 km** of its point, divided by the disc's 12.57 km².
 Sequences are cut into pieces no longer than 0.5 km so length lands where it was driven.
 
-The validation population is every production catalog city with a Mapillary drive walk whose centre lies inside the scanned regions: **n = 1,121**.
+The validation population is every production catalog city with a Mapillary drive walk whose centre lies inside a scanned z6 tile: **n = 1,111**.
+Membership is decided by the tiles, not by a bounding box: ten walked cities inside the box sit in no scanned tile (Kodiak, Mexico City and Punta Cana among them), and kept, they would enter the validation as a score of 0 that nothing measured.
 The score is taken at the catalog centre while the walk covers the whole frozen grid, so this understates how well the score works for a town-sized disc.
 "Good" means walk coverage ≥ 50% of street-km **and** a median covered age ≤ 2 years.
 
-**Spearman ρ between score and walk coverage: 0.664.**
+**Spearman ρ between score and walk coverage: 0.666.**
 
 | Score (km/km²) | Walked cities | Median walk coverage | Good (≥ 50%, ≤ 2 yr) |
 |---|---|---|---|
-| [0, 0.5) | 974 | 0.0% | 2 (0.2%) |
+| [0, 0.5) | 964 | 0.0% | 2 (0.2%) |
 | [0.5, 1.5) | 71 | 17.0% | 0 |
 | [1.5, 3) | 36 | 25.4% | 1 (2.8%) |
 | [3, 6) | 19 | 45.3% | 4 (21.1%) |
 | [6, ∞) | 21 | 58.3% | 7 (33.3%) |
 
 At the candidate threshold of 3 km/km², **40 cities hold 11 of the 14 good ones** (79% recall).
-The base rate over all 1,121 is 1.25%, so the threshold concentrates good cities about 22-fold (27.5% vs 1.25%).
+The base rate over all 1,111 is 1.26%, so the threshold concentrates good cities about 22-fold (27.5% vs 1.26%).
 
 Reference towns, score vs walk:
 
@@ -133,7 +137,8 @@ A candidate (`candidate_rules`) scores ≥ 3, has a median capture date on or af
 That leaves **161**.
 
 The grid-membership test matters: distance to a centre is not membership, since a frozen grid can be 40 km across.
-It removed **32** places the 10 km rule alone had admitted, e.g. Lower Pearl City inside Honolulu's grid and Dedham inside a neighbour's.
+Without it, the thinned list holds 193 places, **37** of them inside a catalog grid, e.g. Lower Pearl City inside Honolulu's grid and Dedham inside a neighbour's (`grid_rule_effect`).
+Removing those 37 readmits 5 places that thinning had dropped in their favour, so the list shrinks by only 32 (193 − 37 + 5 = 161); 32 is the net change, not the count removed.
 Those places are tracked on the grid, though not walked as towns of their own.
 
 ## What was done on production
@@ -183,6 +188,6 @@ python scripts/mapillary_discovery_collect.py resolve-creators --out-dir experim
 python scripts/mapillary_discovery_analyze.py ...   # again, to attach usernames
 ```
 
-`tests/test_mapillary_discovery.py` pins the sampling frame (97 tiles), the y-up tile-coordinate mapping, length conservation through sample splitting, the disc membership and weighted median of the score, grid-rectangle membership, and the manifest's name and geocode overrides.
+`tests/test_mapillary_discovery.py` pins the sampling frame (97 tiles), the y-up tile-coordinate mapping, length conservation through sample splitting, the disc membership and weighted median of the score, grid-rectangle membership, the manifest's name and geocode overrides, every candidate and tranche rule where `apply_rules` applies it, the validation population's tile membership, the analyzer's refusal of a scan that stopped early, and the fetcher's stop rules and request cap.
 
 Related: #383 (this screen), #406 (the 2026-10-01 web-research pass that preceded it), `mapillary-user-activity.md` (per-uploader enumeration), `mapillary-image-quality.md` (why `quality_score` ranks against on-foot imagery, and so is not used here).

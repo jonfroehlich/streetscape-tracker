@@ -52,10 +52,16 @@ from scripts.mapillary_discovery_common import (  # noqa: E402
     split_samples,
     thin_by_distance,
 )
+from streetscape_metadata_tracker.download_common import (  # noqa: E402
+    lonlat_to_tile_frac,
+    tiles_for_bbox,
+)
 
 EXPERIMENT = "mapillary-discovery-screen"
 RECENT_SINCE = "2024-10-02"  # two years before the 2026-10-02 scan
-SCAN_BOX = (-161.0, 18.5, -66.0, 66.0)  # places outside every scanned region are not scored
+# A coarse prefilter on GeoNames places only. Validation membership is decided by
+# the scanned TILES (scan_tiles), since a box this size holds cities in no scanned tile.
+SCAN_BOX = (-161.0, 18.5, -66.0, 66.0)
 
 # Candidate list: not in the catalog, recent, dense, dominated by one sweep
 CANDIDATE_RULES = {
@@ -124,6 +130,63 @@ def load_places(path: str, admin1_path: str) -> pd.DataFrame:
     return pl[pl.lon.between(x0, x1) & pl.lat.between(y0, y1)].reset_index(drop=True)
 
 
+def load_scan_manifest(raw: Path) -> dict:
+    """
+    The scan's manifest, refusing a scan that stopped early: ``collect scan``
+    still writes ``sequences.parquet`` after a stop, and an unscanned tile
+    would then read as a tile with no imagery.
+    """
+    manifest = json.loads((raw / "scan_manifest.json").read_text())
+    if manifest.get("stopped"):
+        raise SystemExit(
+            f"refusing a partial scan: {raw / 'scan_manifest.json'} records "
+            f"stopped={manifest['stopped']!r}; re-run collect scan to completion first"
+        )
+    return manifest
+
+
+def scan_tiles(manifest: dict) -> set[tuple[int, int]]:
+    """The (x, y) tiles the scan covered, from the manifest's own region boxes."""
+    return {
+        t for bbox in manifest["regions"].values() for t in tiles_for_bbox(*bbox, manifest["zoom"])
+    }
+
+
+def in_tiles(lats, lons, tiles: set[tuple[int, int]], zoom: int) -> np.ndarray:
+    """Whether each point lies in one of ``tiles``."""
+    out = []
+    for lat, lon in zip(lats, lons, strict=True):
+        fx, fy = lonlat_to_tile_frac(lon, lat, zoom)
+        out.append((int(fx), int(fy)) in tiles)
+    return np.array(out, dtype=bool)
+
+
+def build_validation(
+    samples: pd.DataFrame,
+    cat: pd.DataFrame,
+    walks: pd.DataFrame,
+    tiles: set[tuple[int, int]],
+    zoom: int,
+) -> pd.DataFrame:
+    """
+    Score each catalog centre and join its measured walk. Only centres in a
+    SCANNED tile are kept: one in an unscanned tile has no samples, and would
+    enter the validation as a score of 0 nobody measured.
+    """
+    cat_places = cat.rename(columns={"city_id": "name"})
+    val = place_scores(samples, cat_places[["name", "lat", "lon"]], min_km=0.0)
+    val = cat_places[["name", "lat", "lon"]].merge(
+        val.drop(columns=["lat", "lon"]), on="name", how="left", validate="one_to_one"
+    )
+    val["km_per_km2"] = val.km_per_km2.fillna(0.0)
+    val = val[in_tiles(val.lat, val.lon, tiles, zoom)]
+    val = val.rename(columns={"name": "city_id"}).merge(
+        walks, on="city_id", how="inner", validate="one_to_one"
+    )
+    val["good"] = (val.coverage_pct_by_length >= 50) & (val.median_covered_age_years <= 2)
+    return val
+
+
 def inside_grid(lat: float, lon: float, grids: pd.DataFrame) -> str:
     """The first catalog city whose frozen grid rectangle contains (lat, lon), else ''."""
     dy = (grids.lat.to_numpy() - lat) * 110_570.0
@@ -154,13 +217,35 @@ def apply_rules(df: pd.DataFrame, rules: dict) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
+def grid_rule_effect(scored: pd.DataFrame, rules: dict) -> dict:
+    """
+    What the grid-membership rule does to a ranked list, as counts rather than
+    a net difference: removing in-grid places also readmits places that
+    thinning had suppressed in their favour, so ``without - with`` undercounts
+    the places it removed.
+    """
+    without = apply_rules(
+        scored.assign(_in_grid=scored.inside_catalog_grid, inside_catalog_grid=""), rules
+    )
+    removed = int((without._in_grid != "").sum())
+    kept = len(apply_rules(scored, rules))
+    return {
+        "thinned_list_without_the_rule": int(len(without)),
+        "of_which_inside_a_catalog_grid": removed,
+        "readmitted_once_those_are_removed": int(kept - (len(without) - removed)),
+        "thinned_list_with_the_rule": int(kept),
+    }
+
+
 def manifest_rows(tranche: pd.DataFrame) -> pd.DataFrame:
     """register_frame.py's manifest format (as in mapillary_360_cities.csv)."""
     rows = []
     for r in tranche.itertuples(index=False):
         country = {"US": "United States", "CA": "Canada"}.get(r.cc, r.cc)
         name = r.name.translate(NAME_STRIP).strip()
-        admin = effective_admin(name, r.admin_name)
+        # GeoNames has no admin-1 name for some places: NaN, never a string
+        admin_name = r.admin_name if pd.notna(r.admin_name) else ""
+        admin = effective_admin(name, admin_name)
         query = GEOCODE_OVERRIDES.get(int(r.geonameid)) or ", ".join(
             p for p in (name, admin, country) if p
         )
@@ -168,7 +253,7 @@ def manifest_rows(tranche: pd.DataFrame) -> pd.DataFrame:
             {
                 "query_string": query,
                 "city": name,
-                "admin": r.admin_name or "",
+                "admin": admin_name,
                 "iso2": r.cc,
                 "country": country,
                 "continent": "NA" if r.cc in ("US", "CA", "MX") else "",
@@ -197,6 +282,7 @@ def main(argv=None) -> int:
     args = p.parse_args(argv)
     raw = Path(args.raw_dir)
     docs = Path(args.docs_dir)
+    scan_manifest = load_scan_manifest(raw)
 
     seq = pd.read_parquet(raw / "sequences.parquet")
     since_ms = pd.Timestamp(RECENT_SINCE).value // 10**6
@@ -212,18 +298,7 @@ def main(argv=None) -> int:
     ]
 
     # ── Validation: score each catalog centre and join its measured walk ──
-    cat_places = cat.rename(columns={"city_id": "name"})
-    val = place_scores(samples, cat_places[["name", "lat", "lon"]], min_km=0.0)
-    val = cat_places[["name", "lat", "lon"]].merge(
-        val.drop(columns=["lat", "lon"]), on="name", how="left", validate="one_to_one"
-    )
-    val["km_per_km2"] = val.km_per_km2.fillna(0.0)
-    x0, y0, x1, y1 = SCAN_BOX
-    val = val[val.lon.between(x0, x1) & val.lat.between(y0, y1)]
-    val = val.rename(columns={"name": "city_id"}).merge(
-        walks, on="city_id", how="inner", validate="one_to_one"
-    )
-    val["good"] = (val.coverage_pct_by_length >= 50) & (val.median_covered_age_years <= 2)
+    val = build_validation(samples, cat, walks, scan_tiles(scan_manifest), scan_manifest["zoom"])
     val["score_bin"] = pd.cut(val.km_per_km2, SCORE_BINS, right=False)
     bins = []
     for b, g in val.groupby("score_bin", observed=True):
@@ -301,7 +376,6 @@ def main(argv=None) -> int:
     ]
 
     calib = json.loads((raw / "calibration.json").read_text())
-    scan_manifest = json.loads((raw / "scan_manifest.json").read_text())
     log = [json.loads(line) for line in (raw / "request_log.jsonl").read_text().splitlines()]
     statuses: dict[str, dict[str, int]] = {}
     for e in log:
@@ -338,7 +412,7 @@ def main(argv=None) -> int:
         },
         "calibration_zoom_recall": calib,
         "validation": {
-            "population": "catalog cities with a Mapillary drive walk, centre inside the scanned regions; "
+            "population": "catalog cities with a Mapillary drive walk, centre inside a scanned z6 tile; "
             "the score is taken at the catalog centre, the walk covers the whole frozen grid",
             "n": int(len(val)),
             "spearman_score_vs_walk_coverage": spearman(val.km_per_km2, val.coverage_pct_by_length),
@@ -362,10 +436,7 @@ def main(argv=None) -> int:
             "score_distribution": pct(scored.km_per_km2),
             "candidate_rules": CANDIDATE_RULES,
             "candidates": int(len(cand)),
-            "excluded_inside_a_catalog_grid": int(
-                len(apply_rules(scored.assign(inside_catalog_grid=""), {**CANDIDATE_RULES}))
-                - len(cand)
-            ),
+            "grid_rule_effect": grid_rule_effect(scored, CANDIDATE_RULES),
             "candidates_by_top_creator": {
                 str(names.get(str(k), k)): int(v)
                 for k, v in cand.groupby("top_creator")

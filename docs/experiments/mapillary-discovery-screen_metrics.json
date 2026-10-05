@@ -5,7 +5,7 @@
   "generated_by": "python scripts/mapillary_discovery_analyze.py --raw-dir experiments/mapillary-discovery-383 --places experiments/mapillary-discovery-383/cities500.txt --prod-snapshot experiments/mapillary-discovery-383/prod/prod_snapshot.csv --catalog-label makelab2-prod-f1885f5 --docs-dir docs/experiments --manifest-out mapillary_discovery_cities.csv",
   "collected_by": "python scripts/mapillary_discovery_collect.py {scan,calibrate,resolve-creators} --out-dir experiments/mapillary-discovery-383",
   "catalog_label": "makelab2-prod-f1885f5",
-  "generated_at": "2026-10-02T13:50:32+00:00",
+  "generated_at": "2026-10-05T13:54:09+00:00",
   "note": "Screening signals from z6 vector tiles, never coverage. 'recent' means captured on or after 2024-10-02. A place's score is recent-360 km within 2.0 km of its point per km^2 of that disc, from samples <= 0.5 km along simplified z6 geometry."
  },
  "requests": {
@@ -321,14 +321,14 @@
   "cache_hits": 16
  },
  "validation": {
-  "population": "catalog cities with a Mapillary drive walk, centre inside the scanned regions; the score is taken at the catalog centre, the walk covers the whole frozen grid",
-  "n": 1121,
-  "spearman_score_vs_walk_coverage": 0.664,
+  "population": "catalog cities with a Mapillary drive walk, centre inside a scanned z6 tile; the score is taken at the catalog centre, the walk covers the whole frozen grid",
+  "n": 1111,
+  "spearman_score_vs_walk_coverage": 0.666,
   "good_definition": "walk coverage_pct_by_length >= 50 and median_covered_age_years <= 2",
   "by_score_bin": [
    {
     "km_per_km2": "[0, 0.5)",
-    "walked_cities": 974,
+    "walked_cities": 964,
     "median_walk_coverage_pct": 0.0,
     "share_ge50pct_and_le2yr": 0.002,
     "good": 2
@@ -367,7 +367,7 @@
    "good_total": 14,
    "good_at_or_above": 11,
    "cities_at_or_above": 40,
-   "base_rate": 0.0125
+   "base_rate": 0.0126
   },
   "reference_towns": [
    {
@@ -490,7 +490,12 @@
    "thin_km": 5.0
   },
   "candidates": 161,
-  "excluded_inside_a_catalog_grid": 32,
+  "grid_rule_effect": {
+   "thinned_list_without_the_rule": 193,
+   "of_which_inside_a_catalog_grid": 37,
+   "readmitted_once_those_are_removed": 5,
+   "thinned_list_with_the_rule": 161
+  },
   "candidates_by_top_creator": {
    "marker_geo1": 31,
    "rking": 30,

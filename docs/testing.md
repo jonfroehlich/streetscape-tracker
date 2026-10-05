@@ -1209,4 +1209,15 @@ the y-up tile-local mapping (a tile's (0, 4096) is its NORTH-west corner — a f
 `split_samples` conserving a polyline's length exactly, bounding each piece at `SAMPLE_KM`, and spreading a long segment along its length;
 `place_scores` counting a sample 1.9 km away and not one 2.1 km away, the score as km / (pi r^2), the top uploader's length share, the on-foot share, and the LENGTH-weighted median capture date, with empty and below-`min_km` discs skipped;
 `thin_by_distance` keeping the first of a cluster; `inside_grid` as rectangle membership (15 km off-centre inside a 40 km-wide grid, 12 km off-centre outside a 20 km-tall one), never centre distance;
-the manifest dropping apostrophes and applying `GEOCODE_OVERRIDES`; and the jittered pacer's mean and floor.
+the manifest dropping apostrophes and applying `GEOCODE_OVERRIDES`, and writing an empty admin rather than NaN when GeoNames has none; and the jittered pacer's mean and floor.
+
+Added after the PR's first review, which found twelve mutations surviving:
+
+- **The fetcher's stop rules**, through a fake session (the template a standing `screen-provider mapillary` would copy): a 302, a 200 with an HTML body, or a 403 stops the run, is logged with its `host`, is never cached, and is never followed as a redirect; a 204 caches as an empty tile and a cached tile costs no request; `--max-requests` is never exceeded.
+- **`catalog-snapshot` exporting each city's LATEST Mapillary drive walk**, never an older one, a non-drive network or another provider's.
+- **`apply_rules` applying every candidate and tranche rule where it is applied** — the grid, the 10 km centre distance, the date, the score, the uploader share, population, on-foot share, thinning, the per-uploader cap and the size — one failing row per rule; `grid_rule_effect` counting the places the grid rule removes rather than the net change (a removal that readmits a thinned neighbour nets to 0).
+- **`build_samples` keeping only recent panos**, `spearman` being rank correlation (a monotone outlier keeps it at 1.0), `nearest_km` picking the nearest, `inside_grid` bounding the WIDTH at half, and the weighted median landing on OLDER imagery when it holds most of the length (so `median = newest` fails).
+- **The validation population is the scanned TILES**, never the bounding box: Mexico City and Kodiak sit in the box and in no scanned tile, and are dropped rather than scored 0; `scan_tiles` derives the tiles from the manifest's own regions.
+- **The analyzer refuses a scan that stopped early** (`scan_manifest.json` `stopped` set), writing nothing, since an unscanned tile would otherwise read as one with no imagery.
+
+All 39 mutations run after this change, the review's survivors included, fail at least one test.
