@@ -1,0 +1,13 @@
+5026416	Fergus Falls	Fergus Falls	City of Fergus Falls,FFM,Fergas Folls,Fergas Fols,Fergus Falls,Fergus-Fols,frghws fwlz,frgs falz  mynh‌swta,fu ge si fu er si,Фергас Фоллс,Фергас Фолс,Фергус-Фолс,Ферґус-Фолс,فرغوس فولز,فرگس فالز، مینه‌سوتا,弗格斯福尔斯	46.28302	-96.07756	P	PPLA2	US		MN	111	20906		13281	360	361	America/Chicago	2017-05-23
+5250402	Delavan Lake	Delavan Lake	Delavan Lejk,Делаван Лейк	42.58418	-88.6326	P	PPL	US		WI	127	19475		2649	286	293	America/Chicago	2026-09-17
+5249259	Como	Como	Como,Komo,ke mo,kwmw,kwmw  wyskansyn,Комо,كومو,کومو,کومو، ویسکانسین,科莫	42.61224	-88.48232	P	PPL	US		WI	127	28550		2631	279	289	America/Chicago	2026-08-30
+4769339	Lexington	Lexington	Leksington,Lexington,Lexington City,Shrine of the South,ksynghtwn,legsingteon,lei xing dun,lksyngtwn  wyrjynya,rekishinton,Лексингтон,كسينغتون,لکسینگتون، ویرجینیا,لیکسنگٹن، ورجینیا,レキシントン,勒星頓,렉싱턴	37.78402	-79.44282	P	PPLA2	US		VA	678			7262	324	322	America/New_York	2017-03-09
+4737676	Trophy Club	Trophy Club	Trofi Klub,Трофи Клуб	32.9979	-97.18362	P	PPL	US		TX	121			11759	185	190	America/Chicago	2026-09-16
+5854718	Waipi‘o Acres	Waipi'o Acres	Waipi'o Acres,Waipio Acres,Waipi‘o Acres	21.46485	-158.01331	P	PPL	US		HI	003			5531	211	210	Pacific/Honolulu	2024-10-24
+5086321	Francestown	Francestown	Franstaun,fransystawn,Франстаун,فرانسيستاون,فرینسسٹاؤن، نیو ہیمپشائر	42.98758	-71.81258	P	PPL	US		NH	011	27140		1571	253	258	America/New_York	2026-08-31
+5090096	New Boston	New Boston	Lane's New Boston,N'ju Boston,New Boston,Нью Бостон	42.97619	-71.69396	P	PPL	US		NH	011	50740		4934	135	151	America/New_York	2026-09-17
+5400065	Sunnyslope	Sunnyslope	Sannijslop,Саннийслоп	34.01196	-117.43338	P	PPL	US		CA	065			5153	275	279	America/Los_Angeles	2026-09-17
+4930183	Bedford	Bedford	BED,Bedford,Bedford Centre,Behdford,bai fu,bdfwrd  masachwst,bdpwrd,beddofodo,bei te fu de,bydfwrd,Бедфорд,Бэдфорд,בדפורד,بدفورد، ماساچوست,بيدفورد,بیڈفورڈ، میساچوسٹس,ベッドフォード,百福,貝特福德	42.49065	-71.27617	P	PPL	US		MA	017	04615		12502	42	45	America/New_York	2017-05-23
+7261418	Heber-Overgaard	Heber-Overgaard	Geber-Overgaard,Heber,Heber-Overgaard,Heber-Overgaard CDP,Kheber-Overgaard,Khiber-Overgard,hbrawrgard,hbrawrqard  aryzwna,he bo-ao fu jia de,hebara'obaragarda,Гебер-Овергаард,Хебер-Овергаард,Хибер-Овергард,هبراورقارد، آریزونا,هبراورگارد,हेबरओबरगार्द,赫伯-奧弗加德	34.41414	-110.56956	P	PPL	US		AZ	017			2822	2020	2021	America/Phoenix	2026-09-17
+5089746	Mont Vernon	Mont Vernon	Mont Vernon,Mount Vernon,Mount-Vernon,Монт Вернон	42.89453	-71.67424	P	PPL	US		NH	011	49140		2166	250	251	America/New_York	2026-09-17
+5777332	Lindon	Lindon	Lindon,Lindun,lin dun,lyndwn,lyndwn  ywta,rindon,Линдон,Линдън,Ліндон,ليندون,لیندون، یوتا,リンドン,林頓,林顿	40.34329	-111.72076	P	PPL	US		UT	049			10810	1415	1418	America/Denver	2026-08-30

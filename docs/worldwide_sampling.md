@@ -202,6 +202,8 @@ Cities added for a specific reason live in their own manifest in the same format
 - `mapillary_discovery_cities.csv` (2026-10-02, 25 cities) — the first tranche of the Mapillary discovery screen (#383, `docs/experiments/mapillary-discovery-screen.md`): uncatalogued North American towns with dense, recent, single-uploader 360° sequence coverage.
   Unlike `mapillary_360_cities.csv` it HAS a generator, `scripts/mapillary_discovery_analyze.py`, which reproduces it byte for byte from the 2026-10-02 scan's gitignored raw data and the cities500 file downloaded that day (not vendored, so the generator alone cannot rebuild it later); it carries one geocode-query override (Fond du Lac, whose plain query matched the county) and drops apostrophes from names (`Waipi'o Acres` -> `Waipio Acres`).
   Registered with `--overlap-km 5 --notes-label "mapillary discovery screen 2026-10-02"`.
+- `mapillary_discovery_cities_tranche2.csv` (2026-10-04, 14 cities, #383) — the second tranche of the Mapillary discovery screen's towns (PR #419, `experiments/mapillary-discovery-screen.md`), selected by a RULE over the screen's per-place scores rather than curated.
+  Its own section is below; registering it is the runbook in [`operations.md`](operations.md) ("Registering the Mapillary discovery screen's second tranche").
 - `panoramax_360_cities.csv` (2026-10-04, 40 cities, #406) — the richest Panoramax 360° clusters the 2026-10-01 world screen found outside the catalog ([`experiments/panoramax-world-screen.md`](experiments/panoramax-world-screen.md)), selected by a RULE rather than curated: every new cluster with a 360° upper bound of at least 100,000 (10,000 in the US and Canada), plus Kilkenny by name.
   Its own section is below; registering it is the runbook in [`operations.md`](operations.md) ("Registering a purposive manifest on production").
 
@@ -235,6 +237,127 @@ The trap for these cities is the opposite of the province centroid the `--max-ce
 
 Since #406 that vetting is a command, `scripts/vet_manifest_geometry.py --manifest <csv>`: it calls `register_frame.resolve_frame_geometry`, the function `register_frame_city` freezes from, so the preview and the registration cannot drift apart, and it prints the offset, the OSM feature matched and each grid's request price from `scheduler.estimate_requests`.
 It geocodes through Nominatim only (the library's 1.1 s limiter), opens no catalog, and refuses a `makelab*` host; run it from a laptop.
+
+### `mapillary_discovery_cities_tranche2.csv` (#383)
+
+**Selection.**
+The input is the discovery screen's 161 candidates (`docs/experiments/mapillary-discovery-screen_candidates.csv` on PR #419's branch): GeoNames cities500 places scoring at least 3 km of recent 360° Mapillary sequence per km² within 2 km of their point, outside every catalog grid.
+`scripts/build_mapillary_discovery_tranche2.py` applies the second tranche's rule and writes every candidate's decision to [`experiments/mapillary-discovery-screen_tranche2.csv`](experiments/mapillary-discovery-screen_tranche2.csv), which `tests/test_mapillary_discovery_tranche2_manifest.py` re-derives independently.
+In order:
+
+1. score ≥ 3 (all 161 pass; it is the screen's own floor);
+2. more than 25 km from every city the catalog knows: the production snapshot the screen exported on 2026-10-02 (1,232 cities, Montréal and Ottawa among them) plus tranche 1's 25 towns (`mapillary_discovery_cities.csv`, Cedar Falls among them) — **116 dropped**, two of which (Fergus Falls MN, Delavan Lake WI) are admitted anyway by operator decision (below);
+3. the place is in the vendored `cities15000.txt` or is one of this tranche's three rows of `data_sources/geonames_supplement.txt` (`TRANCHE2_SUPPLEMENT_IDS`), since a manifest row is a join against vendored GeoNames data and the screen's frame, cities500, is not vendored — **29 dropped** (listed below).
+   The joinable set is pinned rather than read from the whole supplement, because the supplement is shared: a row another manifest adds later must not change a decision this record froze;
+4. its geometry resolved in the vetting run (below) — **3 dropped**;
+5. greedily, GIS_ISG and UAS_ISG towns first and then by descending score, no row within 25 km of a row already kept — **1 dropped** (Sparks NV, 5.5 km from Reno), and one pair (Delavan Lake and Como WI) admitted by operator decision (below);
+6. those uploaders' towns ahead of a cap of 30 rows, the rest by score — the cap does not bind.
+
+That leaves **14 rows**, in descending score, so `register_frame.py --limit N` registers the strongest first.
+Re-running the script reproduces both committed files byte for byte (no network; the snapshot is gitignored on the laptop that ran the screen):
+
+```bash
+mkdir -p /tmp/t1   # the --also-registered file must keep its name: the record labels known cities by it
+git show origin/mapillary-discovery-screen-383:docs/experiments/mapillary-discovery-screen_candidates.csv > /tmp/candidates.csv
+git show origin/mapillary-discovery-screen-383:mapillary_discovery_cities.csv > /tmp/t1/mapillary_discovery_cities.csv
+python scripts/build_mapillary_discovery_tranche2.py --candidates /tmp/candidates.csv \
+    --catalog-snapshot experiments/mapillary-discovery-383/prod/prod_snapshot.csv \
+    --also-registered /tmp/t1/mapillary_discovery_cities.csv
+```
+
+Each row is the scored place itself, scored at its own GeoNames point (the 2 km disc was measured around the manifest's own lat/lon), so no row is admitted on a neighbour's imagery (the defect #428's review found in a cluster-anchored selection).
+Registration centres the grid on the geocode, not on that point — 0.1 to 5.5 km away in the vetting runs below — so the test also requires the scored point inside each vetted grid and at least three quarters of the scored disc's area with it.
+By area the minimum is 77% (Como; Delavan Lake 79%, Phoenixville 81%, Atwater 99.7%, the other ten 100%, on the test's 200 x 200 lattice), because a narrow grid or an offset centre clips the disc's edge; the imagery-weighted share is higher, but measuring it needs the screen's raw segments, which are not committed.
+
+**All three GIS_ISG / UAS_ISG towns are in, by operator exception.**
+Laurens, Iowa's uploader and its sibling account have three candidates, and the rule alone drops all three; each exception is pinned by the test with the geometry below, and "operator decision" is its whole provenance.
+Fergus Falls MN (5.38, GIS_ISG 100%, 67.6 km of recent 360° within 2 km) fails rule 2 only against `elizabeth--minnesota--united-states`, 11.5 km away.
+Elizabeth's frozen grid is 1,624 x 812 m and Fergus Falls' vetted grid 11,551 x 8,879 m, so their half-diagonals (0.9 + 7.3 km) plus the vetted geocode's 1.4 km offset fall short of the distance and the rectangles cannot overlap: the reuse radius is a duplicate guard, and here the geometry proves there is no duplicate.
+Registration uses `--overlap-km 5`, which admits it.
+Delavan Lake WI (4.08, UAS_ISG 100%) fails rule 2 only against `clinton--wisconsin--united-states`, 19.1 km away: Clinton's frozen grid is 2,174 x 2,648 m and Delavan Lake's vetted grid 6,043 x 5,136 m, so their half-diagonals (1.7 + 4.0 km) plus the 2.0 km geocode offset come to 7.7 km and the rectangles cannot overlap.
+Both waive rule 2 only (`OPERATOR_EXCEPTIONS` in the generator).
+Delavan Lake and Como WI (3.94, GIS_ISG 83%) are 12.7 km apart on the Lake Geneva lakes, so rule 4 would keep only Delavan Lake.
+They are two distinct places whose grids do not overlap: Delavan Lake's half-diagonal plus offset (4.0 + 2.0 km) and Como's (3.2 + 0.7 km) total 9.8 km, under the 12.7 km between their GeoNames points (between the vetted centres the rectangles are 4.7 km apart east–west), and registration's `--overlap-km 5` admits both (`PAIR_EXCEPTIONS`).
+Neither Delavan (the city), Lake Geneva, Williams Bay nor any other catalog city or manifest row is within 19 km of either; the nearest is Clinton, and the nearest other screen candidate is Burlington WI (dropped by rule 2), 18.4 km from Como.
+None of the three is in `cities15000.txt`, so each GeoNames line is copied verbatim from cities500 into `data_sources/geonames_supplement.txt`, which holds only the rows a committed manifest needs (`data_sources/README.md`); nothing now waits on vendoring among these uploaders' towns.
+
+**Needs a cities500 vendoring decision** — 29 candidates that pass every other rule but cannot be joined from `data_sources/`, because they are neither in `cities15000.txt` nor in the supplement (the screen downloaded cities500 on the day).
+Each can be admitted in a later manifest the way Fergus Falls was, by copying its cities500 line into the supplement — not into this tranche, whose joinable set is pinned and whose record is frozen; vendoring all of cities500 (about 40 MB) is the alternative, and either is the owner's call.
+
+| Place | geonameid | Score | Top uploader | Share | Population |
+|---|---|---|---|---|---|
+| Aptos, CA | 5324400 | 6.10 | marker_geo1 | 1.00 | 6,220 |
+| Blende, CO | 5414264 | 3.55 | marker_geo1 | 1.00 | 878 |
+| California, MD | 4350049 | 4.39 | stmaryscounty1 | 0.83 | 11,857 |
+| Carmel-by-the-Sea, CA | 5334320 | 3.90 | pixelpete | 1.00 | 3,897 |
+| Cedonia, MD | 4350831 | 3.17 | Rossitransportationgroup | 1.00 | 3,168 |
+| Coolidge, AZ | 5290663 | 6.08 | rking | 1.00 | 12,297 |
+| Eldorado, IL | 4237767 | 8.61 | Dale_Hat | 1.00 | 4,064 |
+| Ephrata, WA | 5793832 | 5.92 | rking | 1.00 | 8,047 |
+| Gilbert, MN | 5027943 | 3.10 | RS-EH-MAPR-1 | 1.00 | 1,792 |
+| Hailey, ID | 5594956 | 4.94 | rking | 1.00 | 8,134 |
+| Horizon West, FL | 7315230 | 5.54 | rking | 1.00 | 14,000 |
+| Hudson, QC | 5978126 | 5.47 | zombiegraph | 1.00 | 5,088 |
+| Kapa'a, HI | 5848280 | 3.01 | KauaiGIS | 1.00 | 10,699 |
+| Lanare, CA | 5364937 | 3.10 | marker_geo1 | 1.00 | 589 |
+| Leisure Knoll, NJ | 5100381 | 3.25 | DrivingRoundTown | 1.00 | 2,490 |
+| Locust Grove, GA | 4206502 | 7.22 | CM-FDC | 1.00 | 5,790 |
+| Mexia, TX | 4710963 | 6.59 | MEW-Utilities | 1.00 | 7,406 |
+| Moyock, NC | 4481150 | 5.33 | vorpalblade | 1.00 | 3,759 |
+| New Roads, LA | 4335096 | 3.21 | rking | 1.00 | 4,697 |
+| North Auburn, CA | 5377266 | 4.00 | marker_geo1 | 1.00 | 13,022 |
+| Rocky Mount, VA | 4782691 | 4.78 | rking | 1.00 | 4,799 |
+| Shelter Cove, CA | 5571188 | 4.50 | marker_geo1 | 1.00 | 693 |
+| Stacy, MN | 5048496 | 3.05 | quickness805 | 1.00 | 1,470 |
+| Troy, NH | 5093821 | 4.36 | henryu | 1.00 | 1,221 |
+| Webster City, IA | 4881096 | 3.10 | Hopen111 | 1.00 | 7,814 |
+| West Pittston, PA | 5218853 | 4.43 | rking | 1.00 | 4,772 |
+| White Marsh, MD | 4373426 | 4.22 | Rossitransportationgroup | 0.93 | 9,513 |
+| Winters, CA | 5410125 | 3.79 | rking | 1.00 | 7,034 |
+| Yreka, CA | 5574093 | 4.07 | marker_geo1 | 0.96 | 7,597 |
+
+**Vetting (2026-10-04, from a laptop, one run of `vet_manifest_geometry.py` over the 14 rows the rule admitted before step 4).**
+Each run's `--csv` output is committed verbatim: [`experiments/mapillary-discovery-screen_tranche2_vet.csv`](experiments/mapillary-discovery-screen_tranche2_vet.csv) (this run), [`_vet_fergus.csv`](experiments/mapillary-discovery-screen_tranche2_vet_fergus.csv) and [`_vet_lakes.csv`](experiments/mapillary-discovery-screen_tranche2_vet_lakes.csv) (the two below).
+The table, its totals, the offset summary and every grid and offset the test pins are those files' values, and the test checks that they are.
+Fergus Falls was vetted in a second, single-row run on 2026-10-05, after its exception: the bare query matched the city's `boundary/administrative` polygon (not Otter Tail County), 1.4 km off, so it needs no override.
+Delavan Lake and Como were vetted in a third run on 2026-10-05 (two geocodes): both are census-designated places and both matched a `boundary/census` polygon, 2.0 and 0.7 km off, so neither fell back to a polygon-less node's bbox (#302's Copenhagen failure) and neither needs an override.
+Three geocoded to the wrong feature and failed the 10 km center guard, so registration would skip them; with no second Nominatim run to test a fix, they are left out rather than given an untested override:
+
+- **Elko, NV** matched Elko County, 32 km off; try `Elko, Elko County, Nevada, United States`.
+- **Live Oak, CA** matched Live Oak in Sutter County, 257 km off; the scored place is the Santa Cruz County census-designated place, so try `Live Oak, Santa Cruz County, California, United States`.
+- **Searcy, AR** matched Searcy County, 113 km off (the city is in White County); try `Searcy, White County, Arkansas, United States`.
+
+The other 14 matched a `boundary/administrative` polygon (Delavan Lake and Como a `boundary/census` one), p50 1.65 km and max 5.5 km (Toms River's township) from their GeoNames point, so `--max-center-km 10` registers every row and `--center-from-geonames` is unnecessary.
+Prices are for one collection: GSV and Mapillary are default-membership, so an enabled city is due on both the next night; the GSV walk is the scheduler's area proxy, an over-estimate by design; the Mapillary, KartaView and Panoramax walks read their grid run's census from the shared cache for 0 requests on a paired night (#290).
+
+| # | City | Geocode query | OSM match | Grid W x H (m) | GSV points | GSV walk samples (area proxy) | Mapillary z14 tiles | KartaView requests | Panoramax z15 tiles | Offset (km) | Center | Flags |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | Tracy | Tracy, California, United States | boundary/administrative | 14,870 x 13,082 | 487,320 | 96,616 | 64 | 198 | 240 | 4.0 | geocoded |  |
+| 2 | Reno | Reno, Nevada, United States | boundary/administrative | 26,735 x 36,750 | 2,457,406 | 487,980 | 300 | 923 | 1,160 | 4.2 | geocoded |  |
+| 3 | Elko |  |  |  |  |  |  |  |  |  |  | FAILED: 32 km off |
+| 4 | Woodland | Woodland, California, United States | boundary/administrative | 10,976 x 7,980 | 219,600 | 43,502 | 35 | 86 | 108 | 3.0 | geocoded |  |
+| 5 | Perris | Perris, California, United States | boundary/administrative | 7,690 x 17,333 | 333,795 | 66,201 | 45 | 140 | 162 | 1.3 | geocoded |  |
+| 6 | Payson | Payson, Utah, United States | boundary/administrative | 10,999 x 8,066 | 222,200 | 44,063 | 35 | 86 | 130 | 1.9 | geocoded |  |
+| 7 | Live Oak |  |  |  |  |  |  |  |  |  |  | FAILED: 257 km off |
+| 8 | Searcy |  |  |  |  |  |  |  |  |  |  | FAILED: 113 km off |
+| 9 | Galesburg | Galesburg, Illinois, United States | boundary/administrative | 11,752 x 10,107 | 297,528 | 58,992 | 48 | 129 | 168 | 0.1 | geocoded |  |
+| 10 | Phoenixville | Phoenixville, Pennsylvania, United States | boundary/administrative | 4,057 x 4,821 | 49,126 | 9,714 | 9 | 21 | 30 | 1.1 | geocoded |  |
+| 10a | Fergus Falls (second run) | Fergus Falls, Minnesota, United States | boundary/administrative | 11,551 x 8,879 | 256,632 | 50,938 | 56 | 113 | 180 | 1.4 | geocoded |  |
+| 11 | Atwater | Atwater, California, United States | boundary/administrative | 6,395 x 5,215 | 83,520 | 16,563 | 20 | 36 | 48 | 1.3 | geocoded |  |
+| 12 | Keene | Keene, New Hampshire, United States | boundary/administrative | 13,546 x 10,639 | 360,696 | 71,577 | 63 | 144 | 208 | 2.7 | geocoded |  |
+| 13 | Buffalo | Buffalo, Minnesota, United States | boundary/administrative | 6,543 x 8,266 | 135,792 | 26,861 | 20 | 54 | 80 | 0.6 | geocoded |  |
+| 13a | Delavan Lake (third run) | Delavan Lake, Wisconsin, United States | boundary/census | 6,043 x 5,136 | 77,871 | 15,414 | 16 | 36 | 56 | 2.0 | geocoded |  |
+| 13b | Como (third run) | Como, Wisconsin, United States | boundary/census | 5,622 x 2,924 | 41,454 | 8,164 | 12 | 21 | 28 | 0.7 | geocoded |  |
+| 14 | Toms River | Toms River, New Jersey, United States | boundary/administrative | 18,112 x 14,057 | 636,918 | 126,451 | 88 | 234 | 336 | 5.5 | geocoded |  |
+| | **Total (14 resolved)** | | | | 5,659,858 | 1,123,036 | 811 | 2,221 | 2,934 | | | |
+
+**Reno is the decision point.**
+It qualifies by the rule (10.32, one uploader), but its score is the 2 km core of a 264,000-person city whose boundary is 26.7 x 36.8 km: it is 43% of the tranche's GSV points and 37% of its Mapillary tiles, and its walk will measure coverage over 982 km² from a sweep scored on 12.6.
+The tranche's other thirteen are places of 2,600–89,000.
+Dropping it is one row and one `EXPECTED_CITY_IDS` entry; the runbook enables it last, on its own night, so it can also simply be left disabled.
+
+Nominatim can answer differently on the day of registration, so `register_frame.py --execute` prints each frozen W x H; compare it with this table before enabling anything, and treat a difference as a reason to stop.
+A score ranks what to walk and never measures coverage (the screen's writeup, "Caveats"); the walk is the measurement.
 
 ### `panoramax_360_cities.csv` (#406)
 

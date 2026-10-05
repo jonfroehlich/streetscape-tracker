@@ -13,12 +13,14 @@ published to the web server. (`data/` is rsynced and git-ignored;
 | `cities15000.txt` | GeoNames | All cities with population > 15,000 (~34k rows). Columns per the GeoNames "geoname" schema (tab-separated, no header). We use: `asciiname`, `country code` (ISO-3166 alpha-2), `admin1 code`, `population`, `latitude`, `longitude`. |
 | `countryInfo.txt` | GeoNames | ISO-2 → country name and continent code (`AF/AS/EU/NA/SA/OC/AN`). Leading `#` comment lines describe the columns. |
 | `admin1CodesASCII.txt` | GeoNames | `"<iso2>.<admin1code>"` → admin-1 (state/province/region) name, for building human-readable geocoding queries. |
+| `geonames_supplement.txt` | GeoNames `cities500.txt`, downloaded 2026-10-02 | Single rows copied verbatim from cities500 (same schema as `cities15000.txt`) for purposive-manifest towns too small to be in cities15000, so a manifest test can still join them by geonameid. **Only the rows a committed manifest needs** (the full cities500 file is ~40 MB and is not vendored). Currently 13 rows: Fergus Falls, MN (5026416), Delavan Lake, WI (5250402) and Como, WI (5249259), for `mapillary_discovery_cities_tranche2.csv`; and Bedford, MA, Francestown, NH, Heber-Overgaard, AZ, Lexington, VA, Lindon, UT, Mont Vernon, NH, New Boston, NH, Sunnyslope, CA, Trophy Club, TX and Waipio Acres, HI, the ten rows of tranche 1 (`mapillary_discovery_cities.csv`, #383) that cities15000 lacks. Add a row by copying its line, never by typing one. The file is shared, so a manifest whose selection reads it pins the rows it may join (tranche 2's `TRANCHE2_SUPPLEMENT_IDS`): adding a row for a new manifest never changes an earlier one's decisions. `tests/test_geonames_supplement.py` refuses a duplicated line, a row cities15000 already has, and a row no committed manifest uses. |
 | `gsv_coverage_regime.csv` | Hand-maintained (this repo) | Per-country GSV coverage regime (`present`/`sparse`/`absent`). Force-includes the cross-provider (GSV-absent, Mapillary-present) story into the frame. Edit as coverage changes. |
 | `geocode_overrides.csv` | Hand-maintained (this repo) | Replacement `register_frame.py` manifest rows for frame cities whose `worldwide_frame.csv` query Nominatim cannot geocode under any Latin transliteration (currently Al Jammaliyah, Egypt — needs the Arabic "الجمالية, الدقهلية" query; the bare Arabic name matches Cairo's Gamaliya district instead). Register with `python scripts/register_frame.py --manifest data_sources/geocode_overrides.csv --execute`; identity columns stay GeoNames-pinned, only `query_string` differs. |
 
 ## Attribution / license
 
-GeoNames data (`cities15000.txt`, `countryInfo.txt`, `admin1CodesASCII.txt`) is
+GeoNames data (`cities15000.txt`, `countryInfo.txt`, `admin1CodesASCII.txt`,
+`geonames_supplement.txt`) is
 © GeoNames, licensed under **Creative Commons Attribution 4.0**
 (<https://creativecommons.org/licenses/by/4.0/>). Source:
 <https://download.geonames.org/export/dump/>.

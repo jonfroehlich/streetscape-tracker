@@ -1,0 +1,3 @@
+n,city,geonameid,geocode_query,osm_match,center_lat,center_lon,width_m,height_m,gsv_points,gsv_streets_samples,mapillary_z14_tiles,kartaview_requests,panoramax_z15_tiles,offset_km,center,flags
+1,Delavan Lake,5250402,"Delavan Lake, Wisconsin, United States",boundary/census,42.597786,-88.616758,6043,5136,77871,15414,16,36,56,2.0,geocoded,
+2,Como,5249259,"Como, Wisconsin, United States",boundary/census,42.607047,-88.487919,5622,2924,41454,8164,12,21,28,0.7,geocoded,

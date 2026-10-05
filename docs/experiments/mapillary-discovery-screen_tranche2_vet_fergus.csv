@@ -1,0 +1,2 @@
+n,city,geonameid,geocode_query,osm_match,center_lat,center_lon,width_m,height_m,gsv_points,gsv_streets_samples,mapillary_z14_tiles,kartaview_requests,panoramax_z15_tiles,offset_km,center,flags
+1,Fergus Falls,5026416,"Fergus Falls, Minnesota, United States",boundary/administrative,46.278702,-96.094119,11551,8879,256632,50938,56,113,180,1.4,geocoded,
