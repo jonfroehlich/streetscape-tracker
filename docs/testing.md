@@ -50,6 +50,7 @@ already gone wrong once:
   - `test_concurrent_first_connects_seed_the_v16_backfill_exactly_once` — four spawned processes, lined up on a barrier, first-connect each of eight fresh v15 catalogs; every one ends at the current version (v17 since #367) with exactly its two backfill rows and no process fails.
     A racer that dies fails the test in about two seconds and leaves no child behind: the processes are daemons, the parent aborts the barrier the moment one exits nonzero (the wait is also bounded), and a `finally` terminates and joins any still alive — checked by making one racer raise before its loop.
     The race window is microseconds wide, so the workers pause inside it (a slowed `clock.snapshot_date_today`, read between the empty-table check and the inserts); unwidened, dropping `BEGIN IMMEDIATE` survived 3 of 3 runs, widened it fails every run with each catalog seeded four times.
+    The process orchestration (barrier, daemons, abort, deadline) is `_race_first_connects`, shared with the column race test below.
 - The GSV query radius (issue #367), whose rule lives in `analysis.apply_query_radius`.
   `tests/test_coverage.py::TestQueryRadius` pins the seam on a frame with panos at 10, 49, 51 m and 3,000 km: coverage is 2 of 5, the two far points are `num_points_out_of_radius` and NOT `num_points_with_errors`, the unique-pano count excludes them, and `calculate_run_stats` puts them in `status_out_of_radius` rather than `status_other` with `query_radius_m` 50.0 (null for Mapillary).
   The boundary is pinned by a pano whose float distance is EXACTLY 50.0 m, found at test time with `nextafter` rather than hard-coded, because a 49/51 pair cannot tell `>` from `>=`.
@@ -68,6 +69,29 @@ already gone wrong once:
 - The v16→v17 migration (issue #367), which runs on its rung AND on every connect, because #385's v16 shipped first and both branches stamped v16 while in flight: a catalog already stamped v16 without the columns gains them; a v15 catalog takes both rungs in one connect, the host_usage backfill AND the columns (`test_a_v15_catalog_takes_both_rungs_backfill_and_columns`, killed by a v17 rung that consumes the v15 stamp ahead of the v16 one).
   And: `status_out_of_radius` and `query_radius_m` arrive NULL on an existing row whose other stats survive, reconnecting is idempotent, a catalog holding only one of the two columns (an interrupted migration, or this step reached under a renumbered version) completes rather than failing on the existing column, and `register_run` round-trips the pair.
 - The per-run summary's `coverage.query_radius_m` is null and `num_points_out_of_radius` 0 for a Mapillary run (`tests/test_json_v2.py`), so the summary never claims a tolerance nothing enforced.
+- Row counts versus grid points (issue #289):
+  - `tests/test_coverage.py::TestGridPointsAreNotRows` — for every census provider (parametrized, and pinned equal to `checkpointing.CENSUS_PROVIDERS` so a new one cannot go unpinned), a 9-row, 5-point fixture stores `total_grid_points` 5, `total_points` 9 and `status_ok` 6 (images: the row counts keep their meaning), and `coverage_rate_pct` is 2 of 5 points, not the 6-of-9 row rate; for gsv, `total_grid_points == total_points` and two points snapped to one pano stay two points.
+    The expected 5 is written down rather than re-derived with the code's own dedupe; killed by `total_grid_points = len(df)`.
+    `test_a_grid_point_is_the_lat_lon_pair_not_either_coordinate` calls `count_grid_points` on a 2 × 2 grid (rows sharing latitudes AND longitudes) plus one repeated point and expects 4; every other fixture varies latitude only, so a dedupe on `query_lat` alone survived the whole suite until this test (PR #422 review), and it is killed by keying on either coordinate alone.
+    `test_a_repeated_gsv_row_is_one_grid_point`: a gsv frame with one row repeated, the shape of a resumed legacy baseline run, stores `total_points` 4 and `total_grid_points` 3, so "gsv rows are points" is never pinned as a rule.
+  - `tests/test_json_v2.py::test_published_total_search_points_is_the_deduplicated_grid_size` — for gsv and each census provider, the per-run JSON's `total_search_points` and the aggregate's `latest.total_search_points` are 5, the same as `total_grid_points`, never the row count.
+  - The v19→v20 migration (`tests/test_db.py`): the column arrives NULL on an existing mapillary row whose row counts and coverage survive (killed by a `DEFAULT` or a copy from `total_points`); a catalog already stamped v20 without the column gains it (killed by running the step only from its rung); `register_run` round-trips it and stores NULL when omitted.
+  - `test_concurrent_first_connects_add_the_every_connect_columns_once` (PR #422 review): six spawned processes, lined up on a barrier, first-connect each of six v19 catalogs lacking `total_grid_points` and six v16 catalogs lacking the query-radius pair; no connect may fail and every catalog ends current with all three columns.
+    Both every-connect steps go through `db._add_missing_run_columns`, whose PRAGMA check and ALTERs share one `BEGIN IMMEDIATE`; the review measured the bare check-then-ALTER at 164 of 240 connects raising `duplicate column name`.
+    Nothing widens the window here, unlike the v16 test: the barrier alone loses the race on most connects, and the test is killed by moving the check outside the transaction for either step.
+  - The backfill (`tests/test_recompute_run_stats.py::test_recompute_backfills_total_grid_points_for_every_provider`): a mapillary and a gsv run cataloged with NULL are reported by a dry run that writes nothing, filled by one `--execute` pass (5 for the 9-row census, its `total_points` left at 9; 3 for gsv), and a second pass changes nothing.
+  - The column-restricted backfill, `--only total_grid_points` (PR #422 review), in `tests/test_recompute_run_stats.py`: it fills 5 for a 9-row census run and leaves a deliberately stale `newest_capture_date` exactly as it was, so a later `--regenerate-json` dry run still reports that date as moving (killed by the `--only` pass writing the full stats row); it reads only `query_lat,query_lon`, pinned by a CSV holding nothing else on a 2 × 2 grid with a repeated point, which the full loader cannot open (killed by routing `--only` through `load_city_csv_file`); and it refuses `--regenerate-json` with exit 2.
+  - `test_moving_dates_without_regenerate_json_is_refused`: a plain dry run that would move a capture-date column without `--regenerate-json` prints a WARNING naming the run (`city_id [provider] run_date`); `--execute` exits 64 with the same list on stderr and writes nothing (killed by dropping the refusal); `--allow-unrebuilt-dates` applies it and still names the run; and a later `--regenerate-json` pass then finds nothing to change, which is the trap the refusal exists for.
+    The three older tests whose plain `--execute` moves NULL or impossible dates pass `--allow-unrebuilt-dates`, because what they pin is the catalog repair, not the JSON.
+  - `test_a_plain_pass_whose_dates_are_already_right_is_not_refused`: a plain pass that changes only `total_grid_points` on a run whose dates are already right prints no WARNING, dry or applied, and is written (killed by the trigger firing on any change rather than on a moved date column).
+  - `test_only_with_provider_leaves_other_providers_runs_null`: `--only total_grid_points --provider gsv --execute` with a gsv and a mapillary run cataloged scans one run and leaves the mapillary row NULL (killed by dropping the `--provider` filter from the `--only` query).
+  - `test_only_skips_runs_with_missing_csv`: the `--only` pass skips and counts a run whose CSV is gone (`1 runs scanned, 1 skipped (missing CSV), 0 would change`) and leaves its column NULL.
+  - `tests/test_undated_imagery_share_analyze.py`: `of_queried` divides by `total_grid_points` (30 of 100 points, not the 6.0 that 30 of 500 rows gave), a run with NULL `total_grid_points` is left out of every `of_queried` figure and counted in `runs_without_grid_points` while still counting toward `of_present`, and a census provider's figure is labelled `upper_bound`, gsv's `exact`.
+    gsv is `exact` only while no run has more rows than grid points: one resumed-shaped gsv run makes the block `upper_bound` and counts in `runs_with_more_rows_than_grid_points` (killed by deciding the kind from the provider alone).
+    `max_run_pct_of_present` and `max_run_pct_of_queried` name the run behind each maximum, on a fixture where the two maxima are different runs.
+    `test_the_committed_record_names_its_producer` pins the committed metrics file's provenance, not its numbers (those came from the production catalog, which no test can reach): `_about.generated_by` is exactly what `docs_generated_by` produces for `--catalog-label makelab2-prod`, and the label itself is pinned literally, since it is the only thing separating this result from the dev-catalog run that concluded the opposite (killed by renaming a flag in `docs_generated_by`).
+    `test_the_committed_stamp_parses_under_the_scripts_own_cli` parses that stamp with the script's own `build_parser`, so a flag renamed in the CLI instead is killed too — what stays unpinned is that `main()` stamps through `docs_generated_by` at all.
+    `test_the_writeup_replicates_with_the_committed_stamp` checks the writeup's Replicating command is that same stamp.
 - `scripts/recompute_run_stats.py` as the query-radius repair handle (`tests/test_recompute_run_stats.py`): a run cataloged with a 1.1 km pano as coverage moves from 50% to 25%, gains `status_out_of_radius` 1 and `query_radius_m` 50.0 with `status_other` still 0 (both panos share a date, so the radius is the only reason the JSON is rebuilt), the report line and summary name the reclassified count, `--regenerate-json` rebuilds its JSON with the new coverage block, the CSV stays as written, and a second pass changes nothing.
   Both panos carry the SAME capture date and the stored date columns are already right, so the radius is the only reason the JSON can be rebuilt — which is what makes the rebuild a pin on that trigger.
   And the trigger is idempotent: a second `--regenerate-json` pass finds the JSON already carrying `coverage.query_radius_m`, and rebuilds nothing, although the far pano is still in the CSV.
@@ -197,6 +221,24 @@ Incidental coverage of a deprecated spelling trains readers to ignore the notice
 - `run-due --city`: that it narrows the slate to the named city without touching another due city's clock, composes with `--provider`, resolves a query and a `city_id` to the same city, runs every one of several named cities, is not truncated by `max_cities_per_day`, names the cities an explicit `--limit` leaves out, skips AND warns about a named city that is not due, and exits 64 on an unknown name before the stagger assignment writes anything.
   The STRANDED alert's `--city` recovery commands are pinned in the #341 section.
   `test_main_forwards_run_due_city_filter` pins the `main()` pass-through, which the direct `cmd_run_due` tests cannot see: dropping it left every direct `--city` test green and would have run the whole due list.
+- A second `run-due` on a GSV key (issue #412).
+  **The nightly is never refused**: `test_the_nightly_is_never_refused_and_alerts_instead` runs a bare night with `_is_nightly_unit` true beside a hand `--provider gsv` catch-up, and asserts every channel collects and one alert names the other pid and its command line.
+  A hand run is refused (64, before the catalog opens) when it shares a GSV key with another run — GSV named, in a comma list, or through the default set — and the message names the pid, the shared key and `--force`.
+  `--force` collects past it; a Mapillary run and a dry run never read `ps`; an empty scan proceeds.
+  A hand `gsv` run is NOT refused beside a mapillary-only, a `gsv_streets`-only, a `--dry-run` or a keyless comma-list run (`test_a_hand_gsv_run_is_not_refused_without_a_shared_key`), and `test_the_overlap_is_reported_per_key` pins that the two keys are separate.
+  The other process's channels are parsed from argv in both `--provider` spellings, repeated, comma-separated, bare and dry-run; `GSV_KEY_CHANNELS` is pinned against `CHANNEL_HOSTS`, so a channel with neither a host lock nor the guard is red; `test_force_reaches_its_command` pins `main()` for both commands.
+  `assess-city` (in `tests/test_assess_city.py`) is refused beside a `run-due` on `gsv_streets`, and passes the guard without reading `ps` under `--estimate`, `--force` and a non-GSV `--provider`.
+  The scan is pinned against a faked `ps` whose lines must each be ignored: this process and its ancestors (including a python grand-parent), a collection child, `tail -f logs/run-due.log`, a pgrep loop, `pytest -k run-due`, another module's `run-due` argument, and a `timeout` wrapper whose child is reported once; a macOS framework `…/MacOS/Python` is matched.
+  Its `timer-status` line holds no `run-due` at all, so it pins only "another subcommand" and would have passed the old substring test too; the line that tells a token from a substring is `--config run-due.toml status`, which a match over the joined argv accepts.
+  `test_the_scan_reads_a_run_due_whose_argv_holds_apostrophes` pins whitespace splitting (`shlex` swallowed `run-due` between two apostrophes), and `test_the_scan_survives_an_argv_that_is_not_utf8` runs the REAL `subprocess.run` with only the command swapped, so the scan's own decoding arguments are what is exercised and the batch on the next line must still be found.
+  `test_run_due_refuses_an_abbreviated_option` pins `allow_abbrev=False` on `run-due` (`--prov`, `--dry`, `--prov=`), which is what makes the guard's exact-token read of `--provider`/`--dry-run` complete.
+  That macOS line is a measured finding: a real-`ps` run showed the framework build re-execs under a capitalized name, which the case-sensitive first version missed.
+  `test_the_real_scan_finds_a_real_run_due_shaped_process` is the end-to-end case: it `Popen`s a sleeping python carrying the module and subcommand in its argv and asserts the real scan reports its pid (skipped without `ps`).
+  The nightly is identified from a cgroup file: the unit's path is true, the prefreeze unit, a `systemd-run` scope, an SSH session and the `OnFailure` notify instance (`…notify@streetscape-tracker.service.service`, which kills a plain substring match) are false, and a missing `/proc` is false.
+  `STREETSCAPE_NIGHTLY=1` alone identifies it with no `/proc`; `0` and empty do not.
+  `test_the_nightly_unit_file_is_what_the_guard_identifies` reads `deploy/systemd/<NIGHTLY_UNIT>`, runs its `ExecStart` (with `%h` substituted) through `_is_run_due_argv`, and asserts the unit sets the variable; the suite's nightly command line is read from that file rather than hand-copied.
+  A refused `run-due` names the variable's value and the cgroup lines it read, and `_nightly_unit_signals` names an unreadable cgroup's `OSError`.
+  The autouse `_no_run_due_in_flight` fixture in `conftest.py` stubs the scan to empty and the nightly check to False for the whole suite, because on the production host during a live batch the real `ps` would refuse every GSV test; the real functions are bound at import in `tests/test_scheduler.py`.
 - The census cache at the scheduler seam (issue #290): `_channel_estimate` returns 0 on a probe hit and its full estimate otherwise, only the census channels read it (gsv and `gsv_streets` query per point and must not be priced off a Mapillary entry), each channel reads its own PROVIDER's entry,
   an expired entry prices at full cost, and — the one that keeps the two estimators honestly separate — **a cache hit must not collapse a child's timeout**, since `estimate_requests` also feeds `_tile_census_timeout_seconds`.
   Plus the dry run naming a cached census at ~0 requests, an entry that would expire during the batch priced as the fetch it will become (the probe's window is narrowed by `max_batch_hours`), the tail pruning expired entries and counting them, and a tail that survives a cache directory it cannot read.
@@ -527,6 +569,30 @@ Added in the fifth review round:
 
 **The equivalent mutant**: dropping `CHANNEL_METERED_HOST.get(channel) is None` from the resume's free extras (the reviewers' M21) changes nothing, because the coverage gate admits extras only when every usable metered member channel is already in the resume — so no metered channel is left for the extras loop to add. The check stays as the statement of intent.
 
+## The failure quarantine, made visible (issue #421)
+
+`tests/test_failure_quarantine.py` drives one real `cmd_run_due` per night with a fake `_run_one_city`, gsv + mapillary enabled, and `failure_threshold = 99`, so a plain failed collection sends nothing and any email a test sees came from a condition that alerts on its own.
+Every "killed by" below was run against the committed code, one mutation at a time with the file restored after; 33 mutants (12 of them from the review fixes), all killed.
+
+- `test_a_fill_failure_that_reaches_the_cap_is_reported_as_a_transition` — at `max_consecutive_failures = 1` (the fill adds at most one failure, so only there can it reach the cap), with nothing due, the FILL's failure is the night's only one and still alerts as `1 QUARANTINED`; killed by taking the after-snapshot right after `_run_city_loop`, ahead of the fill.
+- `test_a_later_night_does_not_re_alert_but_keeps_counting` — a pair already at the cap is not attempted, sends no email, and is counted on the `Done:` line without `new tonight`; killed by using the standing set as the transition (`count >= max`).
+- `test_a_pair_already_over_the_cap_that_fails_again_is_not_a_new_transition` — the set difference, on hand-built rows.
+- `test_a_raising_quarantine_check_costs_neither_the_night_nor_its_tail` — `_quarantined_pairs` raises on the BEFORE call, then (separately) on the AFTER one; the night still collects, runs both backups, rebuilds, publishes, names the failure on the `Done:` line and alerts as `QUARANTINE CHECK FAILED`, and a standing pair already at the cap is never reported as new; killed by unguarding either snapshot, by dropping the subject part or its `unhealthy` entry, and by diffing a failed before-snapshot as an empty set; the AFTER case asserts no standing count, killed by reporting the before-set when the after-snapshot failed (`quarantined = list(quarantined_before or [])`).
+- `test_an_amnestied_outcome_never_quarantines_a_pair_one_failure_from_the_cap` — blocked, busy, crawl-incomplete, argv-rejected and a child killed by the SIGTERM wind-down (#206), each on a pair one failure from the cap, leave the counter there, alert nothing as `QUARANTINED` and add nothing to the `Done:` line; the SIGTERM case also asserts the stop's amnesty branch was the one taken; killed, per family, by recording a failure in that family's amnesty branch.
+- `test_get_quarantined_is_exactly_the_pairs_dueness_drops_for_failing` — each non-quarantined row differs from a quarantined one in one respect; killed by `>` for `>=`, by dropping the `enabled` gate, and by dropping the membership gate.
+- `test_reset_consecutive_failures_commits_what_another_connection_reads` — reads the reset back through a SECOND connection to the file database, since every other test reads through the writer, which sees its own uncommitted transaction; killed by deleting `conn.commit()` in `db.reset_consecutive_failures`.
+- `test_reset_consecutive_failures_zeroes_only_the_counter` — `last_error` and `last_success_at` survive, the sibling channel is untouched; killed by stamping a success in the reset.
+- `test_reset_failures_bad_input_exits_64_and_writes_nothing` — asserts each refusal's MESSAGE, not just 64: an unknown channel also exits 64 as "nothing to reset" (no row matches it), so the status alone survived deleting the channel check.
+- `test_reset_failures_execute_clears_the_quarantine_and_the_pair_is_due_again` — through `get_due_cities`, not just the column.
+- `test_reset_failures_is_a_dry_run_without_execute`; killed by writing regardless of `--execute`.
+- `test_reset_failures_is_wired_into_the_cli` — through `main()`; killed by dropping `--execute` on the way to the command.
+- `test_status_marks_the_quarantined_pair_and_counts_them`; killed by dropping the marker.
+- `test_the_done_line_says_nothing_about_quarantine_when_there_is_none`; killed by printing the clause unconditionally.
+- `test_the_quarantine_clauses_hold_no_semicolon_past_their_leading_separator` — the `Done:` line is split on `;` (`scripts/night_length_analyze.py`), so the count clause (with and without `new tonight`) and a failed check's clause, on an exception message that itself holds `;`, each carry exactly one; killed by a `;` before `new tonight` and by passing the exception text through unescaped.
+- `test_the_night_a_pair_reaches_the_cap_alerts_once_naming_it_and_its_fix` — the fifth failure alerts once past the threshold, with the subject part, the pair's count and `last_error`, the exact `--config ... reset-failures ... --execute` command, and the `Done:` clause; killed by dropping the subject part, the body paragraph, the `unhealthy` entry, the `Done:` clause, `--execute` from the command, or the snapshot's channel list.
+- `test_the_positive_control_a_plain_failure_one_from_the_cap_does_quarantine` — the control that keeps the amnesty test from passing by never counting at all.
+- `test_the_reset_command_survives_an_apostrophe_in_the_city_id` — the alert's pasted command, for `coeur-d'alene--idaho--united-states` and a `--config` path with a space, round-trips through `shlex.split` to the exact argv; killed by joining the argv unquoted.
+
 ## Concurrent channel lanes (issue #240)
 
 **Added after the split.**
@@ -663,6 +729,7 @@ and `hosts_unavailable` is anchored to the blocked-host note's own `; `-delimite
 - The walk diff's detail-file lifecycle (issue #265, `tests/test_walk_diff.py`), each case starting from a diff that already wrote a file:
   a same-date re-collection at a new `--spacing` leaves no file (the issue's reproduction, needing no data change);
   a re-diff to no changes removes the file and records `detail_filename = NULL`; one that still has changes rewrites it, asserted on content;
+  `write_walk_diff_detail` failing mid-write (a detail whose `to_csv` writes part of a row, then raises) leaves the previous file byte-identical, which a write straight to the final name fails;
   the "no previous walk" return and a backfilled walk that became the predecessor both remove the file the CLEARED ROW named, which no name derived from today's predecessor reaches;
   the no-changes branch heals an unreferenced file at the deterministic name, and the has-changes write truncates one;
   a file already gone is tolerated without a warning, and an unlink raising `OSError` is logged while the diff is still recorded.
@@ -675,6 +742,25 @@ and `hosts_unavailable` is anchored to the blocked-host note's own `; `-delimite
   — the columns are added one ALTER at a time, so a guard checking only the first would strand the rest; the collector and salvage paths persisting the lengths,
   salvage tolerating a pre-v12 artifact rather than raising and forcing a full-cost re-crawl; the manifest publishing the lengths,
   trimming and order-preserving the per-class block, and surviving an unparseable one; and the backfill script's dry run, idempotency, rounding tolerance, wrong-artifact refusal, and the null-tolerant cases that must not become permanent candidates)
+- **The walk recompute** (#262, `tests/test_recompute_streetwalk_stats.py`), on walks collected by the REAL `collect.run_collect` from a real GraphML in the frozen-network cache (a cache hit, so no network), with a stale walk produced by the collector itself under `street_coverage.PRESENT_STATUSES` narrowed to `("OK",)` — the one thing #257 changed.
+  A walk holding `NO_DATE` samples recomputes to higher coverage, and its row and artifact are asserted EQUAL to a `--force` re-collection of the same responses under the current code, so the tool cannot drift from the collector; the CSV is asserted byte-identical, and a second pass changes nothing.
+  The stat columns are compared over a list spelled out in the TEST, so dropping one from the script's own `STAT_COLUMNS` cannot also drop it from the comparison.
+  The same equality is asserted for a stale census walk of EACH census provider — KartaView, Mapillary, Panoramax, each through the real collector with only its census collector served from memory — which must recompute to 100%, never to the ~0% a GSV copyright gate applied to a census CSV would give.
+  **A fixed point across the axes a GSV/drive fixture cannot see** (`test_census_broad_network_and_match_distance_walks_recompute_to_themselves`): a census walk of each census provider with no copyright (forcing `provider="gsv"` zeroes it), an `all_public` walk on its own GraphML of the same city (forcing `network_type="drive"`, or keying the network cache on the city alone, refuses it), and a gsv walk at `--match-dist 10` whose panos sit ~14 m off (hard-coding 25 m moves it) — all collected under the current code, so the pass must leave every row and file untouched.
+  `--provider` and `--city` each move only their own series.
+  The frame match: a unit test puts a sample and its CSV row one ULP apart on either side of the 9-decimal half-way point (different keys, one location), asserts the match is accepted and counted as noise, and that the samples are NOT moved; two CSV locations within twice the tolerance of each other are refused as ambiguous, even with each sample's key exact; duplicate CSV rows are accepted and counted.
+  **The boundary sample, end to end** (`test_a_sample_the_loader_parses_across_the_boundary_scores_as_the_collector_scores_it`, gsv and mapillary): a graph whose single-sample edge was FOUND BY SEARCH to put its sample one ULP from a half-way point that pandas' default C parser crosses; the test re-measures that premise on the real collector's own CSV (Python's round-trip parse reproduces every sample key, `load_city_csv_file` misses exactly that one), then asserts the recompute equals a `--force` collection under the same definition, with that edge at 0.0 — re-adding the old coordinate substitution scores it covered and fails.
+  The noise this pins is the LOADER's, so an injected post-collection jitter (the test it replaced) was the wrong model of it.
+  A network renumbered over identical geometry (same samples, same coordinates) is refused by the edge-id check alone.
+  A sample frame mismatch (one CSV row dropped, which the `sample_points` pre-check cannot see) refuses the WHOLE series, leaving the other walk — which would move — untouched; so does the other direction, a stray CSV location no sample reaches, which the scorer would silently ignore; a refreshed network is refused by the count pre-check; each refusal names its reason in the summary count.
+  A missing GraphML refuses with `fetch_graph`, `fetch_street_edges`, `_download_graph`, `_overpass_refusing` and `ox.graph_from_bbox` all replaced by recorders that must stay uncalled.
+  The dry run leaves the data dir byte-identical, catalog included; a `run-due` appearing after the start-of-pass check stops the pass before its write AND leaves the manifest byte-identical (the batch owns it), and a walk collected into the series mid-pass abandons it.
+  A re-run with nothing left to write still regenerates a manifest the previous pass never reached; the `--execute` fixed-point tests therefore compare the manifest minus its `generated_at`.
+  The phantom pair is an old-definition walk then a new-definition one over identical imagery: the collector's diff records a positive delta and a detail file (asserted, so the premise is real), a `--catalog-only` pass leaves the diff and says so, and `--execute` leaves a no-changes row equal to `compute_walk_diff` over the two artifacts now on disk, a NULL pointer, no file, the name listed AFTER "remove these there:", and a manifest `change` block of 0.0.
+  **Each diff staleness criterion alone** (`test_each_stale_diff_field_alone_is_repaired`): on a correct real-change row, only `from_walk_id` (pointed at another series' walk), only one counter, or only the pointer (NULLed while the right file stays on disk) is corrupted, and each is re-diffed back to the correct row — dropping any one comparison from `stale_diffs` fails its case.
+  An orphan detail file at the deterministic name, under a NULL pointer or no row at all, is removed AND listed for the web server.
+  A detail file with the right counters and pointer but the wrong rows is rewritten by content; a missing diff row is recorded when a same-frame predecessor exists; a re-diff that deletes and then fails leaves no row, and the next pass records it; and a pair whose match distance changed is not a diff pair, so a dry run reports nothing.
+  `--catalog-only` prints no "changed" line once it has nothing left to write.
 
 ## The census seam
 
@@ -1174,6 +1260,30 @@ That third mode is the one the pin did not originally cover: the invariant was F
 The first is fixed in the regex, the second in how the test compiles it, and the impossible-date case is pinned as the one surviving exception rather than left out of the corpus.
 A test written against a fix is worth what its failure against the defect is worth.
 
+### The growth screen on grid.html (issue #349)
+
+*Added after the 2026-08-22 split.*
+
+`streetscape-utils.test.js` pins the four helpers.
+`screenedProviders` is asserted to read the PAYLOAD: a provider key the registry lacks is still listed, a registered provider absent from the document is not, and an entry with no cities screened nothing.
+`screenVerdict` separates no imagery at all ("none"), a zero 360° bound under a positive any-imagery bound ("flat"), a positive 360° bound ("hint") and a missing record or missing bound (null) — including a zero 360° bound with no readable any-imagery bound, which must not claim "none" — and `lookupScreen` misses on an absent city, provider or document.
+`fetchProviderScreen` resolves null for a 404 AND for an unparseable body, since grid.html must render as before #349 when the file is absent.
+
+`grid.test.js` pins the page.
+With no document, `pivotGridRows` returns the same rows for `null`, an empty document and no argument, and **every row's `Object.keys` equals a literal list read off the pre-#349 `grid.js`** (`PRE_349_ROW_KEYS`) — "equal to each other" alone would pass a mutation that adds any key to every row, screen or not.
+With one, the keys appear for the SCREENED provider only (Panoramax, which that payload never collects), a flat-only city reads "flat" with both bounds carried, the absent `first_positive_date` reads null, and the screened city with no published run is counted in `screenUnlisted` rather than made a row.
+The column group exists only with a screened provider, has no Δ, and its title says what the top of a descending sort means.
+The cells are asserted on the asymmetry: "0 · none" with "no imagery of any kind … a zero is conclusive", "0 · flat only" naming its flat bound and never "conclusive", "≤ 512" for a bound, "—" for unscreened, and the hint and flat titles carrying a caveat string **no JS file contains**, so a paraphrase hardcoded in `grid.js` fails.
+The first-positive date is titled "(any imagery)", because the writer derives it from the any-imagery bound.
+Two of the writer's own caveats are pinned where they surface: a first positive equal to `first_screen_date` says when watching began, and `instrument.cell_warning` replaces "conclusive" only on cells from the latest screen date, which is the only pass it describes, and is appended to the hint and flat titles too.
+A caveat carrying `"`, `'`, `<` and `&` is asserted escaped in both titles under the REAL `escapeHtml` — this file's stub leaves quotes alone, so the test swaps the real one in.
+Presets (never the default; "Where to look next" only with a screen), the per-provider filter's four values (flat-only must not match "none"), the caption read from the LAST `series` point and labelled "(any imagery)", its unlisted count worded as its own clause rather than "N of them", and the series table's escaping complete it.
+
+The fixture screens Panoramax twice through the real writer (`build_fixture.py`), giving one positive city, one conclusive zero and one unscreened, and `test_the_fixture_carries_a_provider_screen_with_a_zero_and_a_positive_city` (fast suite) refuses a committed screen that has lost either reading.
+Two browser tests read it: the column, preset, filter, caption and series table end to end, and a 404'd screen leaving the page with no column, preset, filter, caption clause or section.
+The series table is a second `<table>` on grid.html, so the layout tests parametrized over all three pages now scope their bare `tbody tr` and `tbody th[scope='row']` locators to `.streets-table`; unscoped, they resolved to the series table's first row, hidden in its closed disclosure, and seven failed.
+Every assertion above was mutation-checked; the table is in the PR body.
+
 ## The pivoted data tables (issue #250)
 
 **The pivoted data tables (issue #250) are covered on both sides.**
@@ -1379,3 +1489,35 @@ the solar day keeping an American afternoon and evening on its own date, cells a
 the catalog match inside / outside / disabled / never-collected, the SMALLEST of two overlapping bboxes winning with the other in `also_in`, the latest Mapillary run (not a newer gsv one) read, and `after_last_run` and `newer_than_seen` each shown true without the other (the 2026-08-26 Spokane case) — including a NULL newest capture — against a catalog opened read-only;
 a missing catalog reported and never created, a catalog at schema 0 or newer than `db.SCHEMA_VERSION` exiting 64, the GeoJSON's properties, exits 64 / 75 / 83, a block on page 2 still reporting page 1, the default `--since` derived from `--until`, catalog paths committed without a home directory, the metrics upsert replacing a window rather than appending it, and a `makelab*` host refused.
 Every mutation of the script listed in the PR (#368) was run after commit and fails at least one test.
+
+## The Mapillary discovery screen (issue #383)
+
+**Added after the 2026-08-22 split.**
+
+`tests/test_mapillary_discovery.py`, offline: tiles are built with `mapbox_vector_tile.encode`, never fetched.
+It pins the sampling frame (the 2026-10-02 regions are exactly 97 z6 tiles, no duplicates), so a change to `REGIONS` or the tile math cannot silently change the population the committed numbers describe;
+the y-up tile-local mapping (a tile's (0, 4096) is its NORTH-west corner — a flipped y moves a town's sweep a tile south) and an empty or layerless tile decoding to nothing;
+`split_samples` conserving a polyline's length exactly, bounding each piece at `SAMPLE_KM`, and spreading a long segment along its length;
+`place_scores` counting a sample 1.9 km away and not one 2.1 km away, the score as km / (pi r^2), the top uploader's length share, the on-foot share, and the LENGTH-weighted median capture date, with empty and below-`min_km` discs skipped;
+`thin_by_distance` keeping the first of a cluster; `inside_grid` as rectangle membership (15 km off-centre inside a 40 km-wide grid, 12 km off-centre outside a 20 km-tall one), never centre distance;
+the manifest dropping apostrophes and applying `GEOCODE_OVERRIDES`, and writing an empty admin rather than NaN when GeoNames has none; and the jittered pacer's mean and floor.
+
+Added after the PR's first review, which found twelve mutations surviving:
+
+- **The fetcher's stop rules**, through a fake session (the template a standing `screen-provider mapillary` would copy): a 302, a 200 with an HTML body, or a 403 stops the run, is logged with its `host`, is never cached, and is never followed as a redirect; a 204 caches as an empty tile and a cached tile costs no request; `--max-requests` is never exceeded.
+- **`catalog-snapshot` exporting each city's LATEST Mapillary drive walk**, never an older one, a non-drive network or another provider's.
+- **`apply_rules` applying every candidate and tranche rule where it is applied** — the grid, the 10 km centre distance, the date, the score, the uploader share, population, on-foot share, thinning, the per-uploader cap and the size — one failing row per rule; `grid_rule_effect` counting the places the grid rule removes rather than the net change (a removal that readmits a thinned neighbour nets to 0).
+- **`build_samples` keeping only recent panos**, `spearman` being rank correlation (a monotone outlier keeps it at 1.0), `nearest_km` picking the nearest, `inside_grid` bounding the WIDTH at half, and the weighted median landing on OLDER imagery when it holds most of the length (so `median = newest` fails).
+- **The validation population is the scanned TILES**, never the bounding box: Mexico City and Kodiak sit in the box and in no scanned tile, and are dropped rather than scored 0; `scan_tiles` derives the tiles from the manifest's own regions.
+- **The analyzer refuses a scan that stopped early** (`scan_manifest.json` `stopped` set), writing nothing, since an unscanned tile would otherwise read as one with no imagery.
+
+All 39 mutations run after this change, the review's survivors included, fail at least one test.
+
+Added after the final review, which found seven more surviving:
+
+- **`grid_rule_effect` counts by place id, not by subtraction**: in a G/B/A chain (B 4 km from the in-grid G, A 4 km from B) removing G readmits B, which then thins A away, so the expected counts are 1 removed, 1 readmitted and 1 cascade-dropped — a constant or net-difference `readmitted` fails; duplicate `geonameid`s are refused, since set difference would miscount them.
+- **The validation's edges**: in one scanned tile, a point at tile fraction 15.9 is kept and one at 14.6 dropped (so `round()` for `int()` fails both ways), a scanned city with no samples is kept at score 0 rather than as NaN, a city with no walk is dropped (an inner join), and walks at 49.9% coverage or 2.01 yr median age are not "good".
+- **`collect scan`'s half of the stopped-scan contract**, through a fake session over Hawaii's four tiles: a 204 then a 302 stops after two requests, exits nonzero, records the stop in `scan_manifest.json`, and `load_scan_manifest` refuses that manifest.
+- **The metrics JSON is strict**: `strict_json` writes NaN (numpy's included) as `null`, parsed with a `parse_constant` that refuses `NaN`, and raises on infinity rather than writing it.
+
+The final review's 48 mutations (its two against the replaced subtraction re-aimed at the set-difference code) and eight more against this round's fixes, run after this change, all fail at least one test.

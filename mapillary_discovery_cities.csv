@@ -1,0 +1,26 @@
+query_string,city,admin,iso2,country,continent,size_band,population,coverage_regime,geonameid,lat,lon
+"Kaysville, Utah, United States",Kaysville,Utah,US,United States,NA,,30472,,5776715,41.03522,-111.93855
+"Lexington, Virginia, United States",Lexington,Virginia,US,United States,NA,,7262,,4769339,37.78402,-79.44282
+"Petersburg, Virginia, United States",Petersburg,Virginia,US,United States,NA,,32477,,4778626,37.22793,-77.40193
+"Foothill Farms, California, United States",Foothill Farms,California,US,United States,NA,,33121,,5349803,38.67877,-121.35114
+"Trophy Club, Texas, United States",Trophy Club,Texas,US,United States,NA,,11759,,4737676,32.9979,-97.18362
+"Orangevale, California, United States",Orangevale,California,US,United States,NA,,33960,,5379566,38.67851,-121.22578
+"Waipio Acres, Hawaii, United States",Waipio Acres,Hawaii,US,United States,NA,,5531,,5854718,21.46485,-158.01331
+"Francestown, New Hampshire, United States",Francestown,New Hampshire,US,United States,NA,,1571,,5086321,42.98758,-71.81258
+"New Boston, New Hampshire, United States",New Boston,New Hampshire,US,United States,NA,,4934,,5090096,42.97619,-71.69396
+"Ewa Gentry, Hawaii, United States",Ewa Gentry,Hawaii,US,United States,NA,,22690,,5855070,21.33999,-158.03039
+"Hopewell, Virginia, United States",Hopewell,Virginia,US,United States,NA,,22378,,4764826,37.30432,-77.2872
+"Fond du Lac, Fond du Lac County, Wisconsin, United States",Fond du Lac,Wisconsin,US,United States,NA,,42933,,5253352,43.775,-88.43883
+"Los Altos, California, United States",Los Altos,California,US,United States,NA,,30671,,5368335,37.38522,-122.11413
+"Sunnyslope, California, United States",Sunnyslope,California,US,United States,NA,,5153,,5400065,34.01196,-117.43338
+"Cedar Falls, Iowa, United States",Cedar Falls,Iowa,US,United States,NA,,41255,,4850699,42.52776,-92.44547
+"Bedford, Massachusetts, United States",Bedford,Massachusetts,US,United States,NA,,12502,,4930183,42.49065,-71.27617
+"Cottonwood Heights, Utah, United States",Cottonwood Heights,Utah,US,United States,NA,,34343,,5773304,40.61967,-111.81021
+"Heber-Overgaard, Arizona, United States",Heber-Overgaard,Arizona,US,United States,NA,,2822,,7261418,34.41414,-110.56956
+"Eureka, California, United States",Eureka,California,US,United States,NA,,27017,,5563397,40.80207,-124.16367
+"Mont Vernon, New Hampshire, United States",Mont Vernon,New Hampshire,US,United States,NA,,2166,,5089746,42.89453,-71.67424
+"Apex, North Carolina, United States",Apex,North Carolina,US,United States,NA,,45585,,4452808,35.73265,-78.85029
+"Foster City, California, United States",Foster City,California,US,United States,NA,,33477,,5350159,37.55855,-122.27108
+"Morton, Illinois, United States",Morton,Illinois,US,United States,NA,,16306,,4902754,40.61282,-89.45926
+"Lindon, Utah, United States",Lindon,Utah,US,United States,NA,,10810,,5777332,40.34329,-111.72076
+"State College, Pennsylvania, United States",State College,Pennsylvania,US,United States,NA,,42161,,5213681,40.79339,-77.86

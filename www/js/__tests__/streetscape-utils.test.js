@@ -52,6 +52,11 @@ const {
   fetchStreetwalkManifest,
   lookupStreetwalk,
   mergeStreetwalkStats,
+  providerScreenUrl,
+  fetchProviderScreen,
+  screenedProviders,
+  lookupScreen,
+  screenVerdict,
   cityDisplayLabel,
   cityFullLabel,
   GSV_QUERY_RADIUS_M,
@@ -1791,6 +1796,87 @@ test("fetchStreetwalkManifest: a missing/unreadable manifest resolves null, neve
   } finally {
     restoreGzippedFetch();
   }
+});
+
+// --- the provider growth screen (issue #349) --------------------------------
+
+test("fetchProviderScreen: reads provider_screen.json.gz from the data base URL", async () => {
+  const seen = stubGzippedFetch({ schema_version: 1, providers: {} });
+  try {
+    const doc = await fetchProviderScreen();
+    assert.deepEqual(seen, [STREETSCAPE_DATA_BASE_URL + "provider_screen.json.gz"]);
+    assert.equal(providerScreenUrl(), seen[0]);
+    assert.equal(doc.schema_version, 1);
+  } finally {
+    restoreGzippedFetch();
+  }
+});
+
+test("fetchProviderScreen: a missing or unreadable screen resolves null, never rejects", async () => {
+  // grid.html must render exactly as before #349 when the file is absent, so
+  // a 404 (or a corrupt body) cannot be allowed to reject into the page.
+  const realInfo = console.info;
+  console.info = () => {};
+  try {
+    stubGzippedFetch({}, { ok: false });
+    assert.equal(await fetchProviderScreen(), null);
+    global.pako = { inflate: () => "not json{" };
+    assert.equal(await fetchProviderScreen(), null);
+  } finally {
+    restoreGzippedFetch();
+    console.info = realInfo;
+  }
+});
+
+test("screenedProviders: reads the PAYLOAD, never the registry (#334)", () => {
+  const doc = {
+    providers: {
+      // Not a registered provider: published data still counts as screened.
+      notregistered: { cities: [{ city_id: "a--b", pictures_360_upper_bound: 0 }] },
+      panoramax: { cities: [{ city_id: "a--b", pictures_360_upper_bound: 4 }] },
+      // An entry that screened nothing is not a screened provider.
+      mapillary: { cities: [] },
+    },
+  };
+  assert.ok(!("notregistered" in PROVIDERS), "the fixture key must be unregistered");
+  assert.deepEqual(screenedProviders(doc), ["notregistered", "panoramax"]);
+  // Registered providers absent from the document are not listed.
+  assert.ok(!screenedProviders(doc).includes("gsv"));
+  assert.deepEqual(screenedProviders(null), []);
+  assert.deepEqual(screenedProviders({}), []);
+  assert.deepEqual(screenedProviders({ providers: {} }), []);
+});
+
+test("lookupScreen: finds the city's record per provider, null on any miss", () => {
+  const zero = { city_id: "zero--x", pictures_360_upper_bound: 0, screen_date: "2026-09-16" };
+  const rich = { city_id: "rich--x", pictures_360_upper_bound: 512, screen_date: "2026-09-16" };
+  const doc = { providers: { panoramax: { cities: [zero, rich] } } };
+  assert.equal(lookupScreen(doc, "panoramax", "zero--x"), zero);
+  assert.equal(lookupScreen(doc, "panoramax", "rich--x"), rich);
+  assert.equal(lookupScreen(doc, "panoramax", "absent--x"), null);
+  assert.equal(lookupScreen(doc, "mapillary", "zero--x"), null);
+  assert.equal(lookupScreen(null, "panoramax", "zero--x"), null);
+});
+
+test("screenVerdict: no imagery is 'none', flat only is 'flat', a 360° bound is 'hint'", () => {
+  const rec = (any, b360) => ({ pictures_upper_bound: any, pictures_360_upper_bound: b360 });
+  assert.equal(screenVerdict(rec(0, 0)), "none");
+  // A zero 360° bound under a positive any-imagery bound is NOT the
+  // conclusive zero: on the live screen that was 284 cities.
+  assert.equal(screenVerdict(rec(40, 0)), "flat");
+  assert.equal(screenVerdict(rec(1, 1)), "hint");
+  assert.equal(screenVerdict(rec(900, 512)), "hint");
+  assert.equal(screenVerdict(null), null);
+  assert.equal(screenVerdict(undefined), null);
+  // A record without the bound it needs is neither a fact nor a hint.
+  assert.equal(screenVerdict({ pictures_upper_bound: 9 }), null);
+  assert.equal(screenVerdict({ pictures_360_upper_bound: null }), null);
+  // "none" is reserved for an any-imagery bound of exactly 0, so a zero 360°
+  // bound with no readable any-imagery bound cannot claim it.
+  assert.equal(screenVerdict({ pictures_360_upper_bound: 0 }), null);
+  assert.equal(screenVerdict(rec(Number.NaN, 0)), null);
+  // A positive 360° bound is a hint whatever the other bound says.
+  assert.equal(screenVerdict({ pictures_360_upper_bound: 3 }), "hint");
 });
 
 test("lookupStreetwalk: finds by city_id+provider, null on miss or absent manifest", () => {

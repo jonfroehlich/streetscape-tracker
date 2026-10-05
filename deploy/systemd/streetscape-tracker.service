@@ -30,6 +30,12 @@ WorkingDirectory=%h/streetscape-tracker
 EnvironmentFile=%h/streetscape-tracker/.env
 # Publish straight to the NFS-mounted docroot (no SSH) — see sync_data_to_server.sh
 Environment=STREETSCAPE_PUBLISH_LOCAL=1
+# Identifies THIS unit as the nightly (issue #412): a run-due that sees another
+# run-due on its GSV key refuses a hand run but never the nightly, and a
+# misidentified nightly would be refused and lose the night. This is one of two
+# independent signals; the other is the cgroup path (scheduler._is_nightly_unit).
+# Set it here only -- never in .env, which hand runs read too.
+Environment=STREETSCAPE_NIGHTLY=1
 # Where the per-IP host locks live (issue #208). Set EXPLICITLY, and to the real
 # path rather than %h, for two independent reasons — either alone would make the
 # lock a silent no-op against a detached operator process:

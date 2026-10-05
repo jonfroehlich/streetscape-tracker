@@ -10,10 +10,11 @@ An edit that changes a rule belongs in both files; anything written since the sp
 
 **Added after the 2026-08-22 split** (#304, PR #399 review, #412).
 
-Claude runs essentially every hand run and catch-up on prod (makelab2), so this checklist is the mitigation for the one overlap nothing in the code refuses.
+Claude runs essentially every hand run and catch-up on prod (makelab2), so this checklist is the mitigation for the overlaps the code does not refuse.
 Since #304 each GSV process actually reaches its configured pace, so a hand run on the **same GSV key** as a nightly lane that is collecting presents more than that project's 60,000/min quota: ~72,000/min for a direct-CLI run at its 24,000 default beside the lane's 48,000, and ~96,000/min for a scheduler-path run, which paces at the lane's own 48,000.
 The nightly `gsv` and `gsv_streets` lanes never collide with each other: they use different keys in separate Cloud projects.
-The decision taken is **no lock and no shared pacer**: hand runs follow this checklist, and #412 tracks making `run-due` refuse to start beside another `run-due`.
+The decision taken is **no lock and no shared pacer**: hand runs follow this checklist.
+Since #412 a hand `run-due` or `assess-city` on a GSV key another `run-due` on this host is collecting exits 64 (`--force` overrides), and the nightly is never refused but alerts; that guard is per-host, sees only `run-due` processes and checks only at start, so a direct-CLI run and a run on another machine still rely on this checklist (blind spots in `docs/scheduler.md`).
 The mechanism, the realistic pairs and the rejected options are in [`provider-access.md`](provider-access.md) (the #304 section); this section is only the procedure.
 
 ### 1. Gather everything in one SSH call
@@ -70,7 +71,7 @@ EOF
 The `awk` patterns spell `.`, `/`, `-` and spaces as `[.]`, `\/`, `[-]` and `[ ]` so they cannot match awk's own command line, which a plain `ps | grep` does.
 The slash is escaped rather than bracketed because `[/]` inside an awk regex literal is a syntax error in BSD awk ("nonterminated character class"), though mawk and gawk accept it.
 The git alternative allows `-C <dir>` because `deploy_makelab1.sh` runs `git -C "$REPO_DIR" pull --ff-only`, which a bare `git pull` pattern misses; the script's own name covers its later `rsync` of `www/`.
-The run-due test is the same two-substring test (`streetscape_metadata_tracker.scheduler` and `run-due`) over `ps -eo pid=,args=` that `scheduler._run_due_in_flight()` applies for `import-bundle`, the prefreeze and the two repair scripts.
+The run-due line here is a looser two-substring test than the code's: since #412 `scheduler._run_due_in_flight()` (for `import-bundle`, the prefreeze and the two repair scripts) and the `run-due` guard match argv tokens instead, so read any line this prints, and treat one the code would not match (a wrapper's) as the batch it wraps.
 The status call keeps `Error` and `Traceback` lines, because a filter for the budget lines alone turns a crashed `status` into empty output.
 **Do not use `pgrep -f "scheduler run-due"`**: the unit's command line is `-m streetscape_metadata_tracker.scheduler --config … run-due`, so that pattern never matches it and reports idle mid-batch.
 `deploy/README.md` uses `pgrep -af '[s]cheduler .*run-due'`, which does match; the bracket matters, because on Linux `pgrep` excludes only itself, so inside a compound remote command (`ssh host 'pgrep … || echo idle'`) a bare `scheduler .*run-due` matches the parent `bash -c` and never prints idle.
@@ -105,7 +106,8 @@ The snippet prints both paces from the deployed config, so use its numbers, not 
   It is a ceiling with **no** margin (the two then sum to the quota, and each token bucket can run about a second ahead of its rate), so go lower when the hand run is not urgent.
   Never rely on either CLI's default: both default to 24,000, and 24,000 + 48,000 is already over 60,000.
 - **Same GSV key, through the scheduler** (`run-due --provider gsv` or `gsv_streets`, or `assess-city`, whose set includes `gsv_streets`): these take **no** rate override, so wait until the batch can no longer collect that channel (its budget is spent, or the in-flight run is a filtered `run-due` that does not name it), or until the batch has ended.
-  The nightly batch is city-major and its GSV budgets do not bind, so against the nightly unit that means waiting for it to end.
+  The nightly batch is city-major and its GSV budgets do not bind, so against the nightly unit that means waiting until its city loop has ended: the log shows no more `Collecting … [gsv]` / `[gsv_streets]` launches and the tail (aggregate, manifests, backup, publish) is under way.
+  Since #412 the code refuses such a run (exit 64) for as long as the other `run-due` is ALIVE, tail included, because it cannot see which channel that process is on; once step 2 shows it is past that key, re-run with `--force`, which is exactly what the refusal message tells you.
 - **Different key, or a non-GSV channel:** proceed — for example a hand `gsv` run beside a `run-due --provider gsv_streets` catch-up, or any GSV run beside a `run-due --provider mapillary`.
 - **No `run-due` in flight now is not the whole check: the 02:00 Pacific timer starts an unfiltered night on both keys**, and after a reboot the 08:30 watchdog re-arm can start a `Persistent` catch-up night at once ([`scheduler.md`](scheduler.md)).
   Step 1 cannot see a batch that has not started, so decide before launching: a direct-CLI GSV run that could still be going at 02:00 takes the same quota-minus-pace cap from the start.
@@ -166,8 +168,8 @@ The realistic victim is not a dev laptop but prod with publishing switched off d
 Exit stays 0 there, on the same reasoning that makes `--no-publish` exit 0 — only an *attempted* publish that failed is a failure.
 **Do not run it while the nightly batch is collecting** (PR #399 review): its `gsv_streets` walk uses the same key as the nightly `gsv_streets` lane, nothing serializes GSV processes, and since #304 each engine actually reaches its 48,000/min, so the two would present ~96,000/min against that key's 60,000/min project quota.
 The same holds for any hand-run GSV collection (`streetscape_tracker.py`, `collect --provider gsv`) against its nightly twin.
-The failure is OVER_QUERY_LIMIT answers, retried after 20 s waits and, past 1% of points, an aborted run; the full account and the decision taken (no lock, a pre-run checklist, #412 for a `run-due` guard) are in [`provider-access.md`](provider-access.md) (the #304 section).
-Run the checklist under "Before any hand run or catch-up" above first: `assess-city` has no rate override, so it waits for the batch to end, while a direct-CLI hand run can instead pass `--max-requests-per-minute` at the quota minus the nightly pace.
+The failure is OVER_QUERY_LIMIT answers, retried after 20 s waits and, past 1% of points, an aborted run; the full account and the decision taken (no lock, a pre-run checklist, and since #412 a start-time guard that refuses this command beside a `run-due` on the same key) are in [`provider-access.md`](provider-access.md) (the #304 section).
+Run the checklist under "Before any hand run or catch-up" above first: `assess-city` has no rate override, so it waits for the batch to end (and exits 64 if started beside a `run-due` collecting `gsv_streets`), while a direct-CLI hand run can instead pass `--max-requests-per-minute` at the quota minus the nightly pace.
 Refusals mirror #214's: an unpaired `--width/--height`, a `--provider` naming the grid channel or an unknown/disabled one, and a config with no assess channel enabled all exit `USAGE_EXIT_CODE` **before the catalog is opened**.
 `--width/--height` without `--lat/--lng` is refused where `cli.py` accepts it.
 `cli.py` now centers such a grid on the geocoder's reported point rather than the OSM bbox midpoint (#186), but nobody has verified that point is downtown (#185), and an assessment freezes geometry for a partner answer — a guess there is the right size in possibly the wrong place, permanently.
@@ -240,6 +242,40 @@ The script checks for an in-flight `run-due` only when it starts (`--execute` is
 If step 2 might not finish before 02:00, disable the timer for the night (`systemctl --user disable --now streetscape-tracker.timer`, and `enable --now` after step 3; never `stop`, which the #369 watchdog re-arms).
 The publish never passes rsync `--delete`, so a detail file the pass REMOVES stays on the web server until removed there; the pass lists those names.
 
+### Schema v20 and the `runs.total_grid_points` backfill (issue #289)
+
+v20 is not a stats-definition change — no stored value moves — but it is the first schema step since v16 whose deploy needs the same care.
+
+- **The migration is one-way.**
+  Code older than v20 refuses a v20 catalog (`init_schema` raises "newer than this code supports"), so once any process has connected with the new code, rolling the code back stops every command, the 02:00 batch included.
+  A rollback is a **catalog restore** (`scheduler restore-backup`, see [`catalog-backups.md`](catalog-backups.md)) as well as a code revert, and it loses every run cataloged since that backup.
+- **Deploy only with no `run-due` in flight** (`pgrep -af '[s]cheduler .*run-due'`, as [`../deploy/README.md`](../deploy/README.md) says for any deploy): a child launched from the new tree would migrate the catalog under a parent still running the old module, which then refuses its own next connect.
+- **A v19 laptop bundle is refused** by `import-bundle` (it requires the bundle's schema to equal this host's).
+  Update the laptop checkout, open its catalog once with any command that connects (that migrates it), and copy the bundle again.
+
+The column arrives NULL on every existing run.
+Backfill it with the column-restricted mode, which reads only `query_lat,query_lon` from each CSV and writes only `total_grid_points`:
+
+```bash
+# Dry run: one line per run that would change. Expect every run, NULL -> N.
+.venv-makelab2/bin/python scripts/recompute_run_stats.py \
+    --data-dir /projects/makeabilitylab/streetscape-tracker/data --only total_grid_points --provider gsv
+# Apply, one provider per invocation, in the daytime.
+.venv-makelab2/bin/python scripts/recompute_run_stats.py \
+    --data-dir /projects/makeabilitylab/streetscape-tracker/data --only total_grid_points \
+    --provider mapillary --execute >> logs/backfill_289.log 2>&1
+```
+
+**Never backfill with a plain `--execute`.**
+It loads every CSV through the full loader (the PR #422 review put a 16.5M-row Mapillary census run at ~15 GiB resident, on the host that runs the batch), and it applies every OTHER pending definition change too.
+If one of those moves a capture-date column without `--regenerate-json`, that run's published JSON keeps the old dates and no later `--regenerate-json` pass can find it, because nothing moves any more.
+So a plain `--execute` that would move any capture-date column is **refused** (exit 64, nothing written), and the refusal lists each affected run as `city_id [provider] run_date`; a plain dry run prints the same list as a WARNING.
+The fix is to add `--regenerate-json`; `--allow-unrebuilt-dates` overrides the refusal only for an operator who will rebuild the listed runs' JSONs by hand.
+The `--only` dry run's summary line says no other column is read or written; if a plain dry run is what you are reading, it is the wrong command.
+
+Run it **per provider, in the daytime, never overlapping the 02:00 timer** — it shares the catalog with the batch, and a census provider's pass still reads millions of rows apiece.
+Nothing published reads `total_grid_points`, so the backfill republishes nothing; `scripts/undated_imagery_share_analyze.py` is its first reader; the backfill ran on production on 2026-10-04 and that regeneration is committed (see [`experiments/undated-imagery-share.md`](experiments/undated-imagery-share.md)).
+
 ## Backfilling the Mapillary quality block (issue #321)
 
 #321 adds a `quality` block to every Mapillary run's `mapillary_meta` (the `quality_score` distribution and its on-foot split; [`census.md`](census.md)), and `grid.html` builds its "Imagery quality" group from it.
@@ -271,6 +307,7 @@ The one exception is a run whose JSON is missing or unreadable: the CSV header d
 **Even four columns of a Mapillary census are up to millions of rows per run**, so on production this is a daytime job and **never inside a night**: `--execute` is refused while a `run-due` is in flight (`scheduler._run_due_in_flight`, the check `recompute_run_diffs.py` makes), but like that script it checks only when it starts, and the nightly batch never checks for it.
 If step 2 might not finish before 02:00, disable the timer for the night (`systemctl --user disable --now streetscape-tracker.timer`, and `enable --now` afterwards; never `stop`, which the #369 watchdog re-arms).
 Only this mode carries the in-flight gate; the stats pass keeps its existing behaviour.
+It is not combinable with `--only` or `--regenerate-json` (exit 2): it returns before either would run.
 
 ## Landing a laptop investigation in this catalog: `scheduler import-bundle` (issue #330)
 

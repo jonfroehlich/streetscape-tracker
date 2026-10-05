@@ -631,3 +631,33 @@ def test_the_backfill_flag_requires_the_mapillary_provider(data_dir):
     )
     assert result.returncode == 2
     assert "requires --provider mapillary" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("other", "named"),
+    [
+        (["--only", "total_grid_points"], "--only"),
+        (["--regenerate-json"], "--regenerate-json"),
+    ],
+)
+def test_the_backfill_flag_refuses_the_other_modes(data_dir, other, named):
+    # The quality backfill returns before the stats pass, so either companion
+    # flag would be silently dropped rather than combined: refuse instead.
+    result = subprocess.run(
+        [
+            sys.executable,
+            os.path.join(_PROJECT_ROOT, "scripts", "recompute_run_stats.py"),
+            "--data-dir",
+            data_dir,
+            "--provider",
+            "mapillary",
+            "--regenerate-json-mapillary-meta",
+            *other,
+        ],
+        cwd=_PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 2
+    assert f"its own mode; run {named} separately" in result.stderr

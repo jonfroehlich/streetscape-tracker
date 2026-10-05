@@ -18,6 +18,7 @@ from .analysis import (
     PRESENT_STATUSES,
     calculate_coverage_stats,
     calculate_pano_stats,
+    count_grid_points,
 )
 from .fileutils import get_list_of_city_csv_files, load_city_csv_file
 from .geoutils import get_city_location_data, get_country_code, get_state_abbreviation
@@ -555,9 +556,11 @@ def generate_city_metadata_summary_as_json(
             "height_meters": grid_height,
             "step_length_meters": step_length,
             "diagonal_meters": diagonal_meters,
-            # Unique query points, not len(df): Mapillary runs have one row
-            # per pano, so several rows can share a grid point
-            "total_search_points": int(df[["query_lat", "query_lon"]].drop_duplicates().shape[0]),
+            # Unique query points, not len(df): a census run has one row per
+            # image, so several rows can share a grid point. The same function
+            # that fills runs.total_grid_points (issue #289), so the published
+            # grid size and the catalog's can never disagree.
+            "total_search_points": count_grid_points(df),
             "area_km2": (grid_width * grid_height) / 1_000_000,
         },
         "download": {

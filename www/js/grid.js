@@ -18,9 +18,14 @@
  * third provider is a registry edit rather than a column-list edit. The Δ
  * columns are the deliberate exception — see GRID_DELTA_PAIRS.
  *
+ * The growth-screen group (issue #349) is the other exception: it fans out over
+ * the providers the SCREEN document carries, which is a different list from
+ * the collected one — see `gridScreenColumns`.
+ *
  * Depends on globals from streetscape-utils.js (loaded first): PROVIDERS,
  * STREETSCAPE_DATA_BASE_URL, fetchGzippedJson, adaptCitiesPayload,
- * escapeHtml — from table-utils.js: cityDisplayLabel, sortRowsBy,
+ * escapeHtml, fetchProviderScreen, screenedProviders, lookupScreen,
+ * screenVerdict — from table-utils.js: cityDisplayLabel, sortRowsBy,
  * formatCellNumber, coverageCellHtml, providerShortLabel, deltaCellHtml,
  * providerColumnGroup, providerCellHtml, rowHtmlFromColumns,
  * createSortableTable — and from
@@ -263,6 +268,137 @@ function qualityFields(quality) {
   };
 }
 
+// ── The growth screen (issue #349) ────────────────────────────
+
+/**
+ * The tooltip a positive ("hint") or flat-only screen cell carries.
+ *
+ * The artifact's own `caveat` goes in VERBATIM rather than a paraphrase kept
+ * here: it is the writer's statement of what the number may be read as, and a
+ * copy in this file would drift the first time the writer's wording moved
+ * (it already has once, #406). A document with no caveat still gets the one
+ * sentence the asymmetry cannot do without.
+ *
+ * @param {Object} row - From pivotGridRows.
+ * @param {string} provider
+ * @param {?Object} entry - `doc.providers[provider]`.
+ * @returns {string} Plain text (escape before it enters an attribute).
+ */
+function gridScreenHintTitle(row, provider, entry) {
+  const date = row[`screenDate_${provider}`];
+  const lead =
+    row[`screenVerdict_${provider}`] === "flat"
+      ? `Screened ${date}: no 360° imagery in or around this city, but at most ` +
+        `${formatCellNumber(row[`screenAny_${provider}`])} flat (non-360°) pictures, ` +
+        "so it is worth measuring for any-imagery coverage, not for 360°."
+      : `Screened ${date}: at most ${formatCellNumber(row[`screen_${provider}`])} 360° pictures ` +
+        "in or around this city.";
+  const parts = [
+    lead,
+    entry?.caveat ?? "Upper bounds, not counts: only a collection run measures coverage.",
+  ];
+  const first = row[`screenFirstPositive_${provider}`];
+  if (first) {
+    // The writer derives this date from the ANY-imagery bound
+    // (`db.get_provider_screen_firsts`, `pictures_upper_bound > 0`), so under
+    // a 360° bound it must say so: flat imagery may have arrived first.
+    // And the writer's own caveat on it: a city already positive at the FIRST
+    // screen records when we started looking, not when imagery arrived.
+    parts.push(
+      first === entry?.first_screen_date
+        ? `Positive (any imagery) since the first screen (${first}), which is when watching ` +
+            "began, not when the imagery arrived."
+        : `First screened positive (any imagery) ${first}.`
+    );
+  }
+  return parts.join(" ");
+}
+
+/**
+ * The warning that applies to THIS cell, or null.
+ *
+ * `instrument.cell_warning` describes the LATEST screen only, and is present
+ * only when that pass read hexagons at an unexpected resolution — including
+ * the override case where a zero is NOT conclusive. A record from an older
+ * screen date was not read by that pass, so the warning is not hung on it.
+ *
+ * @param {Object} row - From pivotGridRows.
+ * @param {string} provider
+ * @param {?Object} entry - `doc.providers[provider]`.
+ * @returns {?string}
+ */
+function gridScreenWarning(row, provider, entry) {
+  const warning = entry?.instrument?.cell_warning;
+  return warning && row[`screenDate_${provider}`] === entry?.latest_screen_date ? warning : null;
+}
+
+/**
+ * Cell parts for one provider's screen leaf.
+ *
+ * The asymmetry is the whole rendering: a zero is a FACT and says so in words,
+ * a positive number is a HINT and is printed as a bound ("≤ N"), never as a
+ * bare count a reader could take for coverage. There are two zeros, kept
+ * apart: "0 · none" (no imagery of any kind, the conclusive zero) and
+ * "0 · flat only" (no 360°, but flat pictures an any-imagery reading counts).
+ *
+ * @param {Object} row - From pivotGridRows.
+ * @param {string} provider
+ * @param {?Object} entry - `doc.providers[provider]`.
+ * @returns {{html: string, className: string, title?: string}}
+ */
+function gridScreenCellParts(row, provider, entry) {
+  const verdict = row[`screenVerdict_${provider}`];
+  if (verdict == null) return { html: "—", className: "screen-cell" };
+  const warning = gridScreenWarning(row, provider, entry);
+  if (verdict === "none") {
+    const title =
+      `Screened ${row[`screenDate_${provider}`]}: no imagery of any kind in or around this city` +
+      (warning ? `. ${warning}` : " (a zero is conclusive)");
+    return { html: "0 · none", className: "screen-cell screen-none", title: escapeHtml(title) };
+  }
+  const hint = gridScreenHintTitle(row, provider, entry);
+  const title = escapeHtml(warning ? `${hint} ${warning}` : hint);
+  if (verdict === "flat") {
+    return { html: "0 · flat only", className: "screen-cell screen-flat", title };
+  }
+  return {
+    html: `≤ ${formatCellNumber(row[`screen_${provider}`])}`,
+    className: "screen-cell screen-hint",
+    title,
+  };
+}
+
+/**
+ * The growth-screen column group, one leaf per SCREENED provider.
+ *
+ * Built from the screen document's providers, never the collected list or
+ * the registry: a provider can be screened and never collected here, and vice
+ * versa. No Δ — two providers' upper bounds over different instruments answer
+ * nothing by subtraction. Sorting is allowed; the header says what the top of
+ * a descending sort means, because that is the misreading this group invites.
+ *
+ * @param {?Object} screenDoc - Parsed provider_screen.json.gz, or null.
+ * @returns {Object[]} Column descriptors (empty with no screen).
+ */
+function gridScreenColumns(screenDoc) {
+  const screened = screenedProviders(screenDoc);
+  if (screened.length === 0) return [];
+  return providerColumnGroup({
+    providers: screened,
+    id: "screen",
+    groupLabel: "Growth screen (360°, upper bound)",
+    groupTitle:
+      "Upper bound on 360° pictures in or around each city, from the weekly growth screen — " +
+      "NOT coverage. \"0 · none\" (no imagery of any kind) is conclusive; \"0 · flat only\" " +
+      "means no 360° imagery but some flat pictures; a positive number only means a closer " +
+      "look is worth taking. Sorted descending, the top rows are the cities most worth " +
+      "MEASURING, not the best covered.",
+    keyFor: (p) => `screen_${p}`,
+    cellFor: (p) => (row) => gridScreenCellParts(row, p, screenDoc.providers[p]),
+    initial: "desc",
+  });
+}
+
 // ── Columns ───────────────────────────────────────────────────
 
 /**
@@ -280,13 +416,15 @@ function qualityFields(quality) {
  * @param {string[]} [providers] - Providers to give a leaf column, in order.
  *   The render path passes the ones the payload actually contains; the default
  *   is the whole registry, which is what a caller with no payload wants.
+ * @param {?Object} [screenDoc] - Parsed provider_screen.json.gz. Null (the
+ *   default) builds exactly the columns the page had before #349.
  * @param {string[]} [qualityProviders] - Providers whose records carry a
  *   quality block somewhere in the payload (issue #321). Empty by default, so
  *   the static full-registry build has no quality group: whether one exists is
  *   a fact about the payload, not the registry.
  * @returns {Object[]}
  */
-function buildGridColumns(providers = gridProviders(), qualityProviders = []) {
+function buildGridColumns(providers = gridProviders(), screenDoc = null, qualityProviders = []) {
   const pair = gridDeltaPair(providers);
   const [ahead, behind] = pair ?? [];
   const pairNames = pair ? `${providerShortLabel(ahead)} − ${providerShortLabel(behind)}` : "";
@@ -488,6 +626,9 @@ function buildGridColumns(providers = gridProviders(), qualityProviders = []) {
       linkFor: gridProviderLink,
       initial: "desc",
     }),
+    // LAST, so every column before it keeps the position it had; with no
+    // screen this contributes nothing.
+    ...gridScreenColumns(screenDoc),
   ];
 }
 
@@ -614,6 +755,22 @@ function buildGridPresets(columns = GRID_COLUMNS) {
           },
         ]
       : []),
+    // Only when a screen was built into `columns`. Never the default: the
+    // screen is a hint, not a measure. Beside the coverage a collection run
+    // MEASURED and when that was, so "worth measuring" reads against "already
+    // measured" in one row.
+    ...(groupKeys("screen").length > 0
+      ? [
+          {
+            id: "screen",
+            label: "Where to look next",
+            title:
+              "The growth screen's upper bounds beside measured coverage: \"0 · none\" rules a " +
+              "city out, a positive bound only says it is worth collecting",
+            columns: [...groupKeys("screen"), ...metricKeys("cov"), ...groupKeys("collected")],
+          },
+        ]
+      : []),
   ];
 }
 
@@ -623,11 +780,13 @@ function buildGridPresets(columns = GRID_COLUMNS) {
  * @param {string[]} [providers] - Providers to offer as scopes, in order.
  *   The render path passes the ones the payload contains; the default is the
  *   whole registry.
+ * @param {string[]} [screened] - Providers the screen document carries; one
+ *   select each. Empty (the default) adds none.
  * @param {string[]} [qualityProviders] - Providers carrying a quality block
  *   (issue #321); each gets a quality-median and an on-foot-share slider.
  * @returns {Object[]}
  */
-function buildGridFilters(providers = gridProviders(), qualityProviders = []) {
+function buildGridFilters(providers = gridProviders(), screened = [], qualityProviders = []) {
   return [
     {
       key: "provider",
@@ -744,6 +903,27 @@ function buildGridFilters(providers = gridProviders(), qualityProviders = []) {
         digits: 1,
       },
     ]),
+    // One per screened provider (issue #349). A select, not a slider: the
+    // screen's number is a bound, and a window over bounds ("between 100 and
+    // 500") asks a question the instrument cannot answer. The readings it CAN
+    // answer are a fact (no imagery), flat imagery only, a 360° hint, and
+    // "not looked at" -- the same four states the cell renders.
+    ...screened.map((p) => ({
+      key: `screen_${p}`,
+      label: `Screened (${providerShortLabel(p)})`,
+      type: "select",
+      anyLabel: "Any",
+      options: [
+        { value: "none", label: "No imagery at all (0 · none)" },
+        { value: "flat", label: "Flat imagery only (0 · flat only)" },
+        { value: "hint", label: "360° positive (upper bound)" },
+        { value: "unscreened", label: "Not screened" },
+      ],
+      test: (row, value) =>
+        value === "unscreened"
+          ? row[`screenVerdict_${p}`] == null
+          : row[`screenVerdict_${p}`] === value,
+    })),
   ];
 }
 
@@ -804,14 +984,29 @@ function bestAcrossProviders(row, providers, keyFor, lowest = false) {
  * place — so it collapses to a single field, taken from the first provider
  * that reports it.
  *
+ * A screen document (issue #349) adds, for each SCREENED provider `p`,
+ * `screen_${p}` (the 360° upper bound), `screenAny_${p}` (the any-imagery
+ * upper bound), `screenDate_${p}`, `screenVerdict_${p}` ("none" / "flat" /
+ * "hint") and `screenFirstPositive_${p}`, all null for a city that provider
+ * never screened. With no document, no key is
+ * added at all, so the rows are exactly what they were before #349.
+ *
+ * Rows are still the cities the AGGREGATE carries. A city the screen covers
+ * that has no published run is not a row — there is nothing of it to link to
+ * or measure against — and is counted in `screenUnlisted` instead, so the
+ * caption can say how many the table cannot show.
+ *
  * @param {?Object} rawCities - Parsed cities.json.gz, or null.
+ * @param {?Object} [screenDoc] - Parsed provider_screen.json.gz, or null.
  * @returns {{rows: Object[], generatedAt: ?string, providers: string[],
- *   qualityProviders: string[]}}
+ *            qualityProviders: string[], screened: string[],
+ *            screenUnlisted: Object<string, number>}}
  *   `providers` is registry order, narrowed to those the payload contains;
  *   `qualityProviders` narrows it again to those with a quality block on at
- *   least one record (issue #321) -- the only ones that get quality keys.
+ *   least one record (issue #321) -- the only ones that get quality keys;
+ *   `screened` is the screen document's own provider list.
  */
-function pivotGridRows(rawCities) {
+function pivotGridRows(rawCities, screenDoc = null) {
   const byCity = new Map();
   let generatedAt = null;
 
@@ -939,7 +1134,25 @@ function pivotGridRows(rawCities) {
     // The freshest, i.e. the MINIMUM age — "best" here is the small number.
     row.medianAgeBest = bestAcrossProviders(row, providers, (p) => `medianAge_${p}`, true);
   }
-  return { rows, generatedAt, providers, qualityProviders };
+
+  const screened = screenedProviders(screenDoc);
+  const screenUnlisted = {};
+  for (const p of screened) {
+    for (const row of rows) {
+      // An id-less row joins nothing (its cityId is ""), so it reads unscreened.
+      const record = row.cityId ? lookupScreen(screenDoc, p, row.cityId) : null;
+      row[`screen_${p}`] = record?.pictures_360_upper_bound ?? null;
+      row[`screenAny_${p}`] = record?.pictures_upper_bound ?? null;
+      row[`screenDate_${p}`] = record?.screen_date ?? null;
+      row[`screenVerdict_${p}`] = screenVerdict(record);
+      // Absent (never positive) in the artifact reads null here.
+      row[`screenFirstPositive_${p}`] = record?.first_positive_date ?? null;
+    }
+    screenUnlisted[p] = screenDoc.providers[p].cities.filter(
+      (record) => !byCity.has(record?.city_id)
+    ).length;
+  }
+  return { rows, generatedAt, providers, qualityProviders, screened, screenUnlisted };
 }
 
 /**
@@ -962,12 +1175,16 @@ let gridControls = null;
  * Render the table (or the empty state) from the aggregate payload.
  *
  * @param {?Object} rawCities - Parsed cities.json.gz, or null.
+ * @param {?Object} [screenDoc] - Parsed provider_screen.json.gz, or null.
  */
-function renderGridRuns(rawCities) {
+function renderGridRuns(rawCities, screenDoc = null) {
   const statusEl = document.getElementById("grid-status");
   const wrapEl = document.getElementById("grid-table-wrap");
 
-  const { rows, generatedAt, providers, qualityProviders } = pivotGridRows(rawCities);
+  const { rows, generatedAt, providers, qualityProviders, screened, screenUnlisted } = pivotGridRows(
+    rawCities,
+    screenDoc
+  );
 
   if (rows.length === 0) {
     statusEl.textContent = "No city collections have been published yet.";
@@ -979,7 +1196,7 @@ function renderGridRuns(rawCities) {
   // every metric group (six more columns and three more default-preset ones
   // for KartaView alone), all of them em-dashes, plus a scope option that
   // matches no rows and points every slider at an all-null field.
-  const columns = buildGridColumns(providers, qualityProviders);
+  const columns = buildGridColumns(providers, screenDoc, qualityProviders);
   gridTable ??= createSortableTable({
     columns,
     defaultSort: GRID_DEFAULT_SORT,
@@ -991,11 +1208,13 @@ function renderGridRuns(rawCities) {
     table: gridTable,
     columns,
     presets: buildGridPresets(columns),
-    filters: buildGridFilters(providers, qualityProviders),
+    filters: buildGridFilters(providers, screened, qualityProviders),
     searchFields: GRID_SEARCH_FIELDS,
-    onChange: (shown, all) => updateGridCaption(shown, all, generatedAt),
+    onChange: (shown, all) =>
+      updateGridCaption(shown, all, generatedAt, gridScreenCaption(screenDoc, screenUnlisted)),
   });
   gridControls.setRows(rows);
+  renderGridScreenSections(screenDoc);
 
   statusEl.hidden = true;
   wrapEl.hidden = false;
@@ -1011,8 +1230,9 @@ function renderGridRuns(rawCities) {
  * @param {Object[]} shown - Filtered rows.
  * @param {Object[]} all - Every row.
  * @param {?string} generatedAt - Aggregate timestamp.
+ * @param {string} [screenSuffix] - From gridScreenCaption; "" with no screen.
  */
-function updateGridCaption(shown, all, generatedAt) {
+function updateGridCaption(shown, all, generatedAt, screenSuffix = "") {
   const series = shown.reduce((n, row) => n + row.providerCount, 0);
   const noun = `${formatCellNumber(series)} provider series`;
   const counts =
@@ -1020,14 +1240,131 @@ function updateGridCaption(shown, all, generatedAt) {
       ? `${formatCellNumber(all.length)} cities (${noun})`
       : `${formatCellNumber(shown.length)} of ${formatCellNumber(all.length)} cities (${noun})`;
   document.getElementById("grid-caption").textContent =
-    counts + (generatedAt ? ` · updated ${new Date(generatedAt).toLocaleString()}` : "");
+    counts +
+    (generatedAt ? ` · updated ${new Date(generatedAt).toLocaleString()}` : "") +
+    screenSuffix;
 }
 
-/** Fetch the aggregate, then render. */
+/**
+ * The caption's growth-screen clause, one per screened provider, or "".
+ *
+ * Read off the LAST `series` point — the latest screen's own catalog-level
+ * counts — rather than recounted from the city records, which carry each
+ * city's latest answer and so can mix screen dates. "Screened positive" and
+ * not "hold imagery": a positive bound is a hint. "(any imagery)" because
+ * `cities_positive` counts `pictures_upper_bound > 0`, which is the column's
+ * "flat only" and "≤ N" cells together, not the 360° hints alone.
+ *
+ * The unlisted count is its own clause, not "N of them": it counts screened
+ * records of ANY verdict (zeros included) and of any screen date, so it is
+ * not a subset of the positive count beside it.
+ *
+ * @param {?Object} screenDoc - Parsed provider_screen.json.gz, or null.
+ * @param {Object<string, number>} [unlisted] - From pivotGridRows.
+ * @returns {string}
+ *
+ * @example
+ *   gridScreenCaption(doc, { panoramax: 2 });
+ *   // " · Panoramax screen 2026-09-16: 411 of 1,221 cities screened positive
+ *   //    (any imagery); 2 screened cities have no published run, so no row here"
+ */
+function gridScreenCaption(screenDoc, unlisted = {}) {
+  return screenedProviders(screenDoc)
+    .map((p) => {
+      const entry = screenDoc.providers[p];
+      const series = Array.isArray(entry.series) ? entry.series : [];
+      const last = series[series.length - 1];
+      if (!last) return "";
+      const n = unlisted[p];
+      const missing = n
+        ? `; ${formatCellNumber(n)} screened ${n === 1 ? "city has" : "cities have"} ` +
+          "no published run, so no row here"
+        : "";
+      return (
+        ` · ${providerShortLabel(p)} screen ${entry.latest_screen_date ?? last.screen_date}: ` +
+        `${formatCellNumber(last.cities_positive)} of ${formatCellNumber(last.cities_screened)} ` +
+        `cities screened positive (any imagery)${missing}`
+      );
+    })
+    .join("");
+}
+
+/**
+ * The series disclosure for one screened provider: a plain table, one row per
+ * screen date. No chart library is loaded on this page, and a handful of
+ * weekly points reads fine as rows.
+ *
+ * @param {string} provider
+ * @param {Object} entry - `doc.providers[provider]`.
+ * @returns {string} HTML for one <details>.
+ */
+function gridScreenSeriesHtml(provider, entry) {
+  const name = escapeHtml(providerShortLabel(provider));
+  const series = Array.isArray(entry?.series) ? entry.series : [];
+  const body = series
+    .map(
+      (point) =>
+        `<tr><th scope="row">${escapeHtml(point.screen_date ?? "—")}</th>` +
+        `<td>${formatCellNumber(point.cities_screened)}</td>` +
+        `<td>${formatCellNumber(point.cities_positive)}</td>` +
+        `<td>${formatCellNumber(point.pictures_360_upper_bound)}</td></tr>`
+    )
+    .join("");
+  return `
+    <details class="screen-series" data-provider="${escapeHtml(provider)}">
+      <summary>${name} screen over time</summary>
+      <table class="screen-series-table">
+        <caption>
+          Every ${name} growth screen since ${escapeHtml(entry?.first_screen_date ?? "—")}.
+          The sum is an upper bound that double-counts imagery shared by
+          neighbouring cities: a trend line, never an inventory.
+        </caption>
+        <thead><tr>
+          <th scope="col">Screen date</th>
+          <th scope="col">Cities screened</th>
+          <th scope="col">Cities positive (any imagery)</th>
+          <th scope="col">360° upper bound (sum)</th>
+        </tr></thead>
+        <tbody>${body}</tbody>
+      </table>
+    </details>`;
+}
+
+/**
+ * Show the screen's prose and series sections, or leave them hidden.
+ *
+ * Both are authored `hidden` in grid.html, so a page with no screen document
+ * renders exactly as it did before #349.
+ *
+ * @param {?Object} screenDoc - Parsed provider_screen.json.gz, or null.
+ */
+function renderGridScreenSections(screenDoc) {
+  const screened = screenedProviders(screenDoc);
+  if (screened.length === 0) return;
+  const seriesEl = document.getElementById("grid-screen-series");
+  const aboutEl = document.getElementById("grid-screen-about");
+  if (seriesEl) {
+    seriesEl.innerHTML = screened
+      .map((p) => gridScreenSeriesHtml(p, screenDoc.providers[p]))
+      .join("");
+    seriesEl.hidden = false;
+  }
+  if (aboutEl) aboutEl.hidden = false;
+}
+
+/**
+ * Fetch the aggregate and the provider screen concurrently, then render.
+ *
+ * `fetchProviderScreen` resolves null rather than rejecting, so a missing
+ * screen cannot fail the page — it only leaves the screen sections out.
+ */
 async function loadGridRuns() {
   try {
-    const rawCities = await fetchGzippedJson(STREETSCAPE_DATA_BASE_URL + "cities.json.gz");
-    renderGridRuns(rawCities);
+    const [rawCities, screenDoc] = await Promise.all([
+      fetchGzippedJson(STREETSCAPE_DATA_BASE_URL + "cities.json.gz"),
+      fetchProviderScreen(),
+    ]);
+    renderGridRuns(rawCities, screenDoc);
   } catch (error) {
     console.error("Error loading grid coverage:", error);
     document.getElementById("grid-status").textContent =
@@ -1054,6 +1391,10 @@ if (typeof module !== "undefined" && module.exports) {
     buildGridFilters,
     renderGridRuns,
     updateGridCaption,
+    gridScreenCaption,
+    gridScreenColumns,
+    gridScreenCellParts,
+    gridScreenSeriesHtml,
     GRID_COLUMNS,
     GRID_PRESETS,
     GRID_FILTERS,

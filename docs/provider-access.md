@@ -801,7 +801,8 @@ Three options were considered and rejected:
 a per-key cross-process lock, because it would serialize a hand run behind a multi-hour night (and a fail-fast `timeout=0` lock like `host_lock`'s could instead make the nightly child the loser, skipping that city's channel);
 a shared cross-process pacer, because it would put new cross-process state on the path of every GSV request to guard an overlap that only a hand run creates;
 and halving the per-process rate while two could overlap, because the two nightly lanes never share a key, so it would cost every night half its GSV rate for an occasional hand run.
-Nothing in code refuses a second `run-due` yet: `scheduler._run_due_in_flight()` exists, but only `import-bundle`, the prefreeze and two repair scripts call it; #412 tracks adding it to `run-due`.
+Since #412 a hand `run-due` (or `assess-city`) that would collect a GSV key another `run-due` on this host is collecting exits 64, and the nightly unit, which is never refused, proceeds and sends an alert naming the other process.
+The guard is per-host and sees only `run-due` processes, so a same-key run on another machine, or a direct-CLI hand run, is still covered by the checklist alone; the rules and blind spots are in `docs/scheduler.md`.
 Note that `pgrep -f "scheduler run-due"`, which an earlier version of this paragraph recommended, never matches the unit (its command line is `-m streetscape_metadata_tracker.scheduler --config … run-due`); the checklist gives a test that does.
 
 **`api_requests` counts one per point per pass, not one per HTTP attempt** (PR #399 review).

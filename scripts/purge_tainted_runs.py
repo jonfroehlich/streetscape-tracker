@@ -208,11 +208,13 @@ def main() -> int:
         for item in items:
             run = item["run"]
             if item["reason"] == "tainted":
+                # Rows over rows: runs.total_points is a ROW count (issue #289),
+                # which for a census run counts images, so it is labelled rows.
                 pct = 100.0 * item["tainted"] / run["total_points"] if run["total_points"] else 0.0
                 logger.info(
                     f"{run['city_id']} [{run['provider']}]: "
                     f"{item['tainted']:,} retryable-status rows "
-                    f"of {run['total_points']:,} points ({pct:.1f}%)"
+                    f"of {run['total_points']:,} rows ({pct:.1f}%)"
                 )
             else:
                 logger.info(
