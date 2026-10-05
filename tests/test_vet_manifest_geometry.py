@@ -118,6 +118,31 @@ def test_a_clean_row_reports_the_geometry_and_the_scheduler_prices(fake_geocode)
     assert record["panoramax_z15_tiles"] > record["mapillary_z14_tiles"]
 
 
+def test_the_tile_prices_are_taken_at_the_geocoded_center(fake_geocode):
+    """
+    A tile census's price depends on where the grid sits on the tile lattice,
+    so it must be computed at the center registration freezes, never at the
+    GeoNames point. The geocode here lands ~6.7 km off, inside the guard, at a
+    point whose tile counts differ from the GeoNames point's (asserted, so the
+    test cannot pass by the two coinciding).
+    """
+    fake_geocode["center"] = (48.05, 2.05)
+    record = _vet(_row())
+
+    def city_at(lat, lon):
+        return db.CityRow(
+            "x", "x", "x", None, None, None, None, lat, lon, 6000, 4000, 20, "", False, None
+        )
+
+    geocoded, geonames = city_at(48.05, 2.05), city_at(48.0, 2.0)
+    for channel, column in (
+        ("mapillary", "mapillary_z14_tiles"),
+        ("panoramax", "panoramax_z15_tiles"),
+    ):
+        assert estimate_requests(geocoded, channel) != estimate_requests(geonames, channel)
+        assert record[column] == estimate_requests(geocoded, channel)
+
+
 def test_the_step_is_passed_through_to_the_price(fake_geocode):
     """A --step other than 20 must reach the estimator (pins the pass-through)."""
     assert _vet(_row(), step_m=40)["gsv_points"] == 151 * 101
@@ -208,6 +233,37 @@ def test_main_is_clean_when_nothing_is_flagged_and_limit_is_honoured(tmp_path, f
 
     assert vet.main(["--manifest", manifest, "--limit", "1"]) == 0
     assert fake_geocode["queries"] == ["Testville, Testshire, Testland"] * 2  # +1 cached re-read
+
+
+def test_main_passes_max_center_km_through(tmp_path, fake_geocode):
+    """An 11 km geocode fails the 10 km default guard and passes a 50 km one."""
+    manifest = _write(tmp_path / "m.csv", [_row()])
+    fake_geocode["center"] = (48.1, 2.0)
+    out_csv = tmp_path / "vet.csv"
+
+    assert vet.main(["--manifest", manifest, "--csv", str(out_csv)]) == 1
+    with open(out_csv, encoding="utf-8") as f:
+        assert next(csv.DictReader(f))["flags"].startswith("FAILED")
+
+    argv = ["--manifest", manifest, "--csv", str(out_csv), "--max-center-km", "50"]
+    assert vet.main([*argv, "--flag-offset-km", "20"]) == 0
+    with open(out_csv, encoding="utf-8") as f:
+        row = next(csv.DictReader(f))
+    assert (row["flags"], row["center"]) == ("", "geocoded")
+
+
+def test_main_passes_center_from_geonames_through(tmp_path, fake_geocode):
+    """The same guard-failing geocode, recentered on the GeoNames point."""
+    manifest = _write(tmp_path / "m.csv", [_row()])
+    fake_geocode["center"] = (48.1, 2.0)
+    out_csv = tmp_path / "vet.csv"
+
+    vet.main(["--manifest", manifest, "--csv", str(out_csv), "--center-from-geonames"])
+    with open(out_csv, encoding="utf-8") as f:
+        row = next(csv.DictReader(f))
+    assert row["center"] == "GeoNames"
+    assert (float(row["center_lat"]), float(row["center_lon"])) == (48.0, 2.0)
+    assert not row["flags"].startswith("FAILED")
 
 
 def test_it_never_opens_a_catalog(tmp_path, fake_geocode, monkeypatch):
