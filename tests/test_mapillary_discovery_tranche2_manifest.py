@@ -16,13 +16,21 @@ again, independently of the script, plus the GeoNames join run in reverse:
   from every city the catalog knows (the 2026-10-02 production snapshot, whose
   distance is a committed column, plus the 25 tranche-1 towns registered the
   same day, re-checked here from literals) unless named in
-  OPERATOR_EXCEPTIONS, joinable from the vendored cities15000 or the
-  data_sources/geonames_supplement.txt rows, geometry resolved at vetting, no two rows within 25 km (greedy,
-  GIS_ISG / UAS_ISG towns first), at most 30 rows with those towns ahead of
-  the cap, in descending score;
-* each row's score is the score OF THAT PLACE, at the very point registered —
-  the defect #428's review found in Kortrijk (admitted on a neighbour's
-  imagery) cannot happen here.
+  OPERATOR_EXCEPTIONS, joinable from the vendored cities15000 or this
+  tranche's three data_sources/geonames_supplement.txt rows
+  (TRANCHE2_SUPPLEMENT_IDS — pinned, so a later tranche adding supplement
+  rows cannot change this frozen record's decisions), geometry resolved at
+  vetting, no two rows within 25 km (greedy, GIS_ISG / UAS_ISG towns first),
+  at most 30 rows with those towns ahead of the cap, in descending score;
+* each row's score is the score OF THAT PLACE, measured at its own GeoNames
+  point — the defect #428's review found in Kortrijk (admitted on a
+  neighbour's imagery) cannot happen here. Registration centres the grid on
+  the GEOCODE, not on that point (0.1-5.5 km away), so a separate test
+  requires the scored point inside the vetted grid and at least three
+  quarters of the scored disc's area with it;
+* every vetting number the tests and docs quote (grids, offsets, the
+  failures, the pricing table) traces to the three committed vet CSVs,
+  docs/experiments/mapillary-discovery-screen_tranche2_vet*.csv.
 
 The GeoNames and query_string assertions duplicate
 tests/test_mapillary_360_cities_manifest.py rather than sharing a helper, so
@@ -52,10 +60,26 @@ MANIFEST = REPO_ROOT / "mapillary_discovery_cities_tranche2.csv"
 RECORD = REPO_ROOT / "docs" / "experiments" / "mapillary-discovery-screen_tranche2.csv"
 DATA_SOURCES = REPO_ROOT / "data_sources"
 OTHER_MANIFESTS = [REPO_ROOT / "mapillary_360_cities.csv", REPO_ROOT / "worldwide_frame.csv"]
+WORLDWIDE_SAMPLING_DOC = REPO_ROOT / "docs" / "worldwide_sampling.md"
+
+# The three runs of scripts/vet_manifest_geometry.py --csv, committed verbatim:
+# the 14 rows the rule admitted before vetting (2026-10-04), then Fergus Falls
+# alone and Delavan Lake + Como (2026-10-05), each after its exception.
+VET_CSVS = [
+    REPO_ROOT / "docs" / "experiments" / f"mapillary-discovery-screen_tranche2_{name}.csv"
+    for name in ("vet", "vet_fergus", "vet_lakes")
+]
 
 SCORE_FLOOR = 3.0
 REUSE_RADIUS_KM = 25.0
 CAP = 30
+SCORE_DISC_KM = 2.0  # the screen scored recent-360° km within 2 km of the point
+MIN_DISC_INSIDE_GRID = 0.75  # measured minimum 0.774 (Como); see the test
+
+# This tranche's joinable set is cities15000 plus exactly these supplement
+# rows (Fergus Falls, Delavan Lake, Como). The supplement is shared, and a
+# row another manifest adds must not change a decision this record froze.
+TRANCHE2_SUPPLEMENT_IDS = frozenset({"5026416", "5250402", "5249259"})
 FAVOURED_CREATORS = {"1361362982257515", "1006984308465014"}  # GIS_ISG, UAS_ISG
 
 # Registered on production AFTER the 2026-10-02 catalog snapshot the record's
@@ -201,6 +225,18 @@ def geonames():
     )
 
 
+@pytest.fixture(scope="module")
+def vetted():
+    """{geonameid: vet row} over the three committed vetting runs."""
+    rows = {}
+    for path in VET_CSVS:
+        with open(path, encoding="utf-8") as f:
+            for r in csv.DictReader(f):
+                assert r["geonameid"] not in rows, r["geonameid"]  # vetted once
+                rows[r["geonameid"]] = r
+    return rows
+
+
 def _rederive(record, vendored_ids):
     """
     The selection rule over the committed record, written independently of
@@ -334,17 +370,20 @@ def test_selection_rederives_from_the_record(manifest_rows, record, geonames):
     The rule, run again here: the manifest is exactly its output, in order, and
     every candidate's committed decision is the one the rule gives it.
     """
-    decisions, chosen = _rederive(record, set(geonames.cities))
+    assert TRANCHE2_SUPPLEMENT_IDS <= set(geonames.supplement)
+    assert gen.TRANCHE2_SUPPLEMENT_IDS == TRANCHE2_SUPPLEMENT_IDS
+    decisions, chosen = _rederive(record, set(geonames.cities15000) | TRANCHE2_SUPPLEMENT_IDS)
     assert [row["geonameid"] for row in manifest_rows] == chosen
     for r in record:
         assert r["decision"] == decisions[r["geonameid"]], r["name"]
 
 
-def test_each_row_is_scored_at_its_own_registered_point(manifest_rows, record):
+def test_each_row_is_scored_at_its_own_geonames_point(manifest_rows, record):
     """
     The anti-Kortrijk check (#428's review): the score that admitted a row was
-    measured within 2 km of the very GeoNames point registration centres on,
-    and clears the floor on its own.
+    measured within 2 km of that row's own GeoNames point (the manifest's
+    lat/lon), and clears the floor on its own. Registration centres the grid
+    on the geocode instead; the next test covers that gap.
     """
     by_id = {r["geonameid"]: r for r in record}
     for row in manifest_rows:
@@ -352,6 +391,60 @@ def test_each_row_is_scored_at_its_own_registered_point(manifest_rows, record):
         assert float(scored["lat"]) == pytest.approx(float(row["lat"])), row["city"]
         assert float(scored["lon"]) == pytest.approx(float(row["lon"])), row["city"]
         assert float(scored["score_km_per_km2"]) >= SCORE_FLOOR, row["city"]
+
+
+def _grid_frame_km(lat, lon, grid):
+    """
+    The vetted grid rectangle in a local equirectangular frame centred on
+    (lat, lon), in km: (centre x, centre y, half-width, half-height).
+    """
+    clat, clon = float(grid["center_lat"]), float(grid["center_lon"])
+    kx, ky = 111.32 * math.cos(math.radians(clat)), 110.57
+    return (
+        (clon - lon) * kx,
+        (clat - lat) * ky,
+        float(grid["width_m"]) / 2000,
+        float(grid["height_m"]) / 2000,
+    )
+
+
+def _disc_fraction_inside(lat, lon, grid, n=200):
+    """
+    Share of the AREA of the SCORE_DISC_KM disc around (lat, lon) that lies in
+    the axis-aligned vetted grid rectangle, on an n x n lattice.
+    """
+    cx, cy, hw, hh = _grid_frame_km(lat, lon, grid)
+    step = 2 * SCORE_DISC_KM / n
+    total = inside = 0
+    for i in range(n):
+        x = -SCORE_DISC_KM + (i + 0.5) * step
+        for j in range(n):
+            y = -SCORE_DISC_KM + (j + 0.5) * step
+            if x * x + y * y <= SCORE_DISC_KM**2:
+                total += 1
+                inside += abs(x - cx) <= hw and abs(y - cy) <= hh
+    return inside / total
+
+
+def test_each_rows_scored_disc_lies_inside_its_vetted_grid(manifest_rows, vetted):
+    """
+    The score was measured around the GeoNames point, but the frozen grid is
+    centred on the geocode (0.1-5.5 km away in the vetting run). So: the
+    scored point must lie inside the vetted grid, and at least
+    MIN_DISC_INSIDE_GRID of the scored disc's AREA with it.
+
+    Area, not imagery: the imagery-weighted share (92-100%, measured from the
+    screen's raw segments) needs data the repo does not hold. By area the
+    measured minimum is 0.774 (Como), with Delavan Lake 0.790 and
+    Phoenixville 0.817 — narrow grids or offset centres — Atwater 0.997, and
+    1.0 for the other ten.
+    """
+    for row in manifest_rows:
+        lat, lon = float(row["lat"]), float(row["lon"])
+        grid = vetted[row["geonameid"]]
+        cx, cy, hw, hh = _grid_frame_km(lat, lon, grid)
+        assert abs(cx) <= hw and abs(cy) <= hh, row["city"]  # the scored point itself
+        assert _disc_fraction_inside(lat, lon, grid) >= MIN_DISC_INSIDE_GRID, row["city"]
 
 
 def test_rows_are_in_descending_score(manifest_rows, record):
@@ -367,19 +460,63 @@ def test_vetting_failures_are_named_and_agree_with_the_generator(record):
     assert failed == set(VETTING_FAILED)
 
 
-def test_supplement_holds_only_rows_a_manifest_needs(manifest_rows, geonames):
+def test_vetting_literals_trace_to_the_committed_vet_csvs(manifest_rows, vetted):
     """
-    The supplement is verbatim cities500 lines for towns cities15000 lacks,
-    and nothing else: every row is absent from cities15000 and is a row of
-    this manifest, so it cannot grow into an unreviewed copy of cities500.
+    Every grid, offset and failure this file pins is a value of the committed
+    vet CSVs: each manifest row resolved there unflagged within the 10 km
+    guard, the failures are exactly VETTING_FAILED, and the exceptions'
+    vetted W x H and offsets are those runs' numbers.
     """
-    manifest_ids = {row["geonameid"] for row in manifest_rows}
-    assert geonames.supplement, "the supplement is empty"
-    raw = (DATA_SOURCES / "geonames_supplement.txt").read_text(encoding="utf-8").splitlines()
-    assert len(raw) == len(geonames.supplement), "a duplicated or unparseable line"
-    for gid in geonames.supplement:
-        assert gid not in geonames.cities15000, gid
-        assert gid in manifest_ids, gid
+    for row in manifest_rows:
+        v = vetted[row["geonameid"]]
+        assert v["flags"] == "", row["city"]
+        assert float(v["offset_km"]) <= 10.0, row["city"]
+        assert v["geocode_query"] == row["query_string"], row["city"]
+    failed = {gid for gid, v in vetted.items() if v["flags"].startswith("FAILED")}
+    assert failed == set(VETTING_FAILED)
+    assert set(vetted) == {row["geonameid"] for row in manifest_rows} | failed
+
+    def as_vetted(gid):
+        v = vetted[gid]
+        return (int(v["width_m"]), int(v["height_m"])), float(v["offset_km"])
+
+    for gid, (*_, grid, offset_km) in OPERATOR_EXCEPTIONS.items():
+        assert (grid, offset_km) == as_vetted(gid), gid
+    for members in PAIR_EXCEPTIONS.values():
+        for gid, (grid, offset_km) in members.items():
+            assert (grid, offset_km) == as_vetted(gid), gid
+
+
+def test_the_docs_vetting_table_is_the_committed_vet_csvs(manifest_rows, vetted):
+    """
+    docs/worldwide_sampling.md's vetting table, its totals and its offset
+    summary are the committed vet CSVs, formatted; a hand-edited cell fails.
+    """
+    doc = WORLDWIDE_SAMPLING_DOC.read_text(encoding="utf-8")
+    rows = [vetted[row["geonameid"]] for row in manifest_rows]
+    price_cols = [
+        "gsv_points",
+        "gsv_streets_samples",
+        "mapillary_z14_tiles",
+        "kartaview_requests",
+        "panoramax_z15_tiles",
+    ]
+    for v in rows:
+        cells = [
+            v["geocode_query"],
+            v["osm_match"],
+            f"{int(v['width_m']):,} x {int(v['height_m']):,}",
+            *(f"{int(v[c]):,}" for c in price_cols),
+            v["offset_km"],
+            v["center"],
+        ]
+        assert "| " + " | ".join(cells) + " |" in doc, v["city"]
+    totals = " | ".join(f"{sum(int(v[c]) for v in rows):,}" for c in price_cols)
+    assert f"| **Total ({len(rows)} resolved)** | | | | {totals} |" in doc
+    offsets = sorted(float(v["offset_km"]) for v in rows)
+    mid = len(offsets) // 2
+    p50 = (offsets[mid - 1] + offsets[mid]) / 2 if len(offsets) % 2 == 0 else offsets[mid]
+    assert f"p50 {p50:.2f} km and max {offsets[-1]:.1f} km" in doc
 
 
 def test_operator_exceptions_cannot_duplicate_their_neighbour(manifest_rows, record):
@@ -555,3 +692,168 @@ def test_generator_reports_cities500_known_and_vetting_drops():
     assert small["decision"] == "cities500 only"
     assert failed["decision"] == "failed geometry vetting"
     assert weak["decision"] == "below score floor"
+
+
+# --- the generator's I/O half: main() on a synthetic data_sources/ -----------
+
+_CANDIDATE_COLUMNS = [
+    "geonameid",
+    "name",
+    "admin1",
+    "cc",
+    "lat",
+    "lon",
+    "pop",
+    "km_per_km2",
+    "km_in_disc",
+    "top_creator",
+    "top_creator_username",
+    "top_share",
+    "median_captured",
+]
+
+
+def _geonames_line(gid, name, lat, lon, population):
+    """A 19-column GeoNames row in California, US (feature class P)."""
+    cols = [""] * 19
+    cols[0], cols[1], cols[2] = gid, name, name
+    cols[4], cols[5], cols[6] = str(lat), str(lon), "P"
+    cols[8], cols[10], cols[14] = "US", "CA", str(population)
+    return "\t".join(cols) + "\n"
+
+
+def _write_csv(path, header, rows):
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=header)
+        w.writeheader()
+        w.writerows(rows)
+
+
+@pytest.fixture
+def generated(tmp_path, monkeypatch):
+    """
+    Run gen.main over synthetic inputs and return its record and manifest.
+
+    * 31 far-apart cities15000 towns "100".."130" (scores 9.0 down to 6.0):
+      with "900" that is 32 eligible rows, and the cap of 30 drops the two
+      weakest;
+    * "200" sits 24.996 km from the snapshot's only city, a distance the
+      generator rounds to exactly 25.0 — inside the radius, since it is `<=`;
+    * "300" is 5.6 km from a town in an --also-registered manifest only;
+    * "900" is a pinned supplement row (joinable, score 8.3); "901" is a
+      supplement row the tranche does not pin ("cities500 only", never joined).
+    """
+    ds = tmp_path / "data_sources"
+    ds.mkdir()
+    for name in ("admin1CodesASCII.txt", "countryInfo.txt"):
+        (ds / name).symlink_to(DATA_SOURCES / name)
+    places = [(str(100 + i), 20.0 + 0.5 * i, -100.0, 9.0 - 0.1 * i) for i in range(31)]
+    places += [("200", 50.0 + 0.2248, -100.0, 8.5), ("300", 60.05, -100.0, 8.4)]
+    (ds / "cities15000.txt").write_text(
+        "".join(
+            _geonames_line(gid, f"Town{gid}", lat, lon, 20000 + int(gid))
+            for gid, lat, lon, _ in places
+        ),
+        encoding="utf-8",
+    )
+    supplement = [("900", 70.0, -100.0, 8.3), ("901", 72.0, -100.0, 8.2)]
+    (ds / "geonames_supplement.txt").write_text(
+        "".join(
+            _geonames_line(gid, f"Town{gid}", lat, lon, 1000 + int(gid))
+            for gid, lat, lon, _ in supplement
+        ),
+        encoding="utf-8",
+    )
+    candidates = [
+        dict(
+            zip(
+                _CANDIDATE_COLUMNS,
+                [gid, f"Town{gid}", "CA", "US", lat, lon, 1, score, 1.0, "1", "u", 1.0, "2026"],
+                strict=True,
+            )
+        )
+        for gid, lat, lon, score in places + supplement
+    ]
+    _write_csv(tmp_path / "candidates.csv", _CANDIDATE_COLUMNS, candidates)
+    _write_csv(
+        tmp_path / "snapshot.csv",
+        ["table", "city_id", "lat", "lon"],
+        [{"table": "cities", "city_id": "known--city", "lat": 50.0, "lon": -100.0}],
+    )
+    _write_csv(
+        tmp_path / "t1.csv",
+        ["city", "lat", "lon"],
+        [{"city": "Neighbour", "lat": 60.0, "lon": -100.0}],
+    )
+    monkeypatch.setattr(gen, "DATA_SOURCES", str(ds))
+    monkeypatch.setattr(gen, "TRANCHE2_SUPPLEMENT_IDS", frozenset({"900"}))
+    # fmt: off
+    argv = [
+        "--candidates", str(tmp_path / "candidates.csv"),
+        "--catalog-snapshot", str(tmp_path / "snapshot.csv"),
+        "--also-registered", str(tmp_path / "t1.csv"),
+        "--record", str(tmp_path / "record.csv"),
+        "--manifest-out", str(tmp_path / "manifest.csv"),
+    ]
+    # fmt: on
+    assert gen.main(argv) == 0
+    with open(tmp_path / "record.csv", encoding="utf-8") as f:
+        record = {r["geonameid"]: r for r in csv.DictReader(f)}
+    with open(tmp_path / "manifest.csv", encoding="utf-8") as f:
+        manifest = list(csv.DictReader(f))
+    return SimpleNamespace(record=record, manifest=manifest)
+
+
+def test_generator_constants_are_the_tests_constants():
+    assert (gen.SCORE_FLOOR, gen.REUSE_RADIUS_KM, gen.CAP) == (SCORE_FLOOR, REUSE_RADIUS_KM, CAP)
+
+
+def test_generator_main_caps_at_thirty_rows(generated):
+    """32 eligible towns (31 plus the pinned supplement row): 30 rows, the 2 weakest over."""
+    assert len(generated.manifest) == CAP
+    over = sorted(gid for gid, r in generated.record.items() if r["decision"] == "over the cap")
+    assert over == ["129", "130"]
+
+
+def test_generator_main_reads_the_known_radius_inclusively(generated):
+    r = generated.record["200"]
+    assert (r["nearest_known"], r["nearest_known_km"]) == ("known--city", "25.0")
+    assert r["decision"] == "within 25 km of a known city"
+
+
+def test_generator_main_reads_also_registered_manifests(generated):
+    r = generated.record["300"]
+    assert r["nearest_known"] == "t1.csv:Neighbour"
+    assert r["decision"] == "within 25 km of a known city"
+
+
+def test_generator_main_joins_only_the_pinned_supplement_rows(generated):
+    """
+    900 (pinned) is joined from the supplement file, not from cities15000;
+    901 is in the same file but not pinned, so it is never joinable.
+    """
+    rows = {r["geonameid"]: r for r in generated.manifest}
+    assert generated.record["900"]["decision"] == "selected"
+    assert generated.record["900"]["in_cities15000"] == "no"
+    assert (rows["900"]["city"], int(rows["900"]["population"])) == ("Town900", 1900)
+    assert generated.record["901"]["decision"] == "cities500 only"
+    assert "901" not in rows
+
+
+def test_generator_main_writes_each_row_from_its_geonames_record(generated):
+    """The manifest row's values come from the vendored record, not the candidate."""
+    rows = {r["geonameid"]: r for r in generated.manifest}
+    row = rows["100"]
+    assert row["city"] == "Town100"
+    assert row["query_string"] == "Town100, California, United States"
+    assert (row["admin"], row["iso2"], row["country"], row["continent"]) == (
+        "California",
+        "US",
+        "United States",
+        "NA",
+    )
+    assert int(row["population"]) == 20100
+    assert (float(row["lat"]), float(row["lon"])) == (20.0, -100.0)
+    assert row["size_band"] == row["coverage_regime"] == ""
+    scores = [float(generated.record[g]["score_km_per_km2"]) for g in rows]
+    assert scores == sorted(scores, reverse=True)

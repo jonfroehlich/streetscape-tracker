@@ -1,0 +1,15 @@
+n,city,geonameid,geocode_query,osm_match,center_lat,center_lon,width_m,height_m,gsv_points,gsv_streets_samples,mapillary_z14_tiles,kartaview_requests,panoramax_z15_tiles,offset_km,center,flags
+1,Tracy,5403191,"Tracy, California, United States",boundary/administrative,37.720721,-121.464462,14870,13082,487320,96616,64,198,240,4.0,geocoded,
+2,Reno,5511077,"Reno, Nevada, United States",boundary/administrative,39.557931,-119.846776,26735,36750,2457406,487980,300,923,1160,4.2,geocoded,
+3,Elko,5703670,,,,,,,,,,,,,,FAILED: geocoded center is 32 km from the GeoNames coordinates (> 10 km) — likely a province centroid; re-run with --center-from-geonames or fix by hand
+4,Woodland,5410430,"Woodland, California, United States",boundary/administrative,38.673372,-121.739744,10976,7980,219600,43502,35,86,108,3.0,geocoded,
+5,Perris,5382146,"Perris, California, United States",boundary/administrative,33.792001,-117.221018,7690,17333,333795,66201,45,140,162,1.3,geocoded,
+6,Payson,5779548,"Payson, Utah, United States",boundary/administrative,40.034439,-111.750929,10999,8066,222200,44063,35,86,130,1.9,geocoded,
+7,Live Oak,5367314,,,,,,,,,,,,,,FAILED: geocoded center is 257 km from the GeoNames coordinates (> 10 km) — likely a province centroid; re-run with --center-from-geonames or fix by hand
+8,Searcy,4130430,,,,,,,,,,,,,,FAILED: geocoded center is 113 km from the GeoNames coordinates (> 10 km) — likely a province centroid; re-run with --center-from-geonames or fix by hand
+9,Galesburg,4893392,"Galesburg, Illinois, United States",boundary/administrative,40.946934,-90.371428,11752,10107,297528,58992,48,129,168,0.1,geocoded,
+10,Phoenixville,5205849,"Phoenixville, Pennsylvania, United States",boundary/administrative,40.138356,-75.523425,4057,4821,49126,9714,9,21,30,1.1,geocoded,
+11,Atwater,5325187,"Atwater, California, United States",boundary/administrative,37.351527,-120.594851,6395,5215,83520,16563,20,36,48,1.3,geocoded,
+12,Keene,5088262,"Keene, New Hampshire, United States",boundary/administrative,42.952146,-72.300057,13546,10639,360696,71577,63,144,208,2.7,geocoded,
+13,Buffalo,5019588,"Buffalo, Minnesota, United States",boundary/administrative,45.175096,-93.86852,6543,8266,135792,26861,20,54,80,0.6,geocoded,
+14,Toms River,4504476,"Toms River, New Jersey, United States",boundary/administrative,39.996304,-74.164627,18112,14057,636918,126451,88,234,336,5.5,geocoded,

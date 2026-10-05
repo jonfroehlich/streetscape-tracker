@@ -21,11 +21,13 @@ script applies the second tranche's rule to the same record:
    whose own rows are candidates and so drop out here at distance 0) plus
    ``EXTRA_KNOWN`` (cities registered after the snapshot that are in no
    manifest);
-3. the place is in the vendored ``data_sources/cities15000.txt`` or the
-   one-row-per-town ``data_sources/geonames_supplement.txt``, because a
-   manifest row is a join against vendored GeoNames data and the screen's
-   cities500 frame is not vendored — any other cities500-only town is
-   reported, never joined; and its geometry resolved in the one pre-registration vetting run
+3. the place is in the vendored ``data_sources/cities15000.txt`` or is one of
+   ``TRANCHE2_SUPPLEMENT_IDS``, this tranche's rows of the shared
+   ``data_sources/geonames_supplement.txt``, because a manifest row is a join
+   against vendored GeoNames data and the screen's cities500 frame is not
+   vendored — any other cities500-only town is reported, never joined (a
+   supplement row added later, for another manifest, changes nothing here);
+   and its geometry resolved in the pre-registration vetting runs
    (``VETTING_FAILED`` lists the three that did not);
 4. greedily, in rank order, more than ``REUSE_RADIUS_KM`` from every row
    already kept, where rank is (favoured creator first, then score
@@ -126,6 +128,12 @@ PAIR_EXCEPTIONS = {
     "both geocode offsets (2.0 and 0.7 km) total 9.8 km",
 }
 EXCEPTION_DECISION = "selected (operator exception)"
+
+# The supplement rows this tranche may join (Fergus Falls, Delavan Lake,
+# Como). The supplement file is shared by every purposive manifest, so the
+# joinable set is pinned rather than read whole: a later manifest's row must
+# not turn one of this frozen record's "cities500 only" drops into a pick.
+TRANCHE2_SUPPLEMENT_IDS = frozenset({"5026416", "5250402", "5249259"})
 
 RECORD_COLUMNS = [
     "rank",
@@ -308,7 +316,9 @@ def main(argv=None) -> int:
     args = parse_args(argv)
     cities = {c.geonameid: c for c in load_cities(os.path.join(DATA_SOURCES, "cities15000.txt"))}
     supplement = {
-        c.geonameid: c for c in load_cities(os.path.join(DATA_SOURCES, "geonames_supplement.txt"))
+        c.geonameid: c
+        for c in load_cities(os.path.join(DATA_SOURCES, "geonames_supplement.txt"))
+        if c.geonameid in TRANCHE2_SUPPLEMENT_IDS
     }
     admin = load_admin1(os.path.join(DATA_SOURCES, "admin1CodesASCII.txt"))
     countries = load_countries(os.path.join(DATA_SOURCES, "countryInfo.txt"))

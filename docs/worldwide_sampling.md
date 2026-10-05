@@ -173,10 +173,14 @@ scheduler host (makelab2), after the merged code is deployed there.
 2. **Vet boundaries before collecting.** International OSM boundary quality
    varies, so run the boundary-audit workflow on the newly registered cities
    before enabling them: `scripts/audit_city_boundaries.py` →
-   `scripts/reregister_boundaries.py` (dry run; it writes the
+   `scripts/reregister_boundaries.py` dry run (read the plan; it writes the
    `reregister_plan.csv` / `manual_review.csv` the review page is built from,
-   so skipping it builds an EMPTY page) → `scripts/build_boundary_review.py` →
-   human review → `scripts/apply_decisions.py`. Swap rejects from
+   so skipping it builds an EMPTY page) → the same with `--execute` (the page
+   drops a resize city whose geometry is unchanged, so after a dry run alone
+   every auto-resized city is skipped unreviewed; safe while the new cities
+   are disabled and have no runs) → `scripts/build_boundary_review.py` (spot-check
+   the resized cities' before/after) → human review →
+   `scripts/apply_decisions.py` for the deferred cities. Swap rejects from
    `worldwide_candidates.csv`.
 3. **Enable in the scheduler.** `scheduler enable-city CITY` for each vetted
    city (issue #374), which also enrols it on the opt-in channels behind their
@@ -232,7 +236,8 @@ In order:
 
 1. score ≥ 3 (all 161 pass; it is the screen's own floor);
 2. more than 25 km from every city the catalog knows: the production snapshot the screen exported on 2026-10-02 (1,232 cities, Montréal and Ottawa among them) plus tranche 1's 25 towns (`mapillary_discovery_cities.csv`, Cedar Falls among them) — **116 dropped**, two of which (Fergus Falls MN, Delavan Lake WI) are admitted anyway by operator decision (below);
-3. the place is in the vendored `cities15000.txt` or in `data_sources/geonames_supplement.txt`, since a manifest row is a join against vendored GeoNames data and the screen's frame, cities500, is not vendored — **29 dropped** (listed below);
+3. the place is in the vendored `cities15000.txt` or is one of this tranche's three rows of `data_sources/geonames_supplement.txt` (`TRANCHE2_SUPPLEMENT_IDS`), since a manifest row is a join against vendored GeoNames data and the screen's frame, cities500, is not vendored — **29 dropped** (listed below).
+   The joinable set is pinned rather than read from the whole supplement, because the supplement is shared: a row another manifest adds later must not change a decision this record froze;
 4. its geometry resolved in the vetting run (below) — **3 dropped**;
 5. greedily, GIS_ISG and UAS_ISG towns first and then by descending score, no row within 25 km of a row already kept — **1 dropped** (Sparks NV, 5.5 km from Reno), and one pair (Delavan Lake and Como WI) admitted by operator decision (below);
 6. those uploaders' towns ahead of a cap of 30 rows, the rest by score — the cap does not bind.
@@ -241,6 +246,7 @@ That leaves **14 rows**, in descending score, so `register_frame.py --limit N` r
 Re-running the script reproduces both committed files byte for byte (no network; the snapshot is gitignored on the laptop that ran the screen):
 
 ```bash
+mkdir -p /tmp/t1   # the --also-registered file must keep its name: the record labels known cities by it
 git show origin/mapillary-discovery-screen-383:docs/experiments/mapillary-discovery-screen_candidates.csv > /tmp/candidates.csv
 git show origin/mapillary-discovery-screen-383:mapillary_discovery_cities.csv > /tmp/t1/mapillary_discovery_cities.csv
 python scripts/build_mapillary_discovery_tranche2.py --candidates /tmp/candidates.csv \
@@ -248,7 +254,9 @@ python scripts/build_mapillary_discovery_tranche2.py --candidates /tmp/candidate
     --also-registered /tmp/t1/mapillary_discovery_cities.csv
 ```
 
-Each row is the scored place itself, at the point its 2 km disc was measured around, so no row is admitted on a neighbour's imagery (the defect #428's review found in a cluster-anchored selection).
+Each row is the scored place itself, scored at its own GeoNames point (the 2 km disc was measured around the manifest's own lat/lon), so no row is admitted on a neighbour's imagery (the defect #428's review found in a cluster-anchored selection).
+Registration centres the grid on the geocode, not on that point — 0.1 to 5.5 km away in the vetting runs below — so the test also requires the scored point inside each vetted grid and at least three quarters of the scored disc's area with it.
+By area the minimum is 77% (Como; Delavan Lake 79%, Phoenixville 82%, Atwater 99.7%, the other ten 100%), because a narrow grid or an offset centre clips the disc's edge; the imagery-weighted share is higher, but measuring it needs the screen's raw segments, which are not committed.
 
 **All three GIS_ISG / UAS_ISG towns are in, by operator exception.**
 Laurens, Iowa's uploader and its sibling account have three candidates, and the rule alone drops all three; each exception is pinned by the test with the geometry below, and "operator decision" is its whole provenance.
@@ -263,7 +271,7 @@ Neither Delavan (the city), Lake Geneva, Williams Bay nor any other catalog city
 None of the three is in `cities15000.txt`, so each GeoNames line is copied verbatim from cities500 into `data_sources/geonames_supplement.txt`, which holds only the rows a committed manifest needs (`data_sources/README.md`); nothing now waits on vendoring among these uploaders' towns.
 
 **Needs a cities500 vendoring decision** — 29 candidates that pass every other rule but cannot be joined from `data_sources/`, because they are neither in `cities15000.txt` nor in the supplement (the screen downloaded cities500 on the day).
-Each can be admitted the way Fergus Falls was, by copying its cities500 line into the supplement; vendoring all of cities500 (about 40 MB) is the alternative, and either is the owner's call.
+Each can be admitted in a later manifest the way Fergus Falls was, by copying its cities500 line into the supplement — not into this tranche, whose joinable set is pinned and whose record is frozen; vendoring all of cities500 (about 40 MB) is the alternative, and either is the owner's call.
 
 | Place | geonameid | Score | Top uploader | Share | Population |
 |---|---|---|---|---|---|
@@ -298,6 +306,8 @@ Each can be admitted the way Fergus Falls was, by copying its cities500 line int
 | Yreka, CA | 5574093 | 4.07 | marker_geo1 | 0.96 | 7,597 |
 
 **Vetting (2026-10-04, from a laptop, one run of `vet_manifest_geometry.py` over the 14 rows the rule admitted before step 4).**
+Each run's `--csv` output is committed verbatim: [`experiments/mapillary-discovery-screen_tranche2_vet.csv`](experiments/mapillary-discovery-screen_tranche2_vet.csv) (this run), [`_vet_fergus.csv`](experiments/mapillary-discovery-screen_tranche2_vet_fergus.csv) and [`_vet_lakes.csv`](experiments/mapillary-discovery-screen_tranche2_vet_lakes.csv) (the two below).
+The table, its totals, the offset summary and every grid and offset the test pins are those files' values, and the test checks that they are.
 Fergus Falls was vetted in a second, single-row run on 2026-10-05, after its exception: the bare query matched the city's `boundary/administrative` polygon (not Otter Tail County), 1.4 km off, so it needs no override.
 Delavan Lake and Como were vetted in a third run on 2026-10-05 (two geocodes): both are census-designated places and both matched a `boundary/census` polygon, 2.0 and 0.7 km off, so neither fell back to a polygon-less node's bbox (#302's Copenhagen failure) and neither needs an override.
 Three geocoded to the wrong feature and failed the 10 km center guard, so registration would skip them; with no second Nominatim run to test a fix, they are left out rather than given an untested override:

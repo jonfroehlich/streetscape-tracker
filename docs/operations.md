@@ -424,7 +424,10 @@ python scripts/register_frame.py --manifest mapillary_discovery_cities_tranche2.
 - Each `--execute` line prints the frozen W x H; compare it with the vetting table and stop on any difference.
 
 **3. Audit the boundaries: the full chain, in its own directory.**
-`build_boundary_review.py` renders only the cities `reregister_boundaries.py` put in `reregister_plan.csv` or `manual_review.csv`, so a chain that skips that script builds an empty page and the gate passes having checked nothing.
+The order is #91's: audit, `reregister_boundaries.py` as a dry run (read the plan), the same with `--execute`, then `build_boundary_review.py`, then `apply_decisions.py` for the cities it deferred.
+`build_boundary_review.py` reads the `reregister_plan.csv` and `manual_review.csv` that `reregister_boundaries.py` writes, so a chain that skips that script builds an empty page and the gate passes having checked nothing.
+It also DROPS every plan city whose geometry still equals the audit snapshot (`_resize_changed`): after a dry run only, every auto-RESIZE city (verdict UNDER, OSM bbox ≤ 30 km) appears only in the "skipped" banner and is never reviewed or decided.
+So `--execute` is passed before the page is built — safe here, because these cities are disabled and have no runs — and the page then shows each resized city before and after, for a spot check; the DEFER cities (`manual_review.csv`) are what `apply_decisions.py` decides.
 The ids come from the notes label, so the audit cannot drop one:
 
 ```bash
@@ -434,14 +437,18 @@ python scripts/audit_city_boundaries.py --data-dir "$DATA" \
     --cache audit/mdt2/nominatim_boundary_cache.jsonl --report audit/mdt2/boundary_audit_report.csv \
     $(for c in $IDS; do printf -- '--city %s ' "$c"; done)
 python scripts/reregister_boundaries.py --report audit/mdt2/boundary_audit_report.csv \
-    --data-dir "$DATA" --out-dir audit/mdt2    # DRY RUN: writes the plan and manual-review CSVs, changes nothing
+    --data-dir "$DATA" --out-dir audit/mdt2    # DRY RUN: writes the plan and manual-review CSVs; read the plan
+python scripts/reregister_boundaries.py --report audit/mdt2/boundary_audit_report.csv \
+    --data-dir "$DATA" --out-dir audit/mdt2 --execute   # applies the RESIZE rows; DEFER rows are untouched
 python scripts/build_boundary_review.py --data-dir "$DATA" --audit-dir audit/mdt2
-# review audit/mdt2/boundary_review.html, export boundary_decisions.csv into audit/mdt2, then:
+# spot-check the resized cities' before/after in audit/mdt2/boundary_review.html, decide the deferred ones,
+# export boundary_decisions.csv into audit/mdt2, then:
 python scripts/apply_decisions.py --data-dir "$DATA" --decisions audit/mdt2/boundary_decisions.csv   # dry run, then --execute
 ```
 
 The audit sends one structured Nominatim query per city (14), never a provider request.
 If `reregister_boundaries.py` flags nothing, the review page is empty because every city's verdict is `OK`; read the report's `verdict` column for all 14 to confirm that, rather than reading an empty page as a pass.
+A city the audit resizes (or `apply_decisions.py` changes) no longer has its vetted grid, so its row in the vetting table and the step-6 night table is stale: re-price it with `scheduler.estimate_requests` on the new geometry before planning its night.
 
 **4. Enable, one tranche per night: `scheduler enable-city CITY`.**
 `enable-city` enrols the opt-in pairs BEFORE flipping `enabled` (#374), so a city's grid runs and walks pair on one UTC date: KartaView at an estimate ≤ 1,000 (all 14 clear it; Reno is the largest at 923), Panoramax only on a nonzero one-city screen.
@@ -463,12 +470,13 @@ for c in $NIGHT1; do python -m streetscape_metadata_tracker.scheduler enable-cit
 After enabling, so the new cities are in tomorrow's slate (#341: a walk on a frozen network never contacts Overpass, and a first walk that does can be stranded by a mid-night refusal):
 
 ```bash
-python scripts/prefreeze_street_networks.py --config config/scheduler.makelab1.toml --nights 1             # list
-python scripts/prefreeze_street_networks.py --config config/scheduler.makelab1.toml --nights 1 --execute   # freeze
+python scripts/prefreeze_street_networks.py --config config/scheduler.makelab1.toml --nights 1 --limit 40             # list
+python scripts/prefreeze_street_networks.py --config config/scheduler.makelab1.toml --nights 1 --limit 40 --execute   # freeze
 ```
 
 Without `--execute` the script only lists.
-The daily 15:00 timer runs the same pass with `--nights 2 --limit 40 --execute`, so a tranche enabled in the morning is frozen by it; run the commands above when enabling after 15:00, and not on an afternoon that already carried a drain or a daytime walk catch-up (Overpass's ~100 queries/day guidance, `provider-access.md`).
+The daily 15:00 timer runs the same pass as `--nights 2 --limit 40 --pause-s 120 --execute --alert`, so a tranche enabled before it runs is frozen by it, and the manual commands are needed only when enabling after the 15:00 timer has run; `--limit 40` keeps them to the timer's one-night ceiling.
+Do not run them on an afternoon that already carried a drain or a daytime walk catch-up (Overpass's ~100 queries/day guidance, `provider-access.md`).
 
 **6. Pricing, and the nights.**
 From the vetting table, one collection of all 14 is 5,659,858 GSV grid points (1.97 h at 48,000/min) plus 1,123,036 GSV walk samples by the area proxy (an over-estimate, 0.39 h), **811 Mapillary z14 tiles**, 2,221 KartaView requests (2.31 h at 16/min) and at most 2,934 Panoramax z15 tiles (49 min at 60/min, only if the screen enrols the pair).
