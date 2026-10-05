@@ -172,9 +172,22 @@ scheduler host (makelab2), after the merged code is deployed there.
    `--manifest data_sources/geocode_overrides.csv`.
 2. **Vet boundaries before collecting.** International OSM boundary quality
    varies, so run the boundary-audit workflow on the newly registered cities
-   before enabling them: `scripts/audit_city_boundaries.py` →
-   `scripts/build_boundary_review.py` → human review →
-   `scripts/apply_decisions.py`. Swap rejects from `worldwide_candidates.csv`.
+   before enabling them: `scripts/audit_city_boundaries.py`, then #91's four
+   steps in order:
+   1. `scripts/reregister_boundaries.py` dry run, then read the plan — it
+      writes the `reregister_plan.csv` and `manual_review.csv` that the review
+      page renders, and without them the page is empty, so the gate passes
+      having checked nothing;
+   2. `scripts/reregister_boundaries.py --execute` — safe because the new
+      cities are disabled and have no runs, and required because
+      `build_boundary_review.py` silently drops every auto-resize city whose
+      geometry is still unchanged;
+   3. `scripts/build_boundary_review.py` — resized cities show before and
+      after, and `Resize cities skipped (unchanged geometry)` must read 0;
+   4. `scripts/apply_decisions.py` for the DEFER cities.
+
+   A resized city's prices in any vetting or tranche table are then stale;
+   re-price it before enabling. Swap rejects from `worldwide_candidates.csv`.
 3. **Enable in the scheduler.** `scheduler enable-city CITY` for each vetted
    city (issue #374), which also enrols it on the opt-in channels behind their
    gates (`docs/operations.md`). Default-membership channels stay global (GSV
@@ -189,6 +202,8 @@ Cities added for a specific reason live in their own manifest in the same format
 - `mapillary_discovery_cities.csv` (2026-10-02, 25 cities) — the first tranche of the Mapillary discovery screen (#383, `docs/experiments/mapillary-discovery-screen.md`): uncatalogued North American towns with dense, recent, single-uploader 360° sequence coverage.
   Unlike `mapillary_360_cities.csv` it HAS a generator, `scripts/mapillary_discovery_analyze.py`, which reproduces it byte for byte from the 2026-10-02 scan's gitignored raw data and the cities500 file downloaded that day (not vendored, so the generator alone cannot rebuild it later); it carries one geocode-query override (Fond du Lac, whose plain query matched the county) and drops apostrophes from names (`Waipi'o Acres` -> `Waipio Acres`).
   Registered with `--overlap-km 5 --notes-label "mapillary discovery screen 2026-10-02"`.
+- `panoramax_360_cities.csv` (2026-10-04, 40 cities, #406) — the richest Panoramax 360° clusters the 2026-10-01 world screen found outside the catalog ([`experiments/panoramax-world-screen.md`](experiments/panoramax-world-screen.md)), selected by a RULE rather than curated: every new cluster with a 360° upper bound of at least 100,000 (10,000 in the US and Canada), plus Kilkenny by name.
+  Its own section is below; registering it is the runbook in [`operations.md`](operations.md) ("Registering a purposive manifest on production").
 
 Two things differ from a frame registration:
 
@@ -217,6 +232,103 @@ That city was corrected in the catalog with `resize_city.py`, and the override i
 
 Vetting is the same requirement as for the frame, but the full audit chain is disproportionate for a handful of cities: read the registered rectangles back out of `cities`, and for anything that looks wrong render it with `streetscape_tracker.py "<query>" --check-boundary` and correct it with `scripts/resize_city.py` (safe only while the city has no runs).
 The trap for these cities is the opposite of the province centroid the `--max-center-km` guard catches: several have a *tiny* core municipality as their OSM boundary — the City of Brussels and the City of Melbourne LGA are both a few km across inside metros many times larger.
+
+Since #406 that vetting is a command, `scripts/vet_manifest_geometry.py --manifest <csv>`: it calls `register_frame.resolve_frame_geometry`, the function `register_frame_city` freezes from, so the preview and the registration cannot drift apart, and it prints the offset, the OSM feature matched and each grid's request price from `scheduler.estimate_requests`.
+It geocodes through Nominatim only (the library's 1.1 s limiter), opens no catalog, and refuses a `makelab*` host; run it from a laptop.
+
+### `panoramax_360_cities.csv` (#406)
+
+**Selection.**
+The rows are the new clusters of [`experiments/panoramax-world-screen_clusters.csv`](experiments/panoramax-world-screen_clusters.csv) (not within 25 km of the screen's 2026-10-01 catalog snapshot) whose 360° upper bound is at least 100,000, or 10,000 in the US and Canada, plus Kilkenny (73,765) by name for its city-completion camera grant.
+A row is the cluster's NAME point — its most populous GeoNames place — so Strasbourg is the row even though its bound was summed around the Lingolsheim anchor.
+Every row's OWN 10 km bound (its name point's, from [`experiments/panoramax-world-screen_places.csv`](experiments/panoramax-world-screen_places.csv)) also clears its floor, with one named exception the test pins, so a future row cannot be admitted on an off-centre anchor's imagery without a decision:
+
+- Kortrijk — its own bound is 2,725, 2.7% of the floor.
+  The cluster's 109,576 was summed around the anchor Wevelgem, 7.6 km west-south-west of Kortrijk's GeoNames point (6.9 km W, 3.1 km S).
+  Both distances are from that point, not from the grid: the grid freezes on the geocoded centre, 3.0 km off it (the vetting table's offset), and that geometry is not committed here, so "Wevelgem lies outside Kortrijk's 11,159 m-wide grid" is approximate.
+  The argument does not depend on it: Kortrijk's own bound, read at its own point, is 2,725, so most of the cluster's imagery lies outside what Kortrijk will collect.
+  It is kept as an operator decision, because #406's table names it; expect its Panoramax series to measure close to empty while it costs 445,842 GSV points per cycle.
+
+The rows are ordered by descending bound, so `register_frame.py --limit N` registers the richest N first.
+Excluded, each with its reason in `tests/test_panoramax_360_cities_manifest.py`:
+
+- Cergy-Pontoise — one of the writeup's six `tracked_split` clusters (its anchor is within 25 km of Paris), and the only one of the six that clears the floor.
+- Quimper — 20.4 km from Douarnenez, a richer row, and its bound was summed around Concarneau.
+- Vienne — 24.9 km from Lyon, and its bound was summed around Givors, between the two.
+- Waterloo, Iowa — 9 km from Cedar Falls, enabled on production on 2026-10-02, after the screen's snapshot.
+
+The test also checks every row against the cities registered since the snapshot (the 25 towns of `mapillary_discovery_cities.csv` on PR #419's branch, and Montréal) and against the two committed manifests (Ottawa, enabled since, is a `mapillary_360_cities.csv` row); nothing else is within 25 km.
+
+**Identity.**
+The slugs follow the GeoNames rule unchanged, which has two visible consequences.
+French admin-1 names are GeoNames' post-2016 regions, two of them under GeoNames' truncated names: `FR.84 Rhone-Alpes` is Auvergne-Rhône-Alpes and `FR.27 Bourgogne` is Bourgogne-Franche-Comté.
+So `besancon--bourgogne--france` and `lons-le-saunier--bourgogne--france` carry a region name neither city was in (both are in Franche-Comté), and the public label will read "Besancon, Bourgogne, France"; the identity rule is accepted as is rather than adding an admin-name override, a kind the repo does not have.
+Marseille's slug carries an apostrophe, `marseille--provence-alpes-cote-d'azur--france`, as the registered `coeur-d'alene--idaho--united-states` and `rancagua--o'higgins-region--chile` already do; the scheduler's printed commands `shlex`-quote such an id.
+
+**Vetting (2026-10-04, from a laptop, 49 Nominatim requests in two runs).**
+The first run covered all 40 rows as first written; the second re-ran the four calls on the two query overrides it led to (and on two rejected alternatives).
+
+- **Mayenne** matched the Mayenne *département* — the commune shares its name — 17 km off, so registration would have skipped it.
+  `Mayenne, Mayenne, Pays de la Loire, France` resolves the commune, 0.4 km off; `53100 Mayenne, France` resolves a 17x16 km postal-code area and was rejected.
+- **Muscatine** matched Muscatine *County*, 49x29 km, capped to 40 km: 2.95 M GSV points for a town of 24,000.
+  `Muscatine, Muscatine County, Iowa, United States` resolves the city (13.7x13.4 km); `City of Muscatine, Iowa, United States` does not geocode.
+- **Bordeaux, Bayonne and Angoulême** do not geocode under GeoNames' `New Aquitaine` and register through `register_frame.py`'s bare `City, France` fallback, which resolves each commune within 2.5 km.
+  They carry no override, since an override equal to that fallback is forbidden by the test.
+- **Norman, Oklahoma** is the real city boundary (33.7x22.5 km, Lake Thunderbird included), 7.5 km off: 1.9 M GSV points, the second-largest grid here.
+  It is kept, and priced last.
+- **Kilkenny** matched a `place/town` node with no polygon, Copenhagen's failure mode (#302), but its node extent (5.4x5.6 km) covers the town and stays inside the 40 km cap.
+
+Every other row matched a `boundary/administrative` polygon (Immokalee, a census-designated place, a `boundary/census` one) within 3.8 km of its GeoNames point.
+The offsets over all 40 are p50 1.65 km and max 7.5 km, so `--max-center-km 10` registers every row, and `--center-from-geonames` is unnecessary.
+The table is the script's output with the two overrides' rows from the second run; KartaView is priced on the GeoNames point because the first run predates that column (no row's offset exceeds 7.5 km).
+All prices are for one collection: GSV and Mapillary are default-membership, so an enabled city is due on both the next night; the GSV walk is the scheduler's area proxy, an over-estimate by design; the Mapillary, KartaView and Panoramax walks are not listed because each reads its grid run's census from the shared cache for 0 requests on a paired night (#290).
+
+| # | City | Geocode query | OSM match | Grid W x H (m) | GSV points | GSV walk samples (area proxy) | Mapillary z14 tiles | KartaView requests | Panoramax z15 tiles | Offset (km) | Center | Flags |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | Strasbourg | Strasbourg, Grand Est, France | boundary/administrative | 10,917 x 17,153 | 468,468 | 93,005 | 88 | 187 | 330 | 2.1 | geocoded |  |
+| 2 | Lyon | Lyon, Rhone-Alpes, France | boundary/administrative | 9,849 x 11,214 | 276,573 | 54,855 | 42 | 100 | 168 | 1.4 | geocoded |  |
+| 3 | Bordeaux | Bordeaux, France | boundary/administrative | 8,299 x 11,713 | 243,190 | 48,279 | 42 | 97 | 154 | 2.5 | geocoded | FALLBACK-QUERY |
+| 4 | Lille | Lille, Hauts-de-France, France | boundary/administrative | 11,161 x 6,721 | 188,383 | 37,256 | 40 | 72 | 150 | 0.7 | geocoded |  |
+| 5 | Laval | Laval, Pays de la Loire, France | boundary/administrative | 7,716 x 7,413 | 143,206 | 28,408 | 30 | 64 | 100 | 1.6 | geocoded |  |
+| 6 | Saint-Nazaire | Saint-Nazaire, Pays de la Loire, France | boundary/administrative | 9,884 x 9,715 | 240,570 | 47,691 | 49 | 88 | 169 | 2.1 | geocoded |  |
+| 7 | Caen | Caen, Normandy, France | boundary/administrative | 6,054 x 7,034 | 106,656 | 21,149 | 24 | 45 | 80 | 1.0 | geocoded |  |
+| 8 | Montpellier | Montpellier, Occitanie, France | boundary/administrative | 10,838 x 9,627 | 261,244 | 51,820 | 42 | 100 | 156 | 0.2 | geocoded |  |
+| 9 | Le Havre | Le Havre, Normandy, France | boundary/administrative | 9,327 x 9,840 | 230,231 | 45,582 | 48 | 88 | 168 | 1.7 | geocoded |  |
+| 10 | Nantes | Nantes, Pays de la Loire, France | boundary/administrative | 12,339 x 12,815 | 395,497 | 78,535 | 72 | 162 | 272 | 2.4 | geocoded |  |
+| 11 | Brest | Brest, Brittany, France | boundary/administrative | 10,445 x 11,370 | 297,587 | 58,983 | 56 | 129 | 195 | 2.2 | geocoded |  |
+| 12 | Montauban | Montauban, Occitanie, France | boundary/administrative | 12,527 x 15,661 | 491,568 | 97,438 | 80 | 194 | 285 | 1.0 | geocoded |  |
+| 13 | Orleans | Orleans, Centre-Val de Loire, France | boundary/administrative | 5,457 x 13,373 | 182,637 | 36,244 | 36 | 72 | 136 | 3.3 | geocoded |  |
+| 14 | Grenoble | Grenoble, Rhone-Alpes, France | boundary/administrative | 5,935 x 6,660 | 99,198 | 19,631 | 20 | 45 | 72 | 0.6 | geocoded |  |
+| 15 | Besancon | Besancon, Bourgogne, France | boundary/administrative | 10,788 x 13,273 | 358,560 | 71,117 | 63 | 144 | 238 | 1.4 | geocoded |  |
+| 16 | Morlaix | Morlaix, Brittany, France | boundary/administrative | 5,613 x 7,383 | 103,970 | 20,582 | 20 | 43 | 80 | 2.2 | geocoded |  |
+| 17 | Toulouse | Toulouse, Occitanie, France | boundary/administrative | 13,322 x 15,111 | 504,252 | 99,983 | 80 | 198 | 304 | 1.0 | geocoded |  |
+| 18 | Bayonne | Bayonne, France | boundary/administrative | 7,085 x 7,667 | 136,320 | 26,979 | 30 | 64 | 90 | 1.4 | geocoded | FALLBACK-QUERY |
+| 19 | Mayenne | Mayenne, Mayenne, Pays de la Loire, France | boundary/administrative | 5,426 x 6,400 | 87,312 | 17,247 | 20 | 36 | 72 | 0.4 | geocoded |  |
+| 20 | Lons-le-Saunier | Lons-le-Saunier, Bourgogne, France | boundary/administrative | 3,835 x 4,297 | 41,280 | 8,184 | 16 | 21 | 42 | 0.1 | geocoded |  |
+| 21 | Tours | Tours, Centre-Val de Loire, France | boundary/administrative | 6,380 x 10,081 | 161,600 | 31,944 | 35 | 72 | 117 | 0.7 | geocoded |  |
+| 22 | Angouleme | Angouleme, France | boundary/administrative | 7,079 x 5,727 | 101,598 | 20,135 | 20 | 54 | 72 | 0.8 | geocoded | FALLBACK-QUERY |
+| 23 | Mannheim | Mannheim, Baden-Wurttemberg, Germany | boundary/administrative | 12,733 x 20,033 | 638,274 | 126,689 | 126 | 270 | 459 | 2.8 | geocoded |  |
+| 24 | Douarnenez | Douarnenez, Brittany, France | boundary/administrative | 8,145 x 6,876 | 140,352 | 27,815 | 36 | 54 | 110 | 1.8 | geocoded |  |
+| 25 | Marseille | Marseille, Provence-Alpes-Cote d'Azur, France | boundary/administrative | 24,650 x 24,598 | 1,516,590 | 301,149 | 225 | 583 | 841 | 1.8 | geocoded |  |
+| 26 | Beaune | Beaune, Bourgogne, France | boundary/administrative | 8,382 x 7,033 | 147,840 | 29,278 | 30 | 54 | 99 | 0.4 | geocoded |  |
+| 27 | Kortrijk | Kortrijk, Flanders, Belgium | boundary/administrative | 11,159 x 15,975 | 445,842 | 88,538 | 88 | 172 | 315 | 3.0 | geocoded |  |
+| 28 | Cherbourg | Cherbourg, Normandy, France | boundary/administrative | 14,750 x 10,485 | 387,450 | 76,811 | 88 | 158 | 300 | 1.9 | geocoded |  |
+| 29 | Ulm | Ulm, Baden-Wurttemberg, Germany | boundary/administrative | 14,837 x 17,990 | 667,800 | 132,569 | 132 | 257 | 460 | 3.8 | geocoded |  |
+| 30 | Kilkenny | Kilkenny, Leinster, Ireland | place/town | 5,366 x 5,629 | 75,858 | 15,001 | 25 | 28 | 81 | 0.5 | geocoded |  |
+| 31 | Ottumwa | Ottumwa, Iowa, United States | boundary/administrative | 7,887 x 12,661 | 250,430 | 49,595 | 40 | 97 | 135 | 1.5 | geocoded |  |
+| 32 | Marshalltown | Marshalltown, Iowa, United States | boundary/administrative | 11,263 x 8,641 | 244,212 | 48,337 | 48 | 100 | 140 | 2.0 | geocoded |  |
+| 33 | Norman | Norman, Oklahoma, United States | boundary/administrative | 33,722 x 22,522 | 1,901,249 | 377,211 | 216 | 691 | 816 | 7.5 | geocoded |  |
+| 34 | Newton | Newton, Iowa, United States | boundary/administrative | 7,176 x 6,432 | 115,598 | 22,924 | 20 | 54 | 64 | 1.0 | geocoded |  |
+| 35 | Mason City | Mason City, Iowa, United States | boundary/administrative | 13,661 x 8,828 | 302,328 | 59,897 | 54 | 126 | 176 | 1.1 | geocoded |  |
+| 36 | Muscatine | Muscatine, Muscatine County, Iowa, United States | boundary/administrative | 13,730 x 13,356 | 458,916 | 91,077 | 72 | 180 | 256 | 3.1 | geocoded |  |
+| 37 | Fort Dodge | Fort Dodge, Iowa, United States | boundary/administrative | 9,058 x 9,492 | 215,175 | 42,702 | 36 | 88 | 121 | 2.0 | geocoded |  |
+| 38 | Davenport | Davenport, Iowa, United States | boundary/administrative | 16,446 x 18,167 | 748,107 | 148,391 | 110 | 280 | 399 | 2.3 | geocoded |  |
+| 39 | Owatonna | Owatonna, Minnesota, United States | boundary/administrative | 8,381 x 9,602 | 202,020 | 39,968 | 36 | 75 | 120 | 2.1 | geocoded |  |
+| 40 | Immokalee | Immokalee, Florida, United States | boundary/census | 7,909 x 5,263 | 104,544 | 20,673 | 15 | 43 | 48 | 0.6 | geocoded |  |
+| | **Total (40 resolved)** | | | | 13,682,485 | 2,713,672 | 2,350 | 5,385 | 8,390 | | | |
+
+Nominatim can answer differently on the day of registration than on the day of vetting, so `register_frame.py --execute` prints each frozen W x H; compare it with this table before enabling anything, and treat a difference as a reason to stop.
+The numbers are upper-bound-selected, not coverage: Immokalee's 360° share is the one the screen's own `/api/search` probe contradicted (its 20 sampled pictures were flat phone imagery), so expect it to measure low.
 
 ## Refreshing the frame
 

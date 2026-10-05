@@ -144,6 +144,15 @@ It pins `--notes-label` by MUTATING it rather than by asserting the default: a c
 The city list is curated, but its values are a GeoNames join keyed by `geonameid` and there is no generator script to name in a `generated_by`, so the test re-runs that join in reverse: city, admin, country, continent, population and coordinates must match the vendored records, and `query_string` must equal what `build_worldwide_frame.query_string` writes, so a query here behaves exactly like a frame query at the geocoder.
 The `city_id`s are pinned as **literals** deliberately — registration freezes them into filenames and published URLs, so a change in `db.derive_city_id` or `naming.sanitize_city_query_str` must break a test instead of quietly renaming a city — and the single deliberate departure from GeoNames' ASCII names (`Malmoe` -> `Malmo`) is a named constant rather than an unexplained mismatch.
 
+`tests/test_panoramax_360_cities_manifest.py` is the same provenance for `panoramax_360_cities.csv` (#406), with the GeoNames, `query_string` and slug assertions duplicated rather than shared, so the file that pins the Mapillary batch's already-registered slugs was not edited.
+It adds the SELECTION in reverse, since this list is the output of a rule rather than a curation: each row is joined on its GeoNames point to exactly one cluster of the committed screen record (`docs/experiments/panoramax-world-screen_clusters.csv` — on coordinates, because the record carries `Orléans` and the manifest `Orleans`), that cluster must be new and clear the floor (100,000 360° pictures, 10,000 in the US and Canada) or be a named exception (Kilkenny), and every cluster the rule admits must be in the manifest or in `EXCLUDED_CLUSTERS` with a reason — so a future screen record that admits a cluster nobody decided about fails rather than being silently left out.
+The rows must be in descending bound, so `register_frame.py --limit N` registers the richest first, and no row may sit within the 25 km reuse radius of another row, of a committed manifest, or of a city registered after the screen's catalog snapshot (`POST_SNAPSHOT_CITIES`) — the case the screen's own "new" flag cannot see, which is how Waterloo, Iowa is excluded.
+Because the rule reads a cluster's bound, summed around its anchor, while a row registers the cluster's NAME point, each row's OWN 10 km bound (joined on its GeoNames point to `docs/experiments/panoramax-world-screen_places.csv`) must clear its floor too, or be in `OWN_BOUND_EXCEPTIONS` with its own bound, its anchor and the anchor's bound pinned; Kortrijk (own 2,725, admitted on Wevelgem's 109,576) is the one entry, kept by decision, and an entry whose own bound clears the floor fails as stale.
+
+`tests/test_vet_manifest_geometry.py` pins `scripts/vet_manifest_geometry.py` through register_frame's own geocoding seam, patched exactly as `test_register_frame.py` patches it: the preview goes through `register_frame.resolve_frame_geometry`, the function `register_frame_city` freezes from, so a preview that drifted from the registration would have to edit that one function.
+Prices are asserted EQUAL to `scheduler.estimate_requests` on the stored (integer) geometry, so the table quotes what the scheduler will budget rather than a formula of its own; `--step` and `--flag-offset-km` are pinned by mutating them, and `--max-center-km` and `--center-from-geonames` through `main` itself (an 11 km geocode that fails the default guard and passes a 50 km one, or is recentered);
+the tile prices are taken at the geocoded center, at a center whose Mapillary and Panoramax tile counts are asserted to differ from the GeoNames point's; the offset reported under `--center-from-geonames` is the geocode's, not the 0.0 of the GeoNames center that replaced it; a guard failure is a FAILED row, not a crash; and the script refuses a `makelab*` host before any geocode and never opens a catalog.
+
 ## Choosing a new city's grid center (issue #186)
 
 `tests/test_city_center.py` pins `city_registration.choose_center`'s rule through its two real call sites, `resolve_or_register_city` and `cli._check_boundary`, with both modules' geocoding seams monkeypatched.
@@ -1492,3 +1501,15 @@ Added after the final review, which found seven more surviving:
 - **The metrics JSON is strict**: `strict_json` writes NaN (numpy's included) as `null`, parsed with a `parse_constant` that refuses `NaN`, and raises on infinity rather than writing it.
 
 The final review's 48 mutations (its two against the replaced subtraction re-aimed at the set-difference code) and eight more against this round's fixes, run after this change, all fail at least one test.
+
+## The Mapillary candidate probe (#406)
+
+**Added after the 2026-08-22 split.**
+
+`tests/test_mapillary_candidate_probe.py` drives `scripts/mapillary_candidate_probe.py` with the same in-memory `HttpResult` fetch and injected clock as the user-activity tool, whose client and pacer the probe imports.
+It pins each clause of the probe's contract: exactly one request per candidate, to `graph.mapillary.com/images` with `fields=id,captured_at,creator_id,is_pano`, `limit` 200 by default and passed through when lowered, and a bbox 2 km on a side centred on the candidate (its longitude span checked as square on the ground at 60° N);
+request starts at least 3 s apart on the injected clock;
+**no retry at all** — a 500 (the research pass's payload-size refusal), a 429 with a `Retry-After`, a 302, an HTML 200 and a transport error each stop the run after the second of three candidates, keeping the first one's row and both log lines, with exit 1 or, for the two block shapes, 75;
+a summary that marks a limit-filling answer `capped` (a floor) and reads the pano count, the dominant creator's share and the newest capture date;
+dry-run by default without building an HTTP client, a `makelab*` host refused under `--execute` before one is built, `--limit` above 200 or `--min-interval` under 3 s refused with exit 64, `--execute` without `--out` refused, an existing `--out` never overwritten, and a malformed candidates file a usage error.
+Because those tests drive `run` directly, `main` is pinned separately with `run` substituted: `--min-interval` reaches the Pacer, and `--limit`, `--out` and `--request-log` (explicit, and defaulted to `<out>.requests.jsonl`) reach `run` as given.
