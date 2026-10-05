@@ -291,6 +291,23 @@ systemctl --user show streetscape-tracker.service -p TimeoutStopUSec
 
 `daemon-reload` is safe during a live batch; `stop` obviously is not.
 
+The same copy-and-reload is what makes `Environment=STREETSCAPE_NIGHTLY=1`
+(issue #412) live. It is one of two independent ways `run-due` recognises the
+nightly unit, which is never refused beside another `run-due` on its GSV key
+(a hand run is). Until the copy is refreshed, the other signal covers it alone:
+`/proc/self/cgroup` ending in `/streetscape-tracker.service`. Verify both:
+
+```bash
+systemctl --user show streetscape-tracker.service -p Environment
+#   want: ... STREETSCAPE_NIGHTLY=1 ...
+systemctl --user show streetscape-tracker.service -p ControlGroup
+#   want: a path ending in /streetscape-tracker.service
+```
+
+If the nightly is ever refused anyway (exit 64, `REFUSED: run-due would collect
+a GSV key ...`), the refusal's last line prints the variable's value and the
+cgroup lines it read.
+
 ### Running anything by hand alongside the scheduler (issue #208)
 
 Mapillary's tile CDN and the Overpass API both rate-limit **per IP**, not per
@@ -944,6 +961,9 @@ Enrolment rows survive that and cost nothing while the channel is unconfigured, 
 ```bash
 pgrep -af '[s]cheduler .*run-due'   # [s]: never matches a parent `bash -c` holding this line
 ```
+
+A schema bump makes this one-way: code older than the catalog refuses to open it, so rolling back past a migration also means restoring a pre-migration catalog backup.
+Schema v20 (#289) is the current instance; its deploy and backfill steps are in [`../docs/operations.md`](../docs/operations.md), "Schema v20 and the `runs.total_grid_points` backfill".
 
 A city that fails `max_consecutive_failures` nights in a row is skipped
 automatically until you reset it:

@@ -83,6 +83,17 @@ Issue #312 — why every KartaView pano link on the site opens an error page, an
 The deep-link format is **theirs, not our guess**: their own SPA writes `details/{sequence_id}/{sequence_index}` into the address bar.
 What fails is the one v1 call that page depends on (`POST /details` → `osv: null`), for **every sequence probed including KartaView's own documented example** — which is the control that makes this a statement about their service rather than about our data, and the reason nobody should "fix" the URL builder.
 Generalizes past this provider: when a third-party page breaks on a link we build, probe **their** canonical example through the identical call before touching our code, and prefer a fallback keyed on geometry — the map link covers rows the photo link never could, since it needs only a position.
+
+### `mapillary-discovery-screen.md`
+
+Issue #383 — finding fresh, systematic 360° Mapillary capture OUTSIDE the catalog, since road walks can only evaluate cities already in it.
+The coarsest sequence-tile zoom (z6) is enough: 97 tiles screen North America, and a place's recent-360° length within 2 km, per km², has Spearman 0.666 against measured walk coverage over 1,111 catalog cities, with 11 of the 14 "good" cities (≥ 50% street-km, ≤ 2 yr) among the 40 scoring ≥ 3.
+Three things generalize.
+**(1) Validate a screen against the measurement it stands in for, over the whole catalog**, not against the handful of towns that motivated it: the eight calibration towns showed the score works, the 1,111 walks showed how often.
+**(2) Distance to a centre is not membership.** A frozen grid can be 40 km across; 37 places on the thinned list the 10 km rule admitted were already inside one.
+**(3) Score the unit you will act on.** Connected-cell clusters merged a statewide sweep into one 10,687 km blob; scoring each place from its own point is what ranks towns.
+It also registered its first 25 candidates on production and enabled them the same day, and found that the uploader, not the town, is the unit that generalizes.
+
 ### `mapillary-image-quality.md`
 
 Whether Mapillary's per-image `quality_score` — the only visual-quality prediction any provider we collect publishes — can rank Sidewalk candidate cities.
@@ -146,14 +157,14 @@ Its transferable lesson is that a log holds **three** populations that look alik
 ### `undated-imagery-share.md`
 
 Issue #257 — how much imagery carries no usable capture date, per provider, which is the number three prose claims in the road-walk fix rested on.
-**Undated imagery arrives in batches, not as diffuse noise**, so the per-run maximum is the number a decision has to survive and the pooled share describes no run in the distribution: GSV pools to 0.0086% but its worst run is 0.34%, Mapillary pools to 0.150% but its worst run is **23.3%**, and KartaView is 9.56% of audited photos concentrated in one 2025-11-19 ingest.
+**Undated imagery arrives in batches, not as diffuse noise**, so the per-run maximum is the number a decision has to survive and the pooled share describes no run in the distribution: GSV pools to 0.0092% but its worst run is 0.34%, Mapillary pools to 0.109% but its worst run is **23.3%**, and KartaView is 9.56% of audited photos concentrated in one 2025-11-19 ingest.
 Three things generalize.
-**(1) An undated population is a property of an upload BATCH, not of a provider** — Mapillary's entire undated corpus is 99.96% four adjacent Denver-metro runs, and KartaView's is one 2025-11-19 Grab ingest, so a pooled per-provider rate systematically understates what any single city can hit.
+**(1) An undated population is a property of an upload BATCH, not of a provider** — 98.1% of Mapillary's undated corpus is four adjacent Denver-metro runs, and KartaView's, in the API audit, is one 2025-11-19 Grab ingest, so a pooled per-provider rate systematically understates what any single city can hit.
 **(2) A batch is a single point in time by construction**, which makes the bias directional rather than merely noisy: KartaView's undated imagery is its *newest*, so excluding it from an age median drags the median **older** instead of widening its error bar.
 **(3) A per-provider question cannot be answered from a catalog that is well-populated for only one provider** — and this one nearly shipped wrong because of it.
-The first pass ran against a dev laptop holding 1,144 GSV cities but **three** Mapillary runs, and concluded Mapillary emits no undated imagery at all; production's 1,201 runs say 0.150%, about 17× GSV's rate.
+The first pass ran against a dev laptop holding 1,144 GSV cities but **three** Mapillary runs, and concluded Mapillary emits no undated imagery at all; production's 1,201 runs said 0.150%, about 17× GSV's rate (1,959 runs and 0.109%, about 12×, at the 2026-10 regeneration).
 Hence `--catalog-label`, recorded in the metrics file: it is the only thing separating that result from its opposite.
-The catalog half is a census and the KartaView half is an API sample read from `kartaview-shotdate-audit_metrics.json`; the two frames are reported side by side and never pooled.
+KartaView appears in both frames — the catalog (a census of our runs, 6 of them holding imagery) and an API sample read from `kartaview-shotdate-audit_metrics.json` — and the two are reported side by side and never pooled.
 Both are proxies for the road-walk share, which no walk recorded until #257 added `dated_covered_samples`.
 
 The generating code is `scripts/{topic}_{collect,analyze,common}.py` (kept so the result can be reproduced, not because it runs routinely) and its test pins the sampling invariant.

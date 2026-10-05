@@ -205,6 +205,33 @@ def test_write_walk_diff_detail_roundtrip(tmp_path):
     assert back["change_type"].tolist() == ["coverage_changed"]
 
 
+def test_write_walk_diff_detail_failing_mid_write_leaves_the_old_file_intact(tmp_path):
+    """The write goes to a temp name and is renamed in: a failure partway
+    through (ENOSPC, a kill) must leave the previously published file whole,
+    never truncated at the deterministic name."""
+    out = str(tmp_path / "diff.csv.gz")
+    good = compute_walk_diff(_fc([_edge("1-2", fraction=0.2)]), _fc([_edge("1-2", fraction=0.9)]))
+    write_walk_diff_detail(good, out)
+    with open(out, "rb") as fh:
+        before = fh.read()
+
+    class _FailsMidWrite:
+        def to_csv(self, fh, index=False):
+            fh.write("edge_id,change_type\npartial")
+            fh.flush()
+            raise OSError("No space left on device")
+
+        def __len__(self):
+            return 1
+
+    failing = compute_walk_diff(_fc([_edge("1-2", fraction=0.2)]), _fc([]))
+    failing.detail = _FailsMidWrite()
+    with pytest.raises(OSError, match="No space left"):
+        write_walk_diff_detail(failing, out)
+    with open(out, "rb") as fh:
+        assert fh.read() == before
+
+
 # ── Orchestrator ───────────────────────────────────────────────────────────
 
 

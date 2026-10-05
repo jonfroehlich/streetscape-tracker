@@ -1938,3 +1938,65 @@ def test_assess_city_never_defers_for_a_deadline(conn, monkeypatch, tmp_path):
 
     assert rc == 0
     assert sorted(provider for _cid, provider in ran) == sorted(ASSESS_CHANNELS)
+
+
+# --------------------------------------------------------------------------
+# the GSV-key guard (issue #412)
+# --------------------------------------------------------------------------
+
+_NIGHTLY = (
+    "/v/bin/python -m streetscape_metadata_tracker.scheduler --config "
+    "config/scheduler.makelab1.toml run-due"
+)
+
+
+def _nightly_in_ps(monkeypatch):
+    asked = []
+    found = [
+        _sched.RunDueProcess(pid=4242, args=_NIGHTLY, argv=tuple(_sched._split_ps_args(_NIGHTLY)))
+    ]
+    monkeypatch.setattr(_sched, "_scan_run_due_processes", lambda: asked.append(1) or found)
+    return asked
+
+
+def test_assess_city_refuses_gsv_streets_beside_a_run_due_on_that_key(
+    conn, monkeypatch, tmp_path, caplog
+):
+    """assess-city spends the gsv_streets key with no rate override, exactly
+    like a hand run-due, so it is refused the same way and before anything is
+    registered."""
+    _nightly_in_ps(monkeypatch)
+    rc, connected = _refusal(monkeypatch, tmp_path, conn)
+    assert rc == _sched.USAGE_EXIT_CODE
+    assert connected == []
+    assert "pid 4242 (shared key: gsv_streets)" in caplog.text
+    assert "may already be past its GSV channels" in caplog.text
+    assert "re-run with --force" in caplog.text
+    # assess-city is never the nightly, so it has no identification to explain.
+    assert "nightly unit" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        pytest.param({"estimate_only": True}, id="estimate-spends-nothing"),
+        pytest.param({"force": True}, id="force"),
+        pytest.param({"requested_providers": ["mapillary_streets"]}, id="no-gsv-key"),
+    ],
+)
+def test_assess_city_passes_the_guard_when_it_spends_no_shared_key(
+    conn, monkeypatch, tmp_path, kwargs
+):
+    """Past the guard means the catalog is opened; none of these read `ps`."""
+    asked = _nightly_in_ps(monkeypatch)
+
+    class _PastTheGuard(Exception):
+        pass
+
+    def connect(path):
+        raise _PastTheGuard
+
+    monkeypatch.setattr(_sched.db, "connect", connect)
+    with pytest.raises(_PastTheGuard):
+        _sched.cmd_assess_city(_cfg(tmp_path), QUERY, today=TODAY, assume_yes=True, **kwargs)
+    assert asked == []

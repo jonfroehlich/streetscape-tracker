@@ -927,6 +927,31 @@ def _no_host_recheck_probe(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_run_due_in_flight(monkeypatch):
+    """
+    Report "no other run-due, and not the nightly unit" to the scheduler suite-wide.
+
+    ``cmd_run_due`` and ``cmd_assess_city`` refuse a GSV key another
+    ``run-due`` in ``ps`` is collecting (issue #412), and ``ps`` is the real
+    process table. This suite is meant to be runnable on the production host
+    DURING a live nightly batch, and there every GSV test would read the
+    nightly's command line and exit 64 instead of testing what it names. The
+    nightly check reads ``/proc/self/cgroup``, pinned to False so no host's
+    cgroup layout can steer a test. Tests of either override this
+    (``monkeypatch.setattr``), which runs after the fixture and so wins; the
+    real functions are bound at import in ``tests/test_scheduler.py``.
+
+    ``_run_due_in_flight`` is a view over the scan, so it answers None too. The
+    repair scripts import it by name, keep their own binding, and stub it in
+    their own tests.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    monkeypatch.setattr(sched, "_scan_run_due_processes", lambda: [])
+    monkeypatch.setattr(sched, "_is_nightly_unit", lambda: False)
+
+
+@pytest.fixture(autouse=True)
 def _no_recheck_cooldown_wait(monkeypatch):
     """
     Make the stranded-walk retry's cooldown wait (issue #380) instant.

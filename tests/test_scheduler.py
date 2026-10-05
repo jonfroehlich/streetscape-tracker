@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import shlex
+import shutil
 import signal
 import sqlite3
 import subprocess
@@ -1792,6 +1793,594 @@ def test_provider_filter_rejects_a_value_naming_no_channel(conn, monkeypatch, va
 
     assert rc == sched.USAGE_EXIT_CODE
     assert connected == []
+
+
+# ── A second run-due on a GSV key (issue #412) ───────────────────────────────
+
+# Bound at import, BEFORE conftest's autouse fixture replaces the scheduler's
+# bindings for every test: the detector's own tests need the real functions.
+_REAL_SCAN = _sched._scan_run_due_processes
+_REAL_IS_NIGHTLY = _sched._is_nightly_unit
+
+# The nightly's command line is READ from the unit file it runs from, with %h
+# substituted as systemd would, never hand-copied: a copy is what lets the unit
+# change while every test here keeps matching the old line.
+_NIGHTLY_UNIT_PATH = Path(_PROJECT_ROOT, "deploy", "systemd", _sched.NIGHTLY_UNIT)
+_UNIT_HOME = "/homes/gws/jonf"
+
+
+def _nightly_exec_start() -> str:
+    text = _NIGHTLY_UNIT_PATH.read_text()
+    (line,) = re.findall(r"^ExecStart=(.+)$", text, re.M)
+    return line.replace("%h", _UNIT_HOME)
+
+
+_NIGHTLY_ARGS = _nightly_exec_start()
+_PY = _NIGHTLY_ARGS.split()[0]
+_HAND = f"{_PY} -m streetscape_metadata_tracker.scheduler run-due"
+
+
+def _proc(pid, args):
+    return _sched.RunDueProcess(pid=pid, args=args, argv=tuple(_sched._split_ps_args(args)))
+
+
+def _others(monkeypatch, *procs):
+    """Make the scan report these (pid, args) processes; returns the ask counter."""
+    asked = []
+    found = [_proc(pid, args) for pid, args in procs]
+    monkeypatch.setattr(_sched, "_scan_run_due_processes", lambda: asked.append(1) or found)
+    return asked
+
+
+@pytest.mark.parametrize("requested", [None, ["gsv"], ["mapillary,gsv"]])
+def test_a_hand_gsv_run_due_is_refused_beside_the_nightly(conn, monkeypatch, requested):
+    """
+    Two processes on one GSV key present ~96,000/min against a 60,000/min
+    quota, and nothing else serializes GSV across processes. Covers the GSV
+    channel named explicitly and reached through the default channel set; the
+    refusal precedes the catalog, so nothing is launched OR written.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    _register(conn, "Bend", width=1000, height=1000, step=20)
+    ran = []
+    _stub_collection(sched, monkeypatch, conn, ran)
+    connected = []
+    monkeypatch.setattr(sched.db, "connect", lambda path: connected.append(path) or conn)
+    _others(monkeypatch, (4242, _NIGHTLY_ARGS))
+
+    rc = sched.cmd_run_due(_mly_cfg(), today=date(2026, 7, 2), requested_providers=requested)
+
+    assert rc == sched.USAGE_EXIT_CODE
+    assert ran == []
+    assert connected == []
+
+
+def test_the_gsv_refusal_names_the_other_process_and_the_shared_key(conn, monkeypatch, caplog):
+    """The operator has to be able to act on it: which process, which key."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    _others(monkeypatch, (4242, _NIGHTLY_ARGS))
+    with caplog.at_level(logging.ERROR):
+        sched.cmd_run_due(_mly_cfg(), today=date(2026, 7, 2), requested_providers=["gsv"])
+
+    assert "pid 4242 (shared key: gsv)" in caplog.text
+    assert "scheduler.makelab1.toml run-due" in caplog.text
+    assert "--force" in caplog.text
+    # The other run-due may be past its GSV lanes already; the operator is
+    # told where to look and what to do then, not just to wait ~12 h.
+    assert "may already be past its GSV channels" in caplog.text
+    assert "still on gsv/gsv_streets" in caplog.text
+    assert "re-run with --force" in caplog.text
+
+
+def test_a_refused_run_due_says_it_was_not_identified_as_the_nightly(
+    conn, monkeypatch, tmp_path, caplog
+):
+    """
+    A misidentified NIGHTLY is refused like a hand run and loses the night, so
+    the refusal must explain itself: it says the process was not identified as
+    the nightly unit, and prints both signals as read.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    cgroup = tmp_path / "cgroup"
+    cgroup.write_text("0::/user.slice/user-1000.slice/session-7.scope\n")
+    monkeypatch.setattr(sched, "_PROC_CGROUP", str(cgroup))
+    monkeypatch.delenv(sched.NIGHTLY_ENV_VAR, raising=False)
+    _others(monkeypatch, (4242, _NIGHTLY_ARGS))
+    with caplog.at_level(logging.ERROR):
+        rc = sched.cmd_run_due(_mly_cfg(), today=date(2026, 7, 2), requested_providers=["gsv"])
+
+    assert rc == sched.USAGE_EXIT_CODE
+    assert f"NOT identified as the nightly unit ({sched.NIGHTLY_UNIT})" in caplog.text
+    assert f"{sched.NIGHTLY_ENV_VAR}=None" in caplog.text
+    assert "/user.slice/user-1000.slice/session-7.scope" in caplog.text
+
+
+def test_the_nightly_evidence_names_an_unreadable_cgroup(monkeypatch, tmp_path):
+    """No /proc (or a permission error) is shown as the OSError, not as silence."""
+    monkeypatch.setattr(_sched, "_PROC_CGROUP", str(tmp_path / "missing"))
+    monkeypatch.setenv(_sched.NIGHTLY_ENV_VAR, "0")
+    is_nightly, evidence = _sched._nightly_unit_signals()
+    assert is_nightly is False
+    assert f"{_sched.NIGHTLY_ENV_VAR}='0'" in evidence
+    assert "unreadable" in evidence and "No such file" in evidence
+
+
+def test_force_runs_a_hand_gsv_run_due_past_an_overlap(conn, monkeypatch):
+    """--force is the way past a `ps` match known not to be collecting."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+    ran = []
+    _stub_collection(sched, monkeypatch, conn, ran)
+    _others(monkeypatch, (4242, _NIGHTLY_ARGS))
+
+    rc = sched.cmd_run_due(
+        _mly_cfg(), today=date(2026, 7, 2), requested_providers=["gsv"], force=True
+    )
+
+    assert rc == 0
+    assert ran == [(cid, "gsv")]
+
+
+def test_the_nightly_is_never_refused_and_alerts_instead(conn, monkeypatch):
+    """
+    THE acceptance criterion: refusing the nightly would lose every channel's
+    night to protect one key. It proceeds on all channels, and the overlap it
+    cannot prevent goes to [alerts], naming the other process so someone can
+    stop it.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+    ran = []
+    _stub_collection(sched, monkeypatch, conn, ran)
+    _others(monkeypatch, (5151, f"{_HAND} --provider gsv --limit 40"))
+    monkeypatch.setattr(sched, "_is_nightly_unit", lambda: True)
+    sent = []
+    monkeypatch.setattr(
+        sched, "send_alert", lambda cfg, subject, body: sent.append((subject, body))
+    )
+
+    rc = sched.cmd_run_due(_mly_cfg(), today=date(2026, 7, 2))
+
+    assert rc == 0
+    assert ran == [(cid, "gsv"), (cid, "mapillary")]
+    overlap = [(s, b) for s, b in sent if "overlaps another GSV run" in s]
+    assert len(overlap) == 1
+    assert "pid 5151 (shared key: gsv)" in overlap[0][1]
+    assert "--provider gsv --limit 40" in overlap[0][1]
+
+
+def test_a_mapillary_catch_up_never_reads_ps(conn, monkeypatch):
+    """
+    host_lock already serializes the per-IP hosts, so refusing here would block
+    the supported catch-up path (#214) for nothing. The scan must not even be
+    ASKED: a run holding no GSV key has no reason to read `ps`.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+    ran = []
+    _stub_collection(sched, monkeypatch, conn, ran)
+    asked = _others(monkeypatch, (4242, _NIGHTLY_ARGS))
+
+    rc = sched.cmd_run_due(_mly_cfg(), today=date(2026, 7, 2), requested_providers=["mapillary"])
+
+    assert rc == 0
+    assert ran == [(cid, "mapillary")]
+    assert asked == []
+
+
+def test_a_gsv_run_due_with_no_other_run_due_proceeds(conn, monkeypatch):
+    """With the scan empty, a bare run-due asks it and collects every channel."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+    ran = []
+    _stub_collection(sched, monkeypatch, conn, ran)
+    asked = _others(monkeypatch)
+
+    rc = sched.cmd_run_due(_mly_cfg(), today=date(2026, 7, 2))
+
+    assert rc == 0
+    assert ran == [(cid, "gsv"), (cid, "mapillary")]
+    assert asked == [1]
+
+
+def test_a_gsv_dry_run_is_never_checked(conn, monkeypatch):
+    """A preview collects nothing, so it spends no quota; it is how an operator
+    sizes a catch-up mid-batch, and refusing it would only hide the answer."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    _register(conn, "Bend", width=1000, height=1000, step=20)
+    asked = _others(monkeypatch, (4242, _NIGHTLY_ARGS))
+
+    rc = sched.cmd_run_due(
+        _mly_cfg(), today=date(2026, 7, 2), requested_providers=["gsv"], dry_run=True
+    )
+
+    assert rc == 0
+    assert asked == []
+
+
+@pytest.mark.parametrize(
+    "other",
+    [
+        pytest.param(f"{_HAND} --provider mapillary --limit 5", id="mapillary-only"),
+        pytest.param(f"{_HAND} --provider=gsv_streets", id="other-gsv-key"),
+        pytest.param(f"{_HAND} --dry-run", id="dry-run"),
+        pytest.param(f"{_HAND} --provider kartaview,panoramax", id="comma-no-gsv"),
+    ],
+)
+def test_a_hand_gsv_run_is_not_refused_without_a_shared_key(conn, monkeypatch, other):
+    """
+    Only a real GSV-key intersection refuses. gsv and gsv_streets are separate
+    keys in separate projects, a dry run holds none, and a per-IP catch-up
+    holds none -- refusing on any of these would block work for nothing.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    cid = _register(conn, "Bend", width=1000, height=1000, step=20)
+    ran = []
+    _stub_collection(sched, monkeypatch, conn, ran)
+    _others(monkeypatch, (4242, other))
+
+    rc = sched.cmd_run_due(_mly_cfg(), today=date(2026, 7, 2), requested_providers=["gsv"])
+
+    assert rc == 0
+    assert ran == [(cid, "gsv")]
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        pytest.param(["run-due"], {"gsv", "mapillary"}, id="bare-is-the-default-set"),
+        pytest.param(["run-due", "--provider", "gsv"], {"gsv"}, id="space"),
+        pytest.param(["run-due", "--provider=gsv_streets"], {"gsv_streets"}, id="equals"),
+        pytest.param(
+            ["run-due", "--provider", "mapillary", "--provider=gsv"],
+            {"mapillary", "gsv"},
+            id="repeated",
+        ),
+        pytest.param(["run-due", "--provider", "gsv, mapillary"], {"gsv", "mapillary"}, id="comma"),
+        pytest.param(["run-due", "--provider", "gsv", "--dry-run"], set(), id="dry-run"),
+    ],
+)
+def test_another_run_dues_channels_are_read_from_its_argv(argv, expected):
+    assert _sched._run_due_collecting_channels(argv, ["gsv", "mapillary"]) == expected
+
+
+def test_both_gsv_keys_are_guarded_and_no_other_channel_is():
+    """gsv_streets spends its OWN key, and a hand walk overlapping the nightly
+    walk oversubscribes that key exactly as the grid channel does. Every other
+    channel has a per-IP host lock (CHANNEL_HOSTS) instead."""
+    assert _sched.GSV_KEY_CHANNELS == {"gsv", "gsv_streets"}
+    assert _sched.GSV_KEY_CHANNELS <= set(_sched.CHANNEL_HOSTS)
+    for channel in sorted(set(_sched.CHANNEL_HOSTS) - _sched.GSV_KEY_CHANNELS):
+        assert _sched.CHANNEL_HOSTS[channel], f"{channel} has no host lock and no GSV guard"
+
+
+def test_the_overlap_is_reported_per_key(monkeypatch):
+    """A gsv_streets hand walk beside the bare nightly shares gsv_streets only."""
+    cfg = _mly_cfg(
+        providers={
+            "gsv": ProviderConfig(daily_request_budget=10_000_000),
+            "gsv_streets": ProviderConfig(daily_request_budget=10_000_000),
+        }
+    )
+    _others(monkeypatch, (4242, _NIGHTLY_ARGS), (5151, f"{_HAND} --provider gsv"))
+
+    overlaps = _sched._gsv_key_overlaps(cfg, ["gsv_streets", "mapillary_streets"])
+
+    assert [(proc.pid, shared) for proc, shared in overlaps] == [(4242, ["gsv_streets"])]
+
+
+@pytest.mark.parametrize("command", ["run-due", "assess-city"])
+def test_force_reaches_its_command(monkeypatch, command):
+    """The flag is only worth anything if main() forwards it."""
+    cfg = _mly_cfg()
+    monkeypatch.setattr(_sched, "load_scheduler_config", lambda path: cfg)
+    monkeypatch.setattr(_sched, "setup_logging", lambda cfg, verbose=False: None)
+    seen = []
+    target = "cmd_run_due" if command == "run-due" else "cmd_assess_city"
+    monkeypatch.setattr(_sched, target, lambda cfg, *a, **kw: seen.append(kw) or 0)
+    base = [command] if command == "run-due" else [command, "Bend, OR"]
+
+    for extra, expected in (([], False), (["--force"], True)):
+        monkeypatch.setattr(_sched.sys, "argv", ["scheduler", "--config", "x.toml", *base, *extra])
+        assert _sched.main() == 0
+        assert seen[-1]["force"] is expected
+
+
+def _fake_ps(monkeypatch, rows):
+    """rows: (pid, ppid, args). Returns the argv the scan called ps with."""
+    out = "".join(f"{pid:>7} {ppid:>7} {args}\n" for pid, ppid, args in rows)
+    calls = []
+
+    def run(cmd, *a, **kw):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
+
+    monkeypatch.setattr(_sched.subprocess, "run", run)
+    return calls
+
+
+def test_the_scan_matches_only_real_run_due_processes(monkeypatch):
+    """
+    Every line here but 4242, 4244 and 58 must be ignored. The substring test
+    this replaced matched a pgrep loop, a tail of a log named after the
+    subcommand, a pytest `-k run-due`, a wrapper AND its child (one batch
+    counted twice), and its own ancestors. `timer-status` never held `run-due`
+    at all, so it pins only "another subcommand"; the `--config run-due.toml
+    status` line is the one that tells a token from a substring of the argv.
+    """
+    me, parent = os.getpid(), os.getppid()
+    calls = _fake_ps(
+        monkeypatch,
+        [
+            # this process, its parent (a python run-due), and a grand-parent
+            # wrapper that is itself a python run-due line: ancestors, not batches
+            (me, parent, _HAND + " --provider gsv"),
+            (parent, 900, _HAND + " --provider gsv"),
+            (900, 1, _HAND + " --provider gsv_streets"),
+            (4242, 1, _NIGHTLY_ARGS),
+            (4243, 4242, f"{_PY} streetscape_tracker.py Bend --provider gsv"),
+            # a macOS framework build re-execs as a capitalized `Python`
+            (
+                4244,
+                1,
+                "/opt/x/Python.app/Contents/MacOS/Python -m "
+                + _sched.SCHEDULER_MODULE
+                + " run-due",
+            ),
+            (
+                51,
+                1,
+                f"{_PY} -m streetscape_metadata_tracker.scheduler --config x timer-status --rearm",
+            ),
+            (
+                59,
+                1,
+                f"{_PY} -m streetscape_metadata_tracker.scheduler --config run-due.toml status",
+            ),
+            (52, 1, "tail -f logs/run-due.log"),
+            (53, 1, "bash -c while pgrep -af '[s]cheduler .*run-due'; do sleep 60; done"),
+            (54, 1, "pgrep -af scheduler .*run-due"),
+            (55, 1, f"{_PY} -m pytest tests -k run-due"),
+            (56, 1, f"{_PY} -m streetscape_street_analyzer.collect run-due"),
+            (57, 1, f"timeout 3h {_HAND} --provider mapillary"),
+            (58, 57, f"{_HAND} --provider mapillary"),
+        ],
+    )
+
+    found = _REAL_SCAN()
+
+    assert [p.pid for p in found] == [4242, 4244, 58]
+    assert calls[0][:3] == ["ps", "-ww", "-e"], "ww keeps a long line's --provider flags"
+
+
+def test_the_overlap_ignores_dry_runs_and_other_providers(monkeypatch):
+    """The scan finds every run-due; the overlap keeps only a shared GSV key."""
+    _fake_ps(
+        monkeypatch,
+        [
+            (4242, 1, _NIGHTLY_ARGS),
+            (61, 1, f"{_HAND} --dry-run"),
+            (62, 1, f"{_HAND} --provider mapillary --limit 5"),
+            (63, 1, f"{_HAND} --provider=gsv_streets"),
+        ],
+    )
+    monkeypatch.setattr(_sched, "_scan_run_due_processes", _REAL_SCAN)
+
+    overlaps = _sched._gsv_key_overlaps(_mly_cfg(), ["gsv"])
+
+    assert [(proc.pid, shared) for proc, shared in overlaps] == [(4242, ["gsv"])]
+
+
+def test_the_scan_never_reports_this_process_or_its_ancestors(monkeypatch):
+    """The nightly with nothing else running sees an empty list."""
+    me, parent = os.getpid(), os.getppid()
+    _fake_ps(
+        monkeypatch,
+        [(me, parent, _NIGHTLY_ARGS), (parent, 1, "/usr/lib/systemd/systemd --user")],
+    )
+    assert _REAL_SCAN() == []
+
+
+def test_the_scan_reads_a_run_due_whose_argv_holds_apostrophes(monkeypatch):
+    """
+    ps quotes nothing, so a quote in a path or a city is literal. shlex read
+    two apostrophes as one quoted span and swallowed the `run-due` token
+    between them, so this live GSV batch went undetected.
+    """
+    args = (
+        f"{_PY} -m streetscape_metadata_tracker.scheduler --config /homes/o'neil/c.toml "
+        "run-due --city Coeur d'Alene, Idaho --provider gsv"
+    )
+    _fake_ps(monkeypatch, [(4242, 1, args)])
+    monkeypatch.setattr(_sched, "_scan_run_due_processes", _REAL_SCAN)
+
+    overlaps = _sched._gsv_key_overlaps(_mly_cfg(), ["gsv"])
+
+    assert [(proc.pid, shared) for proc, shared in overlaps] == [(4242, ["gsv"])]
+
+
+def test_the_scan_survives_an_argv_that_is_not_utf8(monkeypatch):
+    """
+    Any process's argv may hold bytes that are not UTF-8, and strict decoding
+    raised UnicodeDecodeError out of the nightly's pre-flight. Run through the
+    REAL subprocess.run (only the command is swapped), so the decoding
+    arguments the scan passes are what is exercised; the batch on the next
+    line must still be found, not dropped by a fail-open.
+    """
+    import sys as _sys
+
+    real_run = subprocess.run
+    payload = (
+        b"     70      1 /usr/bin/caf\xe9 --x\n   4242      1 " + _NIGHTLY_ARGS.encode() + b"\n"
+    )
+    script = f"import sys; sys.stdout.buffer.write({payload!r})"
+
+    def run(cmd, *a, **kw):
+        return real_run([_sys.executable, "-c", script], *a, **kw)
+
+    monkeypatch.setattr(_sched.subprocess, "run", run)
+    assert [p.pid for p in _REAL_SCAN()] == [4242]
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        pytest.param(["run-due", "--prov", "gsv"], id="provider"),
+        pytest.param(["run-due", "--provider", "mapillary", "--dry"], id="dry-run"),
+        pytest.param(["run-due", "--prov=gsv"], id="provider-equals"),
+    ],
+)
+def test_run_due_refuses_an_abbreviated_option(argv):
+    """
+    The GSV-key guard reads another run-due's --provider and --dry-run from
+    its argv by exact token. argparse would otherwise accept `--prov gsv`, and
+    that live process would read as collecting the default set (or `--dry` as
+    collecting at all) -- so run-due refuses abbreviations outright.
+    """
+    with pytest.raises(SystemExit) as exc:
+        _sched.build_parser().parse_args(argv)
+    assert exc.value.code == 2
+
+
+def test_run_due_still_accepts_its_full_option_spellings():
+    args = _sched.build_parser().parse_args(
+        ["--config", "x.toml", "run-due", "--provider=gsv", "--provider", "mapillary", "--dry-run"]
+    )
+    assert args.providers == ["gsv", "mapillary"] and args.dry_run is True
+
+
+def test_the_nightly_unit_file_is_what_the_guard_identifies():
+    """
+    NIGHTLY_UNIT names a real unit file, that unit's own ExecStart is a run-due
+    the scan matches (a unit whose command line the scan cannot see would let
+    a hand run start beside it unrefused), and the unit sets the environment
+    signal that identifies it as the nightly.
+    """
+    assert _NIGHTLY_UNIT_PATH.is_file()
+    assert _sched._is_run_due_argv(_sched._split_ps_args(_nightly_exec_start()))
+    unit = _NIGHTLY_UNIT_PATH.read_text()
+    assert re.search(rf"^Environment={_sched.NIGHTLY_ENV_VAR}=1$", unit, re.M)
+
+
+def test_the_scan_fails_open_when_ps_is_unavailable(monkeypatch):
+    """An advisory check must never fail the work it speaks for."""
+
+    def no_ps(*a, **kw):
+        raise FileNotFoundError("ps")
+
+    monkeypatch.setattr(_sched.subprocess, "run", no_ps)
+    assert _REAL_SCAN() == []
+
+
+def test_run_due_in_flight_is_a_view_over_the_scan(monkeypatch):
+    """import-bundle and the scripts keep their contract: any run-due counts."""
+    _others(monkeypatch, (61, f"{_HAND} --dry-run"))
+    assert _sched._run_due_in_flight() == f"pid 61: {_HAND} --dry-run"
+    _others(monkeypatch)
+    assert _sched._run_due_in_flight() is None
+
+
+@pytest.mark.skipif(shutil.which("ps") is None, reason="needs a real ps")
+def test_the_real_scan_finds_a_real_run_due_shaped_process():
+    """
+    End to end against the real process table: a sleeping python whose argv
+    carries the scheduler module and the subcommand must be reported by pid.
+    The fake-ps tests cannot see a ps whose flags or columns differ by platform.
+    """
+    import sys as _sys
+
+    child = subprocess.Popen(
+        [
+            _sys.executable,
+            "-c",
+            "import time; time.sleep(60)",
+            "-m",
+            "streetscape_metadata_tracker.scheduler",
+            "--config",
+            "x.toml",
+            "run-due",
+            "--provider",
+            "gsv",
+        ]
+    )
+    try:
+        deadline = time.monotonic() + 10
+        pids: list[int] = []
+        while time.monotonic() < deadline:
+            pids = [p.pid for p in _REAL_SCAN()]
+            if child.pid in pids:
+                break
+            time.sleep(0.1)
+        assert child.pid in pids
+        assert os.getpid() not in pids
+    finally:
+        child.kill()
+        child.wait()
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        pytest.param(
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/streetscape-tracker.service\n",
+            True,
+            id="the-nightly-unit",
+        ),
+        pytest.param(
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/streetscape-prefreeze.service\n",
+            False,
+            id="another-unit",
+        ),
+        pytest.param(
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/run-u42.service\n",
+            False,
+            id="systemd-run-hand-catch-up",
+        ),
+        pytest.param("0::/user.slice/user-1000.slice/session-7.scope\n", False, id="ssh-shell"),
+        # The OnFailure notify instance carries the nightly's name inside its
+        # own: only a path-component SUFFIX match tells the two apart.
+        pytest.param(
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/"
+            "streetscape-tracker-notify@streetscape-tracker.service.service\n",
+            False,
+            id="the-notify-unit",
+        ),
+    ],
+)
+def test_the_nightly_is_identified_by_its_cgroup(monkeypatch, tmp_path, content, expected):
+    path = tmp_path / "cgroup"
+    path.write_text(content)
+    monkeypatch.setattr(_sched, "_PROC_CGROUP", str(path))
+    monkeypatch.delenv(_sched.NIGHTLY_ENV_VAR, raising=False)
+    assert _REAL_IS_NIGHTLY() is expected
+
+
+def test_no_proc_is_never_the_nightly(monkeypatch, tmp_path):
+    """macOS has no /proc: fail closed to "not nightly", i.e. the hand-run path."""
+    monkeypatch.setattr(_sched, "_PROC_CGROUP", str(tmp_path / "missing"))
+    monkeypatch.delenv(_sched.NIGHTLY_ENV_VAR, raising=False)
+    assert _REAL_IS_NIGHTLY() is False
+
+
+@pytest.mark.parametrize(("value", "expected"), [("1", True), ("0", False), ("", False)])
+def test_the_nightly_is_identified_by_its_environment_alone(monkeypatch, tmp_path, value, expected):
+    """
+    The second, independent signal: the unit sets STREETSCAPE_NIGHTLY=1, so a
+    cgroup layout nobody verified on prod (here: none at all) cannot by itself
+    refuse the night.
+    """
+    monkeypatch.setattr(_sched, "_PROC_CGROUP", str(tmp_path / "missing"))
+    monkeypatch.setenv(_sched.NIGHTLY_ENV_VAR, value)
+    assert _REAL_IS_NIGHTLY() is expected
 
 
 def test_select_providers_never_hands_back_a_none_sentinel():
@@ -7199,7 +7788,9 @@ def _run_main_run_due_raising(monkeypatch, exc, argv):
     monkeypatch.setattr(sched, "load_scheduler_config", lambda path: _publishing_cfg())
     monkeypatch.setattr(sched, "setup_logging", lambda cfg, verbose=False: None)
 
-    def boom(cfg, dry_run=False, limit=None, requested_providers=None, requested_cities=None):
+    def boom(
+        cfg, dry_run=False, limit=None, requested_providers=None, requested_cities=None, force=False
+    ):
         raise exc
 
     monkeypatch.setattr(sched, "cmd_run_due", boom)
