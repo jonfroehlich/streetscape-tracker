@@ -172,13 +172,22 @@ scheduler host (makelab2), after the merged code is deployed there.
    `--manifest data_sources/geocode_overrides.csv`.
 2. **Vet boundaries before collecting.** International OSM boundary quality
    varies, so run the boundary-audit workflow on the newly registered cities
-   before enabling them: `scripts/audit_city_boundaries.py` →
-   `scripts/reregister_boundaries.py` (dry run) → `scripts/build_boundary_review.py`
-   → human review → `scripts/apply_decisions.py`. The dry run of
-   `reregister_boundaries.py` is not optional: it writes the
-   `reregister_plan.csv` and `manual_review.csv` that `build_boundary_review.py`
-   renders, and without them the review page is empty, so the gate passes
-   having checked nothing. Swap rejects from `worldwide_candidates.csv`.
+   before enabling them: `scripts/audit_city_boundaries.py`, then #91's four
+   steps in order:
+   1. `scripts/reregister_boundaries.py` dry run, then read the plan — it
+      writes the `reregister_plan.csv` and `manual_review.csv` that the review
+      page renders, and without them the page is empty, so the gate passes
+      having checked nothing;
+   2. `scripts/reregister_boundaries.py --execute` — safe because the new
+      cities are disabled and have no runs, and required because
+      `build_boundary_review.py` silently drops every auto-resize city whose
+      geometry is still unchanged;
+   3. `scripts/build_boundary_review.py` — resized cities show before and
+      after, and `Resize cities skipped (unchanged geometry)` must read 0;
+   4. `scripts/apply_decisions.py` for the DEFER cities.
+
+   A resized city's prices in any vetting or tranche table are then stale;
+   re-price it before enabling. Swap rejects from `worldwide_candidates.csv`.
 3. **Enable in the scheduler.** `scheduler enable-city CITY` for each vetted
    city (issue #374), which also enrols it on the opt-in channels behind their
    gates (`docs/operations.md`). Default-membership channels stay global (GSV
@@ -232,7 +241,9 @@ A row is the cluster's NAME point — its most populous GeoNames place — so St
 Every row's OWN 10 km bound (its name point's, from [`experiments/panoramax-world-screen_places.csv`](experiments/panoramax-world-screen_places.csv)) also clears its floor, with one named exception the test pins, so a future row cannot be admitted on an off-centre anchor's imagery without a decision:
 
 - Kortrijk — its own bound is 2,725, 2.7% of the floor.
-  The cluster's 109,576 was summed around the anchor Wevelgem, about 7.6 km west-south-west and outside Kortrijk's 11,159 m-wide grid, so most of that imagery lies outside what Kortrijk will collect.
+  The cluster's 109,576 was summed around the anchor Wevelgem, 7.6 km west-south-west of Kortrijk's GeoNames point (6.9 km W, 3.1 km S).
+  Both distances are from that point, not from the grid: the grid freezes on the geocoded centre, 3.0 km off it (the vetting table's offset), and that geometry is not committed here, so "Wevelgem lies outside Kortrijk's 11,159 m-wide grid" is approximate.
+  The argument does not depend on it: Kortrijk's own bound, read at its own point, is 2,725, so most of the cluster's imagery lies outside what Kortrijk will collect.
   It is kept as an operator decision, because #406's table names it; expect its Panoramax series to measure close to empty while it costs 445,842 GSV points per cycle.
 
 The rows are ordered by descending bound, so `register_frame.py --limit N` registers the richest N first.

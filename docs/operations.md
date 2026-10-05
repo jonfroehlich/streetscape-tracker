@@ -386,9 +386,10 @@ python scripts/register_frame.py --manifest panoramax_360_cities.csv \
   `--center-from-geonames` is deliberately NOT passed — a row that geocodes differently on the day should be skipped and listed for review, not quietly recentered.
 - `--notes-label` is what makes the batch selectable later: without it all 40 claim to be worldwide-frame cities in `cities.notes`.
 - Each `--execute` line prints the frozen W x H; compare it with the vetting table and stop on any difference — Nominatim can answer differently than it did on 2026-10-04.
+  (The boundary audit below may later resize a city on purpose; that difference is expected, and it makes that city's price stale.)
 
 Cities register with `enabled = 0`, so nothing is collected yet.
-Then run the boundary-audit chain (`audit_city_boundaries.py` → `reregister_boundaries.py` dry run → `build_boundary_review.py` → human review → `apply_decisions.py`, `docs/worldwide_sampling.md` step 2) over this batch only, in its own audit directory so the catalog-wide report is not overwritten.
+Then run the boundary-audit chain (`audit_city_boundaries.py`, then `docs/worldwide_sampling.md` step 2's four steps) over this batch only, in its own audit directory so the catalog-wide report is not overwritten.
 The batch is selected by its notes label, so no id can be dropped by hand:
 
 ```bash
@@ -404,15 +405,34 @@ echo "${#CITY_ARGS[@]}"   # expect 80: 40 ids, two words each
 python scripts/audit_city_boundaries.py --data-dir "$DATA" \
     --cache audit/pmx406/nominatim_boundary_cache.jsonl --report audit/pmx406/boundary_audit_report.csv \
     "${CITY_ARGS[@]}"
+# 1. dry run, then read the plan: "Re-register" is the auto-resize count, "Deferred" the manual-review count
 python scripts/reregister_boundaries.py --data-dir "$DATA" \
-    --report audit/pmx406/boundary_audit_report.csv --out-dir audit/pmx406   # DRY RUN only: writes the plan CSVs below
+    --report audit/pmx406/boundary_audit_report.csv --out-dir audit/pmx406
+# 2. apply the auto-resizes
+python scripts/reregister_boundaries.py --data-dir "$DATA" \
+    --report audit/pmx406/boundary_audit_report.csv --out-dir audit/pmx406 --execute
+# 3. render the review page: expect manual=<Deferred>, resize=<Re-register> and "Resize cities skipped (unchanged geometry): 0"
 python scripts/build_boundary_review.py --data-dir "$DATA" --audit-dir audit/pmx406
-python scripts/apply_decisions.py --data-dir "$DATA" --decisions <the exported boundary_decisions.csv>   # dry run, then --execute
+# 4. apply the human decisions for the DEFER cities: dry run, then --execute
+python scripts/apply_decisions.py --data-dir "$DATA" --decisions <the exported boundary_decisions.csv>
 ```
 
-`build_boundary_review.py` renders only the cities in `reregister_plan.csv` and `manual_review.csv`, which the `reregister_boundaries.py` dry run writes; without that step the page is empty and the gate passes having checked nothing.
-Never pass `--execute` to `reregister_boundaries.py` here — the human decision is applied by `apply_decisions.py`.
-A city with an `OK` verdict appears on neither list, so an empty page is a pass only when the report's `verdict` column says every city is `OK`.
+The four steps are #91's sequence, and their order is load-bearing:
+
+1. **Dry run, then read the plan.**
+   It writes `reregister_plan.csv` (small `UNDER` cities, OSM bbox ≤ 30 km on both axes) and `manual_review.csv` (every other non-`OK` verdict); `build_boundary_review.py` renders only the cities on those two lists, so without this step the page is empty and the gate passes having checked nothing.
+2. **`--execute`.**
+   This is safe here because every city in the batch is disabled and has no runs, so a recenter-and-grow resets no diff continuity.
+   It is also required: `build_boundary_review.py` shows a plan city only once its geometry has CHANGED from the audit snapshot, so after a dry run alone every auto-resize city is silently dropped, counted only in a `Resize cities skipped (unchanged geometry)` line and a "not shown" banner — and the page is not empty whenever any DEFER city exists, so nothing else would catch it.
+3. **`build_boundary_review.py`.**
+   Resized cities show before and after, and DEFER cities show the OSM boundary beside the frozen grid; a nonzero `Resize cities skipped (unchanged geometry)` means step 2 did not run.
+   A city with an `OK` verdict appears on neither list, so an empty page is a pass only when the report's `verdict` column says every city is `OK`.
+4. **`apply_decisions.py` for the DEFER cities.**
+   A resize that looks wrong on the page is undone the same way, with its "Revert to grid before resize" decision.
+
+**A resized city's prices are stale.**
+The vetting table in `worldwide_sampling.md` and the tranche table in step 4 below were priced on the registered geometry, and the auto-resize grows and recenters a grid while `apply_decisions.py` can set any size; re-price any city either one changed (its new W x H is in `reregister_plan.csv` or the decisions export) before enabling its tranche — including whether it still clears KartaView's 1,000-request enrol ceiling — and move it to a later night if it no longer fits.
+The batch stays selectable afterwards: `update_city_geometry` APPENDS its audit note to `cities.notes`, so the notes-label query above still returns all 40.
 
 The audit geocodes one structured query per city through Nominatim (about 40 requests), never a provider.
 
@@ -426,12 +446,15 @@ python -m streetscape_metadata_tracker.scheduler enable-city lons-le-saunier--bo
     --config config/scheduler.makelab1.toml --dry-run
 ```
 
-Then freeze the tranche's OSM networks during the day, so the gsv_streets walks never contact Overpass at night (#341).
+The tranche's OSM networks must be frozen during the day, so the gsv_streets walks never contact Overpass at night (#341).
+`streetscape-prefreeze.timer` already does this daily at 15:00 (up to 30 min late) with `--nights 2 --limit 40 --pause-s 120 --execute --alert`, so a tranche enabled BEFORE the timer fires needs nothing more.
+Only a tranche enabled after that day's pass needs a manual one, and it keeps the timer's `--limit 40`, because without it the plan covers every cold network in the window and Overpass volume is uncapped.
+Do not overlap the timer's pass: both take the Overpass host lock, so one of the two exits busy (80).
 The script is a dry run unless given `--execute`, so read the listing first and then freeze:
 
 ```bash
-python scripts/prefreeze_street_networks.py --config config/scheduler.makelab1.toml --nights 1             # lists only
-python scripts/prefreeze_street_networks.py --config config/scheduler.makelab1.toml --nights 1 --execute   # freezes
+python scripts/prefreeze_street_networks.py --config config/scheduler.makelab1.toml --nights 1 --limit 40             # lists only
+python scripts/prefreeze_street_networks.py --config config/scheduler.makelab1.toml --nights 1 --limit 40 --execute   # freezes
 ```
 
 Before the next tranche, read the night's log: every tranche city collected (or paused at a cap, exit 83, which resumes), no Mapillary block (exit 75), no Panoramax 403/429 (a refusal reverts #405's stage), no Overpass latch.

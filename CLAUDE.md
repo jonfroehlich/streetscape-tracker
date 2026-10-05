@@ -121,7 +121,7 @@ Every script in this table is catalog/disk-only (no API calls), dry-run by defau
 | `recompute_run_diffs.py --provider gsv --city C --regenerate-json` | Re-derive existing `run_diffs` rows and their detail files from both CSVs under the current reader (#245; #394's re-diff); updates in place so `diff_id` never moves, deletes only a diff-shaped file no other row names, heals stale per-run JSON on a re-run, refuses `--execute` while `run-due` is in flight |
 | `sweep_orphan_diff_details.py [--min-age-hours 24]` | List (and with `--execute` remove) diff detail files no `run_diffs`/`street_walk_diffs` row points at (#265); reads the catalog read-only, never deletes a file younger than the window, refuses `--execute` while `run-due` is in flight or against a catalog older than the disk; a local removal does not reach the web server, since the publish never passes `--delete` |
 
-The boundary-audit workflow (does a frozen grid actually fit its city?) is a four-script chain, each with a pinning test: `audit_city_boundaries.py` → `reregister_boundaries.py` (its dry run writes the CSVs the review page renders; skip it and the page is empty) → `build_boundary_review.py` → `apply_decisions.py`.
+The boundary-audit workflow (does a frozen grid actually fit its city?) is a four-script chain, each with a pinning test: `audit_city_boundaries.py` → `reregister_boundaries.py` dry run (writes the CSVs the review page renders; skip it and the page is empty) then `--execute` (the page silently drops an auto-resize city whose geometry is unchanged) → `build_boundary_review.py` → `apply_decisions.py`.
 
 ### Credentials and config
 

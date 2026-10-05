@@ -62,8 +62,11 @@ NAMED_EXCEPTIONS = {"2963398": "Kilkenny"}
 # Values are (place name, own 10 km bound, anchor name, anchor's cluster bound).
 OWN_BOUND_EXCEPTIONS = {
     # Kept by operator decision (#406's table names it). Its own bound is 2.7%
-    # of the floor; the 109,576 was summed around Wevelgem, about 7 km WSW and
-    # outside Kortrijk's ~11 km-wide grid. Expect a near-empty Panoramax series.
+    # of the floor; the 109,576 was summed around Wevelgem, 7.6 km WSW of
+    # Kortrijk's GeoNames point (6.9 km W, 3.1 km S). The grid freezes on the
+    # geocoded centre ~3 km from that point, so "outside the ~11 km-wide grid"
+    # is approximate; the own bound is the argument. Expect a near-empty
+    # Panoramax series.
     "2794055": ("Kortrijk", 2_725, "Wevelgem", 109_576),
 }
 
@@ -368,7 +371,7 @@ def test_every_row_clears_the_floor_on_its_own_bound(manifest_rows, places):
     """
     A row's own name-point bound clears its floor, or it is a named exception:
     the cluster bound alone admitted Kortrijk on imagery summed around
-    Wevelgem, outside Kortrijk's grid.
+    Wevelgem, 7.6 km from Kortrijk's own point.
     """
     for row in manifest_rows:
         gid = row["geonameid"]
