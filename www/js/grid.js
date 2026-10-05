@@ -138,7 +138,7 @@ function gridLabelCellHtml(row) {
 // ── The growth screen (issue #349) ────────────────────────────
 
 /**
- * The tooltip a positive screen cell carries.
+ * The tooltip a positive ("hint") or flat-only screen cell carries.
  *
  * The artifact's own `caveat` goes in VERBATIM rather than a paraphrase kept
  * here: it is the writer's statement of what the number may be read as, and a
@@ -153,20 +153,29 @@ function gridLabelCellHtml(row) {
  */
 function gridScreenHintTitle(row, provider, entry) {
   const date = row[`screenDate_${provider}`];
+  const lead =
+    row[`screenVerdict_${provider}`] === "flat"
+      ? `Screened ${date}: no 360° imagery in or around this city, but at most ` +
+        `${formatCellNumber(row[`screenAny_${provider}`])} flat (non-360°) pictures, ` +
+        "so it is worth measuring for any-imagery coverage, not for 360°."
+      : `Screened ${date}: at most ${formatCellNumber(row[`screen_${provider}`])} 360° pictures ` +
+        "in or around this city.";
   const parts = [
-    `Screened ${date}: at most ${formatCellNumber(row[`screen_${provider}`])} 360° pictures ` +
-      "in or around this city.",
+    lead,
     entry?.caveat ?? "Upper bounds, not counts: only a collection run measures coverage.",
   ];
   const first = row[`screenFirstPositive_${provider}`];
   if (first) {
-    // The writer's own caveat on this field: a city already positive at the
-    // FIRST screen records when we started looking, not when imagery arrived.
+    // The writer derives this date from the ANY-imagery bound
+    // (`db.get_provider_screen_firsts`, `pictures_upper_bound > 0`), so under
+    // a 360° bound it must say so: flat imagery may have arrived first.
+    // And the writer's own caveat on it: a city already positive at the FIRST
+    // screen records when we started looking, not when imagery arrived.
     parts.push(
       first === entry?.first_screen_date
-        ? `Positive since the first screen (${first}), which is when watching began, ` +
-            "not when the imagery arrived."
-        : `First screened positive ${first}.`
+        ? `Positive (any imagery) since the first screen (${first}), which is when watching ` +
+            "began, not when the imagery arrived."
+        : `First screened positive (any imagery) ${first}.`
     );
   }
   return parts.join(" ");
@@ -193,9 +202,11 @@ function gridScreenWarning(row, provider, entry) {
 /**
  * Cell parts for one provider's screen leaf.
  *
- * The asymmetry is the whole rendering: a zero is a FACT and says so in words
- * ("0 · none"), a positive number is a HINT and is printed as a bound ("≤ N"),
- * never as a bare count a reader could take for coverage.
+ * The asymmetry is the whole rendering: a zero is a FACT and says so in words,
+ * a positive number is a HINT and is printed as a bound ("≤ N"), never as a
+ * bare count a reader could take for coverage. There are two zeros, kept
+ * apart: "0 · none" (no imagery of any kind, the conclusive zero) and
+ * "0 · flat only" (no 360°, but flat pictures an any-imagery reading counts).
  *
  * @param {Object} row - From pivotGridRows.
  * @param {string} provider
@@ -208,15 +219,19 @@ function gridScreenCellParts(row, provider, entry) {
   const warning = gridScreenWarning(row, provider, entry);
   if (verdict === "none") {
     const title =
-      `Screened ${row[`screenDate_${provider}`]}: no 360° imagery in or around this city` +
+      `Screened ${row[`screenDate_${provider}`]}: no imagery of any kind in or around this city` +
       (warning ? `. ${warning}` : " (a zero is conclusive)");
     return { html: "0 · none", className: "screen-cell screen-none", title: escapeHtml(title) };
   }
   const hint = gridScreenHintTitle(row, provider, entry);
+  const title = escapeHtml(warning ? `${hint} ${warning}` : hint);
+  if (verdict === "flat") {
+    return { html: "0 · flat only", className: "screen-cell screen-flat", title };
+  }
   return {
     html: `≤ ${formatCellNumber(row[`screen_${provider}`])}`,
     className: "screen-cell screen-hint",
-    title: escapeHtml(warning ? `${hint} ${warning}` : hint),
+    title,
   };
 }
 
@@ -241,9 +256,10 @@ function gridScreenColumns(screenDoc) {
     groupLabel: "Growth screen (360°, upper bound)",
     groupTitle:
       "Upper bound on 360° pictures in or around each city, from the weekly growth screen — " +
-      "NOT coverage. A zero is conclusive; a positive number only means a closer look is " +
-      "worth taking. Sorted descending, the top rows are the cities most worth MEASURING, " +
-      "not the best covered.",
+      "NOT coverage. \"0 · none\" (no imagery of any kind) is conclusive; \"0 · flat only\" " +
+      "means no 360° imagery but some flat pictures; a positive number only means a closer " +
+      "look is worth taking. Sorted descending, the top rows are the cities most worth " +
+      "MEASURING, not the best covered.",
     keyFor: (p) => `screen_${p}`,
     cellFor: (p) => (row) => gridScreenCellParts(row, p, screenDoc.providers[p]),
     initial: "desc",
@@ -593,7 +609,7 @@ function buildGridPresets(columns = GRID_COLUMNS) {
             id: "screen",
             label: "Where to look next",
             title:
-              "The growth screen's upper bounds beside measured coverage: a zero rules a " +
+              "The growth screen's upper bounds beside measured coverage: \"0 · none\" rules a " +
               "city out, a positive bound only says it is worth collecting",
             columns: [...groupKeys("screen"), ...metricKeys("cov"), ...groupKeys("collected")],
           },
@@ -699,16 +715,18 @@ function buildGridFilters(providers = gridProviders(), screened = []) {
       : []),
     // One per screened provider (issue #349). A select, not a slider: the
     // screen's number is a bound, and a window over bounds ("between 100 and
-    // 500") asks a question the instrument cannot answer. The three readings
-    // it CAN answer are a fact, a hint, and "not looked at".
+    // 500") asks a question the instrument cannot answer. The readings it CAN
+    // answer are a fact (no imagery), flat imagery only, a 360° hint, and
+    // "not looked at" -- the same four states the cell renders.
     ...screened.map((p) => ({
       key: `screen_${p}`,
       label: `Screened (${providerShortLabel(p)})`,
       type: "select",
       anyLabel: "Any",
       options: [
-        { value: "none", label: "No 360° imagery (0)" },
-        { value: "hint", label: "Positive (upper bound)" },
+        { value: "none", label: "No imagery at all (0 · none)" },
+        { value: "flat", label: "Flat imagery only (0 · flat only)" },
+        { value: "hint", label: "360° positive (upper bound)" },
         { value: "unscreened", label: "Not screened" },
       ],
       test: (row, value) =>
@@ -777,9 +795,10 @@ function bestAcrossProviders(row, providers, keyFor, lowest = false) {
  * that reports it.
  *
  * A screen document (issue #349) adds, for each SCREENED provider `p`,
- * `screen_${p}` (the 360° upper bound), `screenDate_${p}`,
- * `screenVerdict_${p}` ("none" / "hint") and `screenFirstPositive_${p}`, all
- * null for a city that provider never screened. With no document, no key is
+ * `screen_${p}` (the 360° upper bound), `screenAny_${p}` (the any-imagery
+ * upper bound), `screenDate_${p}`, `screenVerdict_${p}` ("none" / "flat" /
+ * "hint") and `screenFirstPositive_${p}`, all null for a city that provider
+ * never screened. With no document, no key is
  * added at all, so the rows are exactly what they were before #349.
  *
  * Rows are still the cities the AGGREGATE carries. A city the screen covers
@@ -915,6 +934,7 @@ function pivotGridRows(rawCities, screenDoc = null) {
       // An id-less row joins nothing (its cityId is ""), so it reads unscreened.
       const record = row.cityId ? lookupScreen(screenDoc, p, row.cityId) : null;
       row[`screen_${p}`] = record?.pictures_360_upper_bound ?? null;
+      row[`screenAny_${p}`] = record?.pictures_upper_bound ?? null;
       row[`screenDate_${p}`] = record?.screen_date ?? null;
       row[`screenVerdict_${p}`] = screenVerdict(record);
       // Absent (never positive) in the artifact reads null here.
@@ -1023,8 +1043,13 @@ function updateGridCaption(shown, all, generatedAt, screenSuffix = "") {
  * Read off the LAST `series` point — the latest screen's own catalog-level
  * counts — rather than recounted from the city records, which carry each
  * city's latest answer and so can mix screen dates. "Screened positive" and
- * not "hold imagery": a positive bound is a hint, and `cities_positive` counts
- * any imagery, not only the 360° the column shows.
+ * not "hold imagery": a positive bound is a hint. "(any imagery)" because
+ * `cities_positive` counts `pictures_upper_bound > 0`, which is the column's
+ * "flat only" and "≤ N" cells together, not the 360° hints alone.
+ *
+ * The unlisted count is its own clause, not "N of them": it counts screened
+ * records of ANY verdict (zeros included) and of any screen date, so it is
+ * not a subset of the positive count beside it.
  *
  * @param {?Object} screenDoc - Parsed provider_screen.json.gz, or null.
  * @param {Object<string, number>} [unlisted] - From pivotGridRows.
@@ -1032,8 +1057,8 @@ function updateGridCaption(shown, all, generatedAt, screenSuffix = "") {
  *
  * @example
  *   gridScreenCaption(doc, { panoramax: 2 });
- *   // " · Panoramax screen 2026-09-16: 411 of 1,221 cities screened positive;
- *   //    2 of them have no published run, so no row here"
+ *   // " · Panoramax screen 2026-09-16: 411 of 1,221 cities screened positive
+ *   //    (any imagery); 2 screened cities have no published run, so no row here"
  */
 function gridScreenCaption(screenDoc, unlisted = {}) {
   return screenedProviders(screenDoc)
@@ -1042,13 +1067,15 @@ function gridScreenCaption(screenDoc, unlisted = {}) {
       const series = Array.isArray(entry.series) ? entry.series : [];
       const last = series[series.length - 1];
       if (!last) return "";
-      const missing = unlisted[p]
-        ? `; ${formatCellNumber(unlisted[p])} of them have no published run, so no row here`
+      const n = unlisted[p];
+      const missing = n
+        ? `; ${formatCellNumber(n)} screened ${n === 1 ? "city has" : "cities have"} ` +
+          "no published run, so no row here"
         : "";
       return (
         ` · ${providerShortLabel(p)} screen ${entry.latest_screen_date ?? last.screen_date}: ` +
         `${formatCellNumber(last.cities_positive)} of ${formatCellNumber(last.cities_screened)} ` +
-        `cities screened positive${missing}`
+        `cities screened positive (any imagery)${missing}`
       );
     })
     .join("");
@@ -1087,7 +1114,7 @@ function gridScreenSeriesHtml(provider, entry) {
         <thead><tr>
           <th scope="col">Screen date</th>
           <th scope="col">Cities screened</th>
-          <th scope="col">Cities positive</th>
+          <th scope="col">Cities positive (any imagery)</th>
           <th scope="col">360° upper bound (sum)</th>
         </tr></thead>
         <tbody>${body}</tbody>

@@ -962,7 +962,8 @@ def build():
 
         # 6) Two weekly Panoramax growth screens (#316), so grid.html's screen
         # column, filter, caption and series table (#349) render something an
-        # assertion can see. The three readings that column has to keep apart:
+        # assertion can see. Three of the readings that column has to keep apart
+        # (the fourth, flat-only "0 · flat only", is pinned in grid.test.js):
         #   - Alpha City: a POSITIVE upper bound (a hint, printed "≤ N"),
         #     first positive at the SECOND screen, so it is a genuine arrival
         #     rather than "positive since we started looking".

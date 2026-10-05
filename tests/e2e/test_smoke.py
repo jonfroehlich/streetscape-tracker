@@ -1251,7 +1251,7 @@ def test_grid_reads_the_provider_screen_as_a_hint_not_a_measure(page: Page, base
     # headline read), but the caption names the latest screen's own counts.
     expect(page.locator('th[data-key="screen_panoramax"]')).to_have_count(0)
     expect(page.locator("#grid-caption")).to_contain_text(
-        "Panoramax screen 2026-04-20: 1 of 2 cities screened positive"
+        "Panoramax screen 2026-04-20: 1 of 2 cities screened positive (any imagery)"
     )
     # The prose and the series table are shown only because a screen loaded.
     assert page.locator("#grid-screen-about").evaluate("el => el.hidden") is False
@@ -1274,7 +1274,9 @@ def test_grid_reads_the_provider_screen_as_a_hint_not_a_measure(page: Page, base
     # The hint's title carries the artifact's OWN caveat, read from the file.
     expect(alpha).to_have_attribute("title", re.compile(r"Upper bounds, not counts\."))
     expect(zero).to_have_text("0 · none")
-    expect(zero).to_have_attribute("title", re.compile(r"a zero is conclusive"))
+    expect(zero).to_have_attribute(
+        "title", re.compile(r"no imagery of any kind .*a zero is conclusive")
+    )
     expect(map_ville).to_have_text("—")
 
     # The per-provider select keys on the verdict, and round-trips the URL.

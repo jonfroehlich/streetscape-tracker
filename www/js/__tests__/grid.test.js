@@ -949,8 +949,9 @@ const DOC_CAVEAT = "Upper bounds, not counts (fixture caveat 7f3a): a zero is co
 
 /**
  * A screen document in the writer's shape (json_summarizer
- * .generate_provider_screen_summary): Seattle positive, Bend a conclusive zero,
- * and one screened city the aggregate does not carry. The provider is
+ * .generate_provider_screen_summary): Seattle positive for 360°, Bend a
+ * conclusive zero, Davis flat imagery only (a zero 360° bound under a positive
+ * any-imagery one), and one screened city the aggregate does not carry. The provider is
  * Panoramax, which the grid payloads below never COLLECT — the screened list
  * and the collected list are different lists.
  */
@@ -981,6 +982,15 @@ function screenDoc(overrides = {}) {
             pictures_upper_bound: 0,
             pictures_360_upper_bound: 0,
             pictures_flat_upper_bound: 0,
+          },
+          {
+            city_id: "davis--ca",
+            screen_date: "2026-09-16",
+            cells: 3,
+            pictures_upper_bound: 4321,
+            pictures_360_upper_bound: 0,
+            pictures_flat_upper_bound: 4321,
+            first_positive_date: "2026-09-16",
           },
           {
             city_id: "unpublished--zz",
@@ -1016,21 +1026,57 @@ function screenDoc(overrides = {}) {
   };
 }
 
-const SCREEN_PAYLOAD = () => payload(SEATTLE_GSV, SEATTLE_MAPILLARY, BEND_GSV);
+const DAVIS_GSV = { ...SEATTLE_GSV, city_id: "davis--ca", city: "Davis", state: { name: "California" } };
+const SCREEN_PAYLOAD = () => payload(SEATTLE_GSV, SEATTLE_MAPILLARY, BEND_GSV, DAVIS_GSV);
+
+// A no-screen row's keys, in order, as origin/main's grid.js (the build before
+// #349) produced them for this payload -- read off that file, not this one, so
+// the list is the pre-#349 row model rather than this build compared with
+// itself. Any key added to every row, screen or not, fails against it.
+const PRE_349_ROW_KEYS = [
+  "cityId",
+  "label",
+  "fullLabel",
+  "providers",
+  "providersLabel",
+  "providerCount",
+  "deltaPct",
+  "deltaPctAny",
+  "deltaMedianAge",
+  "searchPoints",
+  "gridWidthM",
+  "gridStepM",
+  "gridSpanLabel",
+  "areaKm2",
+  "filename",
+  "pct_gsv",
+  "pctAny_gsv",
+  "medianAge_gsv",
+  "panos_gsv",
+  "collected_gsv",
+  "snapshots_gsv",
+  "filename_gsv",
+  "pct_mapillary",
+  "pctAny_mapillary",
+  "medianAge_mapillary",
+  "panos_mapillary",
+  "collected_mapillary",
+  "snapshots_mapillary",
+  "filename_mapillary",
+  "pctBest",
+  "medianAgeBest",
+];
 
 test("pivotGridRows: with no screen the rows are exactly the pre-#349 rows", () => {
   const raw = SCREEN_PAYLOAD();
   const bare = pivotGridRows(raw).rows;
   assert.deepEqual(pivotGridRows(raw, null).rows, bare);
   assert.deepEqual(pivotGridRows(raw, { schema_version: 1, providers: {} }).rows, bare);
-  // Not just "the same as each other": no screen key exists at all, so a
-  // mutation that always adds them (as nulls) fails here.
+  // Not just "the same as each other": every row's key list is pinned to the
+  // pre-#349 build's, so a mutation that adds ANY key to every row -- a screen
+  // key as null, or anything else -- fails here.
   for (const row of bare) {
-    assert.deepEqual(
-      Object.keys(row).filter((k) => k.startsWith("screen")),
-      [],
-      `${row.cityId} carries a screen key with no screen`
-    );
+    assert.deepEqual(Object.keys(row), PRE_349_ROW_KEYS, `${row.cityId}'s row model moved`);
   }
 });
 
@@ -1047,15 +1093,23 @@ test("pivotGridRows: screen keys appear for SCREENED providers only, with the ve
   assert.equal(seattle.screenDate_panoramax, "2026-09-16");
   assert.equal(seattle.screenVerdict_panoramax, "hint");
   assert.equal(seattle.screenFirstPositive_panoramax, "2026-09-16");
+  assert.equal(seattle.screenAny_panoramax, 900);
   assert.equal(bend.screen_panoramax, 0);
+  assert.equal(bend.screenAny_panoramax, 0);
   assert.equal(bend.screenVerdict_panoramax, "none");
+  // Flat imagery only: the 360° bound is zero, the any-imagery bound is not,
+  // and that is NOT the conclusive "none".
+  const davis = rows.find((r) => r.cityId === "davis--ca");
+  assert.equal(davis.screen_panoramax, 0);
+  assert.equal(davis.screenAny_panoramax, 4321);
+  assert.equal(davis.screenVerdict_panoramax, "flat");
   // Absent in the artifact (never positive) reads null, not undefined.
   assert.equal(bend.screenFirstPositive_panoramax, null);
   // A collected-but-unscreened provider gets no screen key.
   assert.ok(!("screen_gsv" in seattle));
   assert.ok(!("screenVerdict_mapillary" in seattle));
   // The screened city with no published run is not a row, and is counted.
-  assert.equal(rows.length, 2);
+  assert.equal(rows.length, 3);
   assert.deepEqual(screenUnlisted, { panoramax: 1 });
 });
 
@@ -1065,7 +1119,7 @@ test("pivotGridRows: a city the screen never reached reads null on every screen 
     (c) => c.city_id !== "bend--or"
   );
   const bend = pivotGridRows(SCREEN_PAYLOAD(), doc).rows.find((r) => r.cityId === "bend--or");
-  for (const key of ["screen", "screenDate", "screenVerdict", "screenFirstPositive"]) {
+  for (const key of ["screen", "screenAny", "screenDate", "screenVerdict", "screenFirstPositive"]) {
     assert.equal(bend[`${key}_panoramax`], null, key);
   }
 });
@@ -1108,13 +1162,25 @@ test("screen cells: a zero is a fact in words, a positive is a bound, none is a 
   const { rows } = pivotGridRows(SCREEN_PAYLOAD(), doc);
   const seattle = rows.find((r) => r.cityId === "seattle--wa");
   const bend = rows.find((r) => r.cityId === "bend--or");
+  const davis = rows.find((r) => r.cityId === "davis--ca");
 
   const zero = gridScreenCellParts(bend, "panoramax", entry);
   assert.equal(zero.html, "0 · none");
   assert.equal(
     zero.title,
-    "Screened 2026-09-16: no 360° imagery in or around this city (a zero is conclusive)"
+    "Screened 2026-09-16: no imagery of any kind in or around this city (a zero is conclusive)"
   );
+
+  // Flat only: a zero 360° bound, but NOT the conclusive zero -- its title
+  // names the flat bound, carries the caveat, and never says "conclusive".
+  const flat = gridScreenCellParts(davis, "panoramax", entry);
+  assert.equal(flat.html, "0 · flat only");
+  assert.equal(flat.className, "screen-cell screen-flat");
+  assert.match(flat.title, /^Screened 2026-09-16: no 360° imagery in or around this city/);
+  assert.match(flat.title, /at most 4,321 flat \(non-360°\) pictures/);
+  assert.ok(flat.title.includes(global.escapeHtml(DOC_CAVEAT)), flat.title);
+  assert.doesNotMatch(flat.title, /no imagery of any kind/);
+  assert.match(flat.title, /First screened positive \(any imagery\) 2026-09-16/);
 
   const hint = gridScreenCellParts(seattle, "panoramax", entry);
   assert.equal(hint.html, "≤ 512");
@@ -1145,8 +1211,11 @@ test("screen cells: a first positive AT the first screen says when watching bega
     "panoramax",
     entry
   );
-  assert.match(later.title, /First screened positive 2026-09-16/);
+  // The writer dates this from the ANY-imagery bound, so under a 360° bound it
+  // has to say so: flat imagery may have arrived before the 360° did.
+  assert.match(later.title, /First screened positive \(any imagery\) 2026-09-16\./);
   assert.doesNotMatch(later.title, /watching began/);
+  assert.match(atFirst.title, /Positive \(any imagery\) since the first screen \(2026-09-09\)/);
 });
 
 test("screen cells: the latest pass's cell_warning replaces 'conclusive', on that date only", () => {
@@ -1167,6 +1236,50 @@ test("screen cells: the latest pass's cell_warning replaces 'conclusive', on tha
   );
   assert.ok(!older.title.includes(warning));
   assert.match(older.title, /a zero is conclusive/);
+});
+
+test("screen cells: the cell_warning reaches the hint and flat titles too", () => {
+  const warning = "Hexagons were read at an unexpected resolution (fixture warning 91c2).";
+  const entry = screenDoc({ instrument: { cell_warning: warning } }).providers.panoramax;
+  const base = { screenDate_panoramax: "2026-09-16", screenFirstPositive_panoramax: null };
+  const hint = gridScreenCellParts(
+    { ...base, screen_panoramax: 9, screenAny_panoramax: 9, screenVerdict_panoramax: "hint" },
+    "panoramax",
+    entry
+  );
+  assert.ok(hint.title.endsWith(warning), hint.title);
+  const flat = gridScreenCellParts(
+    { ...base, screen_panoramax: 0, screenAny_panoramax: 7, screenVerdict_panoramax: "flat" },
+    "panoramax",
+    entry
+  );
+  assert.ok(flat.title.endsWith(warning), flat.title);
+});
+
+test("screen cells: a caveat with quotes and markup is escaped into the title", () => {
+  // The live caveat contains an apostrophe ("the city's"); an unescaped `"`
+  // would end the title attribute and spill the rest into the markup.
+  // This file's stub escapeHtml leaves quotes alone, so the REAL one is
+  // swapped in for the duration: the page runs the real one.
+  const caveat = `A "quoted" caveat <b>with</b> the city's markup & more.`;
+  const entry = screenDoc({ caveat }).providers.panoramax;
+  const base = { screenDate_panoramax: "2026-09-16", screenFirstPositive_panoramax: null };
+  const stub = global.escapeHtml;
+  global.escapeHtml = require("../streetscape-utils.js").escapeHtml;
+  try {
+    for (const verdict of ["hint", "flat"]) {
+      const { title } = gridScreenCellParts(
+        { ...base, screen_panoramax: 5, screenAny_panoramax: 5, screenVerdict_panoramax: verdict },
+        "panoramax",
+        entry
+      );
+      assert.ok(title.includes("A &quot;quoted&quot; caveat &lt;b&gt;"), `${verdict}: ${title}`);
+      assert.ok(title.includes("city&#39;s markup &amp; more."), `${verdict}: ${title}`);
+      assert.doesNotMatch(title, /["'<>]/, `${verdict}: raw markup in ${title}`);
+    }
+  } finally {
+    global.escapeHtml = stub;
+  }
 });
 
 test("presets: the screen is never in the default, and 'Where to look next' needs a screen", () => {
@@ -1199,10 +1312,18 @@ test("filters: one 'Screened' select per screened provider, keyed on the verdict
   assert.match(filter.label, /^Screened \(/);
   assert.deepEqual(
     filter.options.map((o) => o.value),
-    ["none", "hint", "unscreened"]
+    ["none", "flat", "hint", "unscreened"]
   );
+  // Each label names the cell text it selects, so the two zeros stay apart.
+  const labels = Object.fromEntries(filter.options.map((o) => [o.value, o.label]));
+  assert.match(labels.none, /0 · none/);
+  assert.match(labels.flat, /0 · flat only/);
+  assert.match(labels.hint, /360°/);
   const row = (verdict) => ({ screenVerdict_panoramax: verdict });
   assert.equal(filter.test(row("none"), "none"), true);
+  assert.equal(filter.test(row("flat"), "none"), false, "flat-only is not the conclusive zero");
+  assert.equal(filter.test(row("flat"), "flat"), true);
+  assert.equal(filter.test(row("hint"), "flat"), false);
   assert.equal(filter.test(row("hint"), "none"), false);
   assert.equal(filter.test(row("hint"), "hint"), true);
   assert.equal(filter.test(row(null), "unscreened"), true);
@@ -1216,13 +1337,21 @@ test("caption: the latest screen's own counts, from the LAST series point", () =
   assert.equal(gridScreenCaption({ providers: {} }), "");
   assert.equal(
     gridScreenCaption(screenDoc(), { panoramax: 0 }),
-    " · panoramax screen 2026-09-16: 411 of 1,221 cities screened positive"
+    " · panoramax screen 2026-09-16: 411 of 1,221 cities screened positive (any imagery)"
   );
+  // The unlisted count is its own clause: it counts screened records of any
+  // verdict and any date, so it is never "N of them" (the positive ones).
   assert.equal(
     gridScreenCaption(screenDoc(), { panoramax: 1 }),
-    " · panoramax screen 2026-09-16: 411 of 1,221 cities screened positive; " +
-      "1 of them have no published run, so no row here"
+    " · panoramax screen 2026-09-16: 411 of 1,221 cities screened positive (any imagery); " +
+      "1 screened city has no published run, so no row here"
   );
+  assert.equal(
+    gridScreenCaption(screenDoc(), { panoramax: 2 }),
+    " · panoramax screen 2026-09-16: 411 of 1,221 cities screened positive (any imagery); " +
+      "2 screened cities have no published run, so no row here"
+  );
+  assert.doesNotMatch(gridScreenCaption(screenDoc(), { panoramax: 2 }), /of them/);
 });
 
 test("series: one plain-table row per screen date, data escaped", () => {

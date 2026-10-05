@@ -1783,15 +1783,25 @@ test("lookupScreen: finds the city's record per provider, null on any miss", () 
   assert.equal(lookupScreen(null, "panoramax", "zero--x"), null);
 });
 
-test("screenVerdict: a zero is 'none', a positive bound is 'hint', no record is null", () => {
-  assert.equal(screenVerdict({ pictures_360_upper_bound: 0 }), "none");
-  assert.equal(screenVerdict({ pictures_360_upper_bound: 1 }), "hint");
-  assert.equal(screenVerdict({ pictures_360_upper_bound: 512 }), "hint");
+test("screenVerdict: no imagery is 'none', flat only is 'flat', a 360° bound is 'hint'", () => {
+  const rec = (any, b360) => ({ pictures_upper_bound: any, pictures_360_upper_bound: b360 });
+  assert.equal(screenVerdict(rec(0, 0)), "none");
+  // A zero 360° bound under a positive any-imagery bound is NOT the
+  // conclusive zero: on the live screen that was 284 cities.
+  assert.equal(screenVerdict(rec(40, 0)), "flat");
+  assert.equal(screenVerdict(rec(1, 1)), "hint");
+  assert.equal(screenVerdict(rec(900, 512)), "hint");
   assert.equal(screenVerdict(null), null);
   assert.equal(screenVerdict(undefined), null);
-  // A record without the bound is neither a fact nor a hint.
+  // A record without the bound it needs is neither a fact nor a hint.
   assert.equal(screenVerdict({ pictures_upper_bound: 9 }), null);
   assert.equal(screenVerdict({ pictures_360_upper_bound: null }), null);
+  // "none" is reserved for an any-imagery bound of exactly 0, so a zero 360°
+  // bound with no readable any-imagery bound cannot claim it.
+  assert.equal(screenVerdict({ pictures_360_upper_bound: 0 }), null);
+  assert.equal(screenVerdict(rec(Number.NaN, 0)), null);
+  // A positive 360° bound is a hint whatever the other bound says.
+  assert.equal(screenVerdict({ pictures_360_upper_bound: 3 }), "hint");
 });
 
 test("lookupStreetwalk: finds by city_id+provider, null on miss or absent manifest", () => {

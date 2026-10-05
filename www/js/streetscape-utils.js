@@ -1236,24 +1236,37 @@ function lookupScreen(doc, provider, cityId) {
 }
 
 /**
- * The reading of one screen record: "none", "hint", or null for no record.
+ * The reading of one screen record: "none", "flat", "hint", or null.
  *
- * Keyed on the 360° bound, because that is what the grid column shows. "none"
- * is a FACT (no 360° imagery anywhere in the box); "hint" is only a reason to
- * measure. A malformed bound reads as null rather than as either.
+ * Three readings, because the record carries two bounds and they answer
+ * different questions:
+ *   - "hint": a positive 360° bound — only a reason to measure;
+ *   - "flat": a ZERO 360° bound but a positive any-imagery bound — no 360°
+ *     imagery anywhere in the box, yet flat pictures that an any-imagery
+ *     coverage number (#116) would count;
+ *   - "none": a zero ANY-imagery bound (`pictures_upper_bound === 0`), the
+ *     only zero the artifact's caveat calls conclusive about the city.
+ * Folding "flat" into "none" ruled out, on the live screen, 284 cities that
+ * the any-imagery reading counts as positive. A record missing either bound
+ * it needs (or carrying a non-finite one) reads null rather than any of them.
  *
  * @param {?Object} record - From lookupScreen.
- * @returns {?("none"|"hint")}
+ * @returns {?("none"|"flat"|"hint")}
  *
  * @example
- *   screenVerdict({ pictures_360_upper_bound: 0 });   // → "none"
- *   screenVerdict({ pictures_360_upper_bound: 512 }); // → "hint"
- *   screenVerdict(null);                              // → null
+ *   screenVerdict({ pictures_upper_bound: 0, pictures_360_upper_bound: 0 });     // → "none"
+ *   screenVerdict({ pictures_upper_bound: 40, pictures_360_upper_bound: 0 });    // → "flat"
+ *   screenVerdict({ pictures_upper_bound: 900, pictures_360_upper_bound: 512 }); // → "hint"
+ *   screenVerdict(null);                                                         // → null
  */
 function screenVerdict(record) {
-  const bound = record?.pictures_360_upper_bound;
-  if (typeof bound !== "number" || !Number.isFinite(bound)) return null;
-  return bound === 0 ? "none" : "hint";
+  const isBound = (v) => typeof v === "number" && Number.isFinite(v);
+  const bound360 = record?.pictures_360_upper_bound;
+  if (!isBound(bound360)) return null;
+  if (bound360 > 0) return "hint";
+  const boundAny = record.pictures_upper_bound;
+  if (!isBound(boundAny)) return null;
+  return boundAny === 0 ? "none" : "flat";
 }
 
 /**

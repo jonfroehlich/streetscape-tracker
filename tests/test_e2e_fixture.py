@@ -314,8 +314,11 @@ def test_the_fixture_carries_a_provider_screen_with_a_zero_and_a_positive_city()
 
     aggregate_ids = {c["city_id"] for c in _read_fixture_json("cities.json.gz")["cities"]}
     for provider, entry in screened.items():
+        # The conclusive zero is the ANY-imagery zero: a city with a zero 360°
+        # bound but flat pictures renders "0 · flat only", not "0 · none".
+        totals = [c["pictures_upper_bound"] for c in entry["cities"]]
         bounds = [c["pictures_360_upper_bound"] for c in entry["cities"]]
-        assert 0 in bounds, f"{provider}: no conclusive-zero city in the fixture screen"
+        assert 0 in totals, f"{provider}: no conclusive-zero city in the fixture screen"
         assert any(b > 0 for b in bounds), f"{provider}: no positive city in the fixture screen"
         assert {c["city_id"] for c in entry["cities"]} <= aggregate_ids
         assert entry["caveat"], f"{provider}: the screen carries no caveat for the hint title"

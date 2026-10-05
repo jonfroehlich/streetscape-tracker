@@ -1165,16 +1165,18 @@ A test written against a fix is worth what its failure against the defect is wor
 
 `streetscape-utils.test.js` pins the four helpers.
 `screenedProviders` is asserted to read the PAYLOAD: a provider key the registry lacks is still listed, a registered provider absent from the document is not, and an entry with no cities screened nothing.
-`screenVerdict` separates `0` ("none"), a positive bound ("hint") and a missing record or missing bound (null), and `lookupScreen` misses on an absent city, provider or document.
+`screenVerdict` separates no imagery at all ("none"), a zero 360° bound under a positive any-imagery bound ("flat"), a positive 360° bound ("hint") and a missing record or missing bound (null) — including a zero 360° bound with no readable any-imagery bound, which must not claim "none" — and `lookupScreen` misses on an absent city, provider or document.
 `fetchProviderScreen` resolves null for a 404 AND for an unparseable body, since grid.html must render as before #349 when the file is absent.
 
 `grid.test.js` pins the page.
-With no document, `pivotGridRows` returns rows deep-equal to the pre-#349 build and **carrying no `screen*` key at all** — "equal to each other" alone would pass a mutation that always adds the keys as nulls.
-With one, the keys appear for the SCREENED provider only (Panoramax, which that payload never collects), the absent `first_positive_date` reads null, and the screened city with no published run is counted in `screenUnlisted` rather than made a row.
+With no document, `pivotGridRows` returns the same rows for `null`, an empty document and no argument, and **every row's `Object.keys` equals a literal list read off the pre-#349 `grid.js`** (`PRE_349_ROW_KEYS`) — "equal to each other" alone would pass a mutation that adds any key to every row, screen or not.
+With one, the keys appear for the SCREENED provider only (Panoramax, which that payload never collects), a flat-only city reads "flat" with both bounds carried, the absent `first_positive_date` reads null, and the screened city with no published run is counted in `screenUnlisted` rather than made a row.
 The column group exists only with a screened provider, has no Δ, and its title says what the top of a descending sort means.
-The cells are asserted on the asymmetry: "0 · none" with "a zero is conclusive", "≤ 512" for a bound, "—" for unscreened, and the hint title carrying a caveat string **no JS file contains**, so a paraphrase hardcoded in `grid.js` fails.
-Two of the writer's own caveats are pinned where they surface: a first positive equal to `first_screen_date` says when watching began, and `instrument.cell_warning` replaces "conclusive" only on cells from the latest screen date, which is the only pass it describes.
-Presets (never the default; "Where to look next" only with a screen), the per-provider filter's three values, the caption read from the LAST `series` point, and the series table's escaping complete it.
+The cells are asserted on the asymmetry: "0 · none" with "no imagery of any kind … a zero is conclusive", "0 · flat only" naming its flat bound and never "conclusive", "≤ 512" for a bound, "—" for unscreened, and the hint and flat titles carrying a caveat string **no JS file contains**, so a paraphrase hardcoded in `grid.js` fails.
+The first-positive date is titled "(any imagery)", because the writer derives it from the any-imagery bound.
+Two of the writer's own caveats are pinned where they surface: a first positive equal to `first_screen_date` says when watching began, and `instrument.cell_warning` replaces "conclusive" only on cells from the latest screen date, which is the only pass it describes, and is appended to the hint and flat titles too.
+A caveat carrying `"`, `'`, `<` and `&` is asserted escaped in both titles under the REAL `escapeHtml` — this file's stub leaves quotes alone, so the test swaps the real one in.
+Presets (never the default; "Where to look next" only with a screen), the per-provider filter's four values (flat-only must not match "none"), the caption read from the LAST `series` point and labelled "(any imagery)", its unlisted count worded as its own clause rather than "N of them", and the series table's escaping complete it.
 
 The fixture screens Panoramax twice through the real writer (`build_fixture.py`), giving one positive city, one conclusive zero and one unscreened, and `test_the_fixture_carries_a_provider_screen_with_a_zero_and_a_positive_city` (fast suite) refuses a committed screen that has lost either reading.
 Two browser tests read it: the column, preset, filter, caption and series table end to end, and a 404'd screen leaving the page with no column, preset, filter, caption clause or section.

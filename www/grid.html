@@ -83,10 +83,14 @@
             not from a collection run. Each number is an
             <strong>upper bound</strong> on the 360° pictures in or around a
             city, read from map cells larger than the city itself, so it can
-            over-count but never miss. That makes the two readings unequal: a
-            <strong>zero is conclusive</strong> (the provider has no 360°
-            imagery anywhere in the city's box), while a positive bound only
-            says a closer look is worth taking. Sorting it high-to-low lists
+            over-count but never miss. That makes the readings unequal:
+            <strong>"0 · none"</strong> is conclusive (the provider has no
+            imagery of any kind anywhere in the city's box);
+            <strong>"0 · flat only"</strong> means no 360° imagery but some
+            flat pictures, which an any-imagery coverage number would count;
+            and a positive bound only says a closer look is worth taking. The
+            caption's "screened positive" count is any imagery, so it covers
+            both the flat-only and the positive cells. Sorting it high-to-low lists
             the cities most worth <em>measuring</em>, not the best covered;
             only a collection run measures coverage. A screened city with no
             published run has no row here, and the caption says how many.
