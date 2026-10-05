@@ -9,6 +9,7 @@ a visibly different answer, and carries one census run with no
 
 import json
 import os
+import shlex
 from datetime import date
 
 import pytest
@@ -16,6 +17,7 @@ import pytest
 from scripts.undated_imagery_share_analyze import (
     DOCS_DIR_DEFAULT,
     TOPIC,
+    build_parser,
     docs_generated_by,
     measure_catalog,
     of_queried_kind,
@@ -144,9 +146,11 @@ def test_the_run_behind_each_maximum_is_named(conn):
 #
 # The JSON was generated on the production catalog, which a test cannot reach,
 # so its numbers are not re-derived here. What CAN be pinned is provenance: the
-# stamp must be one this script's own `docs_generated_by` produces, so a renamed
-# flag or script cannot leave the committed file naming a command that no
-# longer reproduces it (the grid-density and KartaView precedents).
+# stamp must be one this script's own `docs_generated_by` produces, AND its
+# arguments must parse under the script's own CLI, so a flag renamed in either
+# place breaks a test rather than leaving the committed file naming a command
+# that no longer reproduces it (the grid-density and KartaView precedents).
+# Not pinned: that `main()` stamps through `docs_generated_by` at all.
 
 
 def _committed_record():
@@ -176,3 +180,12 @@ def test_the_writeup_replicates_with_the_committed_stamp():
         os.path.join(PROJECT_ROOT, "docs", "experiments", f"{TOPIC}.md"), encoding="utf-8"
     ) as fh:
         assert stamp in fh.read()
+
+
+def test_the_committed_stamp_parses_under_the_scripts_own_cli():
+    stamp = _committed_record()["_about"]["generated_by"]
+    words = shlex.split(stamp)
+    assert words[:2] == ["python", "scripts/undated_imagery_share_analyze.py"]
+    args = build_parser().parse_args(words[2:])
+    assert args.catalog_label == "makelab2-prod"
+    assert args.docs_dir == DOCS_DIR_DEFAULT

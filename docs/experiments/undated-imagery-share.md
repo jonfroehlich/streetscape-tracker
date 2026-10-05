@@ -15,7 +15,7 @@ It arrives in **batches**, and that shape now shows up in every provider with mo
 KartaView's single 2025-11-19 Grab ingest in the API audit, and two catalog runs holding all of KartaView's undated photos;
 Mapillary's Denver-metro uploads, plus a second, unrelated Jefferson City batch;
 and GSV's handful of big metros.
-So the number that matters for any decision is the **per-run maximum**, not the pooled share — they differ by up to two orders of magnitude within a single provider (from the file's unrounded figures, Mapillary's worst run is over 200× its pooled share, GSV's about 38×, KartaView's catalog about 4.5×).
+So the number that matters for any decision is the **per-run maximum**, not the pooled share — within a single provider they differ by more than two orders of magnitude at the extreme (as shares of present imagery, from the file's unrounded figures: Mapillary's worst run is over 200× its pooled share, GSV's about 38×, KartaView's catalog about 4.5×).
 
 Numbers below come from [`undated-imagery-share_metrics.json`](undated-imagery-share_metrics.json), written by `scripts/undated_imagery_share_analyze.py` against the **makelab2 production catalog** (`catalog_label: makelab2-prod`).
 Read entirely out of the catalog and an already-committed metrics file: no network, no credentials, no collection.
@@ -113,7 +113,7 @@ Every figure in this table is an **upper bound** on that shift, for the reasons 
 | GSV | 2,429 | 0.0 pp | 0.0010 pp | **≤ 0.320 pp** | East Hollywood, California, 2026-08-09 |
 | Mapillary | 1,959 | 0.0 pp | 0.0 pp | **≤ 3.00 pp** | Commerce City, Colorado, 2026-07-31 |
 | KartaView | 527 | 0.0 pp | 0.0 pp | **≤ 0.97 pp** | Yogyakarta, Indonesia, 2026-08-28 |
-| Panoramax | 32 | 0.0 pp | 0.0 pp | ≤ 0.0005 pp | Paris, France, 2026-10-01 |
+| Panoramax | 32 | 0.0 pp | 0.0 pp | ≤ 0.0006 pp | Paris, France, 2026-10-01 |
 
 For the overwhelming majority of runs the Δ column will read exactly 0.0, and not merely by rounding: a run with no undated imagery cannot shift at all, and only 149 of 2,429 GSV runs, 19 of 1,959 Mapillary runs, 2 of 527 KartaView runs and 1 of 32 Panoramax runs hold any (`runs_with_any_no_date`).
 The tail is where the bound stops settling anything.
@@ -121,7 +121,7 @@ A GSV city can shift at most a third of a point, which is still visible at one d
 A Mapillary city can shift **at most 3.00 points** — the claim that stood here was *"a Denver-metro Mapillary walk can shift 2.7 points"*, which rested on the withdrawn row-count figure and named a run the file did not record; the corrected bound belongs to Commerce City, and it is a ceiling rather than the shift.
 GSV's, Mapillary's and KartaView's worst bounds (0.320, 3.00 and 0.97 pp) are above 0.05 pp, so for those providers' worst runs the measurement says a visible shift is *possible*, not that it happens; the exact census shift needs the per-point join.
 The file does not count how many runs bound above 0.05 pp, only the percentiles, and GSV's p95 (0.0010 pp) is well under it.
-Panoramax's worst bound, ≤ 0.0005 pp, is under 0.05, which settles every Panoramax run as invisible.
+Panoramax's worst bound, ≤ 0.0006 pp, is under 0.05, which settles every Panoramax run as invisible.
 That is the case the dated note in [`../street-coverage.md`](../street-coverage.md) exists for.
 
 An earlier review of the fix put GSV's maximum at 0.095% and concluded the delta was invisible everywhere; production says up to 0.320 pp for GSV (0.329 at the first pass), so the weaker claim is the true one — invisible in the overwhelming majority of runs, not in all of them.

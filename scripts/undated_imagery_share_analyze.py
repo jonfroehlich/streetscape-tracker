@@ -306,7 +306,8 @@ def read_kartaview_audit(docs_dir: str) -> dict:
     }
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """The CLI, separate from `main` so a test can parse the committed stamp with it."""
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[1])
     parser.add_argument("--data-dir", default=None, help="data dir holding the catalog")
     parser.add_argument(
@@ -319,7 +320,11 @@ def main() -> int:
         default=DEFAULT_LABEL,
         help="which catalog this read, e.g. 'makelab2-prod' (recorded, not a path)",
     )
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
 
     data_dir = args.data_dir or get_default_data_dir()
     conn = db.connect(db.get_default_db_path(data_dir))
