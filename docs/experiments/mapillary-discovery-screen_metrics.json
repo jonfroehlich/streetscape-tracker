@@ -1,0 +1,1021 @@
+{
+ "_about": {
+  "experiment": "mapillary-discovery-screen",
+  "writeup": "docs/experiments/mapillary-discovery-screen.md",
+  "generated_by": "python scripts/mapillary_discovery_analyze.py --raw-dir experiments/mapillary-discovery-383 --places experiments/mapillary-discovery-383/cities500.txt --prod-snapshot experiments/mapillary-discovery-383/prod/prod_snapshot.csv --catalog-label makelab2-prod-f1885f5 --docs-dir docs/experiments --manifest-out mapillary_discovery_cities.csv",
+  "collected_by": "python scripts/mapillary_discovery_collect.py {scan,calibrate,resolve-creators} --out-dir experiments/mapillary-discovery-383",
+  "catalog_label": "makelab2-prod-f1885f5",
+  "generated_at": "2026-10-05T14:16:43+00:00",
+  "note": "Screening signals from z6 vector tiles, never coverage. 'recent' means captured on or after 2024-10-02. A place's score is recent-360 km within 2.0 km of its point per km^2 of that disc, from samples <= 0.5 km along simplified z6 geometry."
+ },
+ "requests": {
+  "by_host_and_status": {
+   "tiles": {
+    "200": 106
+   },
+   "graph": {
+    "200": 89
+   }
+  },
+  "total": 195
+ },
+ "scan": {
+  "regions": {
+   "conus_scanada": [
+    -125.0,
+    24.5,
+    -66.5,
+    50.5
+   ],
+   "se_alaska": [
+    -136.0,
+    55.0,
+    -130.0,
+    59.5
+   ],
+   "anchorage_fairbanks": [
+    -151.5,
+    60.5,
+    -146.5,
+    65.5
+   ],
+   "hawaii": [
+    -160.5,
+    18.8,
+    -154.7,
+    22.4
+   ]
+  },
+  "zoom": 6,
+  "tiles": 97,
+  "rows": 3040897,
+  "unique_sequences": 3030733,
+  "unique_pano_sequences": 539851,
+  "unique_recent_pano_sequences": 148330,
+  "organization_id_share_of_sequences": 0.2078,
+  "recent_pano_km": 245131.8,
+  "creators_with_recent_pano": 477
+ },
+ "calibration_zoom_recall": {
+  "r_km": 3.0,
+  "recent_since": "2024-04-01",
+  "towns": {
+   "laurens--iowa": {
+    "lat": 42.8468,
+    "lon": -94.8515,
+    "by_zoom": [
+     {
+      "zoom": 6,
+      "tile": [
+       15,
+       23
+      ],
+      "sequences": 20,
+      "pano": 20,
+      "pano_recent": 20,
+      "top_creator": 1361362982257515,
+      "top_creator_sequences": 20,
+      "newest_pano": "2025-11-04"
+     },
+     {
+      "zoom": 10,
+      "tile": [
+       242,
+       376
+      ],
+      "sequences": 20,
+      "pano": 20,
+      "pano_recent": 20,
+      "top_creator": 1361362982257515,
+      "top_creator_sequences": 20,
+      "newest_pano": "2025-11-04"
+     }
+    ]
+   },
+   "grand-marais--minnesota": {
+    "lat": 47.7588,
+    "lon": -90.3401,
+    "by_zoom": [
+     {
+      "zoom": 6,
+      "tile": [
+       15,
+       22
+      ],
+      "sequences": 21,
+      "pano": 15,
+      "pano_recent": 15,
+      "top_creator": 645084397752674,
+      "top_creator_sequences": 9,
+      "newest_pano": "2026-07-05"
+     },
+     {
+      "zoom": 10,
+      "tile": [
+       255,
+       356
+      ],
+      "sequences": 14,
+      "pano": 10,
+      "pano_recent": 10,
+      "top_creator": 852685383375160,
+      "top_creator_sequences": 6,
+      "newest_pano": "2026-07-05"
+     }
+    ]
+   },
+   "waterville--maine": {
+    "lat": 44.5433,
+    "lon": -69.6628,
+    "by_zoom": [
+     {
+      "zoom": 6,
+      "tile": [
+       19,
+       23
+      ],
+      "sequences": 165,
+      "pano": 51,
+      "pano_recent": 51,
+      "top_creator": 104497838459143,
+      "top_creator_sequences": 51,
+      "newest_pano": "2026-06-18"
+     },
+     {
+      "zoom": 10,
+      "tile": [
+       313,
+       370
+      ],
+      "sequences": 174,
+      "pano": 56,
+      "pano_recent": 56,
+      "top_creator": 104497838459143,
+      "top_creator_sequences": 56,
+      "newest_pano": "2026-06-18"
+     }
+    ]
+   },
+   "trotwood--ohio": {
+    "lat": 39.7972,
+    "lon": -84.3113,
+    "by_zoom": [
+     {
+      "zoom": 6,
+      "tile": [
+       17,
+       24
+      ],
+      "sequences": 117,
+      "pano": 117,
+      "pano_recent": 117,
+      "top_creator": 104273298482293,
+      "top_creator_sequences": 117,
+      "newest_pano": "2026-03-05"
+     },
+     {
+      "zoom": 10,
+      "tile": [
+       272,
+       388
+      ],
+      "sequences": 126,
+      "pano": 126,
+      "pano_recent": 126,
+      "top_creator": 104273298482293,
+      "top_creator_sequences": 126,
+      "newest_pano": "2026-03-05"
+     }
+    ]
+   },
+   "meridian--idaho": {
+    "lat": 43.6085,
+    "lon": -116.3923,
+    "by_zoom": [
+     {
+      "zoom": 6,
+      "tile": [
+       11,
+       23
+      ],
+      "sequences": 943,
+      "pano": 239,
+      "pano_recent": 193,
+      "top_creator": 713819173436997,
+      "top_creator_sequences": 193,
+      "newest_pano": "2026-09-07"
+     },
+     {
+      "zoom": 10,
+      "tile": [
+       180,
+       373
+      ],
+      "sequences": 917,
+      "pano": 231,
+      "pano_recent": 187,
+      "top_creator": 713819173436997,
+      "top_creator_sequences": 187,
+      "newest_pano": "2026-08-25"
+     }
+    ]
+   },
+   "waterbury--connecticut": {
+    "lat": 41.5538,
+    "lon": -73.044,
+    "by_zoom": [
+     {
+      "zoom": 6,
+      "tile": [
+       19,
+       23
+      ],
+      "sequences": 1261,
+      "pano": 421,
+      "pano_recent": 223,
+      "top_creator": 102956495281411,
+      "top_creator_sequences": 219,
+      "newest_pano": "2026-08-31"
+     },
+     {
+      "zoom": 10,
+      "tile": [
+       304,
+       381
+      ],
+      "sequences": 1403,
+      "pano": 456,
+      "pano_recent": 251,
+      "top_creator": 102956495281411,
+      "top_creator_sequences": 247,
+      "newest_pano": "2026-08-31"
+     }
+    ]
+   },
+   "wasta--south-dakota": {
+    "lat": 44.0694,
+    "lon": -102.4459,
+    "by_zoom": [
+     {
+      "zoom": 6,
+      "tile": [
+       13,
+       23
+      ],
+      "sequences": 24,
+      "pano": 18,
+      "pano_recent": 0,
+      "top_creator": null,
+      "top_creator_sequences": 0,
+      "newest_pano": "2021-09-15"
+     },
+     {
+      "zoom": 10,
+      "tile": [
+       220,
+       372
+      ],
+      "sequences": 24,
+      "pano": 18,
+      "pano_recent": 0,
+      "top_creator": null,
+      "top_creator_sequences": 0,
+      "newest_pano": "2021-09-15"
+     }
+    ]
+   },
+   "richmond--virginia": {
+    "lat": 37.5248,
+    "lon": -77.4933,
+    "by_zoom": [
+     {
+      "zoom": 6,
+      "tile": [
+       18,
+       24
+      ],
+      "sequences": 144,
+      "pano": 128,
+      "pano_recent": 128,
+      "top_creator": 1075708917342928,
+      "top_creator_sequences": 59,
+      "newest_pano": "2026-08-06"
+     },
+     {
+      "zoom": 10,
+      "tile": [
+       291,
+       396
+      ],
+      "sequences": 203,
+      "pano": 138,
+      "pano_recent": 138,
+      "top_creator": 1075708917342928,
+      "top_creator_sequences": 64,
+      "newest_pano": "2026-08-06"
+     }
+    ]
+   }
+  },
+  "requests": 0,
+  "cache_hits": 16
+ },
+ "validation": {
+  "population": "catalog cities with a Mapillary drive walk, centre inside a scanned z6 tile; the score is taken at the catalog centre, the walk covers the whole frozen grid",
+  "n": 1111,
+  "spearman_score_vs_walk_coverage": 0.666,
+  "good_definition": "walk coverage_pct_by_length >= 50 and median_covered_age_years <= 2",
+  "by_score_bin": [
+   {
+    "km_per_km2": "[0, 0.5)",
+    "walked_cities": 964,
+    "median_walk_coverage_pct": 0.0,
+    "share_ge50pct_and_le2yr": 0.002,
+    "good": 2
+   },
+   {
+    "km_per_km2": "[0.5, 1.5)",
+    "walked_cities": 71,
+    "median_walk_coverage_pct": 17.0,
+    "share_ge50pct_and_le2yr": 0.0,
+    "good": 0
+   },
+   {
+    "km_per_km2": "[1.5, 3)",
+    "walked_cities": 36,
+    "median_walk_coverage_pct": 25.4,
+    "share_ge50pct_and_le2yr": 0.028,
+    "good": 1
+   },
+   {
+    "km_per_km2": "[3, 6)",
+    "walked_cities": 19,
+    "median_walk_coverage_pct": 45.3,
+    "share_ge50pct_and_le2yr": 0.211,
+    "good": 4
+   },
+   {
+    "km_per_km2": "[6, inf)",
+    "walked_cities": 21,
+    "median_walk_coverage_pct": 58.3,
+    "share_ge50pct_and_le2yr": 0.333,
+    "good": 7
+   }
+  ],
+  "at_candidate_threshold": {
+   "threshold_km_per_km2": 3.0,
+   "good_total": 14,
+   "good_at_or_above": 11,
+   "cities_at_or_above": 40,
+   "base_rate": 0.0126
+  },
+  "reference_towns": [
+   {
+    "city_id": "meridian--idaho--united-states",
+    "km_per_km2": 8.05,
+    "top_creator": 713819173436997.0,
+    "top_share": 1.0,
+    "median_captured": "2026-07-22",
+    "coverage_pct_by_length": 51.0,
+    "median_covered_age_years": 0.11,
+    "run_date": "2026-08-30"
+   },
+   {
+    "city_id": "honolulu--hawaii--united-states",
+    "km_per_km2": 6.709,
+    "top_creator": 100186595565848.0,
+    "top_share": 1.0,
+    "median_captured": "2025-08-18",
+    "coverage_pct_by_length": 69.7,
+    "median_covered_age_years": 1.0,
+    "run_date": "2026-08-18"
+   },
+   {
+    "city_id": "trotwood--ohio--united-states",
+    "km_per_km2": 4.734,
+    "top_creator": 104273298482293.0,
+    "top_share": 1.0,
+    "median_captured": "2026-03-05",
+    "coverage_pct_by_length": 68.5,
+    "median_covered_age_years": 0.54,
+    "run_date": "2026-09-17"
+   },
+   {
+    "city_id": "waterbury--connecticut--united-states",
+    "km_per_km2": 4.113,
+    "top_creator": 102956495281411.0,
+    "top_share": 0.902,
+    "median_captured": "2024-12-13",
+    "coverage_pct_by_length": 36.3,
+    "median_covered_age_years": 5.36,
+    "run_date": "2026-09-26"
+   },
+   {
+    "city_id": "laurens--iowa--united-states",
+    "km_per_km2": 3.753,
+    "top_creator": 1361362982257515.0,
+    "top_share": 1.0,
+    "median_captured": "2025-11-04",
+    "coverage_pct_by_length": 91.6,
+    "median_covered_age_years": 0.81,
+    "run_date": "2026-08-25"
+   },
+   {
+    "city_id": "waterville--maine--united-states",
+    "km_per_km2": 1.526,
+    "top_creator": 104497838459143.0,
+    "top_share": 1.0,
+    "median_captured": "2026-06-08",
+    "coverage_pct_by_length": 30.3,
+    "median_covered_age_years": 0.3,
+    "run_date": "2026-09-26"
+   },
+   {
+    "city_id": "grand-marais--minnesota--united-states",
+    "km_per_km2": 1.24,
+    "top_creator": 852685383375160.0,
+    "top_share": 0.595,
+    "median_captured": "2026-03-03",
+    "coverage_pct_by_length": 45.7,
+    "median_covered_age_years": 0.57,
+    "run_date": "2026-09-26"
+   },
+   {
+    "city_id": "juneau--alaska--united-states",
+    "km_per_km2": 0.538,
+    "top_creator": 103674181874848.0,
+    "top_share": 1.0,
+    "median_captured": "2025-09-05",
+    "coverage_pct_by_length": 84.2,
+    "median_covered_age_years": 2.36,
+    "run_date": "2026-09-29"
+   },
+   {
+    "city_id": "richmond--virginia--united-states",
+    "km_per_km2": 0.119,
+    "top_creator": 101594325420985.0,
+    "top_share": 1.0,
+    "median_captured": "2026-08-06",
+    "coverage_pct_by_length": 36.3,
+    "median_covered_age_years": 2.05,
+    "run_date": "2026-09-08"
+   },
+   {
+    "city_id": "wasta--south-dakota--united-states",
+    "km_per_km2": 0.0,
+    "top_creator": null,
+    "top_share": null,
+    "median_captured": null,
+    "coverage_pct_by_length": 56.3,
+    "median_covered_age_years": 6.49,
+    "run_date": "2026-09-26"
+   }
+  ]
+ },
+ "places": {
+  "scored_places": 2713,
+  "score_distribution": {
+   "n": 2713,
+   "p10": 0.506,
+   "p25": 0.666,
+   "p50": 1.23,
+   "p75": 2.83,
+   "p90": 6.509
+  },
+  "candidate_rules": {
+   "catalog_km_gt": 10.0,
+   "median_captured_ge": "2025-01-01",
+   "km_per_km2_ge": 3.0,
+   "top_share_ge": 0.6,
+   "thin_km": 5.0
+  },
+  "candidates": 161,
+  "grid_rule_effect": {
+   "thinned_list_without_the_rule": 193,
+   "of_which_inside_a_catalog_grid": 37,
+   "readmitted_once_those_are_removed": 5,
+   "cascade_dropped_once_those_are_removed": 0,
+   "thinned_list_with_the_rule": 161
+  },
+  "candidates_by_top_creator": {
+   "marker_geo1": 31,
+   "rking": 30,
+   "hmhtb": 11,
+   "Lanka6359": 8,
+   "mapillary01730": 7,
+   "pixelpete": 6,
+   "inlandurbanist": 6,
+   "ctroadway360": 5,
+   "TimmonsPavement": 4,
+   "Rossitransportationgroup": 3,
+   "FeetAndInches": 3,
+   "vorpalblade": 2,
+   "ZachJ_POCO": 2,
+   "henryu": 2,
+   "DrivingRoundTown": 2
+  },
+  "tranche_rules": {
+   "catalog_km_gt": 10.0,
+   "median_captured_ge": "2025-03-01",
+   "km_per_km2_ge": 3.5,
+   "top_share_ge": 0.75,
+   "pop_le": 60000,
+   "foot_share_lt": 0.5,
+   "thin_km": 8.0,
+   "per_creator_max": 3,
+   "size": 25
+  },
+  "geocode_overrides": {
+   "5253352": "Fond du Lac, Fond du Lac County, Wisconsin, United States"
+  },
+  "tranche": [
+   {
+    "name": "Kaysville",
+    "admin_name": "Utah",
+    "pop": 30472,
+    "km_per_km2": 17.445,
+    "top_creator_username": "flug32",
+    "top_share": 1.0,
+    "median_captured": "2025-08-16",
+    "catalog_city": "ogden--utah--united-states",
+    "catalog_km": 21.1
+   },
+   {
+    "name": "Lexington",
+    "admin_name": "Virginia",
+    "pop": 7262,
+    "km_per_km2": 16.785,
+    "top_creator_username": "TimmonsPavement",
+    "top_share": 1.0,
+    "median_captured": "2026-04-08",
+    "catalog_city": "covington--virginia--united-states",
+    "catalog_km": 47.9
+   },
+   {
+    "name": "Petersburg",
+    "admin_name": "Virginia",
+    "pop": 32477,
+    "km_per_km2": 16.155,
+    "top_creator_username": "TimmonsPavement",
+    "top_share": 0.944,
+    "median_captured": "2025-10-21",
+    "catalog_city": "richmond--virginia--united-states",
+    "catalog_km": 34.0
+   },
+   {
+    "name": "Foothill Farms",
+    "admin_name": "California",
+    "pop": 33121,
+    "km_per_km2": 13.974,
+    "top_creator_username": "marker_geo1",
+    "top_share": 1.0,
+    "median_captured": "2026-03-11",
+    "catalog_city": "sacramento--california--united-states",
+    "catalog_km": 16.2
+   },
+   {
+    "name": "Trophy Club",
+    "admin_name": "Texas",
+    "pop": 11759,
+    "km_per_km2": 13.814,
+    "top_creator_username": "GIStrophyclub",
+    "top_share": 1.0,
+    "median_captured": "2026-08-25",
+    "catalog_city": "haltom-city--texas--united-states",
+    "catalog_km": 21.2
+   },
+   {
+    "name": "Orangevale",
+    "admin_name": "California",
+    "pop": 33960,
+    "km_per_km2": 13.595,
+    "top_creator_username": "marker_geo1",
+    "top_share": 1.0,
+    "median_captured": "2026-02-09",
+    "catalog_city": "sacramento--california--united-states",
+    "catalog_km": 24.3
+   },
+   {
+    "name": "Waipi'o Acres",
+    "admin_name": "Hawaii",
+    "pop": 5531,
+    "km_per_km2": 13.271,
+    "top_creator_username": "hmhtb",
+    "top_share": 1.0,
+    "median_captured": "2025-09-08",
+    "catalog_city": "honolulu--hawaii--united-states",
+    "catalog_km": 24.1
+   },
+   {
+    "name": "Francestown",
+    "admin_name": "New Hampshire",
+    "pop": 1571,
+    "km_per_km2": 12.637,
+    "top_creator_username": "Lanka6359",
+    "top_share": 1.0,
+    "median_captured": "2025-08-30",
+    "catalog_city": "concord--new-hampshire--united-states",
+    "catalog_km": 33.1
+   },
+   {
+    "name": "New Boston",
+    "admin_name": "New Hampshire",
+    "pop": 4934,
+    "km_per_km2": 12.153,
+    "top_creator_username": "Lanka6359",
+    "top_share": 1.0,
+    "median_captured": "2025-09-12",
+    "catalog_city": "concord--new-hampshire--united-states",
+    "catalog_km": 28.6
+   },
+   {
+    "name": "'Ewa Gentry",
+    "admin_name": "Hawaii",
+    "pop": 22690,
+    "km_per_km2": 12.016,
+    "top_creator_username": "hmhtb",
+    "top_share": 1.0,
+    "median_captured": "2025-09-04",
+    "catalog_city": "honolulu--hawaii--united-states",
+    "catalog_km": 20.9
+   },
+   {
+    "name": "Hopewell",
+    "admin_name": "Virginia",
+    "pop": 22378,
+    "km_per_km2": 11.673,
+    "top_creator_username": "TimmonsPavement",
+    "top_share": 1.0,
+    "median_captured": "2025-12-11",
+    "catalog_city": "richmond--virginia--united-states",
+    "catalog_km": 30.5
+   },
+   {
+    "name": "Fond du Lac",
+    "admin_name": "Wisconsin",
+    "pop": 42933,
+    "km_per_km2": 11.34,
+    "top_creator_username": "FDL_Engineering",
+    "top_share": 0.998,
+    "median_captured": "2025-07-01",
+    "catalog_city": "mount-calvary--wisconsin--united-states",
+    "catalog_km": 16.5
+   },
+   {
+    "name": "Los Altos",
+    "admin_name": "California",
+    "pop": 30671,
+    "km_per_km2": 11.139,
+    "top_creator_username": "pixelpete",
+    "top_share": 0.919,
+    "median_captured": "2025-05-01",
+    "catalog_city": "monte-sereno--california--united-states",
+    "catalog_km": 19.7
+   },
+   {
+    "name": "Sunnyslope",
+    "admin_name": "California",
+    "pop": 5153,
+    "km_per_km2": 11.124,
+    "top_creator_username": "inlandurbanist",
+    "top_share": 0.997,
+    "median_captured": "2026-07-15",
+    "catalog_city": "glendora--california--united-states",
+    "catalog_km": 40.3
+   },
+   {
+    "name": "Cedar Falls",
+    "admin_name": "Iowa",
+    "pop": 41255,
+    "km_per_km2": 11.123,
+    "top_creator_username": "FeetAndInches",
+    "top_share": 0.888,
+    "median_captured": "2026-08-18",
+    "catalog_city": "ackley--iowa--united-states",
+    "catalog_km": 49.8
+   },
+   {
+    "name": "Bedford",
+    "admin_name": "Massachusetts",
+    "pop": 12502,
+    "km_per_km2": 11.095,
+    "top_creator_username": "mapillary01730",
+    "top_share": 1.0,
+    "median_captured": "2025-10-17",
+    "catalog_city": "waltham--massachusetts--united-states",
+    "catalog_km": 13.2
+   },
+   {
+    "name": "Cottonwood Heights",
+    "admin_name": "Utah",
+    "pop": 34343,
+    "km_per_km2": 10.566,
+    "top_creator_username": "rking",
+    "top_share": 0.812,
+    "median_captured": "2026-07-14",
+    "catalog_city": "kearns--utah--united-states",
+    "catalog_km": 16.8
+   },
+   {
+    "name": "Heber-Overgaard",
+    "admin_name": "Arizona",
+    "pop": 2822,
+    "km_per_km2": 10.299,
+    "top_creator_username": "mapillary01730",
+    "top_share": 1.0,
+    "median_captured": "2025-07-30",
+    "catalog_city": "show-low--arizona--united-states",
+    "catalog_km": 52.6
+   },
+   {
+    "name": "Eureka",
+    "admin_name": "California",
+    "pop": 27017,
+    "km_per_km2": 9.998,
+    "top_creator_username": "marker_geo1",
+    "top_share": 1.0,
+    "median_captured": "2026-05-26",
+    "catalog_city": "talent--oregon--united-states",
+    "catalog_km": 197.0
+   },
+   {
+    "name": "Mont Vernon",
+    "admin_name": "New Hampshire",
+    "pop": 2166,
+    "km_per_km2": 9.918,
+    "top_creator_username": "Lanka6359",
+    "top_share": 1.0,
+    "median_captured": "2025-09-04",
+    "catalog_city": "fitchburg--massachusetts--united-states",
+    "catalog_km": 36.0
+   },
+   {
+    "name": "Apex",
+    "admin_name": "North Carolina",
+    "pop": 45585,
+    "km_per_km2": 9.298,
+    "top_creator_username": "connormckinnis",
+    "top_share": 1.0,
+    "median_captured": "2025-09-29",
+    "catalog_city": "morrisville--north-carolina--united-states",
+    "catalog_km": 10.4
+   },
+   {
+    "name": "Foster City",
+    "admin_name": "California",
+    "pop": 33477,
+    "km_per_km2": 9.131,
+    "top_creator_username": "pixelpete",
+    "top_share": 1.0,
+    "median_captured": "2025-11-10",
+    "catalog_city": "san-francisco--california--united-states",
+    "catalog_km": 27.4
+   },
+   {
+    "name": "Morton",
+    "admin_name": "Illinois",
+    "pop": 16306,
+    "km_per_km2": 8.663,
+    "top_creator_username": "rking",
+    "top_share": 1.0,
+    "median_captured": "2025-07-23",
+    "catalog_city": "bay-view-gardens--illinois--united-states",
+    "catalog_km": 22.7
+   },
+   {
+    "name": "Lindon",
+    "admin_name": "Utah",
+    "pop": 10810,
+    "km_per_km2": 8.636,
+    "top_creator_username": "rking",
+    "top_share": 0.827,
+    "median_captured": "2025-09-23",
+    "catalog_city": "saratoga-springs--utah--united-states",
+    "catalog_km": 16.6
+   },
+   {
+    "name": "State College",
+    "admin_name": "Pennsylvania",
+    "pop": 42161,
+    "km_per_km2": 7.359,
+    "top_creator_username": "mcox16801",
+    "top_share": 1.0,
+    "median_captured": "2025-03-30",
+    "catalog_city": "thompsontown--pennsylvania--united-states",
+    "catalog_km": 58.4
+   }
+  ]
+ },
+ "top_creators_by_recent_pano_km": [
+  {
+   "creator_id": 713819173436997,
+   "username": "marker_geo1",
+   "recent_pano_km": 40535.2,
+   "candidate_places": 31,
+   "newest": "2026-09-16"
+  },
+  {
+   "creator_id": 104273298482293,
+   "username": "rking",
+   "recent_pano_km": 17477.5,
+   "candidate_places": 30,
+   "newest": "2026-08-13"
+  },
+  {
+   "creator_id": 104740425095586,
+   "username": "codgis",
+   "recent_pano_km": 15108.3,
+   "candidate_places": 1,
+   "newest": "2026-09-25"
+  },
+  {
+   "creator_id": 645084397752674,
+   "username": "quickness805",
+   "recent_pano_km": 13788.7,
+   "candidate_places": 1,
+   "newest": "2026-07-05"
+  },
+  {
+   "creator_id": 102956495281411,
+   "username": "ctroadway360",
+   "recent_pano_km": 9716.6,
+   "candidate_places": 5,
+   "newest": "2026-09-29"
+  },
+  {
+   "creator_id": 100515802193182,
+   "username": "mapillary01730",
+   "recent_pano_km": 9275.6,
+   "candidate_places": 7,
+   "newest": "2026-09-24"
+  },
+  {
+   "creator_id": 1139817854492667,
+   "username": "Lanka6359",
+   "recent_pano_km": 7111.8,
+   "candidate_places": 8,
+   "newest": "2026-08-10"
+  },
+  {
+   "creator_id": 100186595565848,
+   "username": "hmhtb",
+   "recent_pano_km": 6680.6,
+   "candidate_places": 11,
+   "newest": "2026-06-20"
+  },
+  {
+   "creator_id": 100438652206281,
+   "username": "GoProMAX3M",
+   "recent_pano_km": 6567.7,
+   "candidate_places": 1,
+   "newest": "2025-01-21"
+  },
+  {
+   "creator_id": 108891598508567,
+   "username": "Hopen111",
+   "recent_pano_km": 6315.2,
+   "candidate_places": 1,
+   "newest": "2026-09-29"
+  },
+  {
+   "creator_id": 100380679425438,
+   "username": "flug32",
+   "recent_pano_km": 6143.1,
+   "candidate_places": 1,
+   "newest": "2026-07-19"
+  },
+  {
+   "creator_id": 104214208486349,
+   "username": "vorpalblade",
+   "recent_pano_km": 4711.7,
+   "candidate_places": 2,
+   "newest": "2026-05-25"
+  },
+  {
+   "creator_id": 681336961438940,
+   "username": "nthp_gis",
+   "recent_pano_km": 4693.7,
+   "candidate_places": 0,
+   "newest": "2026-06-25"
+  },
+  {
+   "creator_id": 213206151534424,
+   "username": "milk_man",
+   "recent_pano_km": 3557.8,
+   "candidate_places": 0,
+   "newest": "2026-09-19"
+  },
+  {
+   "creator_id": 106740711564413,
+   "username": "atd2019",
+   "recent_pano_km": 3284.7,
+   "candidate_places": 0,
+   "newest": "2025-09-18"
+  },
+  {
+   "creator_id": 107426641493478,
+   "username": "treestryder",
+   "recent_pano_km": 2778.3,
+   "candidate_places": 1,
+   "newest": "2026-09-08"
+  },
+  {
+   "creator_id": 1432009608267357,
+   "username": "inlandurbanist",
+   "recent_pano_km": 2697.1,
+   "candidate_places": 6,
+   "newest": "2026-09-26"
+  },
+  {
+   "creator_id": 1073094253999318,
+   "username": "pixelpete",
+   "recent_pano_km": 2107.8,
+   "candidate_places": 6,
+   "newest": "2026-03-13"
+  },
+  {
+   "creator_id": 101645835415015,
+   "username": "nonusablebody",
+   "recent_pano_km": 2095.7,
+   "candidate_places": 0,
+   "newest": "2026-09-28"
+  },
+  {
+   "creator_id": 1153246803159292,
+   "username": "LowestPotential",
+   "recent_pano_km": 2014.1,
+   "candidate_places": 0,
+   "newest": "2026-08-08"
+  },
+  {
+   "creator_id": 1459245085093841,
+   "username": "dfoden",
+   "recent_pano_km": 1838.6,
+   "candidate_places": 1,
+   "newest": "2025-07-29"
+  },
+  {
+   "creator_id": 852685383375160,
+   "username": "cartographer",
+   "recent_pano_km": 1778.4,
+   "candidate_places": 0,
+   "newest": "2026-09-21"
+  },
+  {
+   "creator_id": 1361362982257515,
+   "username": "GIS_ISG",
+   "recent_pano_km": 1772.3,
+   "candidate_places": 2,
+   "newest": "2026-08-04"
+  },
+  {
+   "creator_id": 101915392054935,
+   "username": "tonypd",
+   "recent_pano_km": 1741.6,
+   "candidate_places": 0,
+   "newest": "2026-06-03"
+  },
+  {
+   "creator_id": 100797705502941,
+   "username": "hdmaps1",
+   "recent_pano_km": 1484.1,
+   "candidate_places": 0,
+   "newest": "2026-09-25"
+  },
+  {
+   "creator_id": 2594900967557296,
+   "username": "TimmonsPavement",
+   "recent_pano_km": 1454.4,
+   "candidate_places": 4,
+   "newest": "2026-09-24"
+  },
+  {
+   "creator_id": 1006984308465014,
+   "username": "UAS_ISG",
+   "recent_pano_km": 1406.7,
+   "candidate_places": 1,
+   "newest": "2026-09-02"
+  },
+  {
+   "creator_id": 107708041466249,
+   "username": "uwrapid",
+   "recent_pano_km": 1399.9,
+   "candidate_places": 1,
+   "newest": "2026-09-16"
+  },
+  {
+   "creator_id": 1203417138197402,
+   "username": "EnduiCA",
+   "recent_pano_km": 1380.5,
+   "candidate_places": 0,
+   "newest": "2026-07-22"
+  },
+  {
+   "creator_id": 1243749034432301,
+   "username": "ZachJ_POCO",
+   "recent_pano_km": 1368.7,
+   "candidate_places": 2,
+   "newest": "2025-11-21"
+  }
+ ]
+}

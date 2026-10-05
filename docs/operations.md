@@ -274,7 +274,7 @@ The fix is to add `--regenerate-json`; `--allow-unrebuilt-dates` overrides the r
 The `--only` dry run's summary line says no other column is read or written; if a plain dry run is what you are reading, it is the wrong command.
 
 Run it **per provider, in the daytime, never overlapping the 02:00 timer** — it shares the catalog with the batch, and a census provider's pass still reads millions of rows apiece.
-Nothing published reads `total_grid_points`, so the backfill republishes nothing; `scripts/undated_imagery_share_analyze.py` is its first reader, and that regeneration waits for the backfill (see [`experiments/undated-imagery-share.md`](experiments/undated-imagery-share.md)).
+Nothing published reads `total_grid_points`, so the backfill republishes nothing; `scripts/undated_imagery_share_analyze.py` is its first reader; the backfill ran on production on 2026-10-04 and that regeneration is committed (see [`experiments/undated-imagery-share.md`](experiments/undated-imagery-share.md)).
 
 ## Landing a laptop investigation in this catalog: `scheduler import-bundle` (issue #330)
 
@@ -393,6 +393,124 @@ Every dry run — `--estimate`, `import-bundle` without `--execute`, `enable-cit
 **Same-date collection comes from the nightly run, not from `assess-city`.**
 `ASSESS_CHANNELS` is unchanged (the opt-in channels stay refusable there, for the reasons at its definition); enrolment is what answers both of those reasons, since the city becomes a member and Panoramax is screened first.
 The closing summary says so in one sentence: the grid runs and the opt-in providers enrolled above arrive with the city's first nightly run, which collects every member channel on one UTC date.
+
+## Registering a purposive manifest on production (`panoramax_360_cities.csv`, issue #406)
+
+**Added after the 2026-08-22 split.**
+
+The exact sequence for landing a vetted manifest of new cities, written for the 40-city `panoramax_360_cities.csv` and valid for any manifest in its format.
+The selection, the vetting table and every query override are in [`worldwide_sampling.md`](worldwide_sampling.md) ("`panoramax_360_cities.csv`"); this section is only what to run on makelab2, in order, and why.
+Every path below is production's `[paths]` from `config/scheduler.makelab1.toml`; run from the production checkout.
+
+**1. Deploy `main` first.**
+When this runbook was written (2026-10-04, branching from `9da8911`) production ran `f1885f5`, 53 commits behind that `main`, with the catalog at schema v17 against v19; `main` has moved since, so compare the production checkout's `git log -1` with `origin/main` on the day rather than trusting either count.
+The commits it needs carry PR #411's fill, PR #408's Panoramax stage-1 raise (60/min, 8,000/day per channel — the budget the pricing below assumes) and the manifest itself; `enable-city` (#374) is already on production.
+Deploy per `deploy/README.md` and let the catalog migrate on connect before registering anything, so the new rows are written by the code that will collect them.
+
+**2. Register, disabled, then audit the boundaries.**
+
+```bash
+python scripts/register_frame.py --manifest panoramax_360_cities.csv \
+    --db-path /projects/makeabilitylab/streetscape-tracker/data/streetscape_tracker.db \
+    --notes-label "panoramax 360 programmes" --overlap-km 5 --max-center-km 10
+# read the dry run: expect newly-registered=40 (each row marked -> NEW), reused-existing=0, already-registered=0; then the same with --execute
+```
+
+- `--overlap-km 5`, not the default 25, because the default silently ALIASES a genuine neighbour onto an existing city instead of registering it (PR #298's lesson: Johns Creek and Sandusky were 16–17 km from cities already registered).
+  The manifest's own test already holds every row more than 25 km from every other row and every city registered since the screen, so a nonzero `reused-existing` in the dry run means the catalog holds a city this record does not know about; stop and find it.
+- `--max-center-km 10` because the vetting split cleanly there: every row's geocode landed within 7.5 km of its GeoNames point.
+  `--center-from-geonames` is deliberately NOT passed — a row that geocodes differently on the day should be skipped and listed for review, not quietly recentered.
+- `--notes-label` is what makes the batch selectable later: without it all 40 claim to be worldwide-frame cities in `cities.notes`.
+- Each `--execute` line prints the frozen W x H; compare it with the vetting table and stop on any difference — Nominatim can answer differently than it did on 2026-10-04.
+  (The boundary audit below may later resize a city on purpose; that difference is expected, and it makes that city's price stale.)
+
+Cities register with `enabled = 0`, so nothing is collected yet.
+Then run the boundary-audit chain (`audit_city_boundaries.py`, then `docs/worldwide_sampling.md` step 2's four steps) over this batch only, in its own audit directory so the catalog-wide report is not overwritten.
+The batch is selected by its notes label, so no id can be dropped by hand:
+
+```bash
+DATA=/projects/makeabilitylab/streetscape-tracker/data
+CITY_ARGS=()
+while read -r id; do CITY_ARGS+=(--city "$id"); done < <(python -c '
+import sqlite3, sys
+conn = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+for (cid,) in conn.execute("SELECT city_id FROM cities WHERE notes LIKE ? ORDER BY city_id", ("panoramax 360 programmes (geonameid %",)):
+    print(cid)
+' "$DATA/streetscape_tracker.db")
+echo "${#CITY_ARGS[@]}"   # expect 80: 40 ids, two words each
+python scripts/audit_city_boundaries.py --data-dir "$DATA" \
+    --cache audit/pmx406/nominatim_boundary_cache.jsonl --report audit/pmx406/boundary_audit_report.csv \
+    "${CITY_ARGS[@]}"
+# 1. dry run, then read the plan: "Re-register" is the auto-resize count, "Deferred" the manual-review count
+python scripts/reregister_boundaries.py --data-dir "$DATA" \
+    --report audit/pmx406/boundary_audit_report.csv --out-dir audit/pmx406
+# 2. apply the auto-resizes
+python scripts/reregister_boundaries.py --data-dir "$DATA" \
+    --report audit/pmx406/boundary_audit_report.csv --out-dir audit/pmx406 --execute
+# 3. render the review page: expect manual=<Deferred>, resize=<Re-register> and "Resize cities skipped (unchanged geometry): 0"
+python scripts/build_boundary_review.py --data-dir "$DATA" --audit-dir audit/pmx406
+# 4. apply the human decisions for the DEFER cities: dry run, then --execute
+python scripts/apply_decisions.py --data-dir "$DATA" --decisions <the exported boundary_decisions.csv>
+```
+
+The four steps are #91's sequence, and their order is load-bearing:
+
+1. **Dry run, then read the plan.**
+   It writes `reregister_plan.csv` (small `UNDER` cities, OSM bbox ≤ 30 km on both axes) and `manual_review.csv` (every other non-`OK` verdict); `build_boundary_review.py` renders only the cities on those two lists, so without this step the page is empty and the gate passes having checked nothing.
+2. **`--execute`.**
+   This is safe here because every city in the batch is disabled and has no runs, so a recenter-and-grow resets no diff continuity.
+   It is also required: `build_boundary_review.py` shows a plan city only once its geometry has CHANGED from the audit snapshot, so after a dry run alone every auto-resize city is silently dropped, counted only in a `Resize cities skipped (unchanged geometry)` line and a "not shown" banner — and the page is not empty whenever any DEFER city exists, so nothing else would catch it.
+3. **`build_boundary_review.py`.**
+   Resized cities show before and after, and DEFER cities show the OSM boundary beside the frozen grid; a nonzero `Resize cities skipped (unchanged geometry)` means step 2 did not run.
+   A city with an `OK` verdict appears on neither list, so an empty page is a pass only when the report's `verdict` column says every city is `OK`.
+4. **`apply_decisions.py` for the DEFER cities.**
+   A resize that looks wrong on the page is undone the same way, with its "Revert to grid before resize" decision.
+
+**A resized city's prices are stale.**
+The vetting table in `worldwide_sampling.md` and the tranche table in step 4 below were priced on the registered geometry, and the auto-resize grows and recenters a grid while `apply_decisions.py` can set any size; re-price any city either one changed (its new W x H is in `reregister_plan.csv` or the decisions export) before enabling its tranche — including whether it still clears KartaView's 1,000-request enrol ceiling — and move it to a later night if it no longer fits.
+The batch stays selectable afterwards: `update_city_geometry` APPENDS its audit note to `cities.notes`, so the notes-label query above still returns all 40.
+
+The audit geocodes one structured query per city through Nominatim (about 40 requests), never a provider.
+
+**3. Enable by tranche, one tranche per night: `scheduler enable-city CITY`.**
+`enable-city` enrols the opt-in pairs BEFORE flipping `enabled` (#374), so the city's grid runs and walks pair on one UTC date: Panoramax only on a nonzero one-city screen (a few z6 `grid` tiles each, sent at enable time to the Panoramax host), KartaView only at an estimate ≤ 1,000 — which all 40 clear (the largest is Norman's 691), so all 40 are enrolled on KartaView unless `enroll-city CITY --channel kartaview --remove` and `--channel kartaview_streets --remove` are set first (an explicit membership is never overwritten).
+An enabled city is due on every default channel (gsv, gsv_streets, mapillary, mapillary_streets) the next night, and a never-collected city ranks FIRST in each channel's queue (`NULLS FIRST`), so a tranche is what that night collects before anything else; that is why the batch is staged rather than enabled at once.
+Enable after the night's batch has finished and before the next 02:00 run, preview each with `--dry-run`, and pass the production config:
+
+```bash
+python -m streetscape_metadata_tracker.scheduler enable-city lons-le-saunier--bourgogne--france \
+    --config config/scheduler.makelab1.toml --dry-run
+```
+
+The tranche's OSM networks must be frozen during the day, so the gsv_streets walks never contact Overpass at night (#341).
+`streetscape-prefreeze.timer` already does this daily at 15:00 (up to 30 min late) with `--nights 2 --limit 40 --pause-s 120 --execute --alert`, so a tranche enabled BEFORE the timer fires needs nothing more.
+Only a tranche enabled after that day's pass needs a manual one, and it keeps the timer's `--limit 40`, because without it the plan covers every cold network in the window and Overpass volume is uncapped.
+Do not overlap the timer's pass: both take the Overpass host lock, so one of the two exits busy (80).
+The script is a dry run unless given `--execute`, so read the listing first and then freeze:
+
+```bash
+python scripts/prefreeze_street_networks.py --config config/scheduler.makelab1.toml --nights 1 --limit 40             # lists only
+python scripts/prefreeze_street_networks.py --config config/scheduler.makelab1.toml --nights 1 --limit 40 --execute   # freezes
+```
+
+Before the next tranche, read the night's log: every tranche city collected (or paused at a cap, exit 83, which resumes), no Mapillary block (exit 75), no Panoramax 403/429 (a refusal reverts #405's stage), no Overpass latch.
+
+**4. Pricing and the enable order.**
+From the vetting table: the 40 grids hold 13,682,485 GSV grid points (≈ 4.75 h at the 48,000/min nightly pace) plus ≈ 2.71 M GSV walk samples by the scheduler's area proxy (an over-estimate, ≈ 0.94 h), 2,350 Mapillary z14 tiles, 5,385 KartaView requests (≈ 5.6 h at 16/min) and 8,390 Panoramax z15 tiles (≈ 2.3 h at 60/min).
+Enabled at once, the Panoramax total alone exceeds the 8,000/day channel budget and the Mapillary total exceeds the 2,260-tile clean combined-night ceiling (`fill_host_ceilings`) before the night's own due Mapillary demand, so the batch is staged.
+The tranches below are cheapest-GSV-first (the order #301's 2026-09-10 comment used), each capped at 4 M GSV points and 800 Mapillary tiles so a tranche leaves most of the night's Mapillary room to the regular due queue:
+
+| Night | Cities | GSV points (h at 48k/min) | Mapillary tiles | KartaView requests (h at 16/min) | Panoramax tiles (min at 60/min) |
+|---|---|---|---|---|---|
+| 1 | Lons-le-Saunier, Kilkenny, Mayenne, Grenoble, Angouleme, Morlaix, Immokalee, Caen, Newton, Bayonne, Douarnenez, Laval | 1,255,892 (0.44) | 276 | 551 (0.6) | 911 (15) |
+| 2 | Beaune, Tours, Orleans, Lille, Owatonna, Fort Dodge, Le Havre, Saint-Nazaire, Bordeaux, Marshalltown, Ottumwa, Montpellier | 2,567,532 (0.89) | 482 | 1,003 (1.0) | 1,665 (28) |
+| 3 | Lyon, Brest, Mason City, Besancon, Cherbourg, Nantes, Kortrijk, Muscatine, Strasbourg, Montauban | 3,882,789 (1.35) | 703 | 1,552 (1.6) | 2,535 (42) |
+| 4 | Toulouse, Mannheim, Ulm, Davenport | 2,558,433 (0.89) | 448 | 1,005 (1.0) | 1,622 (27) |
+| 5 | Marseille, Norman | 3,417,839 (1.19) | 441 | 1,274 (1.3) | 1,657 (28) |
+
+So the batch takes **five nights** at the earliest, more if a night is not clean.
+The hours are paced request time at the configured rate; the scheduler's own per-city timeout adds ×1.5 headroom plus 600 s, and a tranche shares its night with whatever else is due.
+Mapillary, KartaView and Panoramax all checkpoint and resume at a cap (#318, #335), so a tranche that overruns one of those budgets spills into the next night rather than failing; GSV does not (#373 defers a city whose estimated need exceeds the night's remainder), which is the reason the largest GSV grids go last.
 
 ## Registering the Mapillary discovery screen's second tranche (`mapillary_discovery_cities_tranche2.csv`, issue #383)
 
@@ -577,3 +695,21 @@ A 403 "Application request limit reached" is the Graph API's per-APP limit, scop
 `--max-requests` (default 200, retries included) stops a heavy contributor cleanly with exit **83**; the cursor is newest-first, so a stopped run holds the most recent images and says its counts are lower bounds.
 It refuses a `makelab*` host unless `--allow-collection-host`, and nothing in the scheduler calls it.
 The measurement behind it, including why the UTC date is the wrong grouping key, is [`experiments/mapillary-user-activity.md`](experiments/mapillary-user-activity.md).
+
+## Checking Mapillary candidates before registering one: `scripts/mapillary_candidate_probe.py` (#406)
+
+**Added after the 2026-08-22 split.**
+
+#406's acceptance item 4: before any Mapillary-only candidate is registered, re-run the Graph API probe the 2026-10-01 research pass abandoned after two requests (its second asked for `limit=2000` and drew HTTP 500 "Please reduce the amount of data you're asking for"; [`experiments/panoramax-world-screen.md`](experiments/panoramax-world-screen.md), finding 6).
+The probe sends ONE request per candidate — `graph.mapillary.com/images` over a 2 x 2 km box at the candidate's point, `fields=id,captured_at,creator_id,is_pano`, `limit` at most 200 — at least 3 s apart, and stops at the first answer that is not a 200, retrying nothing.
+
+```bash
+python scripts/mapillary_candidate_probe.py candidates.csv                                  # the plan: no request, no token
+python scripts/mapillary_candidate_probe.py candidates.csv --execute --out probe-2026-10.csv  # writes probe-2026-10.csv.requests.jsonl too
+```
+
+The candidates file needs `name`, `lat` and `lon` columns; the 42 unverified rows live in the research pass's gitignored `experiments/candidate-360-cities-2026-10-01/`, on the laptop that ran it.
+Each answered candidate gets its image count, a `capped` flag when the answer filled the limit (the counts are then a FLOOR), the pano count and share, the number of creators and the dominant one's id and share — the single-creator town sweep #406 found at Laurens, Iowa is the shape to look for — and the oldest and newest capture dates.
+It reuses `mapillary_user_activity.py`'s client (redirects not followed, the token in a header) and its hard-floor pacer, touches only `graph.mapillary.com` (never the per-IP-blocked tile CDN), and exits 75 on a 3xx or an HTML page, how Mapillary presents a per-IP block — stop then, and do not re-run from that IP for hours.
+Run it from a laptop: it refuses a `makelab*` host unless `--allow-collection-host`, and nothing in the scheduler calls it.
+It had not been run when it was committed; the first run's request log and result belong beside a writeup in `docs/experiments/`.

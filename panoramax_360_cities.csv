@@ -1,0 +1,41 @@
+query_string,city,admin,iso2,country,continent,size_band,population,coverage_regime,geonameid,lat,lon
+"Strasbourg, Grand Est, France",Strasbourg,Grand Est,FR,France,EU,,274845,,2973783,48.58392,7.74553
+"Lyon, Rhone-Alpes, France",Lyon,Rhone-Alpes,FR,France,EU,,520774,,2996944,45.74906,4.84789
+"Bordeaux, New Aquitaine, France",Bordeaux,New Aquitaine,FR,France,EU,,265328,,3031582,44.84124,-0.58046
+"Lille, Hauts-de-France, France",Lille,Hauts-de-France,FR,France,EU,,238695,,2998324,50.63391,3.05512
+"Laval, Pays de la Loire, France",Laval,Pays de la Loire,FR,France,EU,,50489,,3005866,48.07247,-0.77019
+"Saint-Nazaire, Pays de la Loire, France",Saint-Nazaire,Pays de la Loire,FR,France,EU,,67054,,2977921,47.27506,-2.2179
+"Caen, Normandy, France",Caen,Normandy,FR,France,EU,,110624,,3029241,49.18585,-0.35912
+"Montpellier, Occitanie, France",Montpellier,Occitanie,FR,France,EU,,248252,,2992166,43.61093,3.87635
+"Le Havre, Normandy, France",Le Havre,Normandy,FR,France,EU,,185972,,3003796,49.49346,0.10785
+"Nantes, Pays de la Loire, France",Nantes,Pays de la Loire,FR,France,EU,,325070,,2990969,47.21725,-1.55336
+"Brest, Brittany, France",Brest,Brittany,FR,France,EU,,144899,,3030300,48.39029,-4.48628
+"Montauban, Occitanie, France",Montauban,Occitanie,FR,France,EU,,52434,,2993002,44.01759,1.3542
+"Orleans, Centre-Val de Loire, France",Orleans,Centre-Val de Loire,FR,France,EU,,116344,,2989317,47.90248,1.90407
+"Grenoble, Rhone-Alpes, France",Grenoble,Rhone-Alpes,FR,France,EU,,158552,,3014728,45.17869,5.71479
+"Besancon, Bourgogne, France",Besancon,Bourgogne,FR,France,EU,,128426,,3033123,47.24878,6.01815
+"Morlaix, Brittany, France",Morlaix,Brittany,FR,France,EU,,17516,,2991772,48.57784,-3.82792
+"Toulouse, Occitanie, France",Toulouse,Occitanie,FR,France,EU,,511684,,2972315,43.60426,1.44367
+"Bayonne, New Aquitaine, France",Bayonne,New Aquitaine,FR,France,EU,,44396,,3034475,43.49316,-1.473
+"Mayenne, Mayenne, Pays de la Loire, France",Mayenne,Pays de la Loire,FR,France,EU,,15583,,2994935,48.30337,-0.61383
+"Lons-le-Saunier, Bourgogne, France",Lons-le-Saunier,Bourgogne,FR,France,EU,,20678,,2997626,46.67535,5.55575
+"Tours, Centre-Val de Loire, France",Tours,Centre-Val de Loire,FR,France,EU,,141621,,2972191,47.39484,0.70398
+"Angouleme, New Aquitaine, France",Angouleme,New Aquitaine,FR,France,EU,,49468,,3037598,45.64997,0.15345
+"Mannheim, Baden-Wurttemberg, Germany",Mannheim,Baden-Wurttemberg,DE,Germany,EU,,307960,,2873891,49.4891,8.46694
+"Douarnenez, Brittany, France",Douarnenez,Brittany,FR,France,EU,,16590,,3020996,48.09542,-4.32904
+"Marseille, Provence-Alpes-Cote d'Azur, France",Marseille,Provence-Alpes-Cote d'Azur,FR,France,EU,,877215,,2995469,43.29695,5.38107
+"Beaune, Bourgogne, France",Beaune,Bourgogne,FR,France,EU,,24162,,3034126,47.02413,4.83887
+"Kortrijk, Flanders, Belgium",Kortrijk,Flanders,BE,Belgium,EU,,73879,,2794055,50.82803,3.26487
+"Cherbourg, Normandy, France",Cherbourg,Normandy,FR,France,EU,,26655,,3025466,49.63984,-1.61636
+"Ulm, Baden-Wurttemberg, Germany",Ulm,Baden-Wurttemberg,DE,Germany,EU,,120451,,2820256,48.39841,9.99155
+"Kilkenny, Leinster, Ireland",Kilkenny,Leinster,IE,Ireland,EU,,21589,,2963398,52.65417,-7.25222
+"Ottumwa, Iowa, United States",Ottumwa,Iowa,US,United States,NA,,24624,,4870380,41.02001,-92.4113
+"Marshalltown, Iowa, United States",Marshalltown,Iowa,US,United States,NA,,27620,,4866371,42.04943,-92.90798
+"Norman, Oklahoma, United States",Norman,Oklahoma,US,United States,NA,,128026,,4543762,35.22257,-97.43948
+"Newton, Iowa, United States",Newton,Iowa,US,United States,NA,,15125,,4868907,41.69971,-93.04798
+"Mason City, Iowa, United States",Mason City,Iowa,US,United States,NA,,27366,,4866445,43.15357,-93.20104
+"Muscatine, Muscatine County, Iowa, United States",Muscatine,Iowa,US,United States,NA,,23968,,4868404,41.42447,-91.04321
+"Fort Dodge, Iowa, United States",Fort Dodge,Iowa,US,United States,NA,,24649,,4857486,42.49747,-94.16802
+"Davenport, Iowa, United States",Davenport,Iowa,US,United States,NA,,102582,,4853423,41.52364,-90.57764
+"Owatonna, Minnesota, United States",Owatonna,Minnesota,US,United States,NA,,25725,,5040647,44.08385,-93.22604
+"Immokalee, Florida, United States",Immokalee,Florida,US,United States,NA,,24154,,4159553,26.41869,-81.4173

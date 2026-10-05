@@ -89,6 +89,9 @@ already gone wrong once:
   - `tests/test_undated_imagery_share_analyze.py`: `of_queried` divides by `total_grid_points` (30 of 100 points, not the 6.0 that 30 of 500 rows gave), a run with NULL `total_grid_points` is left out of every `of_queried` figure and counted in `runs_without_grid_points` while still counting toward `of_present`, and a census provider's figure is labelled `upper_bound`, gsv's `exact`.
     gsv is `exact` only while no run has more rows than grid points: one resumed-shaped gsv run makes the block `upper_bound` and counts in `runs_with_more_rows_than_grid_points` (killed by deciding the kind from the provider alone).
     `max_run_pct_of_present` and `max_run_pct_of_queried` name the run behind each maximum, on a fixture where the two maxima are different runs.
+    `test_the_committed_record_names_its_producer` pins the committed metrics file's provenance, not its numbers (those came from the production catalog, which no test can reach): `_about.generated_by` is exactly what `docs_generated_by` produces for `--catalog-label makelab2-prod`, and the label itself is pinned literally, since it is the only thing separating this result from the dev-catalog run that concluded the opposite (killed by renaming a flag in `docs_generated_by`).
+    `test_the_committed_stamp_parses_under_the_scripts_own_cli` parses that stamp with the script's own `build_parser`, so a flag renamed in the CLI instead is killed too — what stays unpinned is that `main()` stamps through `docs_generated_by` at all.
+    `test_the_writeup_replicates_with_the_committed_stamp` checks the writeup's Replicating command is that same stamp.
 - `scripts/recompute_run_stats.py` as the query-radius repair handle (`tests/test_recompute_run_stats.py`): a run cataloged with a 1.1 km pano as coverage moves from 50% to 25%, gains `status_out_of_radius` 1 and `query_radius_m` 50.0 with `status_other` still 0 (both panos share a date, so the radius is the only reason the JSON is rebuilt), the report line and summary name the reclassified count, `--regenerate-json` rebuilds its JSON with the new coverage block, the CSV stays as written, and a second pass changes nothing.
   Both panos carry the SAME capture date and the stored date columns are already right, so the radius is the only reason the JSON can be rebuilt — which is what makes the rebuild a pin on that trigger.
   And the trigger is idempotent: a second `--regenerate-json` pass finds the JSON already carrying `coverage.query_radius_m`, and rebuilds nothing, although the far pano is still in the CSV.
@@ -141,6 +144,11 @@ It pins `--notes-label` by MUTATING it rather than by asserting the default: a c
 The city list is curated, but its values are a GeoNames join keyed by `geonameid` and there is no generator script to name in a `generated_by`, so the test re-runs that join in reverse: city, admin, country, continent, population and coordinates must match the vendored records, and `query_string` must equal what `build_worldwide_frame.query_string` writes, so a query here behaves exactly like a frame query at the geocoder.
 The `city_id`s are pinned as **literals** deliberately — registration freezes them into filenames and published URLs, so a change in `db.derive_city_id` or `naming.sanitize_city_query_str` must break a test instead of quietly renaming a city — and the single deliberate departure from GeoNames' ASCII names (`Malmoe` -> `Malmo`) is a named constant rather than an unexplained mismatch.
 
+`tests/test_panoramax_360_cities_manifest.py` is the same provenance for `panoramax_360_cities.csv` (#406), with the GeoNames, `query_string` and slug assertions duplicated rather than shared, so the file that pins the Mapillary batch's already-registered slugs was not edited.
+It adds the SELECTION in reverse, since this list is the output of a rule rather than a curation: each row is joined on its GeoNames point to exactly one cluster of the committed screen record (`docs/experiments/panoramax-world-screen_clusters.csv` — on coordinates, because the record carries `Orléans` and the manifest `Orleans`), that cluster must be new and clear the floor (100,000 360° pictures, 10,000 in the US and Canada) or be a named exception (Kilkenny), and every cluster the rule admits must be in the manifest or in `EXCLUDED_CLUSTERS` with a reason — so a future screen record that admits a cluster nobody decided about fails rather than being silently left out.
+The rows must be in descending bound, so `register_frame.py --limit N` registers the richest first, and no row may sit within the 25 km reuse radius of another row, of a committed manifest, or of a city registered after the screen's catalog snapshot (`POST_SNAPSHOT_CITIES`) — the case the screen's own "new" flag cannot see, which is how Waterloo, Iowa is excluded.
+Because the rule reads a cluster's bound, summed around its anchor, while a row registers the cluster's NAME point, each row's OWN 10 km bound (joined on its GeoNames point to `docs/experiments/panoramax-world-screen_places.csv`) must clear its floor too, or be in `OWN_BOUND_EXCEPTIONS` with its own bound, its anchor and the anchor's bound pinned; Kortrijk (own 2,725, admitted on Wevelgem's 109,576) is the one entry, kept by decision, and an entry whose own bound clears the floor fails as stale.
+
 `tests/test_mapillary_discovery_tranche2_manifest.py` is the provenance of `mapillary_discovery_cities_tranche2.csv` (#383), with the GeoNames, `query_string` and slug assertions duplicated rather than shared, so the file pinning an already-registered batch's slugs was not edited.
 It adds the SELECTION in reverse, written independently of `scripts/build_mapillary_discovery_tranche2.py`: from the committed per-candidate record (`docs/experiments/mapillary-discovery-screen_tranche2.csv`) it re-applies the rule —
 score ≥ 3, more than 25 km from every known city unless named in `OPERATOR_EXCEPTIONS`, joinable from the vendored `cities15000.txt` or this tranche's three supplement rows (`TRANCHE2_SUPPLEMENT_IDS`, pinned and asserted equal to the generator's, so a row another manifest adds to the shared supplement cannot change a frozen decision), geometry resolved at vetting, greedy 25 km de-duplication with the GIS_ISG / UAS_ISG towns first (a pair in `PAIR_EXCEPTIONS` excused), a cap of 30 they sit ahead of —
@@ -155,7 +163,7 @@ The generator's I/O half is pinned by running `main` over a synthetic `data_sour
 
 `tests/test_geonames_supplement.py` holds the shared `data_sources/geonames_supplement.txt` to what it is for: each line a 19-column GeoNames row, no geonameid twice (the dict load would hide a duplicate), none already in cities15000, and every row used by SOME committed manifest — so a manifest can add a row without editing another manifest's test, and the file cannot grow into an unreviewed copy of cities500.
 It also joins tranche 1 (`mapillary_discovery_cities.csv`, registered from a cities500 download and never joined back before) on geonameid against cities15000 plus the supplement, on name, coordinates and population; the two Hawaiian names whose ʻokina the tranche-1 generator dropped (`Waipi'o Acres`, `'Ewa Gentry` in GeoNames' ASCII) are named departures, since the registered manifest is not edited.
-That manifest lands with PR #419, so until it is on the branch its join skips, and its ten cities500-only rows are pinned as literals that are joined to the supplement unconditionally and, once the file is present, must equal its cities500-only rows exactly.
+That manifest landed with PR #419; the join skips only on a checkout without it, and its ten cities500-only rows are pinned as literals that are joined to the supplement unconditionally and, with the file present, must equal its cities500-only rows exactly.
 
 `tests/test_vet_manifest_geometry.py` pins `scripts/vet_manifest_geometry.py` through register_frame's own geocoding seam, patched exactly as `test_register_frame.py` patches it: the preview goes through `register_frame.resolve_frame_geometry`, the function `register_frame_city` freezes from, so a preview that drifted from the registration would have to edit that one function.
 Prices are asserted EQUAL to `scheduler.estimate_requests` on the stored (integer) geometry, so the table quotes what the scheduler will budget rather than a formula of its own; `--step` and `--flag-offset-km` are pinned by mutating them, and `--max-center-km` and `--center-from-geonames` through `main` itself (an 11 km geocode that fails the default guard and passes a 50 km one, or is recentered);
@@ -1262,6 +1270,30 @@ That third mode is the one the pin did not originally cover: the invariant was F
 The first is fixed in the regex, the second in how the test compiles it, and the impossible-date case is pinned as the one surviving exception rather than left out of the corpus.
 A test written against a fix is worth what its failure against the defect is worth.
 
+### The growth screen on grid.html (issue #349)
+
+*Added after the 2026-08-22 split.*
+
+`streetscape-utils.test.js` pins the four helpers.
+`screenedProviders` is asserted to read the PAYLOAD: a provider key the registry lacks is still listed, a registered provider absent from the document is not, and an entry with no cities screened nothing.
+`screenVerdict` separates no imagery at all ("none"), a zero 360° bound under a positive any-imagery bound ("flat"), a positive 360° bound ("hint") and a missing record or missing bound (null) — including a zero 360° bound with no readable any-imagery bound, which must not claim "none" — and `lookupScreen` misses on an absent city, provider or document.
+`fetchProviderScreen` resolves null for a 404 AND for an unparseable body, since grid.html must render as before #349 when the file is absent.
+
+`grid.test.js` pins the page.
+With no document, `pivotGridRows` returns the same rows for `null`, an empty document and no argument, and **every row's `Object.keys` equals a literal list read off the pre-#349 `grid.js`** (`PRE_349_ROW_KEYS`) — "equal to each other" alone would pass a mutation that adds any key to every row, screen or not.
+With one, the keys appear for the SCREENED provider only (Panoramax, which that payload never collects), a flat-only city reads "flat" with both bounds carried, the absent `first_positive_date` reads null, and the screened city with no published run is counted in `screenUnlisted` rather than made a row.
+The column group exists only with a screened provider, has no Δ, and its title says what the top of a descending sort means.
+The cells are asserted on the asymmetry: "0 · none" with "no imagery of any kind … a zero is conclusive", "0 · flat only" naming its flat bound and never "conclusive", "≤ 512" for a bound, "—" for unscreened, and the hint and flat titles carrying a caveat string **no JS file contains**, so a paraphrase hardcoded in `grid.js` fails.
+The first-positive date is titled "(any imagery)", because the writer derives it from the any-imagery bound.
+Two of the writer's own caveats are pinned where they surface: a first positive equal to `first_screen_date` says when watching began, and `instrument.cell_warning` replaces "conclusive" only on cells from the latest screen date, which is the only pass it describes, and is appended to the hint and flat titles too.
+A caveat carrying `"`, `'`, `<` and `&` is asserted escaped in both titles under the REAL `escapeHtml` — this file's stub leaves quotes alone, so the test swaps the real one in.
+Presets (never the default; "Where to look next" only with a screen), the per-provider filter's four values (flat-only must not match "none"), the caption read from the LAST `series` point and labelled "(any imagery)", its unlisted count worded as its own clause rather than "N of them", and the series table's escaping complete it.
+
+The fixture screens Panoramax twice through the real writer (`build_fixture.py`), giving one positive city, one conclusive zero and one unscreened, and `test_the_fixture_carries_a_provider_screen_with_a_zero_and_a_positive_city` (fast suite) refuses a committed screen that has lost either reading.
+Two browser tests read it: the column, preset, filter, caption and series table end to end, and a 404'd screen leaving the page with no column, preset, filter, caption clause or section.
+The series table is a second `<table>` on grid.html, so the layout tests parametrized over all three pages now scope their bare `tbody tr` and `tbody th[scope='row']` locators to `.streets-table`; unscoped, they resolved to the series table's first row, hidden in its closed disclosure, and seven failed.
+Every assertion above was mutation-checked; the table is in the PR body.
+
 ## The pivoted data tables (issue #250)
 
 **The pivoted data tables (issue #250) are covered on both sides.**
@@ -1453,3 +1485,47 @@ the solar day keeping an American afternoon and evening on its own date, cells a
 the catalog match inside / outside / disabled / never-collected, the SMALLEST of two overlapping bboxes winning with the other in `also_in`, the latest Mapillary run (not a newer gsv one) read, and `after_last_run` and `newer_than_seen` each shown true without the other (the 2026-08-26 Spokane case) — including a NULL newest capture — against a catalog opened read-only;
 a missing catalog reported and never created, a catalog at schema 0 or newer than `db.SCHEMA_VERSION` exiting 64, the GeoJSON's properties, exits 64 / 75 / 83, a block on page 2 still reporting page 1, the default `--since` derived from `--until`, catalog paths committed without a home directory, the metrics upsert replacing a window rather than appending it, and a `makelab*` host refused.
 Every mutation of the script listed in the PR (#368) was run after commit and fails at least one test.
+
+## The Mapillary discovery screen (issue #383)
+
+**Added after the 2026-08-22 split.**
+
+`tests/test_mapillary_discovery.py`, offline: tiles are built with `mapbox_vector_tile.encode`, never fetched.
+It pins the sampling frame (the 2026-10-02 regions are exactly 97 z6 tiles, no duplicates), so a change to `REGIONS` or the tile math cannot silently change the population the committed numbers describe;
+the y-up tile-local mapping (a tile's (0, 4096) is its NORTH-west corner — a flipped y moves a town's sweep a tile south) and an empty or layerless tile decoding to nothing;
+`split_samples` conserving a polyline's length exactly, bounding each piece at `SAMPLE_KM`, and spreading a long segment along its length;
+`place_scores` counting a sample 1.9 km away and not one 2.1 km away, the score as km / (pi r^2), the top uploader's length share, the on-foot share, and the LENGTH-weighted median capture date, with empty and below-`min_km` discs skipped;
+`thin_by_distance` keeping the first of a cluster; `inside_grid` as rectangle membership (15 km off-centre inside a 40 km-wide grid, 12 km off-centre outside a 20 km-tall one), never centre distance;
+the manifest dropping apostrophes and applying `GEOCODE_OVERRIDES`, and writing an empty admin rather than NaN when GeoNames has none; and the jittered pacer's mean and floor.
+
+Added after the PR's first review, which found twelve mutations surviving:
+
+- **The fetcher's stop rules**, through a fake session (the template a standing `screen-provider mapillary` would copy): a 302, a 200 with an HTML body, or a 403 stops the run, is logged with its `host`, is never cached, and is never followed as a redirect; a 204 caches as an empty tile and a cached tile costs no request; `--max-requests` is never exceeded.
+- **`catalog-snapshot` exporting each city's LATEST Mapillary drive walk**, never an older one, a non-drive network or another provider's.
+- **`apply_rules` applying every candidate and tranche rule where it is applied** — the grid, the 10 km centre distance, the date, the score, the uploader share, population, on-foot share, thinning, the per-uploader cap and the size — one failing row per rule; `grid_rule_effect` counting the places the grid rule removes rather than the net change (a removal that readmits a thinned neighbour nets to 0).
+- **`build_samples` keeping only recent panos**, `spearman` being rank correlation (a monotone outlier keeps it at 1.0), `nearest_km` picking the nearest, `inside_grid` bounding the WIDTH at half, and the weighted median landing on OLDER imagery when it holds most of the length (so `median = newest` fails).
+- **The validation population is the scanned TILES**, never the bounding box: Mexico City and Kodiak sit in the box and in no scanned tile, and are dropped rather than scored 0; `scan_tiles` derives the tiles from the manifest's own regions.
+- **The analyzer refuses a scan that stopped early** (`scan_manifest.json` `stopped` set), writing nothing, since an unscanned tile would otherwise read as one with no imagery.
+
+All 39 mutations run after this change, the review's survivors included, fail at least one test.
+
+Added after the final review, which found seven more surviving:
+
+- **`grid_rule_effect` counts by place id, not by subtraction**: in a G/B/A chain (B 4 km from the in-grid G, A 4 km from B) removing G readmits B, which then thins A away, so the expected counts are 1 removed, 1 readmitted and 1 cascade-dropped — a constant or net-difference `readmitted` fails; duplicate `geonameid`s are refused, since set difference would miscount them.
+- **The validation's edges**: in one scanned tile, a point at tile fraction 15.9 is kept and one at 14.6 dropped (so `round()` for `int()` fails both ways), a scanned city with no samples is kept at score 0 rather than as NaN, a city with no walk is dropped (an inner join), and walks at 49.9% coverage or 2.01 yr median age are not "good".
+- **`collect scan`'s half of the stopped-scan contract**, through a fake session over Hawaii's four tiles: a 204 then a 302 stops after two requests, exits nonzero, records the stop in `scan_manifest.json`, and `load_scan_manifest` refuses that manifest.
+- **The metrics JSON is strict**: `strict_json` writes NaN (numpy's included) as `null`, parsed with a `parse_constant` that refuses `NaN`, and raises on infinity rather than writing it.
+
+The final review's 48 mutations (its two against the replaced subtraction re-aimed at the set-difference code) and eight more against this round's fixes, run after this change, all fail at least one test.
+
+## The Mapillary candidate probe (#406)
+
+**Added after the 2026-08-22 split.**
+
+`tests/test_mapillary_candidate_probe.py` drives `scripts/mapillary_candidate_probe.py` with the same in-memory `HttpResult` fetch and injected clock as the user-activity tool, whose client and pacer the probe imports.
+It pins each clause of the probe's contract: exactly one request per candidate, to `graph.mapillary.com/images` with `fields=id,captured_at,creator_id,is_pano`, `limit` 200 by default and passed through when lowered, and a bbox 2 km on a side centred on the candidate (its longitude span checked as square on the ground at 60° N);
+request starts at least 3 s apart on the injected clock;
+**no retry at all** — a 500 (the research pass's payload-size refusal), a 429 with a `Retry-After`, a 302, an HTML 200 and a transport error each stop the run after the second of three candidates, keeping the first one's row and both log lines, with exit 1 or, for the two block shapes, 75;
+a summary that marks a limit-filling answer `capped` (a floor) and reads the pano count, the dominant creator's share and the newest capture date;
+dry-run by default without building an HTTP client, a `makelab*` host refused under `--execute` before one is built, `--limit` above 200 or `--min-interval` under 3 s refused with exit 64, `--execute` without `--out` refused, an existing `--out` never overwritten, and a malformed candidates file a usage error.
+Because those tests drive `run` directly, `main` is pinned separately with `run` substituted: `--min-interval` reaches the Pacer, and `--limit`, `--out` and `--request-log` (explicit, and defaulted to `<out>.requests.jsonl`) reach `run` as given.

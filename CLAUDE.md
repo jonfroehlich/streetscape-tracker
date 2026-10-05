@@ -60,6 +60,7 @@ python -m streetscape_street_analyzer.collect "Seattle, WA" --network-type all_p
 python scripts/build_worldwide_frame.py
 python scripts/register_frame.py   # dry-run preview; --execute stays disabled until boundary-vetted
 python scripts/register_frame.py --manifest mapillary_360_cities.csv --overlap-km 5 --max-center-km 10 --center-from-geonames --notes-label "mapillary 360 leaders"
+python scripts/vet_manifest_geometry.py --manifest panoramax_360_cities.csv   # BEFORE registering: the geometry --execute would freeze + its price; Nominatim only, laptop only
 
 # Publish data/ to the UW Makeability Lab web server (rsync over SSH)
 ./sync_data_to_server.sh --dry-run
@@ -123,7 +124,7 @@ Every script in this table is catalog/disk-only (no API calls), dry-run by defau
 | `recompute_run_diffs.py --provider gsv --city C --regenerate-json` | Re-derive existing `run_diffs` rows and their detail files from both CSVs under the current reader (#245; #394's re-diff); updates in place so `diff_id` never moves, deletes only a diff-shaped file no other row names, heals stale per-run JSON on a re-run, refuses `--execute` while `run-due` is in flight |
 | `sweep_orphan_diff_details.py [--min-age-hours 24]` | List (and with `--execute` remove) diff detail files no `run_diffs`/`street_walk_diffs` row points at (#265); reads the catalog read-only, never deletes a file younger than the window, refuses `--execute` while `run-due` is in flight or against a catalog older than the disk; a local removal does not reach the web server, since the publish never passes `--delete` |
 
-The boundary-audit workflow (does a frozen grid actually fit its city?) is a four-script chain, each with a pinning test: `audit_city_boundaries.py` → `build_boundary_review.py` → `apply_decisions.py` → `reregister_boundaries.py`.
+The boundary-audit workflow (does a frozen grid actually fit its city?) is a four-script chain, each with a pinning test: `audit_city_boundaries.py` → `reregister_boundaries.py` dry run (writes the CSVs the review page renders; skip it and the page is empty) then `--execute` (the page silently drops an auto-resize city whose geometry is unchanged) → `build_boundary_review.py` → `apply_decisions.py`.
 
 ### Credentials and config
 
@@ -317,6 +318,7 @@ All three share **one layout** — a sticky filter sidebar, a one-sentence lead 
 But only `grid.html` and `streets.html` are pivoted to **one row per city**, providers as sub-columns (#250), so "Collected by" is a **scope, not just a row filter** — it redirects what the numeric filters read, or "coverage over 80%" silently means "some provider's".
 A `driving.html` row is a **place**, so it keeps a flat single-row header — the only page that renders that `theadHtml` branch **by default**, never its only caller (grid/streets reach it whenever every grouped column is unchecked, so deleting it breaks them).
 Anything fanning out over the provider registry must gate on presence in the payload — a registered provider is not a collected one.
+**`grid.html` reads `provider_screen.json.gz` (#349) as UPPER BOUNDS, never coverage** — no imagery at all renders as a conclusive "0 · none", a zero 360° bound over flat imagery as "0 · flat only" (never "none"), a positive 360° bound as "≤ N" titled with the artifact's own `caveat` verbatim, out of the default preset, and an absent file renders the page as before.
 **The inverse is silent, so the JS `PROVIDERS` registry is pinned to `naming.KNOWN_PROVIDERS` (#334)**: Panoramax was collectable for three PRs while unregistered, and nothing failed — the fan-outs skipped it and `getProviderFromFilename` resolved its token to gsv, so its run rendered under Google's attribution, ramp and copyright toggle.
 **An UNRECOGNISED provider token now resolves to `null`, and `isValidRunFilename` is DEFINED as that lookup succeeding (#338)** — two regexes that had to agree is how they came to disagree.
 "No token means gsv" is the legacy-URL contract and is untouched; "a token this build has never heard of means gsv" was the silence, and `city.js` now refuses such a run **by name, and refuses it even when `?city=` could resolve something else** — falling back renders another provider's imagery under the URL that named this one, which is the same substitution in a different costume.
@@ -359,6 +361,7 @@ Keep any list a doc enumerates **alphabetical**, so two branches adding an entry
   - `kartaview-feasibility.md`
   - `kartaview-sweep-cost.md`
   - `kartaview-viewer-deeplink.md`
+  - `mapillary-discovery-screen.md`
   - `mapillary-image-quality.md`
   - `mapillary-user-activity.md`
   - `pano-spacing.md`

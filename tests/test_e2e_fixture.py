@@ -61,9 +61,15 @@ from tests.e2e import build_fixture
 FIXTURE_DIR = pathlib.Path(__file__).resolve().parent / "e2e" / "fixture"
 
 # Artifacts that are not per-(city, provider) and so carry no provider token:
-# the aggregate, the walk manifest and the driving-plan join. A run diff is
-# excluded by its own name shape rather than listed, since its date pair moves.
-_UNTOKENED_ARTIFACTS = {"cities.json.gz", "streetwalks.json.gz", "driving_plan.json.gz"}
+# the aggregate, the walk manifest, the driving-plan join and the provider
+# screen (which names its providers inside, as keys). A run diff is excluded by
+# its own name shape rather than listed, since its date pair moves.
+_UNTOKENED_ARTIFACTS = {
+    "cities.json.gz",
+    "driving_plan.json.gz",
+    "provider_screen.json.gz",
+    "streetwalks.json.gz",
+}
 
 # What to do about a failure here, appended to every message. Spelled out
 # because the fix is three steps and skipping the last one (committing the
@@ -282,6 +288,41 @@ def test_the_fixture_names_no_provider_this_build_does_not_know():
         "since #338, and rendered it as Google's before) or the name is not "
         "one the naming generators emit at all."
     )
+
+
+def test_the_fixture_carries_a_provider_screen_with_a_zero_and_a_positive_city():
+    """``grid.html`` reads ``provider_screen.json.gz`` since #349, so the e2e
+    page gate needs one to read — and one that exercises BOTH readings.
+
+    The screen column's whole design is an asymmetry: a zero renders as a
+    conclusive "0 · none", a positive bound as a hint "≤ N". A fixture whose
+    screen held only zeros (or only positives) would leave one branch of that
+    rendering unseen by the browser suite, which is the non-blocking job, so
+    the gap would be found by nobody. Every screened city must also be a row
+    the page can show, or the cells under test would not exist, and every
+    screened provider must be one this build registers.
+    """
+    path = FIXTURE_DIR / "provider_screen.json.gz"
+    assert path.is_file(), (
+        "the committed fixture has no provider_screen.json.gz; re-run "
+        "`python tests/e2e/build_fixture.py` and commit it."
+    )
+    document = _read_fixture_json(path.name)
+    screened = {p: e for p, e in document["providers"].items() if e["cities"]}
+    assert screened, "the fixture's provider screen screened no provider"
+    assert set(screened) <= set(KNOWN_PROVIDERS), sorted(set(screened) - set(KNOWN_PROVIDERS))
+
+    aggregate_ids = {c["city_id"] for c in _read_fixture_json("cities.json.gz")["cities"]}
+    for provider, entry in screened.items():
+        # The conclusive zero is the ANY-imagery zero: a city with a zero 360°
+        # bound but flat pictures renders "0 · flat only", not "0 · none".
+        totals = [c["pictures_upper_bound"] for c in entry["cities"]]
+        bounds = [c["pictures_360_upper_bound"] for c in entry["cities"]]
+        assert 0 in totals, f"{provider}: no conclusive-zero city in the fixture screen"
+        assert any(b > 0 for b in bounds), f"{provider}: no positive city in the fixture screen"
+        assert {c["city_id"] for c in entry["cities"]} <= aggregate_ids
+        assert entry["caveat"], f"{provider}: the screen carries no caveat for the hint title"
+        assert entry["series"], f"{provider}: the screen carries no series for the table"
 
 
 def test_every_fixture_omission_is_an_explicit_named_decision():
