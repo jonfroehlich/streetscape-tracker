@@ -111,14 +111,14 @@ rank,geonameid,name,admin1,cc,lat,lon,pop,score_km_per_km2,recent_360_km_2km,top
 110,4373426,White Marsh,MD,US,39.38372,-76.43218,9513,4.221,53.04,1532803437981226,Rossitransportationgroup,0.929,2026-09-24,port-deposit--maryland--united-states,37.7,no,cities500 only
 111,5854857,Whitmore Village,HI,US,21.51429,-158.02464,4499,4.134,51.95,100186595565848,hmhtb,1.0,2025-09-07,mapillary_discovery_cities.csv:Waipio Acres,5.6,no,within 25 km of a known city
 112,5323401,Alpine,CA,US,32.83505,-116.76641,14236,4.103,51.56,713819173436997,marker_geo1,1.0,2025-01-24,santee--california--united-states,20.9,no,within 25 km of a known city
-113,5250402,Delavan Lake,WI,US,42.58418,-88.6326,2649,4.08,51.27,1006984308465014,UAS_ISG,1.0,2026-08-17,clinton--wisconsin--united-states,19.1,no,within 25 km of a known city
+113,5250402,Delavan Lake,WI,US,42.58418,-88.6326,2649,4.08,51.27,1006984308465014,UAS_ISG,1.0,2026-08-17,clinton--wisconsin--united-states,19.1,no,selected (operator exception)
 114,5574093,Yreka,CA,US,41.73542,-122.63447,7597,4.074,51.19,713819173436997,marker_geo1,0.956,2025-08-12,talent--oregon--united-states,57.2,no,cities500 only
 115,5284283,Colchester,CT,US,41.57565,-72.33203,4781,4.044,50.81,102956495281411,ctroadway360,1.0,2025-12-09,norwich--connecticut--united-states,20.3,no,within 25 km of a known city
 116,5377266,North Auburn,CA,US,38.93129,-121.08189,13022,4.003,50.3,713819173436997,marker_geo1,1.0,2025-07-21,mapillary_discovery_cities.csv:Orangevale,30.7,no,cities500 only
 117,4157092,Gotha,FL,US,28.52778,-81.52313,1915,3.996,50.22,104273298482293,rking,1.0,2025-01-15,orlando--florida--united-states,19.8,no,within 25 km of a known city
 118,4945055,Needham,MA,US,42.28343,-71.23283,28886,3.958,49.74,1139817854492667,Lanka6359,0.891,2025-11-04,waltham--massachusetts--united-states,10.2,yes,within 25 km of a known city
 119,4462759,Currituck,NC,US,36.44988,-76.01548,0,3.941,49.52,104214208486349,vorpalblade,1.0,2025-05-18,elizabeth-city--north-carolina--united-states,24.7,no,within 25 km of a known city
-120,5249259,Como,WI,US,42.61224,-88.48232,2631,3.94,49.51,1361362982257515,GIS_ISG,0.829,2025-12-02,clinton--wisconsin--united-states,31.8,no,cities500 only
+120,5249259,Como,WI,US,42.61224,-88.48232,2631,3.94,49.51,1361362982257515,GIS_ISG,0.829,2025-12-02,clinton--wisconsin--united-states,31.8,no,selected (operator exception)
 121,5334320,Carmel-by-the-Sea,CA,US,36.55524,-121.92329,3897,3.9,49.01,1073094253999318,pixelpete,1.0,2026-03-10,monte-sereno--california--united-states,76.3,no,cities500 only
 122,4926613,South Haven,IN,US,41.54198,-87.13726,5282,3.869,48.62,1243749034432301,ZachJ_POCO,1.0,2025-10-21,gary--indiana--united-states,16.6,no,within 25 km of a known city
 123,4367417,Rossmoor,MD,US,39.10372,-77.07109,8453,3.866,48.58,1532803437981226,Rossitransportationgroup,0.783,2026-07-13,laytonsville--maryland--united-states,13.2,no,within 25 km of a known city

@@ -118,17 +118,28 @@ QUERY_OVERRIDES: dict[str, str] = {}
 # Registration uses --overlap-km 5.
 OPERATOR_EXCEPTIONS = {
     "5026416": ("elizabeth--minnesota--united-states", 11.5, (1624, 812), (11551, 8879), 1.4),
+    "5250402": ("clinton--wisconsin--united-states", 19.1, (2174, 2648), (6043, 5136), 2.0),
 }
 REGISTRATION_OVERLAP_KM = 5.0
 EXCEPTION_DECISION = "selected (operator exception)"
 
+# Operator decision: pairs of rows admitted although they are within 25 km of
+# each other — two distinct places whose vetted grids do not overlap,
+# registered with --overlap-km 5, which admits both. Each id maps to its
+# vetted grid W x H m and the vetted geocode's offset from its GeoNames point.
+PAIR_EXCEPTIONS = {
+    frozenset({"5250402", "5249259"}): {
+        "5250402": ((6043, 5136), 2.0),  # Delavan Lake
+        "5249259": ((5622, 2924), 0.7),  # Como
+    },
+}
+
 # The favoured uploaders' candidates and what became of each. The priority is
-# more towns like Laurens, Iowa (GIS_ISG): Fergus Falls is in by exception;
-# the other two are pinned with the reason they are not, so their absence
-# cannot be read as an oversight.
+# more towns like Laurens, Iowa (GIS_ISG / UAS_ISG): all three are in by
+# operator exception, each pinned by geometry below.
 FAVOURED_CANDIDATE_DECISIONS = {
-    "Como": "cities500 only",
-    "Delavan Lake": "within 25 km of a known city",
+    "Como": EXCEPTION_DECISION,
+    "Delavan Lake": EXCEPTION_DECISION,
     "Fergus Falls": EXCEPTION_DECISION,
 }
 
@@ -145,6 +156,8 @@ EXPECTED_CITY_IDS = {
     "5325187": "atwater--california--united-states",
     "5088262": "keene--new-hampshire--united-states",
     "5019588": "buffalo--minnesota--united-states",
+    "5250402": "delavan-lake--wisconsin--united-states",
+    "5249259": "como--wisconsin--united-states",
     "4504476": "toms-river--new-jersey--united-states",
 }
 
@@ -211,6 +224,7 @@ def _rederive(record, vendored_ids):
         key=lambda r: (r["top_creator_id"] not in FAVOURED_CREATORS, -float(r["score_km_per_km2"]))
     )
     kept = []
+    admitted_by_exception = set(OPERATOR_EXCEPTIONS)
     for r in pool:
         clash = [
             k
@@ -218,17 +232,23 @@ def _rederive(record, vendored_ids):
             if _haversine_km(float(r["lat"]), float(r["lon"]), float(k["lat"]), float(k["lon"]))
             <= REUSE_RADIUS_KM
         ]
+        paired = [
+            k for k in clash if frozenset({r["geonameid"], k["geonameid"]}) in PAIR_EXCEPTIONS
+        ]
+        clash = [k for k in clash if k not in paired]
         if clash:
             decisions[r["geonameid"]] = f"within 25 km of selected {clash[0]['name']}"
         else:
             kept.append(r)
+            for k in paired:
+                admitted_by_exception |= {r["geonameid"], k["geonameid"]}
     favoured = [r for r in kept if r["top_creator_id"] in FAVOURED_CREATORS]
     others = [r for r in kept if r["top_creator_id"] not in FAVOURED_CREATORS]
     chosen = favoured + others[: max(0, CAP - len(favoured))]
     for r in kept:
         if r not in chosen:
             decisions[r["geonameid"]] = "over the cap"
-        elif r["geonameid"] in OPERATOR_EXCEPTIONS:
+        elif r["geonameid"] in admitted_by_exception:
             decisions[r["geonameid"]] = EXCEPTION_DECISION
         else:
             decisions[r["geonameid"]] = "selected"
@@ -394,10 +414,41 @@ def test_favoured_creators_candidates_and_what_became_of_each(record):
 
 
 def test_no_two_rows_are_within_the_reuse_radius(manifest_rows):
-    points = [(r["city"], float(r["lat"]), float(r["lon"])) for r in manifest_rows]
+    """Except a declared PAIR_EXCEPTIONS pair, which has its own geometry test."""
+    points = [(r["geonameid"], float(r["lat"]), float(r["lon"])) for r in manifest_rows]
     for i, (a, alat, alon) in enumerate(points):
         for b, blat, blon in points[i + 1 :]:
+            if frozenset({a, b}) in PAIR_EXCEPTIONS:
+                continue
             assert _haversine_km(alat, alon, blat, blon) > REUSE_RADIUS_KM, (a, b)
+
+
+def test_pair_exceptions_are_distinct_places_whose_grids_cannot_overlap(manifest_rows, record):
+    """
+    A pair of rows inside each other's reuse radius is admitted only when both
+    are rows, both decisions say exception, their GeoNames points are farther
+    apart than the two vetted half-diagonals plus both geocode offsets (so the
+    rectangles cannot overlap whatever their orientation), and the distance
+    clears the --overlap-km registration actually uses.
+    """
+    assert set(gen.PAIR_EXCEPTIONS) == set(PAIR_EXCEPTIONS)
+    rows = {row["geonameid"]: row for row in manifest_rows}
+    by_id = {r["geonameid"]: r for r in record}
+    for pair, members in PAIR_EXCEPTIONS.items():
+        assert set(members) == set(pair)
+        a, b = sorted(pair)
+        assert a in rows and b in rows, pair
+        assert by_id[a]["decision"] == by_id[b]["decision"] == EXCEPTION_DECISION
+        km = _haversine_km(
+            float(rows[a]["lat"]),
+            float(rows[a]["lon"]),
+            float(rows[b]["lat"]),
+            float(rows[b]["lon"]),
+        )
+        assert km <= REUSE_RADIUS_KM  # else the exception is stale
+        reach_km = sum(math.hypot(w, h) / 2 / 1000 + off for (w, h), off in members.values())
+        assert reach_km < km, (pair, reach_km, km)
+        assert km > REGISTRATION_OVERLAP_KM, pair
 
 
 def test_no_row_is_within_the_reuse_radius_of_a_known_registration(manifest_rows, record):
@@ -476,6 +527,17 @@ def test_generator_exception_waives_only_the_known_city_radius():
     unjoinable = _cand("5026416", 46.1, -96.0, 5.4)
     assert gen.select([unjoinable], known, set()) == []
     assert unjoinable["decision"] == "cities500 only"
+
+
+def test_generator_pair_exception_admits_only_the_named_pair():
+    far = {"elsewhere": (0.0, 0.0)}
+    a = _cand("5250402", 42.58, -88.63, 4.08)  # Delavan Lake's id
+    b = _cand("5249259", 42.61, -88.48, 3.94)  # Como's id, ~12.7 km away
+    c = _cand("8", 42.60, -88.55, 3.5)  # an unnamed third within 25 km of both
+    chosen = gen.select([a, b, c], far, {"5250402", "5249259", "8"})
+    assert [x["geonameid"] for x in chosen] == ["5250402", "5249259"]
+    assert a["decision"] == b["decision"] == gen.EXCEPTION_DECISION
+    assert c["decision"] == "within 25 km of selected P5250402"
 
 
 def test_generator_reports_cities500_known_and_vetting_drops():

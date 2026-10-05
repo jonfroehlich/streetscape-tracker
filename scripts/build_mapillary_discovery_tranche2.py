@@ -34,8 +34,10 @@ script applies the second tranche's rule to the same record:
 5. every favoured-creator row is kept, then the rest up to ``CAP`` rows in
    total.
 
-``OPERATOR_EXCEPTIONS`` waives rule 2 (and only rule 2) for a named town; the
-reason is recorded beside it and the record's decision says so.
+``OPERATOR_EXCEPTIONS`` waives rule 2 (and only rule 2) for a named town, and
+``PAIR_EXCEPTIONS`` waives rule 4 for a named pair; the reason is recorded
+beside each and the record's decision says so for every row an exception
+admitted.
 
 The rows are written in descending score, so ``register_frame.py --limit N``
 registers the strongest first. Every candidate's decision is written to
@@ -108,6 +110,20 @@ OPERATOR_EXCEPTIONS = {
     "1,624 x 812 m; Fergus Falls' vetted grid is 11,551 x 8,879 m, so the two "
     "rectangles cannot overlap and there is no duplicate to guard against; "
     "registration uses --overlap-km 5, which admits it",
+    "5250402": "Delavan Lake WI: its only known city within 25 km is "
+    "clinton--wisconsin--united-states, 19.1 km away, whose frozen grid is "
+    "2,174 x 2,648 m; Delavan Lake's vetted grid is 6,043 x 5,136 m, so the two "
+    "rectangles cannot overlap and there is no duplicate to guard against; "
+    "registration uses --overlap-km 5, which admits it",
+}
+
+# Pairs of rows admitted although rule 4 (no two rows within 25 km) would drop
+# the second: an operator decision, two distinct places whose vetted grids do
+# not overlap; registered with --overlap-km 5, which admits both.
+PAIR_EXCEPTIONS = {
+    frozenset({"5250402", "5249259"}): "Delavan Lake and Como WI, 12.7 km apart: "
+    "vetted grids 6,043 x 5,136 m and 5,622 x 2,924 m, whose half-diagonals plus "
+    "both geocode offsets (2.0 and 0.7 km) total 9.8 km",
 }
 EXCEPTION_DECISION = "selected (operator exception)"
 
@@ -188,6 +204,7 @@ def select(candidates, known, vendored_ids, supplement_ids=frozenset()):
     pool = [c for c in candidates if c["decision"] is None]
     pool.sort(key=lambda c: (c["top_creator"] not in FAVOURED_CREATORS, -float(c["km_per_km2"])))
     kept = []
+    waived = set(OPERATOR_EXCEPTIONS)  # ids an exception admitted
     for c in pool:
         lat, lon = float(c["lat"]), float(c["lon"])
         near = [
@@ -195,10 +212,16 @@ def select(candidates, known, vendored_ids, supplement_ids=frozenset()):
             for k in kept
             if haversine_km(lat, lon, float(k["lat"]), float(k["lon"])) <= REUSE_RADIUS_KM
         ]
+        excused = [
+            k for k in near if frozenset({c["geonameid"], k["geonameid"]}) in PAIR_EXCEPTIONS
+        ]
+        near = [k for k in near if k not in excused]
         if near:
             c["decision"] = f"within 25 km of selected {near[0]['name']}"
         else:
             kept.append(c)
+            if excused:
+                waived.update({c["geonameid"]} | {k["geonameid"] for k in excused})
     favoured = [c for c in kept if c["top_creator"] in FAVOURED_CREATORS]
     others = [c for c in kept if c["top_creator"] not in FAVOURED_CREATORS]
     room = max(0, CAP - len(favoured))
@@ -206,8 +229,7 @@ def select(candidates, known, vendored_ids, supplement_ids=frozenset()):
     for c in others[room:]:
         c["decision"] = "over the cap"
     for c in chosen:
-        exception = c["geonameid"] in OPERATOR_EXCEPTIONS
-        c["decision"] = EXCEPTION_DECISION if exception else "selected"
+        c["decision"] = EXCEPTION_DECISION if c["geonameid"] in waived else "selected"
     return sorted(chosen, key=lambda c: -float(c["km_per_km2"]))
 
 

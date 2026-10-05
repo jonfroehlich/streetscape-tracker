@@ -398,7 +398,7 @@ The closing summary says so in one sentence: the grid runs and the opt-in provid
 
 **Added after the 2026-08-22 split.**
 
-The exact sequence for landing the 12-town second tranche on production, in order, with the reason for each step.
+The exact sequence for landing the 14-town second tranche on production, in order, with the reason for each step.
 The selection, the vetting table and the excluded towns are in [`worldwide_sampling.md`](worldwide_sampling.md) ("`mapillary_discovery_cities_tranche2.csv`").
 Every path below is production's `[paths]` from `config/scheduler.makelab1.toml`; run from the production checkout, after the night's batch has finished.
 
@@ -412,11 +412,11 @@ DATA=/projects/makeabilitylab/streetscape-tracker/data
 python scripts/register_frame.py --manifest mapillary_discovery_cities_tranche2.csv \
     --db-path "$DATA/streetscape_tracker.db" \
     --notes-label "mapillary discovery screen 2026-10-02 tranche 2" --overlap-km 5 --max-center-km 10
-# read the dry run: every row "-> NEW", and "already-registered=0 reused-existing=0 newly-registered=12 failed=0"; then the same with --execute
+# read the dry run: every row "-> NEW", and "already-registered=0 reused-existing=0 newly-registered=14 failed=0"; then the same with --execute
 ```
 
 - `--overlap-km 5`, not the default 25, because the default silently ALIASES a genuine neighbour onto an existing city instead of registering it (PR #298's lesson).
-  The manifest's test already holds every row more than 25 km from every tranche-1 town and every other row, and from every catalog city except Fergus Falls' one operator exception (11.5 km from Elizabeth MN, whose 1,624 x 812 m grid cannot overlap it), which 5 km admits; so a nonzero `reused-existing` means the catalog holds a city the record does not know about; stop and find it.
+  The manifest's test already holds every row more than 25 km from every tranche-1 town, from every other row except the Delavan Lake–Como pair (12.7 km apart, grids that cannot overlap), and from every catalog city except two operator exceptions (Fergus Falls 11.5 km from Elizabeth MN, Delavan Lake 19.1 km from Clinton WI, neither grid able to overlap its neighbour's); 5 km admits all of them, so a nonzero `reused-existing` means the catalog holds a city the record does not know about; stop and find it.
 - `--max-center-km 10` because every row's geocode landed within 5.5 km of its GeoNames point at vetting.
   `--center-from-geonames` is deliberately NOT passed: a row that geocodes differently on the day should fail and be listed, not be quietly recentered.
 - `--notes-label` makes the batch selectable below.
@@ -429,7 +429,7 @@ The ids come from the notes label, so the audit cannot drop one:
 
 ```bash
 IDS=$(python -c "import sqlite3, sys; c = sqlite3.connect(sys.argv[1]); print(' '.join(r[0] for r in c.execute(\"select city_id from cities where notes like 'mapillary discovery screen 2026-10-02 tranche 2%' order by city_id\")))" "$DATA/streetscape_tracker.db")
-echo $IDS | wc -w   # 12
+echo $IDS | wc -w   # 14
 python scripts/audit_city_boundaries.py --data-dir "$DATA" \
     --cache audit/mdt2/nominatim_boundary_cache.jsonl --report audit/mdt2/boundary_audit_report.csv \
     $(for c in $IDS; do printf -- '--city %s ' "$c"; done)
@@ -440,20 +440,21 @@ python scripts/build_boundary_review.py --data-dir "$DATA" --audit-dir audit/mdt
 python scripts/apply_decisions.py --data-dir "$DATA" --decisions audit/mdt2/boundary_decisions.csv   # dry run, then --execute
 ```
 
-The audit sends one structured Nominatim query per city (12), never a provider request.
-If `reregister_boundaries.py` flags nothing, the review page is empty because every city's verdict is `OK`; read the report's `verdict` column for all 12 to confirm that, rather than reading an empty page as a pass.
+The audit sends one structured Nominatim query per city (14), never a provider request.
+If `reregister_boundaries.py` flags nothing, the review page is empty because every city's verdict is `OK`; read the report's `verdict` column for all 14 to confirm that, rather than reading an empty page as a pass.
 
 **4. Enable, one tranche per night: `scheduler enable-city CITY`.**
-`enable-city` enrols the opt-in pairs BEFORE flipping `enabled` (#374), so a city's grid runs and walks pair on one UTC date: KartaView at an estimate ≤ 1,000 (all 12 clear it; Reno is the largest at 923), Panoramax only on a nonzero one-city screen.
+`enable-city` enrols the opt-in pairs BEFORE flipping `enabled` (#374), so a city's grid runs and walks pair on one UTC date: KartaView at an estimate ≤ 1,000 (all 14 clear it; Reno is the largest at 923), Panoramax only on a nonzero one-city screen.
 An enabled city is due on every default channel the next night and a never-collected city ranks first in each queue (`NULLS FIRST`), so the tranche is what that night collects first.
-Preview with `--dry-run`, then enable (night 1's ten towns shown; night 2 is `toms-river--new-jersey--united-states reno--nevada--united-states`):
+Preview with `--dry-run`, then enable (night 1's twelve towns shown; night 2 is `toms-river--new-jersey--united-states reno--nevada--united-states`):
 
 ```bash
 NIGHT1="phoenixville--pennsylvania--united-states atwater--california--united-states
   buffalo--minnesota--united-states woodland--california--united-states payson--utah--united-states
   galesburg--illinois--united-states perris--california--united-states
   keene--new-hampshire--united-states tracy--california--united-states
-  fergus-falls--minnesota--united-states"
+  fergus-falls--minnesota--united-states delavan-lake--wisconsin--united-states
+  como--wisconsin--united-states"
 for c in $NIGHT1; do python -m streetscape_metadata_tracker.scheduler enable-city "$c" --config config/scheduler.makelab1.toml --dry-run; done
 for c in $NIGHT1; do python -m streetscape_metadata_tracker.scheduler enable-city "$c" --config config/scheduler.makelab1.toml; done
 ```
@@ -470,14 +471,14 @@ Without `--execute` the script only lists.
 The daily 15:00 timer runs the same pass with `--nights 2 --limit 40 --execute`, so a tranche enabled in the morning is frozen by it; run the commands above when enabling after 15:00, and not on an afternoon that already carried a drain or a daytime walk catch-up (Overpass's ~100 queries/day guidance, `provider-access.md`).
 
 **6. Pricing, and the nights.**
-From the vetting table, one collection of all 12 is 5,540,533 GSV grid points (1.92 h at 48,000/min) plus 1,099,458 GSV walk samples by the area proxy (an over-estimate, 0.38 h), **783 Mapillary z14 tiles**, 2,164 KartaView requests (2.25 h at 16/min) and at most 2,850 Panoramax z15 tiles (48 min at 60/min, only if the screen enrols the pair).
+From the vetting table, one collection of all 14 is 5,659,858 GSV grid points (1.97 h at 48,000/min) plus 1,123,036 GSV walk samples by the area proxy (an over-estimate, 0.39 h), **811 Mapillary z14 tiles**, 2,221 KartaView requests (2.31 h at 16/min) and at most 2,934 Panoramax z15 tiles (49 min at 60/min, only if the screen enrols the pair).
 The Mapillary walks are free on a paired night (#290).
 Mapillary is priced against the **2,260-tile clean combined night** (`fill_host_ceilings`, the highest combined night recorded without a block), which also has to hold that night's regularly due Mapillary cities; block 4 (2026-09-28) followed ~4,600 tiles in 24.5 h.
 So the tranche is split in two, cheapest GSV first and Reno alone with Toms River:
 
 | Night | Cities | GSV points (h at 48k/min) | Mapillary tiles | KartaView requests (h at 16/min) | Panoramax tiles (min at 60/min) |
 |---|---|---|---|---|---|
-| 1 | Phoenixville, Atwater, Buffalo, Woodland, Payson, Fergus Falls, Galesburg, Perris, Keene, Tracy | 2,446,209 (0.85) | 395 | 1,007 (1.05) | 1,354 (23) |
+| 1 | Como, Phoenixville, Delavan Lake, Atwater, Buffalo, Woodland, Payson, Fergus Falls, Galesburg, Perris, Keene, Tracy | 2,565,534 (0.89) | 423 | 1,064 (1.11) | 1,438 (24) |
 | 2 | Toms River, Reno | 3,094,324 (1.07) | 388 | 1,157 (1.21) | 1,496 (25) |
 
 Before night 2, read night 1's ledger: its combined Mapillary spend plus 388 must stay under 2,260, and the log must show every tranche city collected (or paused at a cap, exit 83, which resumes), no Mapillary block (exit 75) and no Overpass latch.

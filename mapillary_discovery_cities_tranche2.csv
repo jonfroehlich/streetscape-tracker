@@ -10,4 +10,6 @@ query_string,city,admin,iso2,country,continent,size_band,population,coverage_reg
 "Atwater, California, United States",Atwater,California,US,United States,NA,,29237,,5325187,37.34772,-120.60908
 "Keene, New Hampshire, United States",Keene,New Hampshire,US,United States,NA,,23265,,5088262,42.93369,-72.27814
 "Buffalo, Minnesota, United States",Buffalo,Minnesota,US,United States,NA,,16026,,5019588,45.17191,-93.87469
+"Delavan Lake, Wisconsin, United States",Delavan Lake,Wisconsin,US,United States,NA,,2649,,5250402,42.58418,-88.6326
+"Como, Wisconsin, United States",Como,Wisconsin,US,United States,NA,,2631,,5249259,42.61224,-88.48232
 "Toms River, New Jersey, United States",Toms River,New Jersey,US,United States,NA,,88791,,4504476,39.95373,-74.19792
