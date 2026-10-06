@@ -262,13 +262,15 @@ Three rules are load-bearing:
 - **Whole series or none.** One refused walk skips its (city, provider, network type) series, reported by name and counted per reason (missing GraphML, sample count, sample key, edge id, NULL column, missing CSV, error) with exit 1, so a history never mixes two definitions.
   A series that spans a network refresh is therefore refused whole, even though its post-refresh walks alone could be repaired.
 
-**The frame CHECK is tolerant, and the scoring deliberately is not, because that is what the collector does.**
-The CSV text is exact: Python's correctly rounded `float()` of it reproduces every regenerated sample bit for bit.
-The noise is the loader's: `fileutils.load_city_csv_file` reads with pandas' default C float parser, which is not correctly rounded (on the dev catalog's six walk CSVs it misparsed 21–22% of query coordinates, never by more than one ULP: up to 1.4e-14° in longitude on Seattle), and a few samples per large walk sit within one ULP of `quantize_coord`'s 9-decimal half-way point, so the loaded value lands across it (Seattle gsv/drive on the dev catalog: 5 of 247,292 samples).
-An exact key match would refuse most large series over that, with a message that reads like a refreshed network, so the frame check matches within the tolerance.
-But every collector reads its CSV back through that same loader before scoring, so `compute_streetwalk_coverage`'s key join misses those samples in the collector too and scores them uncovered — and the recompute reproduces exactly that, rather than moving the samples onto the CSV's coordinates.
-An earlier version did substitute them, and it disagreed with the collector: Seattle's dev walk moved 98.4 → 98.5 (`edges_fully_covered` +9) from the substitution alone.
-Scoring those samples covered is a real definition change for the loader or the scorer, to be made there and then applied by this tool, never by the tool on its own.
+**The frame CHECK is tolerant and the scoring is exact, and since #425 the two agree on every CSV the collectors write (revised 2026-10).**
+The CSV text is exact: it is `repr` of the sample float, and Python's correctly rounded `float()` of it reproduces every regenerated sample bit for bit.
+Until #425 the noise was the loader's: `fileutils.load_city_csv_file` read with pandas' default C float parser, which is not correctly rounded (dev catalog, six walk CSVs: 4.6–5.6 % of latitudes and 37.3–38.6 % of longitudes one ULP off, never more).
+A few samples per large walk sit within one ULP of `quantize_coord`'s 9-decimal half-way point, so the loaded value landed across it and `compute_streetwalk_coverage`'s key join scored the sample UNCOVERED, in the collector and in the recompute alike (Seattle gsv/drive on the dev catalog: 5 of 247,292 samples; Corvallis `all_public`: 2 of 83,928).
+The loader now reads `float_precision="round_trip"`, so a loaded coordinate equals its text and the key join hits every sample.
+The frame check keeps its 1e-8° tolerance so it can never refuse a series over a sub-ULP difference with a message that reads like a refreshed network; a match that needs the tolerance is still accepted and counted, and the report now flags it as unexpected, because it should be zero.
+The recompute still scores the samples it regenerated against the loader's frame rather than moving them onto the CSV's coordinates.
+An earlier version substituted them and disagreed with the collector (Seattle's dev walk 98.4 → 98.5 from the substitution alone, before the loader was fixed); that same 98.4 → 98.5 is now the CORRECT answer, reached by collector and recompute alike through the fixed loader, and applied to the whole series by this tool.
+Numbers: [`experiments/csv-float-parse.md`](experiments/csv-float-parse.md).
 The keys are taken from Python floats, as the scorer's own `zip` over a Series yields them; `round()` on an `np.float64` takes numpy's path, which can land a half-way value on the other side.
 Duplicate CSV rows are accepted and counted, exactly as the scorer's `drop_duplicates(keep="first")` accepts them.
 
@@ -292,6 +294,7 @@ The orchestrator now removes it (the row's pointer up front, the deterministic n
 It is still not sufficient for the public server: the publish rsync never passes `--delete`, so a copy already published stays there until it is removed from the docroot by hand.
 Note also that the artifact cannot repair itself — its per-edge aggregates were already computed under the old definition, so the dropped `NO_DATE` samples are simply not in it, which rules out the cheap artifact-reading design `backfill_streetwalk_coverage.py` and `backfill_streetwalk_length.py` both use.
 Until `recompute_streetwalk_stats.py --execute` runs on production, the affected deltas are the FIRST walk diff of each series after 2026-08-24.
+The same pass applies #425's loader fix, so one `--execute` after that deploy lands both definitions; the production runbook is in [`operations.md`](operations.md#the-walk-recompute-after-a-walk-definition-change-issues-257-262-425).
 Most will be exactly 0.0 — only 149 of 2,429 GSV runs and 19 of 1,959 Mapillary runs hold any undated imagery at all — but the tail can render.
 These are **upper bounds** on the shift, never the shift, for a different reason per provider (see the writeup's correction).
 For Mapillary the figure is undated images over grid points, where several images can share a point that may also hold a dated one.

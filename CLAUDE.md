@@ -356,6 +356,7 @@ Keep any list a doc enumerates **alphabetical**, so two branches adding an entry
 
   - `capture-date-precision.md`
   - `carto-basemap-key.md`
+  - `csv-float-parse.md`
   - `grid-density.md`
   - `gsv-query-radius.md`
   - `gsv-throughput.md`

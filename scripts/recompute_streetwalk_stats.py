@@ -273,7 +273,9 @@ class Report:
     refused: list = field(default_factory=list)
     refusal_reasons: Counter = field(default_factory=Counter)
     failed: list = field(default_factory=list)
-    notes: list = field(default_factory=list)  # tolerance-only matches (unexpected since #425), duplicate rows
+    notes: list = field(
+        default_factory=list
+    )  # tolerance-only matches (unexpected since #425), duplicate rows
     artifacts_written: int = 0
     rows_updated: int = 0
     removed_files: list = field(default_factory=list)

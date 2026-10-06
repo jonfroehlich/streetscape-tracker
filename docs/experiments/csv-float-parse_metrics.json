@@ -1,0 +1,477 @@
+{
+  "_about": {
+    "experiment": "csv-float-parse",
+    "writeup": "docs/experiments/csv-float-parse.md",
+    "generated_by": "scripts/csv_float_parse_analyze.py --data-dir data --docs-dir docs/experiments",
+    "pandas": "3.0.1",
+    "note": "Measured on the DEV catalog (a laptop copy), not production: the production re-measure is the walk recompute's dry run after deploy. `default` is pandas' default C float parser (the loader before #425); `round_trip` is float_precision='round_trip', which equals float() of the CSV text. Parse timings are wall-clock on the measuring machine."
+  },
+  "summary": {
+    "walk_files": 6,
+    "walk_rows": 441631,
+    "lat_off_share": {
+      "n": 6,
+      "min": 0.0461,
+      "p25": 0.0462,
+      "p50": 0.0464,
+      "p75": 0.0536,
+      "p90": 0.056,
+      "p95": 0.056,
+      "max": 0.056
+    },
+    "lon_off_share": {
+      "n": 6,
+      "min": 0.3731,
+      "p25": 0.3736,
+      "p50": 0.3765,
+      "p75": 0.3842,
+      "p90": 0.3858,
+      "p95": 0.3858,
+      "max": 0.3858
+    },
+    "pooled_coord_off_share": 0.21,
+    "max_err_ulp": 1.0,
+    "keys_shifted_total": 9,
+    "walks_whose_scoring_moved": 2,
+    "grid_runs": 8,
+    "grid_rows": 18229993,
+    "grid_runs_with_stats_moved": 0,
+    "grid_status_flips": 0,
+    "grid_runs_with_grid_keys_changed": 0,
+    "grid_runs_with_grid_points_changed": 0,
+    "grid_runs_with_center_changed": 1,
+    "grid_runs_with_bounds_changed": 3,
+    "grid_load_slowdown": {
+      "n": 6,
+      "min": 1.15,
+      "p25": 1.21,
+      "p50": 1.26,
+      "p75": 1.29,
+      "p90": 1.36,
+      "p95": 1.39,
+      "max": 1.42
+    }
+  },
+  "observations": {
+    "walks": [
+      {
+        "csv_filename": "adrian--oregon--united-states_width_815_height_811_step_20_streetwalk_sp15_2026-07-17.csv.gz",
+        "city_id": "adrian--oregon--united-states",
+        "provider": "gsv",
+        "network_type": "drive",
+        "run_date": "2026-07-17",
+        "rows": 464,
+        "lat_off": 26,
+        "lat_off_share": 0.056,
+        "max_lat_err_deg": 7.105427357601002e-15,
+        "max_lat_err_ulp": 1.0,
+        "lon_off": 179,
+        "lon_off_share": 0.3858,
+        "max_lon_err_deg": 1.4210854715202004e-14,
+        "max_lon_err_ulp": 1.0,
+        "keys_shifted": 0,
+        "parse_s_default": 0.003,
+        "parse_s_round_trip": 0.001,
+        "scoring": {
+          "default": {
+            "edges_total": 41,
+            "edges_fully_covered": 36,
+            "mean_edge_coverage": 0.9362,
+            "coverage_pct_by_length": 95.6,
+            "coverage_pct_by_length_any": 95.6,
+            "length_km": 6.961,
+            "length_km_covered": 6.654,
+            "length_km_covered_any": 6.654,
+            "median_covered_age_years": 0.96
+          },
+          "round_trip": {
+            "edges_total": 41,
+            "edges_fully_covered": 36,
+            "mean_edge_coverage": 0.9362,
+            "coverage_pct_by_length": 95.6,
+            "coverage_pct_by_length_any": 95.6,
+            "length_km": 6.961,
+            "length_km_covered": 6.654,
+            "length_km_covered_any": 6.654,
+            "median_covered_age_years": 0.96
+          },
+          "moved": [],
+          "tolerance_only_matches": {
+            "default": 0,
+            "round_trip": 0
+          }
+        }
+      },
+      {
+        "csv_filename": "seattle--washington--united-states_width_17689_height_28145_step_20_streetwalk_sp15_2026-07-22.csv.gz",
+        "city_id": "seattle--washington--united-states",
+        "provider": "gsv",
+        "network_type": "drive",
+        "run_date": "2026-07-22",
+        "rows": 247292,
+        "lat_off": 11416,
+        "lat_off_share": 0.0462,
+        "max_lat_err_deg": 7.105427357601002e-15,
+        "max_lat_err_ulp": 1.0,
+        "lon_off": 92273,
+        "lon_off_share": 0.3731,
+        "max_lon_err_deg": 1.4210854715202004e-14,
+        "max_lon_err_ulp": 1.0,
+        "keys_shifted": 5,
+        "parse_s_default": 0.19,
+        "parse_s_round_trip": 0.3,
+        "scoring": {
+          "default": {
+            "edges_total": 33597,
+            "edges_fully_covered": 32394,
+            "mean_edge_coverage": 0.9845,
+            "coverage_pct_by_length": 98.4,
+            "coverage_pct_by_length_any": 98.4,
+            "length_km": 3672.287,
+            "length_km_covered": 3615.349,
+            "length_km_covered_any": 3615.349,
+            "median_covered_age_years": 0.97
+          },
+          "round_trip": {
+            "edges_total": 33597,
+            "edges_fully_covered": 32399,
+            "mean_edge_coverage": 0.9845,
+            "coverage_pct_by_length": 98.5,
+            "coverage_pct_by_length_any": 98.5,
+            "length_km": 3672.287,
+            "length_km_covered": 3615.424,
+            "length_km_covered_any": 3615.424,
+            "median_covered_age_years": 0.97
+          },
+          "moved": [
+            "edges_fully_covered",
+            "coverage_pct_by_length",
+            "coverage_pct_by_length_any",
+            "length_km_covered",
+            "length_km_covered_any",
+            "coverage_by_highway"
+          ],
+          "tolerance_only_matches": {
+            "default": 5,
+            "round_trip": 0
+          }
+        }
+      },
+      {
+        "csv_filename": "adrian--oregon--united-states_width_815_height_811_step_20_mapillary_streetwalk_sp15_2026-07-27.csv.gz",
+        "city_id": "adrian--oregon--united-states",
+        "provider": "mapillary",
+        "network_type": "drive",
+        "run_date": "2026-07-27",
+        "rows": 464,
+        "lat_off": 26,
+        "lat_off_share": 0.056,
+        "max_lat_err_deg": 7.105427357601002e-15,
+        "max_lat_err_ulp": 1.0,
+        "lon_off": 179,
+        "lon_off_share": 0.3858,
+        "max_lon_err_deg": 1.4210854715202004e-14,
+        "max_lon_err_ulp": 1.0,
+        "keys_shifted": 0,
+        "parse_s_default": 0.001,
+        "parse_s_round_trip": 0.001,
+        "scoring": {
+          "default": {
+            "edges_total": 41,
+            "edges_fully_covered": 0,
+            "mean_edge_coverage": 0.0,
+            "coverage_pct_by_length": 0.0,
+            "coverage_pct_by_length_any": 0.0,
+            "length_km": 6.961,
+            "length_km_covered": 0.0,
+            "length_km_covered_any": 0.0,
+            "median_covered_age_years": null
+          },
+          "round_trip": {
+            "edges_total": 41,
+            "edges_fully_covered": 0,
+            "mean_edge_coverage": 0.0,
+            "coverage_pct_by_length": 0.0,
+            "coverage_pct_by_length_any": 0.0,
+            "length_km": 6.961,
+            "length_km_covered": 0.0,
+            "length_km_covered_any": 0.0,
+            "median_covered_age_years": null
+          },
+          "moved": [],
+          "tolerance_only_matches": {
+            "default": 0,
+            "round_trip": 0
+          }
+        }
+      },
+      {
+        "csv_filename": "corvallis--oregon--united-states_width_8355_height_9702_step_20_mapillary_streetwalk_sp15_2026-07-27.csv.gz",
+        "city_id": "corvallis--oregon--united-states",
+        "provider": "mapillary",
+        "network_type": "drive",
+        "run_date": "2026-07-27",
+        "rows": 25555,
+        "lat_off": 1178,
+        "lat_off_share": 0.0461,
+        "max_lat_err_deg": 7.105427357601002e-15,
+        "max_lat_err_ulp": 1.0,
+        "lon_off": 9693,
+        "lon_off_share": 0.3793,
+        "max_lon_err_deg": 1.4210854715202004e-14,
+        "max_lon_err_ulp": 1.0,
+        "keys_shifted": 0,
+        "parse_s_default": 0.017,
+        "parse_s_round_trip": 0.027,
+        "scoring": {
+          "default": {
+            "edges_total": 2591,
+            "edges_fully_covered": 47,
+            "mean_edge_coverage": 0.0266,
+            "coverage_pct_by_length": 1.9,
+            "coverage_pct_by_length_any": 9.9,
+            "length_km": 382.317,
+            "length_km_covered": 7.197,
+            "length_km_covered_any": 37.669,
+            "median_covered_age_years": 5.34
+          },
+          "round_trip": {
+            "edges_total": 2591,
+            "edges_fully_covered": 47,
+            "mean_edge_coverage": 0.0266,
+            "coverage_pct_by_length": 1.9,
+            "coverage_pct_by_length_any": 9.9,
+            "length_km": 382.317,
+            "length_km_covered": 7.197,
+            "length_km_covered_any": 37.669,
+            "median_covered_age_years": 5.34
+          },
+          "moved": [],
+          "tolerance_only_matches": {
+            "default": 0,
+            "round_trip": 0
+          }
+        }
+      },
+      {
+        "csv_filename": "corvallis--oregon--united-states_width_8355_height_9702_step_20_mapillary_streetwalk_allpublic_sp15_2026-07-27.csv.gz",
+        "city_id": "corvallis--oregon--united-states",
+        "provider": "mapillary",
+        "network_type": "all_public",
+        "run_date": "2026-07-27",
+        "rows": 83928,
+        "lat_off": 3892,
+        "lat_off_share": 0.0464,
+        "max_lat_err_deg": 7.105427357601002e-15,
+        "max_lat_err_ulp": 1.0,
+        "lon_off": 31359,
+        "lon_off_share": 0.3736,
+        "max_lon_err_deg": 1.4210854715202004e-14,
+        "max_lon_err_ulp": 1.0,
+        "keys_shifted": 2,
+        "parse_s_default": 0.046,
+        "parse_s_round_trip": 0.085,
+        "scoring": {
+          "default": {
+            "edges_total": 30643,
+            "edges_fully_covered": 989,
+            "mean_edge_coverage": 0.0355,
+            "coverage_pct_by_length": 2.2,
+            "coverage_pct_by_length_any": 7.9,
+            "length_km": 1172.091,
+            "length_km_covered": 25.491,
+            "length_km_covered_any": 92.823,
+            "median_covered_age_years": 5.34
+          },
+          "round_trip": {
+            "edges_total": 30643,
+            "edges_fully_covered": 989,
+            "mean_edge_coverage": 0.0355,
+            "coverage_pct_by_length": 2.2,
+            "coverage_pct_by_length_any": 7.9,
+            "length_km": 1172.091,
+            "length_km_covered": 25.491,
+            "length_km_covered_any": 92.823,
+            "median_covered_age_years": 5.34
+          },
+          "moved": [],
+          "tolerance_only_matches": {
+            "default": 2,
+            "round_trip": 0
+          }
+        }
+      },
+      {
+        "csv_filename": "corvallis--oregon--united-states_width_8355_height_9702_step_20_streetwalk_allpublic_sp15_2026-07-27.csv.gz",
+        "city_id": "corvallis--oregon--united-states",
+        "provider": "gsv",
+        "network_type": "all_public",
+        "run_date": "2026-07-27",
+        "rows": 83928,
+        "lat_off": 3892,
+        "lat_off_share": 0.0464,
+        "max_lat_err_deg": 7.105427357601002e-15,
+        "max_lat_err_ulp": 1.0,
+        "lon_off": 31359,
+        "lon_off_share": 0.3736,
+        "max_lon_err_deg": 1.4210854715202004e-14,
+        "max_lon_err_ulp": 1.0,
+        "keys_shifted": 2,
+        "parse_s_default": 0.065,
+        "parse_s_round_trip": 0.098,
+        "scoring": {
+          "default": {
+            "edges_total": 30643,
+            "edges_fully_covered": 24145,
+            "mean_edge_coverage": 0.8171,
+            "coverage_pct_by_length": 74.5,
+            "coverage_pct_by_length_any": 74.5,
+            "length_km": 1172.091,
+            "length_km_covered": 872.853,
+            "length_km_covered_any": 872.853,
+            "median_covered_age_years": 2.32
+          },
+          "round_trip": {
+            "edges_total": 30643,
+            "edges_fully_covered": 24146,
+            "mean_edge_coverage": 0.8171,
+            "coverage_pct_by_length": 74.5,
+            "coverage_pct_by_length_any": 74.5,
+            "length_km": 1172.091,
+            "length_km_covered": 872.867,
+            "length_km_covered_any": 872.867,
+            "median_covered_age_years": 2.32
+          },
+          "moved": [
+            "edges_fully_covered",
+            "length_km_covered",
+            "length_km_covered_any",
+            "coverage_by_highway"
+          ],
+          "tolerance_only_matches": {
+            "default": 2,
+            "round_trip": 0
+          }
+        }
+      }
+    ],
+    "grid": [
+      {
+        "csv_filename": "appleton--wisconsin--united-states_width_8699_height_16140_step_20_2026-07-13.csv.gz",
+        "provider": "gsv",
+        "run_date": "2026-07-13",
+        "rows": 351480,
+        "stats_moved": [],
+        "status_flips": 0,
+        "grid_points_equal": true,
+        "grid_keys_equal": true,
+        "center_equal": true,
+        "bounds_equal": true,
+        "parse_s_default": 0.85,
+        "parse_s_round_trip": 0.98,
+        "max_query_distance_delta_m": 1.4146550597615715e-09
+      },
+      {
+        "csv_filename": "corvallis--oregon--united-states_width_8355_height_9702_step_20_2026-07-06.csv.gz",
+        "provider": "gsv",
+        "run_date": "2026-07-06",
+        "rows": 203148,
+        "stats_moved": [],
+        "status_flips": 0,
+        "grid_points_equal": true,
+        "grid_keys_equal": true,
+        "center_equal": true,
+        "bounds_equal": false,
+        "parse_s_default": 0.46,
+        "parse_s_round_trip": 0.55,
+        "max_query_distance_delta_m": 2.4628654671232653e-09
+      },
+      {
+        "csv_filename": "adrian--oregon--united-states_width_815_height_811_step_20_2026-07-01.csv.gz",
+        "provider": "gsv",
+        "run_date": "2026-07-01",
+        "rows": 1681,
+        "stats_moved": [],
+        "status_flips": 0,
+        "grid_points_equal": true,
+        "grid_keys_equal": true,
+        "center_equal": true,
+        "bounds_equal": true,
+        "parse_s_default": 0.01,
+        "parse_s_round_trip": 0.01,
+        "max_query_distance_delta_m": 2.1625297108585073e-09
+      },
+      {
+        "csv_filename": "adrian--oregon--united-states_width_815_height_811_step_20_2026-07-02.csv.gz",
+        "provider": "gsv",
+        "run_date": "2026-07-02",
+        "rows": 1681,
+        "stats_moved": [],
+        "status_flips": 0,
+        "grid_points_equal": true,
+        "grid_keys_equal": true,
+        "center_equal": true,
+        "bounds_equal": true,
+        "parse_s_default": 0.01,
+        "parse_s_round_trip": 0.01,
+        "max_query_distance_delta_m": 2.1625297108585073e-09
+      },
+      {
+        "csv_filename": "detroit--michigan--united-states_width_31104_height_21683_step_20_mapillary_2026-07-24.csv.gz",
+        "provider": "mapillary",
+        "run_date": "2026-07-24",
+        "rows": 16569307,
+        "stats_moved": [],
+        "status_flips": 0,
+        "grid_points_equal": true,
+        "grid_keys_equal": true,
+        "center_equal": true,
+        "bounds_equal": true,
+        "parse_s_default": 29.64,
+        "parse_s_round_trip": 37.08
+      },
+      {
+        "csv_filename": "appleton--wisconsin--united-states_width_8699_height_16140_step_20_mapillary_2026-07-14.csv.gz",
+        "provider": "mapillary",
+        "run_date": "2026-07-14",
+        "rows": 351480,
+        "stats_moved": [],
+        "status_flips": 0,
+        "grid_points_equal": true,
+        "grid_keys_equal": true,
+        "center_equal": true,
+        "bounds_equal": true,
+        "parse_s_default": 0.31,
+        "parse_s_round_trip": 0.44
+      },
+      {
+        "csv_filename": "corvallis--oregon--united-states_width_8355_height_9702_step_20_mapillary_2026-07-06.csv.gz",
+        "provider": "mapillary",
+        "run_date": "2026-07-06",
+        "rows": 203373,
+        "stats_moved": [],
+        "status_flips": 0,
+        "grid_points_equal": true,
+        "grid_keys_equal": true,
+        "center_equal": false,
+        "bounds_equal": false,
+        "parse_s_default": 0.2,
+        "parse_s_round_trip": 0.26
+      },
+      {
+        "csv_filename": "ames--iowa--united-states_width_14683_height_11442_step_20_panoramax_2026-09-06.csv.gz",
+        "provider": "panoramax",
+        "run_date": "2026-09-06",
+        "rows": 547843,
+        "stats_moved": [],
+        "status_flips": 0,
+        "grid_points_equal": true,
+        "grid_keys_equal": true,
+        "center_equal": true,
+        "bounds_equal": false,
+        "parse_s_default": 0.88,
+        "parse_s_round_trip": 1.11
+      }
+    ]
+  }
+}

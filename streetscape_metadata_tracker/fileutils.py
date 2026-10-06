@@ -153,7 +153,7 @@ def load_city_csv_file(
         # exact (repr of the float that was written), so the correct read is the
         # text's value. Reaches the np.float64 columns only; nullable Float64
         # columns (pano_lat/pano_lon) take another path and are unchanged.
-        # Cost: +15-35% parse wall-clock, no memory (measured, 16.6M rows: 29->35 s).
+        # Cost: 1.15-1.42x load wall-clock, no memory (dev, 16.6M rows: 29.6->37.1 s).
         df = pd.read_csv(
             csv_path,
             dtype=dtypes_for_run_path(csv_path) if dtypes is None else dtypes,
