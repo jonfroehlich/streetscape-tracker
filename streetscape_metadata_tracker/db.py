@@ -2945,12 +2945,19 @@ def claim_quarantine_alerts(
     overlapping run-due processes cannot both email a pair. The counter term makes a
     concurrent success or ``reset-failures`` between the SELECT and the UPDATE a
     no-op rather than an alert for a pair that is no longer quarantined.
+    The UPDATE re-checks only the counter and the stamp, not ``enabled`` or
+    membership, so an exclusion or a disable that another process commits
+    between the SELECT and the UPDATE can still be stamped and emailed once --
+    a window of microseconds, accepted.
 
-    Not ``BEGIN IMMEDIATE`` + SELECT + UPDATE (the shape of the v15 -> v16
-    migration): an explicit BEGIN raises ``cannot start a transaction within a
-    transaction`` if the caller's connection has an implicit transaction open,
-    and this sits in the nightly tail, where a raise costs every later step.
-    This helper uses only ``conn.execute``, ``conn.commit`` and ``conn.rollback``.
+    A per-row compare-and-set, not ``BEGIN IMMEDIATE`` + SELECT + UPDATE (the
+    shape of the v15 -> v16 migration): the decision to email rests on each
+    UPDATE's own ``WHERE`` and ``rowcount``, so correctness never depends on a
+    multi-statement transaction's isolation, and a night with nothing to claim
+    -- most nights -- runs only SELECTs and never takes the write lock, where
+    ``BEGIN IMMEDIATE`` would take it every night, in the nightly tail, before
+    knowing whether there is anything to write. The helper uses only
+    ``conn.execute``, ``conn.commit`` and ``conn.rollback``.
 
     Stamp, then email: the caller sends after this returns, so a crash between
     the two loses that email (at-most-once) -- the ``Done:`` line still counts

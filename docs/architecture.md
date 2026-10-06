@@ -38,7 +38,7 @@ It is **local-only and never rsynced** — it lives in exactly one place, which 
 | `run_diffs` | UNIQUE(from_run_id, to_run_id) | Run-to-run change counters + detail filename |
 | `api_usage` | PK(usage_date, provider) | Daily request-budget ledger; **additive** (`add_api_usage`); streets channels metered under their own strings (#99) |
 | `host_usage` | index(host, recorded_at) | Timestamped per-HOST spend (#385, v16), one row per `add_api_usage` on a channel in `CHANNEL_METERED_HOST`; read over a rolling 24 h by the `[hosts.*]` budget gate, pruned after 30 days |
-| `schedule_state` | PK(city_id, provider) | Stagger day, last attempt/success, `consecutive_failures` (reset only by a success), `member` (per-channel membership, #248), `quarantine_alerted_at` (when the night emailed this failure streak, #424, v21) |
+| `schedule_state` | PK(city_id, provider) | Stagger day, last attempt/success, `consecutive_failures` (reset by a success or `reset-failures`), `member` (per-channel membership, #248), `quarantine_alerted_at` (when the night emailed this failure streak, #424, v21) |
 | `history_harvests` | UNIQUE(city_id, provider, harvest_date) | Out-of-band GSV capture-history harvests (#2) |
 | `street_networks` | UNIQUE(city_id, network_type) | Frozen OSM networks (#103); GraphML lives unpublished under `data/osm_cache/` |
 | `street_walks` | UNIQUE(city_id, provider, network_type, run_date) | Road-walk collection runs (#99) — a second modality with its own unit of observation |
