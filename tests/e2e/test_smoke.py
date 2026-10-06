@@ -395,16 +395,29 @@ def test_capture_history_chart_is_destroyed_on_every_legend_repaint(page: Page, 
     updateLegend swaps the legend's innerHTML on every map click and year
     toggle; without `previousChart?.destroy()` each repaint strands a Chart
     holding a detached canvas.
+
+    Counts only the capture-history chart's instances, never the page total:
+    the street-coverage chart is created AFTER the legend's first paint (it
+    waits on the streetwalk manifest and coverage fetches), so a total sampled
+    when the canvas first shows can be one short of a total sampled later --
+    the race that failed CI with 4 == 3 while no chart leaked.
     """
     errors = _capture_errors(page)
     page.goto(f"{base_url}/city.html?file={ALPHA_LATEST}")
     expect(page.locator("#capture-history-chart")).to_be_visible()
 
-    count_js = "Object.keys(Chart.instances).length"
-    before = page.evaluate(count_js)
     for _ in range(5):
         page.evaluate("updateLegend(Object.keys(markersByYear).map(Number))")
-    assert page.evaluate(count_js) == before
+    # Exactly one capture-history Chart survives, and it draws on the LIVE canvas.
+    assert page.evaluate(
+        """() => {
+            const live = document.getElementById("capture-history-chart");
+            const mine = Object.values(Chart.instances)
+                .filter((c) => c.canvas.id === "capture-history-chart");
+            return mine.length === 1 && mine[0].canvas === live;
+        }"""
+    )
+    # And no chart on the page, from any repaint path, holds a detached canvas.
     assert page.evaluate(
         "Object.values(Chart.instances).every((c) => document.body.contains(c.canvas))"
     )
