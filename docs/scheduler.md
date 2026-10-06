@@ -730,7 +730,7 @@ Success is read off `schedule_state.last_success_at` having moved since admissio
 Not done here: an operator-facing `status` view of fill eligibility, publishing the mark for walks, and any change to Panoramax pacing (#405).
 The provider forums were not re-read for this change: it raises no rate, no budget and no ceiling, and its one new per-IP number (2,260) is a figure this project already measured clean — but it DOES call KartaView and Panoramax more often for their enrolled cities (inside their unchanged daily budgets), which CLAUDE.md's READ THIS FIRST rule asks to be checked against those providers' forums before deploying.
 
-## The failure quarantine, made visible (issue #421, added 2026-10-02)
+## The failure quarantine, made visible (issue #421, added 2026-10-02, revised 2026-10-05 for #424)
 
 **A (city, channel) at `[schedule].max_consecutive_failures` (5 on prod) is dropped from `get_due_cities`, and nothing but a success lifts it.**
 A dropped pair is never attempted, so it never fails, so it never alerts: prod alerts on every failed collection (`failure_threshold = 1`), so nights 1–5 each sent an email and night 6 onward was silence, which reads as the problem having gone away.
@@ -739,39 +739,48 @@ The fill (#404) made that sharper: it drops a failing opt-in channel and refresh
 **The set is `db.get_quarantined`**: an enabled city, a member of the channel (`COALESCE(member, default)`, as dueness reads it), and `consecutive_failures >= max_consecutive_failures`.
 Staleness is deliberately not part of it, so the count tracks the set an operator has to clear rather than flickering with the cycle; a disabled city or a non-member is left out, because neither can be due whatever its counter says.
 
-**The transition alerts ONCE, inside the night email.**
-`cmd_run_due` reads the set after the dry-run return and again after the fill, and the set difference is what entered quarantine tonight.
-It is never `count >= max`, which would re-alert every night forever, and a pair some other path pushes from 5 to 6 is in both snapshots and stays silent.
-It reaches `_finish_batch` as `newly_quarantined`: an `N QUARANTINED` subject part (the subject is what gets read at 03:00) and a paragraph naming each pair's count, `last_error` and its pasteable `reset-failures ... --execute` command, `--config` included.
-It is part of `unhealthy`, so it alerts regardless of `failure_threshold` — it is that pair's last email.
-It rarely changes a night's exit status, since the failure that tripped it already made `attempted > succeeded` in the same process — but not never: with two `run-due` processes overlapping, the one that did NOT record the failure still sees the pair enter between its snapshots, reports it as new, and exits 1 on a night whose own collections all succeeded.
+**The alert is claimed, once per failure streak, inside the night email (#424).**
+`schedule_state.quarantine_alerted_at` (schema v21) is the UTC instant a night claimed the right to email the pair's current failure streak; NULL means it has not been emailed.
+After the fill (and after the dry-run return, so a preview stamps nothing), `cmd_run_due` calls `db.claim_quarantine_alerts` over every enabled channel: each quarantined pair with a NULL stamp is stamped by a compare-and-set `UPDATE ... WHERE quarantine_alerted_at IS NULL AND consecutive_failures >= cap`, and the pair is emailed iff that UPDATE's rowcount is 1.
+The decision and the stamp are one statement, so two overlapping `run-due`s cannot both email a pair: the second UPDATE waits on the write lock, finds the stamp, and matches nothing.
+It is not `BEGIN IMMEDIATE` + SELECT + UPDATE, because an explicit `BEGIN` raises inside an already-open implicit transaction, and this runs in the tail.
+It is never `count >= max`, which would re-alert every night forever, and a failure never clears the stamp, so a pair some other path pushes from 5 to 6 stays silent.
+Stamp, then email: the claim commits before `_finish_batch` sends, so a crash between the two loses that one email (at-most-once) rather than sending it twice; the `Done:` count still carries the pair, and the unit's `OnFailure=` email reports the crash.
+The claimed rows reach `_finish_batch` as `quarantine_alerts`: an `N QUARANTINED` subject part (the subject is what gets read at 03:00) and a paragraph naming each pair's count, `last_error` and its pasteable `reset-failures ... --execute` command, `--config` included.
+It is part of `unhealthy`, so it alerts regardless of `failure_threshold` — it is that streak's only email.
+It rarely changes a night's exit status, since the failure that tripped it usually made `attempted > succeeded` in the same process — but not never: a pair that crossed the cap between nights, or one an overlapping `run-due` pushed over, is claimed by a night whose own collections may all have succeeded, and that night exits 1.
 A separate email was rejected (the night email already carries every other condition), as was a per-night "realign blocked" email, which would duplicate the per-failure alert.
 
-**The standing set is counted on every `Done:` line while it is nonempty** — `; quarantined: 3 (kartaview 2, panoramax 1, 1 new tonight)` — over every enabled channel, not a filtered night's, so a `--provider mapillary` catch-up never reports a KartaView quarantine as gone.
+**The standing set is counted on every `Done:` line while it is nonempty** — `; quarantined: 3 (kartaview 2, panoramax 1, 1 alerted tonight)` — over every enabled channel, not a filtered night's, so a `--provider mapillary` catch-up never reports a KartaView quarantine as gone.
 `status` marks each quarantined pair `QUARANTINED` in its failing-pairs list, from the same query, and prints the count with the clear command.
 
-**Both snapshots are guarded** (`_quarantine_snapshot`): the first runs ahead of the pre-loop backup and the second between the loop and `_finish_batch`, so an unguarded raise in either would cost the whole night or its whole tail — aggregate, manifests, backup, publish and the alert — for a reporting query.
-A raise is logged, named on the `Done:` line as `; quarantine check FAILED (before|after the night: <error>)` — with any `;` in `<error>` turned into `,`, because the `Done:` line is split on `;` (`scripts/night_length_analyze.py`) and the clause's leading separator must be its only one — and alerts on its own as a `QUARANTINE CHECK FAILED` subject part, since that is exactly the night a transition could go unreported.
-A failed FIRST snapshot means the transition is unknown, so nothing is reported as new: diffing against an empty set would call the whole standing set tonight's and re-alert every pair already alerted on.
-A failed second snapshot reports neither the transition nor the standing count that night.
+**Both steps are guarded**: the claim (`_claim_quarantine_alerts`) and then the standing-set read (`_quarantine_snapshot`), both between the fill and `_finish_batch`, so an unguarded raise in either would cost the whole tail — aggregate, manifests, backup, publish and the alert — for a reporting step.
+A raise is logged, named on the `Done:` line as `; quarantine alert claim FAILED (<error>)` or `; quarantine check FAILED (<error>)` — with any `;` in `<error>` turned into `,`, because the `Done:` line is split on `;` (`scripts/night_length_analyze.py`) and the clause's leading separator must be its only one — and alerts on its own as a `QUARANTINE CHECK FAILED` subject part.
+A failed claim rolls back its stamps, so nothing is lost: the next night claims the same pairs.
+A failed read drops that night's standing count but not the email, because the claim runs first.
 
-**What it does not catch**, named rather than argued away:
-a pair that enters the set BETWEEN nights is already in the next night's first snapshot, so it never alerts and appears only in the count.
+**What the stamp catches, and what it still does not**, named rather than argued away.
+The claim's gates (enabled, member, at the cap) are evaluated at claim time, so a pair that enters the set BETWEEN nights is emailed the first night after.
 `assess-city` is not one of those paths — it runs with `record_failures=False`, so a manual probe never increments `consecutive_failures` at all — but these are:
 a LOWERED `max_consecutive_failures`, which sweeps every pair between the old and new caps in at once;
 a re-enabled city whose counter was already at the cap;
 a re-enrolled channel (`enroll-city --clear`, or a bare enrol on an opt-in channel) over a row whose counter was already at the cap;
-and enabling a `[providers.X]` block, which brings that channel's at-cap rows into both snapshots at once.
-Two `run-due` processes overlapping could each see the same transition, and both would alert — once each.
+and enabling a `[providers.X]` block, which brings that channel's at-cap rows into the claim at once.
+Still not caught:
+a crash between the claim's commit and the send loses that one email (the `Done:` count and `notify-failure` cover it);
+the same streak re-reaching a RAISED cap is not emailed again, since only a success or a reset clears the stamp (each extra failed night still emails on prod, where `failure_threshold = 1`);
+and the first night after the v21 deploy emails every standing quarantined pair once, by design, since the migration backfills nothing and a pair quarantined before #423 shipped was never emailed at all.
 
 **The amnestied exit-code families can never reach it.**
 Blocked (75/76/81/84), busy (79/80/82/85), crawl-incomplete (83) and argv-rejected (2) record no `consecutive_failure`, and neither does a child killed by the SIGTERM wind-down (#206), so a host block or a `systemctl stop` never quarantines the city it stopped; `test_an_amnestied_outcome_never_quarantines_a_pair_one_failure_from_the_cap` pins each against a plain failure that does.
 
 **`reset-failures CITY --channel C [--execute]`** is the way out, so the alert's fix is a command rather than SQL against the live catalog.
 It is DRY-RUN until `--execute`, and the preview prints the count, whether the pair is quarantined, and its `last_error`, so the cause is read before it is cleared.
-It moves only the counter: `last_success_at` stays (a reset is not a success, and stamping one would push the next attempt a whole cycle away), and so does `last_error` (the only record of why, overwritten by the next attempt anyway).
+It moves the counter and clears the alert stamp, so a re-quarantine emails again; `last_success_at` stays (a reset is not a success, and stamping one would push the next attempt a whole cycle away), and so does `last_error` (the only record of why, overwritten by the next attempt anyway).
 An unknown channel, an unresolvable city and a pair with nothing to reset all exit 64 writing nothing — the last because a reset that changes nothing and exits 0 is the silent no-op `enroll-city --clear` refuses for the same reason.
 A disabled city or a non-member is allowed and noted, since the counter still gates the pair the moment it is enabled or enrolled.
+The preview also prints the alert stamp (`alerted:`).
+`enroll-city` over an at-cap row prints the pair's quarantine state and whether it was already alerted, and never touches the stamp: the stamp means "this streak was emailed", and enrolling does not change the streak.
 Fix the cause first: a cleared pair that still fails is quarantined again after five more nights, and alerts again then.
 
 ## The subcommand roster, and the production config (added 2026-08-25)

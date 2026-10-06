@@ -963,7 +963,7 @@ pgrep -af '[s]cheduler .*run-due'   # [s]: never matches a parent `bash -c` hold
 ```
 
 A schema bump makes this one-way: code older than the catalog refuses to open it, so rolling back past a migration also means restoring a pre-migration catalog backup.
-Schema v20 (#289) is the current instance; its deploy and backfill steps are in [`../docs/operations.md`](../docs/operations.md), "Schema v20 and the `runs.total_grid_points` backfill".
+Schema v21 (#424) is the current instance; its deploy steps, and v20's (#289) deploy and backfill steps, are in [`../docs/operations.md`](../docs/operations.md), "Schema v21 and the quarantine alert stamp" and "Schema v20 and the `runs.total_grid_points` backfill".
 
 A city that fails `max_consecutive_failures` nights in a row is skipped
 automatically until you reset it:
