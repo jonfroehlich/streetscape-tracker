@@ -666,6 +666,9 @@ test("streetLegendSectionHtml: exactly one radio is checked and it is the state'
     assert.equal(checked.length, 1, `${mode}: ${checked}`);
     assert.ok(checked[0].includes(`data-mode="${mode}"`), checked[0]);
     assert.ok(checked[0].includes("active"), checked[0]);
+    // .gsv-mode-toggle means "this run has the Google-only filter" (the e2e
+    // suite asserts its ABSENCE on Panoramax/KartaView runs, which have walks).
+    assert.ok(!html.includes("gsv-mode-toggle"), html);
   }
 });
 

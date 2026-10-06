@@ -535,7 +535,7 @@ function streetLegendSectionHtml(state) {
         <span class="street-headline-sub">(${Number(state.covered).toLocaleString()} of
         ${Number(state.segments).toLocaleString()} segments covered)</span>
       </p>
-      <div class="gsv-mode-toggle street-mode" role="radiogroup" aria-label="Color streets by">${buttons}
+      <div class="street-mode" role="radiogroup" aria-label="Color streets by">${buttons}
       </div>
       <label class="street-gaps-toggle legend-meta"
              title="Spotlight the streets with NO imagery in red; everything covered fades back">

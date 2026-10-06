@@ -308,6 +308,34 @@ legendControl.onAdd = () => {
 };
 legendControl.addTo(map);
 
+/** Smallest legend height worth keeping; below it, overlap beats a sliver. */
+const LEGEND_MIN_HEIGHT_PX = 160;
+
+/**
+ * Keep the legend's bottom edge above the bottom-right panel stack (issue
+ * #104). Both are right-anchored, so on any viewport shorter than the two
+ * combined the stack (z-index above Leaflet controls) would cover the legend's
+ * lower sections — which is where the street-coverage section and the year
+ * filter live. The legend already scrolls; this only shortens its box. Re-run
+ * whenever the stack changes size (a panel collapses, the street chart
+ * appears) or the window does.
+ */
+function fitLegendAboveBottomPanels() {
+  const legend = document.querySelector(".legend");
+  const stack = document.getElementById("bottom-right-panels");
+  if (!legend || !stack) return;
+  const room = stack.getBoundingClientRect().top - legend.getBoundingClientRect().top - 10;
+  legend.style.maxHeight = `${Math.max(LEGEND_MIN_HEIGHT_PX, Math.floor(room))}px`;
+}
+{
+  const stack = document.getElementById("bottom-right-panels");
+  if (stack && typeof ResizeObserver === "function") {
+    new ResizeObserver(fitLegendAboveBottomPanels).observe(stack);
+  }
+  window.addEventListener("resize", fitLegendAboveBottomPanels);
+  fitLegendAboveBottomPanels();
+}
+
 /**
  * Rebuild the legend HTML to reflect the current marker state.
  * Renders two sections: a data overview table and an interactive year filter.

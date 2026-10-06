@@ -391,7 +391,11 @@
   font-size: 11px;
 }
 
+/* Laid out like .gsv-mode-toggle but deliberately NOT that class: tests (and
+   readers) use .gsv-mode-toggle to mean "this run has the Google-only filter". */
 .street-mode {
+  display: flex;
+  gap: 4px;
   margin-bottom: 6px;
 }
 
