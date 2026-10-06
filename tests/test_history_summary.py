@@ -391,6 +391,16 @@ def test_backfill_refuses_a_missing_data_dir_and_creates_nothing(tmp_path):
     assert not (tmp_path / "typo").exists(), "a refused dry run must create nothing"
 
 
+def test_backfill_refuses_a_missing_data_dir_even_with_a_real_db_path(conn, data_dir, tmp_path):
+    """The directory check stands on its own: an explicit, real --db-path does not excuse it."""
+    missing = tmp_path / "typo" / "data"
+    db_path = os.path.join(data_dir, "streetscape_tracker.db")
+    result = _run_backfill(str(missing), "--db-path", db_path)
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "is not a directory" in result.stderr
+    assert not (tmp_path / "typo").exists()
+
+
 def test_backfill_refuses_a_data_dir_with_no_catalog_and_creates_none(data_dir):
     """An existing directory with no catalog (the code checkout's ./data) is refused too."""
     result = _run_backfill(data_dir)

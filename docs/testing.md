@@ -231,7 +231,7 @@ Incidental coverage of a deprecated spelling trains readers to ignore the notice
   a duplicated `pano_id` counts once (no dedup fails it); an empty harvest publishes nulls and empty histograms, never `NaT`; an existing summary is left alone without `force_recreate_file`;
   the harvester script writes the summary after cataloging, run through `_run` with a stubbed harvester (skipping the call fails it);
   `scripts/backfill_history_json.py` runs as a subprocess: a dry run writes nothing and exits 1 for a missing CSV, `--execute` writes once, a second run is "up to date", and `--force` rewrites (executing on a dry run, or ignoring `--force`, fails it);
-  a `--data-dir` that does not exist, or that holds no catalog, is refused with exit 2, prints no `0 rows`, and creates neither the directory nor an empty catalog (removing either refusal fails its test), while a real catalog with no harvests still answers `0 rows` with exit 0;
+  a `--data-dir` that does not exist, or that holds no catalog, is refused with exit 2, prints no `0 rows`, and creates neither the directory nor an empty catalog (removing either refusal fails its test; the directory refusal is pinned with a real `--db-path`, since otherwise the catalog refusal masks its removal), while a real catalog with no harvests still answers `0 rows` with exit 0;
   and `ParsedHistoryFilename.provider` is `"gsv"`.
 - GSV batch downloader's quota-throttling behavior (OVER_QUERY_LIMIT retry, sub-threshold residual written back as a failure row, over-threshold abort
   — the `fetch_gsv_pano_metadata_async` primitive is monkeypatched to serve responses from memory)
