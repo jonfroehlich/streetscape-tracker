@@ -58,7 +58,7 @@ an arbitrary 0–1 axis on the age filter.
 So `pivotGridRows` reports which providers its payload contained and `walkProvidersIn` which ones the manifest walked, and the columns, the presets, the Δ pair and the scope options are all built from that — the same distinction `GRID_DELTA_PAIRS` already drew for the Δ leaves, widened from “is it registered” to “is it here”.
 Two halves of the contract are easy to break in opposite directions: the module-level `GRID_COLUMNS`/`STREET_COLUMNS` stay the **full-registry** build, so the `?sort=`/`?cols=` vocabulary does not depend on tonight's data, while a `?provider=` naming an uncollected provider is simply absent from `options` and `parseTableState` drops a value no option offers,
 so such a link degrades to unscoped rather than to a dead scope.
-And this is a layout fact rather than a tidiness one: the default view carries three grouped metrics, so each additional collected provider is three more ~90px leaves against the same 1500 − 280px measure the presets are sized to.
+And this is a layout fact rather than a tidiness one: the default view carries three grouped metrics, so each additional collected provider is three more ~90px leaves against the table's wrap, whose width is the window's less the sidebar, up to the page cap ([#438](https://github.com/jonfroehlich/streetscape-tracker/issues/438)).
 
 **The default preset of a pivoted page carries every metric group, and the table scrolls sideways when that does not fit ([#350](https://github.com/jonfroehlich/streetscape-tracker/issues/350)).**
 This reverses [#334](https://github.com/jonfroehlich/streetscape-tracker/issues/334), which capped a default at `DEFAULT_PRESET_LEAF_BUDGET = 8` leaves and dropped whole metric groups from the end to keep the table inside the 1500 − 280px measure.
@@ -74,6 +74,10 @@ At four providers the "Walked" group alone costs **375px** against a container o
 Every lever short of scrolling was measured and none closes a 375px gap: the 12px → 8px cell padding ([#345](https://github.com/jonfroehlich/streetscape-tracker/issues/345)) returns ~80px and is kept anyway, since every px is one the reader does not scroll past.
 
 So the wrap's `overflow-x` becomes the desktop layout rather than the narrow-viewport safety net it was.
+But only where the window is actually too narrow: until [#438](https://github.com/jonfroehlich/streetscape-tracker/issues/438) the page itself was capped at 1500px, so the wrap was 1160px at ANY window width and a 27" monitor scrolled the default beside ~1000px of empty screen.
+The cap is now 1920px, sized to the widest preset — measured live at four providers: Overview 1373px, Kilometres 1489px, Change 1360px, Network 1160px — plus the sidebar, gap and padding (~1830px).
+It stays a cap rather than `none` because the table is `width: 100%`, so past the widest preset extra page width only stretches leaves.
+`test_every_streets_preset_fits_unscrolled_on_a_large_monitor` pins the fit at a 1920px window; at 1440px the tables still scroll, which the pinned-column test below depends on.
 ADR 0001 is untouched — this is horizontal scrolling of one element, not pagination or virtualization.
 What does NOT change is that **the document itself must never scroll sideways**: the table's width has to stay inside `.streets-table-wrap`, which needs `position: relative` or the header's absolutely-positioned `.visually-hidden` span escapes the scroll container and drags the page with it.
 `test_the_page_itself_never_scrolls_sideways` pins that on all three pages, and `driving.html` — one row per PLACE, no provider fan-out, so its width does not grow — keeps the strict fits-its-container assertion in `test_driving_table_still_fits_its_container`.
@@ -181,7 +185,7 @@ One bug the clear path exposed is worth keeping named: three paths change a wind
 *Written after the split.*
 
 **The filter sidebar is a native `<details>`, and the one hole that leaves is closed in JS.**
-The table pages put search/selects/columns/sliders/checkboxes in a ~280px column beside the table (page measure 1200 → 1500px) that collapses to a "Filters" disclosure at ≤900px; native semantics give keyboard and AT support for nothing.
+The table pages put search/selects/columns/sliders/checkboxes in a ~280px column beside the table (page measure 1200 → 1500px, then 1920px in [#438](https://github.com/jonfroehlich/streetscape-tracker/issues/438)) that collapses to a "Filters" disclosure at ≤900px; native semantics give keyboard and AT support for nothing.
 Above the breakpoint the `<summary>` is `display: none` and the panel is simply a column — which means a panel collapsed on a narrow screen and then widened would be closed with its only toggle gone, stranding filters that are in the URL and cannot be seen or changed.
 `wireSidebarDisclosure` re-opens it on widening, one-way (narrowing never closes what the reader opened).
 `controlsHtml` orders the sections search → selects → columns → numeric windows → booleans → clear, partitioning by filter TYPE with an "everything else" bucket so a type added later renders in the wrong place rather than not at all

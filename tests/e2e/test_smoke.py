@@ -2211,6 +2211,50 @@ def test_driving_table_still_fits_its_container(page: Page, base_url):
     assert errors == []
 
 
+def test_every_streets_preset_fits_unscrolled_on_a_large_monitor(page: Page, base_url):
+    """At a 1920px window, no streets.html preset scrolls sideways (#438).
+
+    Until #438 the page was capped at 1500px, so the wrap was 1160px however
+    wide the window was and the four-provider default scrolled on a 27"
+    monitor beside ~1000px of empty screen. The cap is now sized to the widest
+    preset, so this walks EVERY preset rather than the default alone — a cap
+    that fit Overview but not Kilometres would pass a default-only check.
+
+    The vacuity guard matters: the same presets must overflow at 1440px, or
+    the fixture is too narrow to tell a 1500px cap from a 1920px one and the
+    fit below would be green against either.
+    """
+    errors = _capture_errors(page)
+    presets = page.locator("#table-preset option")
+
+    def overflows():
+        return page.evaluate(
+            """() => {
+                 const wrap = document.querySelector('.streets-table-wrap');
+                 return wrap.scrollWidth - wrap.clientWidth;
+               }"""
+        )
+
+    page.set_viewport_size({"width": 1920, "height": 1080})
+    page.goto(f"{base_url}/streets.html")
+    expect(page.locator(".streets-table tbody tr").first).to_be_visible()
+    values = presets.evaluate_all("opts => opts.map(o => o.value)")
+    assert len(values) >= 2, f"expected several presets, got {values}"
+
+    for value in values:
+        page.select_option("#table-preset", value)
+        overflow = overflows()
+        assert overflow <= 0, f"preset {value!r} overflows its wrap by {overflow}px at 1920px wide"
+
+    page.set_viewport_size({"width": 1440, "height": 900})
+    page.select_option("#table-preset", values[0])
+    assert overflows() > 0, (
+        "the default preset fits at 1440px, so this fixture cannot tell the page cap apart"
+    )
+
+    assert errors == []
+
+
 @pytest.mark.parametrize("path", ["grid.html", "streets.html"])
 def test_the_city_column_stays_pinned_while_the_table_scrolls(page: Page, base_url, path):
     """The pivoted tables scroll sideways now (#350), so the row header is

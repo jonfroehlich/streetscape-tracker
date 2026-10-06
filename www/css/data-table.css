@@ -26,13 +26,18 @@
    control strip, and once all three shared the sidebar it was a modifier every
    caller set, which is a base value wearing a class name.
 
-   The width is deliberate arithmetic: the sidebar takes 280px, and 1500 − 280
-   − 20 leaves the table the same 1200px the pages had before the sidebar, so
-   no column preset had to be re-sized. The padding is tighter than the prose
-   pages' because the point of the compact page head is to put the table and
-   its filters on the first screen. */
+   The cap is sized to the widest PRESET, not to a fixed table measure (#438).
+   It was 1500px, which left the table a 1160px wrap at any window width, so
+   a 27" monitor scrolled the default sideways beside ~1000px of empty screen.
+   Measured live at four providers, the widest preset (Kilometres) is 1489px;
+   1489 + the 280px sidebar + 20px gap + 40px padding is ~1830px, and 1920
+   leaves headroom. It is still a cap rather than `none` because the table is
+   `width: 100%`: on an ultrawide an uncapped page would stretch every leaf
+   instead of showing more of them. Prose keeps its own 78ch measure below.
+   The padding is tighter than the prose pages' because the point of the
+   compact page head is to put the table and its filters on the first screen. */
 .streets-main {
-  max-width: 1500px;
+  max-width: 1920px;
   margin: 0 auto;
   padding: 56px 20px 24px; /* 44px header + breathing room */
 }
@@ -175,7 +180,7 @@
      to 60+ characters ("Stara Pazova Municipality, Srem Administrative
      District, Serbia"). Left to `white-space: nowrap` alone (see the shared
      th/td rule above) a label that long single-handedly pushes the table past
-     its 1200px measure; the committed e2e fixture never catches this because
+     its container; the committed e2e fixture never catches this because
      its synthetic city names are short. Truncate with an ellipsis instead and
      carry the untruncated name in `title` (set alongside the cell markup) so
      it's still available on hover/long-press.
@@ -246,7 +251,8 @@
 /* Coverage cell: a proportional bar behind the number. The bar is
    aria-hidden — the percentage text is the accessible content. */
 /* Wide enough for the bar to read as a proportion, narrow enough that the two
-   coverage columns in a default preset still fit the 1200px measure without
+   coverage columns in a default preset still fit the 1160px wrap a 1500px page
+   used to leave (#438 widened it) without
    the table overflowing its container (issue #188). */
 .coverage-cell {
   position: relative;

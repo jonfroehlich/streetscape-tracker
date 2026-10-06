@@ -664,7 +664,7 @@ function gridGroupKeys(id, columns = GRID_COLUMNS, { includeDelta = true } = {})
  *
  * It no longer has to fit the page's content measure (#350): at four
  * collected providers nothing that carries coverage, imagery age AND the
- * collection date fits 1100px, and "Last collected" is not optional — so the
+ * collection date fits the 1100px wrap of a 1440px window, and "Last collected" is not optional — so the
  * table scrolls inside its wrap and the city column is pinned
  * (data-table.css) to keep a scrolled row readable.
  *
