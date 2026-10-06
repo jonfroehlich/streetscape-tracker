@@ -19,7 +19,25 @@ ConditionHost=makelab2*
 # returns nonzero on ANY failed city, so the scheduler's own threshold email
 # ([alerts] in scheduler.toml) is usually the better signal; enable this too
 # only if you want a belt-and-suspenders notice on every failure/crash.
+# OnFailure= lines ACCUMULATE, so uncommenting this one keeps the prefreeze chain
+# below and adds the notice beside it (a test pins that the two coexist).
 #OnFailure=streetscape-tracker-notify@%n.service
+#
+# Chain the street-network prefreeze pass to the END of this unit, whatever its
+# result (issue #389). run-due exits nonzero on ANY failed city, so OnFailure=
+# here is not an error hook: it is the other half of "after every night".
+# This replaced streetscape-prefreeze.timer's 15:00 slot, which assumed a night
+# ends by ~14:45 and would have refused (and alerted) every day once
+# max_batch_hours passes ~12.5 h; the chain tracks the night's end at any value.
+# The pass checks for an in-flight run-due before every fetch itself, and asks a
+# fail-closed Overpass probe before its first one, since it now starts minutes
+# after a night that may have ended on an Overpass refusal. A hand
+# `systemctl --user start` of this unit chains it too, and so does `stop`
+# (deploy/README.md, "Stopping a run in flight"). Never fired when ConditionHost
+# fails: a condition-skipped unit never leaves inactive, so makelab1 chains
+# nothing. Needs systemd >= 249 (OnSuccess=); makelab2 runs 252.
+OnSuccess=streetscape-prefreeze.service
+OnFailure=streetscape-prefreeze.service
 
 [Service]
 Type=oneshot

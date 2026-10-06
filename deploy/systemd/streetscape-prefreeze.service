@@ -1,4 +1,4 @@
-# Daytime street-network prefreeze pass (user unit, issue #355).
+# Post-batch street-network prefreeze pass (user unit, issues #355, #389).
 # Install: see deploy/README.md
 #
 # WHY IT EXISTS. A road walk on a FROZEN network never contacts Overpass; only a
@@ -8,6 +8,19 @@
 # and on 2026-09-21 Overpass refused makelab2 mid-batch: 19 cities stranded
 # un-walked for ~83 days, 18 of them with no frozen network. Measured on prod the
 # same day, 29 of the next night's 40 cities were still cold (72%).
+#
+# TRIGGER. No timer (issue #389): streetscape-tracker.service's OnSuccess= AND
+# OnFailure= start this unit when the night's tail ends, whatever its result
+# (run-due exits nonzero on any failed city). Its old 15:00 timer assumed a night
+# ends by ~14:45, so it would have refused and alerted every day once
+# max_batch_hours passed ~12.5 h; the chain follows the night's end at any value,
+# so the pass runs minutes after the tail, at whatever hour that is. It never runs
+# on makelab1: a condition-skipped unit never leaves inactive, so it chains
+# nothing, and ConditionHost below is a second guard. Because it now starts
+# minutes after a night that may have ended on an Overpass refusal (the night's
+# breaker dies with the night's process), the script asks the breaker's own
+# fail-CLOSED probe once before its first fetch and stops with exit 76 unless
+# Overpass positively answers. No [Install] section: it is triggered, never enabled.
 #
 # PACING (read the Overpass usage policy before changing any of these numbers --
 # CLAUDE.md, READ THIS FIRST). The public instance's policy says a REGULAR
@@ -33,7 +46,7 @@
 # (MAX_GRID_DIM_M; only an explicit override exceeds it, and then osmnx splits). The
 # 10 MB/day figure is NOT met by a large city's network on its own -- but the
 # night fetches exactly that network anyway, so this is a pre-existing property
-# of road walks, not something the timer introduces.
+# of road walks, not something this pass introduces.
 [Unit]
 Description=Streetscape Tracker: freeze the next nights' street networks (issue #355)
 Wants=network-online.target
@@ -63,19 +76,23 @@ EnvironmentFile=-%h/streetscape-tracker/.env
 # i.e. two Overpass talkers from one IP, the profile of the 2026-08-14 ban.
 Environment=STREETSCAPE_LOCK_DIR=/projects/makeabilitylab/streetscape-tracker/locks
 # --execute: without it the script is a dry run, and this unit would list the cold
-#   networks every afternoon and freeze none of them, looking healthy throughout.
+#   networks after every night and freeze none of them, looking healthy throughout.
 # --alert: emails through [alerts] when a pass does not finish (host refused,
 #   lock busy, a run-due in flight, a crash, a SIGTERM from TimeoutStartSec) and
 #   is silent otherwise -- including the steady state, where nothing is cold and
 #   the pass exits 0 having fetched nothing.
 ExecStart=%h/streetscape-tracker/.venv-makelab2/bin/python %h/streetscape-tracker/scripts/prefreeze_street_networks.py --config %h/streetscape-tracker/config/scheduler.makelab1.toml --nights 2 --limit 40 --pause-s 120 --execute --alert
-# The bound that keeps a slow pass out of the nightly window. The timer fires by
-# 15:30 Pacific at the latest, so 6 h ends it by 21:30 -- hours before the 02:00
-# batch -- and a test pins that arithmetic against both timers. A normal pass is
-# ~80 min of pauses plus the fetches; reaching this means something is wrong, and
-# the SIGTERM it sends is caught and alerted (--alert), never silent. Killing a
-# fetch mid-flight is safe: the GraphML is written to .tmp and renamed in (#341),
-# and the host lock is an flock the kernel releases.
+# The bound that keeps a slow pass out of the nightly window. The pass starts at
+# the night's end, whose latest is 02:00 + the nightly timer's 15 min delay +
+# max_batch_hours + the collection unit's TimeoutStopSec (30 min, the stand-in for
+# the tail): 14:45 at 12 h, so 6 h ends it by 20:45, at least an hour clear of the
+# next 02:00. tests/test_prefreeze_unit.py::test_a_chained_pass_ends_well_before_the_next_night
+# pins that arithmetic against the production max_batch_hours, and it FAILS at
+# max_batch_hours = 20 on purpose: that raise must shrink this timeout or --limit
+# first. A normal pass is ~80 min of pauses plus the fetches; reaching this means
+# something is wrong, and the SIGTERM it sends is caught and alerted (--alert),
+# never silent. Killing a fetch mid-flight is safe: the GraphML is written to .tmp
+# and renamed in (#341), and the host lock is an flock the kernel releases.
 TimeoutStartSec=6h
 # The SIGTERM above has to outlive the alert it triggers. systemd's default is
 # 90 s, and the [alerts] SMTP path can spend 30 s per stage (connect, STARTTLS,
@@ -104,7 +121,7 @@ ReadWritePaths=/projects/makeabilitylab/streetscape-tracker
 # One osmnx graph at a time. UNMEASURED, and sized high BECAUSE it is unmeasured:
 # an OOM kill here is a SIGKILL, so the --alert path never runs and the pass is
 # the one failure that IS silent -- and because the plan is in slate order, the
-# same oversized city would sit at its head and die the same way every afternoon
+# same oversized city would sit at its head and die the same way after every night
 # until the night's own walk (which has 48G) freezes that network. 16G is a
 # guess: well above a single city's drive network, a third of the nightly unit's
 # hard cap, and a small share of a 188 GiB box whose free memory is mostly

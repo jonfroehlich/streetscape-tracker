@@ -1,4 +1,4 @@
-"""The systemd units that run the daytime prefreeze pass (issue #355).
+"""The systemd units that run the post-batch prefreeze pass (issues #355, #389).
 
 `scripts/prefreeze_street_networks.py` shipped in #343 with no timer, so the one
 #341 follow-up that takes Overpass out of the night never ran. These tests pin
@@ -6,8 +6,9 @@ what makes the units do their job rather than merely exist: they run on the
 same host, interpreter, config and lock directory as the nightly batch; the
 command line really fetches, really alerts and parses under the script's own
 parser; the pacing stays inside the Overpass usage policy's regular-application
-figure; and the schedule sits in the gap between one night's end and the next
-night's start, on the UTC date the script predicts for.
+figure; and the pass is chained to the collection unit's end on success AND on
+failure, ends an hour before the next fire at the production max_batch_hours,
+and predicts the date the next fire reads.
 
 Every figure is read out of the files themselves (and the production TOML), so a
 change on either side of a cross-file agreement fails here rather than on prod.
@@ -18,9 +19,7 @@ import os
 import re
 import shlex
 import sys
-from datetime import date, datetime, timedelta
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -52,9 +51,14 @@ SMTP_STAGE_TIMEOUT_S = 30
 def _parse_unit(name: str) -> dict[str, dict[str, list[str]]]:
     """{section: {key: [values, in order]}}. systemd repeats keys (ReadWritePaths),
     which configparser cannot represent, and comments are not directives."""
+    return _parse_unit_text((UNIT_DIR / name).read_text())
+
+
+def _parse_unit_text(text: str) -> dict[str, dict[str, list[str]]]:
+    """``_parse_unit`` over a unit's text rather than its file name."""
     sections: dict[str, dict[str, list[str]]] = {}
     current = None
-    for raw in (UNIT_DIR / name).read_text().splitlines():
+    for raw in text.splitlines():
         line = raw.strip()
         if not line or line.startswith(("#", ";")):
             continue
@@ -119,7 +123,6 @@ def _in_repo(path: str) -> Path:
 def units():
     return {
         "service": _parse_unit("streetscape-prefreeze.service"),
-        "timer": _parse_unit("streetscape-prefreeze.timer"),
         "collect": _parse_unit("streetscape-tracker.service"),
         "nightly": _parse_unit("streetscape-tracker.timer"),
     }
@@ -179,8 +182,8 @@ def test_the_memory_cap_is_a_daytime_cap_not_the_nightly_one(units):
     """The VALUE, not merely the presence. Both directions bite: too low and the
     pass is OOM-killed -- a SIGKILL, so the --alert path never runs and this is
     the one failure that IS silent, repeating daily while the same oversized
-    city heads the plan; as large as the nightly's, and a daytime job can squeeze
-    the co-tenants this host serves NFS to."""
+    city heads the plan; as large as the nightly's, and a pass running in the
+    working day can squeeze the co-tenants this host serves NFS to."""
     svc, collect = units["service"], units["collect"]
     ours = _bytes(_one(svc, "Service", "MemoryMax"))
     nightly = _bytes(_one(collect, "Service", "MemoryMax"))
@@ -232,104 +235,127 @@ def test_the_pass_covers_tonight_and_stays_inside_overpass_policy(args, prod_cfg
     assert args.pause_s >= pf.DEFAULT_PAUSE_S
 
 
-def test_the_weekly_screen_fires_after_the_night_can_still_be_running(units, prod_cfg):
-    """The Panoramax screen shares the nightly's Panoramax host lock, so an
-    overlap is a screen that exits 85 and records nothing that week. It fired
-    at Monday 12:00 until 2026-09-25, inside a full 12 h night -- the norm once
-    the city cap began its staged raise. Same bound as the prefreeze test below."""
-    screen = _parse_unit("streetscape-screen-provider.timer")
-    spec = _one(screen, "Timer", "OnCalendar")
-    m = re.fullmatch(r"Mon \*-\*-\* (\d\d):(\d\d):(\d\d) (\S+)", spec)
-    assert m, f"expected a weekly Monday spec with an explicit zone, got {spec!r}"
-    night_start, night_tz = _daily_pacific(units["nightly"])
-    assert m.group(4) == night_tz == "America/Los_Angeles"
-    night_done = (
-        night_start
-        + _span_minutes(_one(units["nightly"], "Timer", "RandomizedDelaySec"))
-        + prod_cfg.max_batch_hours * 60
-        + _span_minutes(_one(units["collect"], "Service", "TimeoutStopSec"))
-    )
-    screen_start = int(m.group(1)) * 60 + int(m.group(2))
-    assert screen_start >= night_done, (
-        f"the screen fires at minute {screen_start}, but the night can run to minute {night_done:.0f}"
-    )
+def _night_done(units, prod_cfg) -> float:
+    """Minutes after local midnight by which the night has certainly ended.
 
-
-def test_it_fires_after_the_night_can_still_be_running(units, prod_cfg):
-    """The nightly fires by 02:00 + its randomized delay and stops launching at
+    The nightly fires by 02:00 + its randomized delay and stops launching at
     max_batch_hours; then its tail runs -- backup, aggregate + manifest, publish.
     Only two of those three terms are importable constants, so the bound used
     here is the collection unit's TimeoutStopSec: a number in a FILE that was
     sized against those same components, and the more conservative of the two
     (30 min against their ~27 min sum). A stop is NOT involved in a normal
-    night; this is a stand-in, and the assertion below keeps it an over-estimate.
-    A pass starting inside the night's window refuses (the in-flight check) and
-    alerts -- correct, but a schedule that does it on purpose is a daily false
-    alarm and a lost day."""
-    night_start, night_tz = _daily_pacific(units["nightly"])
-    ours_start, ours_tz = _daily_pacific(units["timer"])
-    assert ours_tz == night_tz == "America/Los_Angeles"
-    night_done = (
+    night; it is a stand-in, and the assertion here keeps it an over-estimate."""
+    stop_min = _span_minutes(_one(units["collect"], "Service", "TimeoutStopSec"))
+    # The stand-in must stay an over-estimate of the tail terms that ARE
+    # importable, or it has stopped standing in for anything.
+    assert stop_min * 60 >= catalog_backup.BACKUP_TIMEOUT_S + scheduler.PUBLISH_TIMEOUT_S
+    night_start, _ = _daily_pacific(units["nightly"])
+    return (
         night_start
         + _span_minutes(_one(units["nightly"], "Timer", "RandomizedDelaySec"))
         + prod_cfg.max_batch_hours * 60
-        + _span_minutes(_one(units["collect"], "Service", "TimeoutStopSec"))
-    )
-    # The stand-in must stay an over-estimate of the tail terms that ARE
-    # importable, or it has stopped standing in for anything.
-    assert _span_minutes(_one(units["collect"], "Service", "TimeoutStopSec")) * 60 >= (
-        catalog_backup.BACKUP_TIMEOUT_S + scheduler.PUBLISH_TIMEOUT_S
-    )
-    assert ours_start >= night_done, (
-        f"prefreeze fires at minute {ours_start}, but the night can run to minute {night_done:.0f}"
+        + stop_min
     )
 
 
-def test_a_slow_pass_is_ended_well_before_the_next_night(units):
+def test_the_weekly_screen_fires_after_the_night_and_ends_before_the_next(units, prod_cfg):
+    """The Panoramax screen shares the nightly's Panoramax host lock, so an
+    overlap is a screen that exits 85 and records nothing that week. It fired at
+    Monday 12:00 until 2026-09-25 and 18:00 until #389, each inside a night once
+    max_batch_hours grew. Both ends are pinned: it starts after the night's
+    latest end, and its latest end (start + randomized delay + TimeoutStartSec)
+    is an hour clear of the next 02:00. At 23:00 the first assert fails once
+    max_batch_hours passes ~20.25 -- the signal to move or chain the screen."""
+    timer = _parse_unit("streetscape-screen-provider.timer")
+    service = _parse_unit("streetscape-screen-provider.service")
+    spec = _one(timer, "Timer", "OnCalendar")
+    m = re.fullmatch(r"Mon \*-\*-\* (\d\d):(\d\d):(\d\d) (\S+)", spec)
+    assert m, f"expected a weekly Monday spec with an explicit zone, got {spec!r}"
+    night_start, night_tz = _daily_pacific(units["nightly"])
+    assert m.group(4) == night_tz == "America/Los_Angeles"
+    night_done = _night_done(units, prod_cfg)
+    screen_start = int(m.group(1)) * 60 + int(m.group(2))
+    assert screen_start >= night_done, (
+        f"the screen fires at minute {screen_start}, but the night can run to minute "
+        f"{night_done:.0f} at max_batch_hours = {prod_cfg.max_batch_hours}"
+    )
+    screen_end = (
+        screen_start
+        + _span_minutes(_one(timer, "Timer", "RandomizedDelaySec"))
+        + _span_minutes(_one(service, "Service", "TimeoutStartSec"))
+    )
+    assert screen_end <= 24 * 60 + night_start - 60, (
+        f"a slow screen can still hold the Panoramax lock at minute {screen_end:.0f}, "
+        "within an hour of the next nightly fire"
+    )
+
+
+def test_the_collection_unit_chains_the_pass_on_success_and_on_failure(units):
+    """run-due exits nonzero on ANY failed city, so most nights end 'failed':
+    without OnFailure= the pass would run only after a perfectly clean night,
+    and without OnSuccess= only after an imperfect one. The chain must name a
+    unit that ships."""
+    collect = units["collect"]["Unit"]
+    assert "streetscape-prefreeze.service" in collect.get("OnSuccess", [])
+    assert "streetscape-prefreeze.service" in collect.get("OnFailure", [])
+    assert (UNIT_DIR / "streetscape-prefreeze.service").is_file()
+
+
+def test_the_opt_in_failure_notice_coexists_with_the_chain():
+    """The collection unit ships the raw failure notice COMMENTED (opt-in;
+    the scheduler's own [alerts] mail is the primary signal). An operator who
+    uncomments it must get BOTH OnFailure= targets -- systemd accumulates the
+    key -- so the chain must stay a separate line, and the notice line must
+    still be there to uncomment."""
+    text = (UNIT_DIR / "streetscape-tracker.service").read_text()
+    notice = "#OnFailure=streetscape-tracker-notify@%n.service"
+    assert notice in text.splitlines(), "the opt-in failure notice line is gone"
+    sections = _parse_unit_text(
+        "\n".join(line[1:] if line == notice else line for line in text.splitlines())
+    )
+    assert sorted(sections["Unit"]["OnFailure"]) == [
+        "streetscape-prefreeze.service",
+        "streetscape-tracker-notify@%n.service",
+    ]
+    assert (UNIT_DIR / "streetscape-tracker-notify@.service").is_file()
+
+
+def test_no_timer_ships_for_the_prefreeze(units):
+    """A timer beside the chain is two passes a day, two alert surfaces, and a
+    wall-clock slot that re-breaks at every max_batch_hours raise -- the
+    inheritance #389 removed. The service is triggered, never enabled, so it
+    has no [Install] section either."""
+    assert not (UNIT_DIR / "streetscape-prefreeze.timer").exists()
+    assert "Install" not in units["service"]
+
+
+def test_a_chained_pass_ends_well_before_the_next_night(units, prod_cfg):
     """TimeoutStartSec is the only thing between a pathological pass and the
     02:00 batch: a pass still holding the Overpass lock then makes the night's
-    first cold walk exit busy and strand its city (#341)."""
-    ours_start, _ = _daily_pacific(units["timer"])
-    latest_end = (
-        ours_start
-        + _span_minutes(_one(units["timer"], "Timer", "RandomizedDelaySec"))
-        + _span_minutes(_one(units["service"], "Service", "TimeoutStartSec"))
-    )
-    next_night, _ = _daily_pacific(units["nightly"])
-    # At least an hour clear, so a stop's alert and teardown are long over.
-    assert latest_end <= 24 * 60 + next_night - 60
-
-
-@pytest.mark.parametrize("season", [date(2026, 1, 15), date(2026, 7, 15)], ids=["PST", "PDT"])
-def test_the_pass_predicts_the_date_the_next_night_reads(units, season):
-    """The script predicts the slate for tomorrow UTC (`next_run_date`); the
-    night computes dueness for its own UTC date. They agree only if the pass
-    runs on the same UTC day as its Pacific day -- i.e. before 16:00 PST /
-    17:00 PDT, in both seasons, for the whole randomized window."""
-    tz = ZoneInfo("America/Los_Angeles")
-    ours_start, _ = _daily_pacific(units["timer"])
-    delay = _span_minutes(_one(units["timer"], "Timer", "RandomizedDelaySec"))
+    first cold walk exit busy and strand its city (#341). The chained pass
+    starts no later than the night's latest end, so that plus its timeout must
+    leave an hour before the next fire. Holds at 12 h (20:45) and 16 h (00:45);
+    FAILS at 20 h by design -- that raise must shrink this timeout or --limit."""
     night_start, _ = _daily_pacific(units["nightly"])
-    midnight = datetime(season.year, season.month, season.day, tzinfo=tz)
-    night_utc_date = (
-        (midnight + timedelta(days=1, minutes=night_start)).astimezone(ZoneInfo("UTC")).date()
+    latest_end = _night_done(units, prod_cfg) + _span_minutes(
+        _one(units["service"], "Service", "TimeoutStartSec")
     )
-    for offset in (ours_start, ours_start + delay):
-        fire = midnight + timedelta(minutes=offset)
-        predicted = fire.astimezone(ZoneInfo("UTC")).date() + timedelta(days=1)
-        assert predicted == night_utc_date, (
-            f"a pass at {fire:%H:%M %Z} predicts {predicted}, the night reads {night_utc_date}"
-        )
+    assert latest_end <= 24 * 60 + night_start - 60, (
+        f"at max_batch_hours = {prod_cfg.max_batch_hours} a chained pass can run to minute "
+        f"{latest_end:.0f}, within an hour of the next fire: re-derive the prefreeze "
+        "service's TimeoutStartSec (or its --limit) before this raise (#389)"
+    )
 
 
-def test_a_missed_afternoon_is_not_caught_up_at_boot(units):
-    """Persistent=true would fire a missed pass at boot, at any hour --
-    including just before 02:00, where it would hold the Overpass lock against
-    the night's first cold walk. Every other timer here IS persistent, which is
-    exactly why this one is pinned."""
-    persistent = units["timer"]["Timer"].get("Persistent", ["false"])
-    assert persistent == ["false"]
-    assert _one(units["timer"], "Install", "WantedBy") == "timers.target"
+def test_the_scripts_fire_time_is_the_nightly_timers(units):
+    """next_run_date predicts the date the next 02:00 Pacific fire reads from
+    constants restated in the script; a timer moved without them is a pass
+    predicting the wrong night."""
+    minutes, tz = _daily_pacific(units["nightly"])
+    assert (pf.NIGHTLY_FIRE_HOUR * 60 + pf.NIGHTLY_FIRE_MINUTE, pf.NIGHTLY_FIRE_ZONE) == (
+        minutes,
+        tz,
+    )
 
 
 def test_every_unit_is_installed_by_the_deploy_readme():
