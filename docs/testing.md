@@ -61,7 +61,8 @@ already gone wrong once:
 - The loader as the query-radius seam (`tests/test_fileutils.py`): a gsv run's far pano loads as `OUT_OF_RADIUS` by default and as the provider's own `OK` under `raw=True`, with no derived column; a Mapillary-named file with the same far pano is untouched, which pins that the gate reads the file's own provider token.
   A gsv ROAD WALK (a name from `generate_streetwalk_filename`) with the same far pano is untouched too, which pins that the gate reads the file's KIND as well as its provider.
   `tests/test_archival_import.py`'s round-trip column check reads `raw=True`, since it pins what is on disk.
-- `tests/test_archival_import.py` also pins #431: a city the import registers — from a manifest identity through the subprocess, and from a geocode through the imported module's `resolve_or_register_city` — has `enabled = 0`, is absent from gsv's due list until `set_city_enabled` (the second half keeps that absence from being vacuous), and the report names it with `enable_hint`.
+- `tests/test_archival_import.py` also pins #431: a city the import registers — from a manifest identity through the subprocess, and from a geocode through the imported module's `resolve_or_register_city` — has `enabled = 0`, is absent from gsv's due list until `set_city_enabled` (the second half keeps that absence from being vacuous), and the report names it with `enable_hint`;
+a geocode that lands on a city the catalog already holds (a second spelling of an ENABLED city) is reported as existing, never as `NEW ... DISABLED`, which would list it once per spelling and print an `enable-city` hint that exits 64.
 - Every call site's choice of seam, pinned one by one, because each was green under its own mutation until round 1 of the #392 review:
   the collector's recorded diff (`test_diff.py::test_the_collectors_recorded_diff_sees_no_churn_from_a_far_pano`, through `cli._compute_and_record_diff`, which reloads the previous run itself) records 0 added and 0 removed when the same far pano is in both runs;
   an imported gsv run (`test_import_bundle.py`) is cataloged at the filtered coverage with `status_out_of_radius` 1 and diffs against this host's previous run with no churn, the importer's frame being the diff's new side;
@@ -1004,9 +1005,10 @@ In `tests/test_scheduler.py`, `backup-status` gates on the heartbeat only when `
 
 `tests/test_assess_city.py`: the channel set collected in `enabled_providers()` order and **never** including the GSV grid run;
 refusal — with `USAGE_EXIT_CODE` and **without opening the catalog**
-— of every unpaired `--width/--height`/`--lat/--lng` combination, of `--provider gsv` with a message naming `run-due`, of an unknown/disabled/empty channel, and of a config where no assess channel is enabled;
+— of every unpaired `--width/--height`/`--lat/--lng` combination, of `--provider gsv` with a message naming `run-due` and saying a DISABLED city needs `enable-city` first (#431), of an unknown/disabled/empty channel, and of a config where no assess channel is enabled;
 a non-TTY stdin without `--yes` refusing rather than hanging on `input()`, *after* the free pre-flight has still registered the city;
 `--estimate` registering the city DISABLED (#431), printing `enable_hint` and leaving `api_usage` untouched;
+its stop text naming `enable-city` for a disabled city and never for an enabled one, where no hint was printed above to point at;
 a city becoming gsv-due only after `enable-city`;
 the closing note agreeing with `get_due_cities` in both states (nothing due while disabled, gsv alone after `set_city_enabled`);
 the hint printed once for an already-disabled city and never for an enabled one, whose opt-in timing sentence keeps its enabled form;
@@ -1021,7 +1023,7 @@ a Mapillary tile block leaving the GSV walk collected while `mapillary_streets` 
 a channel whose argv our own CLI rejected (issue #359) exiting 1 with `N channel(s) REJECTED by our own CLI` in the summary and no `consecutive_failures`, since it records no attempt and would otherwise score the run complete;
 the tail regenerating before publishing, not publishing when nothing succeeded, and publishing a partial success anyway;
 the answer report leading with street-km ahead of grid coverage and carrying the "NOT the deployment number" label, printing the any-imagery split for Mapillary but not for GSV, reading "not walked" rather than 0% for a missing walk, surviving NULL lengths/ages, and building the city-page link from the grid run's CSV filename
-— preferring the Mapillary run, **falling back to the GSV one** and naming which it opened, saying there is no page only when neither exists, and tolerating a `site_url` with no trailing slash, since link building is bare concatenation;
+— preferring the Mapillary run, **falling back to the GSV one** and naming which it opened, saying there is no page only when neither exists (and saying when the link arrives in agreement with `get_due_cities`: after `enable-city` for a disabled city, never "the next nightly batch", #431), and tolerating a `site_url` with no trailing slash, since link building is bare concatenation;
 that the closing note reports which channels are **actually** due, asserted against `get_due_cities` rather than against its own wording (the natural sentence, "due on every channel", is the opposite of true for the three it just collected) and staying silent about un-paired snapshots when nothing was collected;
 that the pre-flight distinguishes "over the whole daily budget" from "over what is left today" — only the second is a deferral — and reports every Mapillary pacing rate in play rather than the last channel's;
 that a config with publishing disabled prints the notice beside the link and still exits 0, that `--no-publish` does *not* print it (the operator chose that), and that no `--publish` flag exists at all
