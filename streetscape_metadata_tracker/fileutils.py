@@ -205,6 +205,66 @@ def load_city_csv_file(
         raise ValueError(f"Error parsing file {csv_path}: {str(e)}") from e
 
 
+# The string-typed columns of a `_gsv_history_` harvest file. Spelled here
+# rather than imported from download_gsv_history.HISTORY_DTYPES because that
+# module pulls in aiohttp, which nothing that merely READS a harvest needs;
+# tests/test_history_summary.py pins these names to that schema instead.
+HISTORY_STRING_COLUMNS = ("pano_id", "capture_date", "harvested_at")
+
+
+def load_history_csv_file(csv_path: str) -> pd.DataFrame:
+    """
+    Load a `_gsv_history_` harvest file (issue #2) with ``capture_date`` parsed.
+
+    This is the history twin of :func:`load_city_csv_file`'s capture-date seam
+    (issue #226), and it holds the same rule: a reader must be at least as
+    permissive as the data on disk.
+    The harvester writes ``YYYY-MM-01`` (``standardize_capture_date`` pins the
+    endpoint's month precision to the 1st), but the CSV is never rewritten, so
+    the parse is pinned to ``format="ISO8601"`` -- which accepts every
+    precision at once -- with ``errors="coerce"``, so one malformed row reads as
+    NaT instead of taking out the whole harvest.
+    A format inferred from the first value would silently NaT every row at a
+    different precision.
+    No plausibility guard is applied here; that is the summarizer's job
+    (``json_summarizer.generate_history_summary_as_json``), exactly as the run
+    loader leaves it to ``analysis.dated_unique_panos``.
+
+    Example:
+        >>> df = load_history_csv_file("data/x_width_100_height_100_step_20_gsv_history_2026-04-10.csv.gz")
+        >>> df["capture_date"].dtype  # doctest: +SKIP
+        dtype('<M8[ns]')
+
+    Raises:
+        FileNotFoundError: if the file does not exist.
+        ValueError: if the extension is not .csv/.csv.gz, or the file is
+            empty (no header) or unparseable.
+    """
+    file_path = Path(csv_path)
+    if not file_path.exists():
+        raise FileNotFoundError(f"File not found: {csv_path}")
+    if str(file_path).endswith(".csv.gz"):
+        compression = "gzip"
+    elif file_path.suffix == ".csv":
+        compression = None
+    else:
+        raise ValueError(
+            f"Unsupported file format. Expected .csv or .csv.gz, got: {file_path.suffix}"
+        )
+    try:
+        df = pd.read_csv(
+            csv_path,
+            dtype=dict.fromkeys(HISTORY_STRING_COLUMNS, str),
+            compression=compression,
+        )
+    except pd.errors.EmptyDataError as e:
+        raise ValueError(f"The file {csv_path} is empty") from e
+    except pd.errors.ParserError as e:
+        raise ValueError(f"Error parsing file {csv_path}: {str(e)}") from e
+    df["capture_date"] = pd.to_datetime(df["capture_date"], format="ISO8601", errors="coerce")
+    return df
+
+
 def remove_stale_diff_detail(data_dir: str, filename: str | None) -> bool:
     """
     Delete a published diff detail file that no longer describes a recorded

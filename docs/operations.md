@@ -309,6 +309,31 @@ If step 2 might not finish before 02:00, disable the timer for the night (`syste
 Only this mode carries the in-flight gate; the stats pass keeps its existing behaviour.
 It is not combinable with `--only` or `--regenerate-json` (exit 2): it returns before either would run.
 
+## Backfilling the capture-history summaries (issue #109)
+
+#109 gives each GSV capture-history harvest (#2) a sibling summary JSON, which the aggregate points at and `city.html` renders ([`capture-dates.md`](capture-dates.md)).
+`scripts/harvest_gsv_history.py` writes it from now on; a harvest cataloged before the deploy has only its CSV, and the aggregate reads summaries and never builds them, so that city shows no capture-history section until this backfill runs.
+**The dry run is also how to learn whether production holds any harvest at all** — none may exist, in which case it reports `0 rows` and there is nothing more to do.
+`0 rows` is trustworthy because a wrong path cannot produce it: a `--data-dir` that is not a directory, or a catalog path that does not exist (`--db-path`, default `<data-dir>/streetscape_tracker.db` — e.g. the code checkout's default `./data` holds none), is **refused with exit 2** before anything is opened, rather than letting `db.connect` create an empty catalog and answer `0 rows`.
+
+```bash
+cd ~/streetscape-tracker
+# 1. Dry run: one line per history_harvests row (would write / up to date / MISSING CSV), writes nothing.
+.venv-makelab2/bin/python scripts/backfill_history_json.py \
+    --data-dir /projects/makeabilitylab/streetscape-tracker/data
+# 2. Write the missing summaries.
+.venv-makelab2/bin/python scripts/backfill_history_json.py \
+    --data-dir /projects/makeabilitylab/streetscape-tracker/data --execute
+# 3. Rebuild the aggregate and publish.
+.venv-makelab2/bin/python -m streetscape_metadata_tracker.scheduler \
+    --config config/scheduler.makelab1.toml regenerate-aggregate --publish
+```
+
+It contacts no endpoint and writes no catalog row: it reads each `history_harvests` row's CSV through `fileutils.load_history_csv_file` and writes the summary atomically beside it.
+That is why it needs **no timer pause and no in-flight gate**: a publish running beside it ships the old file or the new one, never half of one.
+An existing summary is left alone unless `--force` (the way to re-derive every summary after the guard's definition moves); `--city` limits it to one city.
+A row whose CSV is missing from `--data-dir` is reported and skipped, and the script then exits 1.
+
 ## Landing a laptop investigation in this catalog: `scheduler import-bundle` (issue #330)
 
 **Added after the 2026-08-22 split.**

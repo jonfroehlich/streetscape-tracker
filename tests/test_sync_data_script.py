@@ -32,6 +32,9 @@ PUBLISHED = [
     "seattle--wa_width_20_height_20_step_1_mapillary_2026-01-05.csv.gz",
     "seattle--wa_diff_2025-10-01_to_2026-01-05.csv.gz",
     "seattle--wa_width_20_height_20_step_1_gsv_history_2026-01-05.csv.gz",
+    # ...and its capture-history summary (issue #109), which the aggregate
+    # points at and the city page fetches.
+    "seattle--wa_width_20_height_20_step_1_gsv_history_2026-01-05.json.gz",
     "cities.json.gz",
     "streetwalks.json.gz",
     # The DERIVED driving-plan join (issue #176). Its raw counterpart lives in

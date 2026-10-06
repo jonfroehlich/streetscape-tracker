@@ -268,6 +268,19 @@ module.exports = [
     rules: browserRules,
   },
   {
+    // Harvested capture-history legend section (issue #109): consumes
+    // streetscape-utils.js globals (escapeHtml, getColor,
+    // buildFilledHistogram) and Chart.js, and defines the section's builders
+    // for city.js. Node export shim (`module`) for the unit tests.
+    files: ["js/capture-history.js"],
+    languageOptions: {
+      ecmaVersion: 2022,
+      sourceType: "script",
+      globals: { ...globals.browser, ...vendorGlobals, ...sharedGlobals, module: "readonly" },
+    },
+    rules: browserRules,
+  },
+  {
     // index.js carries a Node export shim (`module`) so its pure helpers can
     // be unit-tested (js/__tests__/index.test.js), like the page scripts
     // above. Flat config merges this into its entry.
@@ -287,6 +300,9 @@ module.exports = [
       globals: {
         renderStreetCoverage: "readonly",
         renderDiffOverlay: "readonly",
+        // capture-history.js (issue #109), also loaded by city.html only.
+        captureHistoryLegendHtml: "readonly",
+        rebuildCaptureHistoryChart: "readonly",
       },
     },
   },

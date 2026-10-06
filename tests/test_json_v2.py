@@ -10,13 +10,21 @@ import pandas as pd
 import pytest
 
 from streetscape_metadata_tracker import db
-from streetscape_metadata_tracker.fileutils import load_city_csv_file
+from streetscape_metadata_tracker.fileutils import load_city_csv_file, load_history_csv_file
 from streetscape_metadata_tracker.json_summarizer import (
     generate_aggregate_v2,
     generate_city_metadata_summary_as_json,
+    generate_history_summary_as_json,
     sanitize_for_json,
 )
-from tests.conftest import COLUMNS, make_city_df, make_mapillary_city_df, write_city_csv_gz
+from streetscape_metadata_tracker.naming import generate_history_filename
+from tests.conftest import (
+    COLUMNS,
+    make_city_df,
+    make_history_df,
+    make_mapillary_city_df,
+    write_city_csv_gz,
+)
 
 
 def strict_load(path):
@@ -497,6 +505,166 @@ def test_aggregate_v2_groups_runs_and_reports_change(conn, data_dir):
     # Issue #404: no run the fill did not take carries the key, so the records
     # above are byte-identical to their pre-#404 form.
     assert all("early_refresh" not in r for r in gsv["runs"])
+    # Issue #109: nothing harvested, so no provider block carries the history
+    # pointer and the record is byte-identical to its pre-#109 form.
+    assert "capture_history" not in gsv
+
+
+def _register_history_city(conn, data_dir, name="Hist"):
+    """A city with one gsv run and one Mapillary run, both summarized."""
+    city_id = db.register_city(
+        conn,
+        city_name=name,
+        state_name=None,
+        state_code=None,
+        country_name="Testland",
+        country_code=None,
+        center_lat=44.0,
+        center_lon=-121.0,
+        grid_width_m=100,
+        grid_height_m=100,
+        step_m=20,
+    )
+    run_date = date(2026, 4, 15)
+    gsv_csv = f"{city_id}_width_100_height_100_step_20_2026-04-15.csv.gz"
+    gsv_path = _write_run(data_dir, [("g1", "2020-01-15")], run_date, gsv_csv)
+    gsv_json = generate_city_metadata_summary_as_json(
+        gsv_path,
+        load_city_csv_file(gsv_path),
+        name,
+        None,
+        "Testland",
+        100,
+        100,
+        20,
+        force_recreate_file=True,
+        run_date=run_date,
+    )
+    db.register_run(
+        conn,
+        city_id=city_id,
+        run_date=run_date,
+        csv_filename=gsv_csv,
+        json_filename=os.path.basename(gsv_json),
+    )
+    m_csv = f"{city_id}_width_100_height_100_step_20_mapillary_2026-04-15.csv.gz"
+    m_path = os.path.join(data_dir, m_csv)
+    write_city_csv_gz(make_mapillary_city_df([("m1", "2021-05-01")], run_date=run_date), m_path)
+    m_json = generate_city_metadata_summary_as_json(
+        m_path,
+        load_city_csv_file(m_path),
+        name,
+        None,
+        "Testland",
+        100,
+        100,
+        20,
+        force_recreate_file=True,
+        run_date=run_date,
+        provider="mapillary",
+    )
+    db.register_run(
+        conn,
+        city_id=city_id,
+        run_date=run_date,
+        csv_filename=m_csv,
+        provider="mapillary",
+        json_filename=os.path.basename(m_json),
+    )
+    return city_id
+
+
+def _harvest(conn, data_dir, city_id, harvest_date, rows, *, summarize, catalog_unique=None):
+    name = generate_history_filename(city_id, 100, 100, 20, harvest_date) + ".csv.gz"
+    path = os.path.join(data_dir, name)
+    write_city_csv_gz(make_history_df(rows), path)
+    db.register_history_harvest(
+        conn,
+        city_id=city_id,
+        harvest_date=harvest_date,
+        csv_filename=name,
+        unique_panos=len(rows) if catalog_unique is None else catalog_unique,
+    )
+    if summarize:
+        generate_history_summary_as_json(
+            path,
+            load_history_csv_file(path),
+            city_id=city_id,
+            harvest_date=harvest_date,
+            force_recreate_file=True,
+        )
+    return name
+
+
+def test_aggregate_omits_capture_history_until_a_harvest_is_summarized(conn, data_dir, caplog):
+    city_id = _register_history_city(conn, data_dir)
+    rows = [
+        ("h2009", "2009-06-01", 44.0, -121.0),
+        ("h2018", "2018-06-01", 44.0, -121.0),
+        ("hbad", "2611-01-01", 44.0, -121.0),
+    ]
+    # Cataloged with a unique_panos the summary will NOT report, so a block
+    # built from the catalog row instead of the JSON is caught.
+    name = _harvest(
+        conn, data_dir, city_id, date(2026, 4, 10), rows, summarize=False, catalog_unique=99
+    )
+
+    # A harvest row whose summary is missing: the key stays absent, and the
+    # warning names the command that fixes it.
+    with caplog.at_level("WARNING"):
+        rec = generate_aggregate_v2(conn, data_dir)["cities"][0]
+    assert "capture_history" not in rec["providers"]["gsv"]
+    assert "backfill_history_json.py" in caplog.text
+    assert name in caplog.text
+
+    generate_history_summary_as_json(
+        os.path.join(data_dir, name),
+        load_history_csv_file(os.path.join(data_dir, name)),
+        city_id=city_id,
+        harvest_date=date(2026, 4, 10),
+    )
+    rec = generate_aggregate_v2(conn, data_dir)["cities"][0]
+    block = rec["providers"]["gsv"]["capture_history"]
+    assert block == {
+        "harvest_date": "2026-04-10",
+        "data_file": name,
+        "json_file": name.replace(".csv.gz", ".json.gz"),
+        "unique_panos": 3,  # the summary's, not the catalog row's 99
+        "plausibly_dated_panos": 2,
+        "oldest_capture_date": "2009-06-01",
+        "newest_capture_date": "2018-06-01",  # the 2611 row did not win
+        "years_with_imagery": 2,
+    }
+    # Per (city, provider): the Mapillary block of the same city carries nothing.
+    assert "capture_history" not in rec["providers"]["mapillary"]
+    strict_load(os.path.join(data_dir, "cities.json.gz"))
+
+
+def test_aggregate_capture_history_follows_the_latest_harvest(conn, data_dir):
+    city_id = _register_history_city(conn, data_dir)
+    # The newer harvest is registered FIRST, so "first row" is the wrong one.
+    _harvest(
+        conn,
+        data_dir,
+        city_id,
+        date(2026, 6, 1),
+        [("a", "2009-06-01", 44.0, -121.0), ("b", "2025-06-01", 44.0, -121.0)],
+        summarize=True,
+    )
+    _harvest(
+        conn,
+        data_dir,
+        city_id,
+        date(2026, 4, 10),
+        [("a", "2009-06-01", 44.0, -121.0)],
+        summarize=True,
+    )
+    block = generate_aggregate_v2(conn, data_dir)["cities"][0]["providers"]["gsv"][
+        "capture_history"
+    ]
+    assert block["harvest_date"] == "2026-06-01"
+    assert block["unique_panos"] == 2
+    assert block["newest_capture_date"] == "2025-06-01"
 
 
 def test_aggregate_marks_only_the_early_refreshed_run(conn, data_dir):

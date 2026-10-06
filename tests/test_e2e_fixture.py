@@ -198,7 +198,14 @@ def _artifact_provider(name):
         # parser is the one that knows the rest of the shape.
         candidates.append(name[: -len(suffix)] + ".csv.gz")
     for candidate in candidates:
-        for parse in (naming.parse_filename, naming.parse_streetwalk_filename):
+        # The history parser is here because a harvested capture history
+        # (#109) is a provider-tagged artifact too; ParsedHistoryFilename
+        # carries a constant provider for exactly this question.
+        for parse in (
+            naming.parse_filename,
+            naming.parse_streetwalk_filename,
+            naming.parse_history_filename,
+        ):
             try:
                 return parse(candidate).provider
             except ValueError:
@@ -288,6 +295,37 @@ def test_the_fixture_names_no_provider_this_build_does_not_know():
         "since #338, and rendered it as Google's before) or the name is not "
         "one the naming generators emit at all."
     )
+
+
+def test_the_fixture_carries_a_gsv_capture_history_for_the_multi_provider_row():
+    """The city page's capture-history section (#109) needs one harvest to show.
+
+    On Alpha City's GSV block and nowhere else: Alpha is the four-provider
+    city, so the e2e suite's Mapillary view of the SAME city is what proves the
+    section is gated on the provider block and not on the city.
+    The numbers pin the plausibility guard end to end: the fixture's harvest
+    holds six panos, one dated 2611, and the published pointer must report
+    five, four years, and a newest date that is not the impossible one.
+    """
+    cities = _read_fixture_json("cities.json.gz")["cities"]
+    carriers = [
+        (rec["city_id"], provider)
+        for rec in cities
+        for provider, block in rec["providers"].items()
+        if "capture_history" in block
+    ]
+    assert carriers == [("alpha-city--alphastate--testland", "gsv")], carriers
+
+    alpha = next(rec for rec in cities if rec["city_id"] == carriers[0][0])
+    block = alpha["providers"]["gsv"]["capture_history"]
+    assert block["unique_panos"] == 6
+    assert block["plausibly_dated_panos"] == 5
+    assert block["years_with_imagery"] == 4
+    assert block["newest_capture_date"] == "2024-06-01", "the 2611 row must not win"
+    # Both artifacts the pointer names are committed beside it.
+    assert (FIXTURE_DIR / block["data_file"]).exists()
+    summary = _read_fixture_json(block["json_file"])
+    assert summary["panos"]["implausible_dates_dropped"] == 1
 
 
 def test_the_fixture_carries_a_provider_screen_with_a_zero_and_a_positive_city():
@@ -448,6 +486,11 @@ def test_every_committed_run_csv_writes_its_integer_columns_as_integers():
     for path in sorted(FIXTURE_DIR.iterdir()):
         name = path.name
         if not name.endswith(".csv.gz") or "_diff_" in name or "_streetwalk_" in name:
+            continue
+        # A capture-history harvest (#109) is a per-pano census, not a run
+        # CSV: dtypes_for_run_path would fall back to a provider schema it
+        # does not have, and the check would prove nothing.
+        if f"_{naming.HISTORY_MARKER}_" in name:
             continue
         dtypes = dtypes_for_run_path(name)
         int_columns = [

@@ -134,6 +134,12 @@ already gone wrong once:
   Its regex and the blanking are self-checked against planted samples so it cannot pass by matching nothing.
   A grep only sees the spellings it names, so the grid CLI's default is also pinned by behaviour, in `tests/test_cli_policy.py`: `async_main` with no `--run-date` under the frozen instant hands `_collect_one_run` the UTC date, which a `datetime.now().date()` or `date.fromtimestamp(time.time())` read — both invisible to the grep — fails.
   The shared `frozen_utc_clock` and `pacific_local_zone` fixtures live in `conftest.py`, non-autouse; the instant is in the past, so an unfrozen `date.today()` can never coincide with either date it asserts.
+- The aggregate's capture-history pointer (issue #109, `tests/test_json_v2.py`): an unharvested catalog carries no `capture_history` key on any provider block (the byte-identity pin, beside `early_refresh`'s);
+  a harvest row whose summary JSON is missing still carries none, and the warning names `scripts/backfill_history_json.py`;
+  once summarized, the block's scalars equal the SUMMARY's post-guard `panos` (the catalog row is seeded with `unique_panos = 99` so a block read from the row fails), `json_file` is the derived sibling, and the same city's Mapillary block carries nothing;
+  with two harvests the block follows the later one, registered FIRST so a first-row read fails;
+  the written aggregate is strict-loaded (no NaN).
+  `db.get_latest_history_harvests_all` is pinned in `tests/test_gsv_history.py` (newest per city and provider; `MIN` for `MAX` fails it).
 
 ## City registration manifests (issue #110, and the purposive additions)
 
@@ -219,6 +225,14 @@ Incidental coverage of a deprecated spelling trains readers to ignore the notice
 - `--connection-limit` above what the GSV engine can use (issue #359, `tests/test_cli_policy.py`): clamped with a stderr warning to `download_gsv.max_requests_in_flight(batch_size)`, i.e. `PIPELINE_DEPTH × batch_size` since #304 (one batch before), and the run proceeds, rather than an argparse exit 2;
   a limit at or below the bound passes through unwarned, including one above a single batch (150 at batch 100) and one of exactly the bound (400 at batch 100, which a `>=` clamp would warn on), so the clamp is one-directional; `tests/test_run_cities.py` pins the same clamp in `run_cities.py`'s parser, which forwards both flags and must not refuse an argv the child accepts
 - GSV history harvester (response parsing, dated-only filter, cross-grid dedup, circuit breaker, resume — endpoint mocked)
+- The capture-history summary (issue #109, `tests/test_history_summary.py`), each test with the mutation that kills it:
+  `fileutils.load_history_csv_file` pins ISO8601 (a month-precision row reads as the 1st; `"%Y-%m-%d"` NaTs it) and coerces garbage, and its string columns are pinned to `HISTORY_DTYPES`;
+  the guard keeps a pano dated ON the harvest date and drops one after it, before 2007 and in 2611 (an exclusive ceiling fails it, and so does the wall clock as ceiling, since 2026-05-01 is then kept);
+  a duplicated `pano_id` counts once (no dedup fails it); an empty harvest publishes nulls and empty histograms, never `NaT`; an existing summary is left alone without `force_recreate_file`;
+  the harvester script writes the summary after cataloging, run through `_run` with a stubbed harvester (skipping the call fails it);
+  `scripts/backfill_history_json.py` runs as a subprocess: a dry run writes nothing and exits 1 for a missing CSV, `--execute` writes once, a second run is "up to date", and `--force` rewrites (executing on a dry run, or ignoring `--force`, fails it);
+  a `--data-dir` that does not exist, or that holds no catalog, is refused with exit 2, prints no `0 rows`, and creates neither the directory nor an empty catalog (removing either refusal fails its test; the directory refusal is pinned with a real `--db-path`, since otherwise the catalog refusal masks its removal), while a real catalog with no harvests still answers `0 rows` with exit 0;
+  and `ParsedHistoryFilename.provider` is `"gsv"`.
 - GSV batch downloader's quota-throttling behavior (OVER_QUERY_LIMIT retry, sub-threshold residual written back as a failure row, over-threshold abort
   — the `fetch_gsv_pano_metadata_async` primitive is monkeypatched to serve responses from memory)
 - GSV engine, what pipelining must not break one level out (PR #399 review, `tests/test_gsv_pipelined_collect.py`):
@@ -1309,6 +1323,16 @@ Two browser tests read it: the column, preset, filter, caption and series table 
 The series table is a second `<table>` on grid.html, so the layout tests parametrized over all three pages now scope their bare `tbody tr` and `tbody th[scope='row']` locators to `.streets-table`; unscoped, they resolved to the series table's first row, hidden in its closed disclosure, and seven failed.
 Every assertion above was mutation-checked; the table is in the PR body.
 
+### Harvested capture history (issue #109)
+
+`capture-history.test.js` pins the city page's section helpers under the REAL `buildFilledHistogram` and a `getColor` stub that names the age and provider it was asked for.
+`captureHistoryYears` returns ascending numbers, and `[]` for a missing summary or an empty histogram (its explicit sort is defensive: JS enumerates integer-like keys ascending anyway, so deleting it is an equivalent mutation).
+`captureHistoryBars` gap-fills with zero bars through the HARVEST's year, not the viewer's: a 2026 harvest viewed in 2028 ends at 2026 (filling through `currentYear` fails it), and each bar is coloured by its AGE against the viewer's year (2009 in 2028 is `color(19,gsv)`; colouring by index, or by age against the harvest year, fails it).
+`captureHistoryEndYear` falls back to the viewer's year only for a missing or unreadable harvest date, and never ends before the newest year the summary holds.
+`captureHistoryLegendHtml` is empty without a harvest; otherwise it carries the canvas id, `role="img"`, an `aria-label` naming both dates, one table row per year WITH imagery (4, not the 18 filled bars), the caveat verbatim, and the dropped-dates line only when dates were dropped, worded "implausible or unreadable" because the count includes NaT; a hostile caveat and harvest date are escaped.
+`streetscape-utils.test.js` pins `adaptCityRecord.capture_history`: the gsv block's own pointer, null for the same city's Mapillary view (a record-level read fails it), and null — never undefined — on v1 and unharvested records; and that a harvest filename resolves to no provider and is not a valid run.
+The Python half of that last pin is `test_a_history_artifact_is_not_a_run_file_in_either_language` in `tests/test_naming.py`, which runs the JS `RUN_FILENAME_RE` itself (widening its token class to `[a-z_]+` fails it).
+
 ## The pivoted data tables (issue #250)
 
 **The pivoted data tables (issue #250) are covered on both sides.**
@@ -1497,6 +1521,14 @@ The grid page's equivalents were discriminating from the start (75.0 / 66.7 / 60
 **The Mapillary runs carry a real quality distribution (issue #321).**
 `build_fixture._add_mapillary_run` cycles `MAPILLARY_FIXTURE_QUALITY` (0.92, 0.58) and `MAPILLARY_FIXTURE_ON_FOOT` over the pano rows, because the shared builder's constant 0.75 and all-vehicle capture would make every percentile, both tail shares and the on-foot share indistinguishable from a broken reduction.
 `test_every_fixture_mapillary_record_carries_a_quality_block` reads the committed `cities.json.gz` and pins both the presence of the block on every Mapillary record and its values, so a fixture regenerated without the cycle fails in the fast suite.
+
+**The fixture carries a harvested capture history (issue #109).**
+Alpha City's GSV block points at a six-pano harvest with one impossible 2611 date, written by the real summarizer, because Alpha is the four-provider city: its Mapillary view of the SAME city is what shows the section is gated on the provider block.
+`_artifact_provider` asks `naming.parse_history_filename` too (its `provider` is a constant `"gsv"`), or the sweep above reports both history artifacts as unplaceable.
+The integer-column sweep skips the history marker: a harvest is a per-pano census, and `dtypes_for_run_path` would read it with a schema it does not have.
+`test_the_fixture_carries_a_gsv_capture_history_for_the_multi_provider_row` pins the pointer to Alpha's gsv block and nowhere else, with five plausibly dated panos over four years and a newest date that is not 2611 (removing the guard and rebuilding the fixture fails it).
+Three browser tests read it: the section renders with four table rows and no 2611, and fetches the summary exactly once; an unharvested city and Alpha's Mapillary view render no section and request no `_gsv_history_` URL at all, recorded with `page.on("request")` (a fetch derived from the run's name instead of the pointer fails the first; a record-level read fails the second).
+Two more drive the chart itself: five forced `updateLegend` repaints leave exactly one capture-history Chart, drawing on the live canvas, and no Chart on a detached canvas (removing `previousChart?.destroy()` fails it); it never compares the page's TOTAL instance count, because the street-coverage chart is created after the legend's first paint and a total sampled then raced it in CI (4 == 3 with nothing leaked), and with the browser clock fixed at 2028 the chart's labels still end at 2026, the fixture's harvest year (passing the wall-clock year as the fill's end fails it).
 
 ## The Mapillary user-activity tool
 

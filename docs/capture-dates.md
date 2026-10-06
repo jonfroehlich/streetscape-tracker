@@ -93,4 +93,17 @@ It sweeps the city's frozen grid, keeps only panos that carry a date (a present 
 — the analogue of the `© Google` filter), de-dups by pano_id, and writes a distinct dated artifact `{city_id}_..._gsv_history_YYYY-MM-DD.csv.gz` (its own `HISTORY_DTYPES` schema, NOT a run/`METADATA_DTYPES` file; `naming.parse_filename` rejects it, `parse_history_filename` parses it) plus a `history_harvests` catalog row (schema v3).
 History is near-static, so a city is harvested once and re-swept rarely.
 Run via `scripts/harvest_gsv_history.py "City"` (city must already be registered so its grid is frozen).
-Downstream JSON/diff/web-viz are intentionally deferred.
+
+### The capture-history summary and its guard (issue #109)
+
+Each harvest now gets a sibling summary, `{city_id}_..._gsv_history_YYYY-MM-DD.json.gz` (its own schema, v1), written by the harvester right after it catalogs the row.
+The aggregate points at it from `providers.<p>.capture_history`, and `city.html` renders it as a legend section ([`frontend.md`](frontend.md)).
+The summary applies the same plausibility guard every run statistic does — `analysis.plausible_capture_mask`, through the same function rather than a copy.
+The floor is the provider's (2007-01-01 for gsv), and the ceiling is the **harvest date, inclusive**: nothing can have been captured after the search that saw it, and the endpoint's month precision is pinned to the 1st, so a true date can only round toward the past.
+`dated_unique_panos` is not called because it needs a run's `status` column; the third-party exclusion it applies by copyright is already true here by construction, since the harvester keeps only dated panos and a present date is this endpoint's official-imagery signal.
+The frame is deduplicated by `pano_id` defensively.
+What the guard drops is **published**, as `panos.implausible_dates_dropped`, never silent — an undocumented endpoint is exactly where a sentinel date would arrive.
+That count includes dates the loader could not parse (coerced to NaT, which the mask rejects), so it means "implausible or unreadable", not only "out of range".
+The harvest CSV is never rewritten; its one reader is `fileutils.load_history_csv_file`, which pins `format="ISO8601"` with `errors="coerce"` for the #226 reason above.
+A harvest that predates the summary gains one from `scripts/backfill_history_json.py` ([`operations.md`](operations.md)); the aggregate reads summaries and never builds them.
+Still deferred (issue #109): a per-pano map layer of historical panos, harvest-to-harvest diffs, and an overview metric.

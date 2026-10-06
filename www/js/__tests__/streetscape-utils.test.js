@@ -328,6 +328,66 @@ test("adaptCityRecord: `quality` is gated on PRESENCE, not on the provider name"
   assert.deepEqual(adaptCityRecord(other, "thirdparty").quality, QUALITY_BLOCK);
 });
 
+// --- capture_history (issue #109) ---------------------------------------------
+//
+// The aggregate puts the harvest pointer INSIDE the provider block it belongs
+// to. These pin that the adapter reads it from the block it selected -- so a
+// Mapillary view of a gsv-harvested city reads null -- and that every record
+// without one reads null rather than undefined.
+
+const HISTORY_BLOCK = {
+  harvest_date: "2026-04-10",
+  data_file: "bend--or_width_100_height_100_step_20_gsv_history_2026-04-10.csv.gz",
+  json_file: "bend--or_width_100_height_100_step_20_gsv_history_2026-04-10.json.gz",
+  unique_panos: 6,
+  plausibly_dated_panos: 5,
+  oldest_capture_date: "2009-06-01",
+  newest_capture_date: "2024-06-01",
+  years_with_imagery: 4,
+};
+
+function twoProviderV4(gsvExtra = {}) {
+  const latest = {
+    run_date: "2026-09-01",
+    panorama_counts: { unique_panos: 10, unique_google_panos: 7 },
+    histogram_of_capture_dates_by_year: { all_panos: {} },
+    all_panos_age_stats: {},
+    coverage_rate_percent: 40,
+    search_area_km2: 25,
+    data_file: "c",
+    json_file: "d",
+  };
+  return {
+    city_id: "bend--or",
+    city: { name: "Bend", state: "OR", country: "USA" },
+    providers: {
+      gsv: { latest, runs: [], change: null, ...gsvExtra },
+      mapillary: { latest, runs: [], change: null },
+    },
+  };
+}
+
+test("adaptCityRecord: capture_history is the provider block's own pointer", () => {
+  const rec = twoProviderV4({ capture_history: HISTORY_BLOCK });
+  assert.deepEqual(adaptCityRecord(rec, "gsv").capture_history, HISTORY_BLOCK);
+  // Per (city, provider): the same city's Mapillary view carries nothing.
+  assert.equal(adaptCityRecord(rec, "mapillary").capture_history, null);
+});
+
+test("adaptCityRecord: capture_history is null -- never undefined -- when absent", () => {
+  assert.equal(adaptCityRecord(V1_RECORD, "gsv").capture_history, null);
+  assert.equal(adaptCityRecord(twoProviderV4(), "gsv").capture_history, null);
+});
+
+test("filename lookups: a capture-history harvest is not a run file", () => {
+  // The JS half of tests/test_naming.py's history-artifact pin (#109): the
+  // harvest CSV is published beside the runs, and must never resolve to a
+  // provider or pass as a ?file= run.
+  const name = "bend--or_width_5000_height_5000_step_20_gsv_history_2026-07-08.csv.gz";
+  assert.equal(getProviderFromFilename(name), null);
+  assert.equal(isValidRunFilename(name), false);
+});
+
 // --- the registry is the authority, not a two-provider `if` ----------------
 //
 // These drive a THIRD provider that is not in PROVIDERS today. Every one of

@@ -11,6 +11,11 @@
  * STREETSCAPE_DATA_BASE_URL. The imagery provider (GSV vs Mapillary) is derived
  * from the data filename's provider token.
  *
+ * Also depends on the page's other scripts: street-coverage.js
+ * (renderStreetCoverage), diff-overlay.js (renderDiffOverlay) and
+ * capture-history.js (captureHistoryLegendHtml, rebuildCaptureHistoryChart --
+ * the harvested capture-history section, issue #109).
+ *
  * Third-party libraries (loaded via CDN in city.html):
  *   Leaflet, Chart.js, moment, chartjs-adapter-moment, PapaParse, pako
  *
@@ -135,6 +140,13 @@ let diffOverlay = { shown: false, loading: false, layer: null, counts: null, dra
 // Run-history mini-chart handle: updateLegend repaints via innerHTML (which
 // destroys the canvas), so the chart is destroyed/recreated alongside it.
 let runHistoryChart = null;
+
+// Harvested capture history (issue #109): the summary JSON the aggregate names
+// for this (city, provider), or null when it names none -- the section then
+// renders nothing. Its chart is rebuilt on every legend repaint, like the one
+// above.
+let captureHistoryGlobal = null;
+let captureHistoryChart = null;
 
 // ── Map interaction ────────────────────────────────────────────
 
@@ -467,6 +479,11 @@ function updateLegend(years) {
     }
   }
 
+  // ── Section 2c: harvested capture history (issue #109) ────
+  // A census of Google's archive from an out-of-band harvest, rendered as its
+  // own dataset -- never overlaid on the run's sampled counts above.
+  html += captureHistoryLegendHtml(captureHistoryGlobal, providerGlobal);
+
   // ── Section 3: imagery mode toggle ───────────────────────
   // Only for a provider that publishes a copyright field, on a run that
   // actually recorded it (so fleet vs contributor is known). Both marker sets
@@ -569,6 +586,8 @@ function updateLegend(years) {
 
   // The innerHTML swap above destroyed any previous chart canvas — rebuild.
   rebuildRunHistoryChart();
+  captureHistoryChart = rebuildCaptureHistoryChart(
+    captureHistoryGlobal, providerGlobal, captureHistoryChart);
 }
 
 /**
@@ -1539,6 +1558,12 @@ async function loadData() {
     providerGlobal = resolvedProvider;
     map.attributionControl.addAttribution(PROVIDERS[providerGlobal].attribution);
 
+    // Issue #109: the harvest summary's fetch is STARTED below and awaited
+    // just before the first full legend paint, so it overlaps the run's
+    // metadata and CSV instead of adding a serial round trip. It resolves to
+    // null (never rejects) for a city with no harvest or a failed fetch.
+    let captureHistoryPromise = Promise.resolve(null);
+
     // Locate this city's run history for the snapshot selector — only the
     // active provider's runs, so the <select> never mixes provider series
     if (rawCities) {
@@ -1549,6 +1574,18 @@ async function loadData() {
       if (record) {
         runsGlobal = record.runs || [];
         cityIdGlobal = record.city_id ?? null; // for the streetwalk manifest lookup
+      }
+      // Issue #109: the aggregate names this (city, provider)'s harvest
+      // summary only when one exists, so an unharvested city -- and every
+      // other provider's view of a harvested one -- fetches nothing (no 404,
+      // no console noise). `record` is the record adapted for providerGlobal.
+      if (record?.capture_history?.json_file) {
+        captureHistoryPromise = fetchGzippedJson(
+          STREETSCAPE_DATA_BASE_URL + record.capture_history.json_file
+        ).catch((e) => {
+          console.info("No capture-history summary for this city (skipping):", e.message);
+          return null;
+        });
       }
     }
 
@@ -1858,6 +1895,8 @@ async function loadData() {
     totalPanosGlobal = totalInMode;
     applyDesired();
 
+    // Long since settled in practice (it raced the whole CSV stream).
+    captureHistoryGlobal = await captureHistoryPromise;
     updateLegend(Object.keys(markersByYear).map(Number));
 
     createTemporalPlot(document.getElementById("temporal-plot"));

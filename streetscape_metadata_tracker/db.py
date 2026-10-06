@@ -1888,6 +1888,43 @@ def get_latest_history_harvest(
     ).fetchone()
 
 
+def get_latest_history_harvests_all(
+    conn: sqlite3.Connection,
+) -> dict[tuple[str, str], sqlite3.Row]:
+    """The newest history harvest of every (city, provider), keyed by that pair.
+
+    One query for the whole catalog, for the aggregate builder (issue #109):
+    the same reason as ``get_channel_exclusions_all`` -- 1,200 point lookups
+    is the shape that makes a nightly tail slow. "Newest" is the same rule as
+    ``get_latest_history_harvest``: the greatest ``harvest_date``, which
+    ``UNIQUE (city_id, provider, harvest_date)`` makes unambiguous.
+    """
+    rows = conn.execute(
+        """SELECT h.* FROM history_harvests h
+           WHERE h.harvest_date = (SELECT MAX(harvest_date) FROM history_harvests
+                                   WHERE city_id = h.city_id AND provider = h.provider)
+           ORDER BY h.city_id, h.provider"""
+    ).fetchall()
+    return {(row["city_id"], row["provider"]): row for row in rows}
+
+
+def get_history_harvests(conn: sqlite3.Connection, city_id: str | None = None) -> list[sqlite3.Row]:
+    """Every history harvest row, oldest first -- or one city's, given ``city_id``.
+
+    For ``scripts/backfill_history_json.py`` (issue #109), which summarizes
+    every harvest on disk, not only the latest one the aggregate points at.
+    """
+    if city_id is None:
+        return conn.execute(
+            "SELECT * FROM history_harvests ORDER BY harvest_date, city_id, provider"
+        ).fetchall()
+    return conn.execute(
+        """SELECT * FROM history_harvests WHERE city_id = ?
+           ORDER BY harvest_date, provider""",
+        (city_id,),
+    ).fetchall()
+
+
 # ── Frozen OSM street networks (issue #103) ────────────────────────────────
 
 

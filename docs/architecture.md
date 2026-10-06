@@ -39,7 +39,7 @@ It is **local-only and never rsynced** — it lives in exactly one place, which 
 | `api_usage` | PK(usage_date, provider) | Daily request-budget ledger; **additive** (`add_api_usage`); streets channels metered under their own strings (#99) |
 | `host_usage` | index(host, recorded_at) | Timestamped per-HOST spend (#385, v16), one row per `add_api_usage` on a channel in `CHANNEL_METERED_HOST`; read over a rolling 24 h by the `[hosts.*]` budget gate, pruned after 30 days |
 | `schedule_state` | PK(city_id, provider) | Stagger day, last attempt/success, `consecutive_failures` (reset only by a success), `member` (per-channel membership, #248) |
-| `history_harvests` | UNIQUE(city_id, provider, harvest_date) | Out-of-band GSV capture-history harvests (#2) |
+| `history_harvests` | UNIQUE(city_id, provider, harvest_date) | Out-of-band GSV capture-history harvests (#2); its summary JSON is the CSV's sibling (#109) |
 | `street_networks` | UNIQUE(city_id, network_type) | Frozen OSM networks (#103); GraphML lives unpublished under `data/osm_cache/` |
 | `street_walks` | UNIQUE(city_id, provider, network_type, run_date) | Road-walk collection runs (#99) — a second modality with its own unit of observation |
 | `street_walk_diffs` | UNIQUE(from_walk_id, to_walk_id) | Walk-to-walk street-coverage diffs (#101) |
@@ -208,6 +208,7 @@ Every published JSON artifact carries a `schema_version`; the frontend's `adaptC
 |---|---|---|
 | Per-run summary | `{base}.json.gz` | 2 |
 | Aggregate | `cities.json.gz` | 4 |
+| Capture-history summary (#109) | `{history_base}.json.gz` | 1 |
 | Streetwalk manifest | `streetwalks.json.gz` | 1 |
 | Driving-plan summary | `driving_plan.json.gz` | 1 |
 | Provider screen (read by `grid.html`, #349) | `provider_screen.json.gz` | 1 |
@@ -219,6 +220,13 @@ Both stay put across #321 too, which publishes Mapillary's `quality_score` as a 
 The per-run summary's `mapillary_meta` gains a `quality` block (`n_scored`, `p10`…`p90`, `pct_ge_good`, `pct_lt_poor`, `n_sequences`, `seq_p25`/`seq_p50`/`seq_p75`, `p50_on_foot`, `p50_vehicle`, `n_on_foot`, `n_foot_known`; definitions in [`census.md`](census.md)), **absent** — never zeros or nulls — when the CSV has no `quality_score` column (every Mapillary run before 2026-07-24) or no pano is scored.
 The aggregate's per-provider `latest` block gains `mapillary_meta`, copied whole from the latest run's JSON and **absent** when that JSON has none, so every GSV, KartaView and Panoramax block, and every legacy Mapillary one, is byte-identical to its pre-#321 form.
 Key presence therefore means "measured": a run summarized before #321 deployed lacks the block until `scripts/recompute_run_stats.py --provider mapillary --regenerate-json-mapillary-meta` splices it in ([`operations.md`](operations.md)).
+
+The aggregate stays at 4 across #109 too.
+A provider block gains `capture_history` — `harvest_date`, `data_file`, `json_file` and the summary's post-guard scalars — **absent** unless that (city, provider) has a `history_harvests` row AND a readable summary JSON, so an unharvested catalog publishes records byte-identical to before.
+The scalars are copied from the summary's `panos` block, never from the catalog row, so the site and the JSON it links cannot disagree.
+The aggregate reads the summary and never builds it (the nightly tail opens no harvest CSV); a row whose summary is missing is skipped with a warning that names `scripts/backfill_history_json.py`.
+There is no new catalog column: the summary's name is derived from `history_harvests.csv_filename` by one helper (`json_summarizer._history_json_filename`) that the writer and the reader share.
+A harvested city with no run at all is still not an aggregate record.
 
 The provider screen stays at 1 across #406's measured cell (v19's `provider_screen_cells`).
 `instrument.cell` is still a string — its value is now derived from the latest pass's decoded hexagon ids instead of the literal "H3 resolution 6 (~36 km²)", which the ids contradicted (resolution 7) — and every other change is a new key: `instrument.cell_resolutions` (null for a screen that predates the measurement), `instrument.cell_area_source`, the absent-unless-unexpected `instrument.cell_warning`, and a per-date `cell_resolutions` on each `series` point.
