@@ -13220,7 +13220,7 @@ def test_stranding_is_decided_after_the_city_drains(conn, monkeypatch):
 def test_a_busy_host_strands_a_city_exactly_like_a_refusal(conn, monkeypatch, caplog):
     """An exit-80 walk skip does not trip the breaker, but the city still leaves
     the night with a grid run and no walk. The lock's other holder is most
-    often our own daytime pre-freeze pass overrunning into the timer, which is
+    often a hand prefreeze pass, or the chained one after a catch-up night, which is
     what makes this the failure #341 is about, reached by the PR's own tool."""
     from streetscape_metadata_tracker.download_common import HOST_OVERPASS
 

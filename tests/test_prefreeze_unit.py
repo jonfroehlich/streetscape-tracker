@@ -204,7 +204,7 @@ def test_the_stop_timeout_outlives_the_alert_a_sigterm_triggers(units):
 
 
 def test_the_command_line_fetches_alerts_and_parses(units, args):
-    """A typo'd flag is argparse exit 2 every afternoon; a missing --execute is
+    """A typo'd flag is argparse exit 2 after every night; a missing --execute is
     a dry run that looks healthy forever; a missing --alert is a pass that can
     die with nobody told. Parsed with the script's OWN parser, so the unit cannot
     name a flag the script does not have."""

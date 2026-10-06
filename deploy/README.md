@@ -276,6 +276,12 @@ Two cautions:
   disposition. systemd itself only sends SIGTERM once, so one `stop` is safe.
 - **A stop mid-city releases the Mapillary and Overpass host locks**, so it is a
   reasonable prelude to the manual work described in the next section.
+- **A stop also starts the chained prefreeze pass** the moment the unit goes
+  inactive, because that is the normal end-of-night trigger (#389). The pass
+  holds the Overpass lock for up to 6 h and writes `street_networks` rows, so
+  before a catalog restore or a hand walk, also run
+  `systemctl --user stop streetscape-prefreeze.service` (a `.service`, which no
+  watchdog re-arms), or `mask` that service before stopping the batch.
 
 **The installed unit is a COPY, not a symlink** — editing `deploy/systemd/`
 changes nothing about the running service until you copy it over and reload:
@@ -350,7 +356,7 @@ python scripts/prefreeze_street_networks.py --config config/scheduler.makelab1.t
 python scripts/prefreeze_street_networks.py --config config/scheduler.makelab1.toml --execute  # freeze, 2 min apart
 ```
 
-A daily timer runs it (issue #355); see **The daily street-network prefreeze** below.
+The collection unit chains it after every night (issues #355, #389); see **The post-batch street-network prefreeze** below.
 
 Three rules for manual work:
 
@@ -627,7 +633,7 @@ systemctl --user start streetscape-backup-check.service   # run once now
 ### After a reboot: the timer watchdog (issue #369)
 
 On 2026-09-23 makelab2 hung and was rebooted, and all four user timers came back
-`enabled` but **`inactive`**.
+`enabled` but **`inactive`** (four then; the prefreeze timer was retired by #389).
 Nothing collected, nothing published, and nothing alerted, because the #193 check
 above runs from one of those timers and went down with them.
 The leading (unproven) cause: the user manager started five seconds before
@@ -899,7 +905,10 @@ systemctl --user enable --now streetscape-screen-provider.timer
 systemctl --user start streetscape-screen-provider.service   # run once now
 ```
 
-- Fires **Mondays at 18:00 Pacific** (up to 30 min late), after the 02:00 batch's latest end (~14:45; it was 12:00 until 2026-09-25, which a full 12 h night overlapped): both take the same machine-wide Panoramax host lock, so an overlap is not a race but a screen that exits **85** (host busy) and records nothing that week.
+- Fires **Mondays at 23:00 Pacific** (up to 30 min late): after the night's latest end at any `max_batch_hours` up to ~20 h (02:15 + hours + ~30 min tail: 14:45 at 12 h, 18:45 at 16 h, 22:45 at 20 h) and, with its 45 min `TimeoutStartSec`, done an hour before the next 02:00.
+  Both take the same machine-wide Panoramax host lock, so an overlap is not a race but a screen that exits **85** (host busy) and records nothing that week.
+  It was 12:00 until 2026-09-25 and 18:00 until #389, each inside the night it was meant to avoid once `max_batch_hours` grew.
+  Still Tuesday in UTC, and both ends are pinned in `tests/test_prefreeze_unit.py`.
 - Every number it writes is an **upper bound** — it sums every hexagon that overlaps the city's bbox, counted whole, so a hexagon straddling the edge brings in imagery from outside it. A zero is conclusive ("nothing in this bbox"); a positive number means only "look closer". Never quote one as a coverage figure.
 - The hexagons' H3 resolution is **read off their ids on every pass** and published as the artifact's `cell` (resolution 7, ~5.16 km², when last measured). A pass that sees a coarser, mixed or non-H3 layer still records, and prints a `WARNING:` line — it is a looser bound and a `cells` count not comparable with earlier weeks, not a broken screen. A pass finer than resolution 9 is REFUSED (a hexagon that small can vanish from a z6 tile and fake a zero); `--allow-fine-cells` records it once you have checked the layer by hand, and the artifact then says its zeros are not conclusive.
 - Price a pass without spending anything: `scheduler screen-provider panoramax --dry-run`.
@@ -908,25 +917,29 @@ systemctl --user start streetscape-screen-provider.service   # run once now
 - **Three refusals are by design, and each exits nonzero without writing.** Every tile answering 404 is a moved endpoint (an empty area answers 200 with no layer). Tiles answering *with a body* that yields no hexagons at all is a renamed layer — the check that protects the very first run, when there is no history to compare against. A pass where every city reads zero although hexagons decoded is a renamed counter, and that one does need history. `--allow-collapse` records a collapse anyway, once you have checked the endpoint by hand.
 - **Lowering `max_requests_per_minute` in `[providers.panoramax]` DOES slow this screen** since #335 wired the channel and the loader stopped dropping that block — one host, one pace. It did not before, which is the opposite of what the same sentence used to say. If Panoramax refuses us outright, pause the timer: `systemctl --user disable --now streetscape-screen-provider.timer` (`disable`, not `stop`: the #369 watchdog re-arms a stopped-but-enabled timer within a day).
 
-### The daily street-network prefreeze (#355)
+### The post-batch street-network prefreeze (#355, #389)
 
-A road walk on a frozen network never contacts Overpass, so freezing the next nights' walk networks by day is what turns a mid-night Overpass refusal into a non-event (#341).
+A road walk on a frozen network never contacts Overpass, so freezing the next nights' walk networks ahead of time is what turns a mid-night Overpass refusal into a non-event (#341).
 The script shipped in #343 without a timer and never ran; on 2026-09-21 a refusal stranded 19 cities, 18 of them with no frozen network.
 
 ```bash
-cp deploy/systemd/streetscape-prefreeze.{service,timer} ~/.config/systemd/user/
+cp deploy/systemd/streetscape-prefreeze.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 # Look before the first real pass -- this lists the cold networks and fetches nothing:
 .venv-makelab2/bin/python scripts/prefreeze_street_networks.py --config config/scheduler.makelab1.toml --nights 2 --limit 40
-systemctl --user enable --now streetscape-prefreeze.timer
-systemctl --user list-timers streetscape-prefreeze.timer   # next fire
+systemctl --user show streetscape-tracker.service -p OnSuccess -p OnFailure   # want: streetscape-prefreeze.service on both
 ```
 
-- Fires **daily at 15:00 Pacific** (+0–30 min): after the latest a night can still be running (02:15 + 12 h `max_batch_hours` + its tail — backup 10 min, aggregate ~7 min, publish 10 min — so ≈ 14:45), and before midnight UTC in both PST and PDT, which is what keeps the script's "tomorrow UTC" prediction on the date the next 02:00 fire reads.
-  The test bounds that tail by the collection unit's `TimeoutStopSec` (30 min), which is a number in a file sized against those same components and about 3 min more conservative than their sum; a stop is not involved in a normal night.
-  `TimeoutStartSec=6h` ends a slow pass by 21:30, and `TimeoutStopSec=5min` is there so the SIGTERM's alert outlives systemd's 90-second default — an SMTP relay can spend 30 s per stage.
-- **Not `Persistent`**, unlike the other timers: a catch-up at boot could land just before 02:00 and hold the Overpass lock against the night's first cold walk, which exits busy and strands its city.
-  A missed afternoon costs little, since the previous day's `--nights 2` pass covered most of tonight.
+- **It has no timer** (#389): the collection unit's `OnSuccess=` and `OnFailure=` start it when the night's tail ends, whatever the result — `run-due` exits nonzero on any failed city, so `OnFailure=` is the other half of "after every night", not an error hook.
+  So at 12 h it runs from ~14:45 at the latest, and at 16 h from ~18:45.
+  It never fires on makelab1 (a condition-skipped unit does not chain), and a hand `systemctl --user start streetscape-tracker.service`, or a `stop`, chains it too.
+  The 15:00 timer it replaced assumed a night ends by ~14:45, so it would have refused and alerted every day once `max_batch_hours` passed ~12.5 h.
+- **Before its first fetch it asks Overpass a fail-closed question** (`download_common.overpass_serving`, the night breaker's own reset test: one tiny metered query, inside the Overpass host lock) and stops with exit 76, fetching nothing, unless Overpass positively answers.
+  The chain starts it minutes after a night that may have ended on an Overpass refusal, the breaker's latch dies with the night's process, and the walk's own `/status` pre-flight is fail-open — so without this a ban presenting as a refused connection would cost the first fetch its whole retry window.
+- The pass predicts the date the NEXT 02:00 Pacific fire will read (`next_run_date`), not "tomorrow UTC": a pass after midnight UTC is already on the fire's UTC day, and the old formula was a day late there (wrong for the opt-in rotation, #348).
+- `TimeoutStartSec=6h` ends a pass by 20:45 at 12 h and by 00:45 at 16 h, an hour or more before the next 02:00; the test bounds the night's tail by the collection unit's `TimeoutStopSec` (30 min), a number sized against the same components and about 3 min more conservative than their sum.
+  That test fails at `max_batch_hours = 20` on purpose: that raise must shrink this timeout or `--limit` first.
+  `TimeoutStopSec=5min` is there so the SIGTERM's alert outlives systemd's 90-second default — an SMTP relay can spend 30 s per stage.
 - Paced for the Overpass usage policy's regular-application figure (under ~100 queries a day): `--limit 40` (the most cities any night has run — the cap until its staged raise began on 2026-09-25 — so tonight's head fits) at `--pause-s 120`.
   It moves fetches the nights would make anyway; it adds none.
   The 242-city backlog measured on 2026-09-21 is therefore never drained in one pass: a cold city is frozen only once it enters the next two nights' slate, at no more than a night's rate.
@@ -935,11 +948,33 @@ systemctl --user list-timers streetscape-prefreeze.timer   # next fire
   Not wired to `OnFailure=` for the backup-check unit's reason: the notify unit is not installed on makelab2 and mails a log this script does not write.
 - Same `ConditionHost=makelab2*` and the same `STREETSCAPE_LOCK_DIR` as the collection unit: the lock only serializes two processes that derive the same path.
   **A host cutover must flip it too.**
-  `tests/test_prefreeze_unit.py` pins both, along with the schedule arithmetic above.
-- **`MemoryMax=16G` is unmeasured, and an OOM kill is the one failure that does NOT alert.** A SIGKILL gives the `--alert` path no chance to run, and because the plan is in slate order the same oversized city would head it every afternoon and die the same way, until the night's own walk (which has 48G) freezes that network.
+  `tests/test_prefreeze_unit.py` pins both, along with the chain and the timeout arithmetic above.
+- **`MemoryMax=16G` is unmeasured, and an OOM kill is the one failure that does NOT alert.** A SIGKILL gives the `--alert` path no chance to run, and because the plan is in slate order the same oversized city would head it after every night and die the same way, until the night's own walk (which has 48G) freezes that network.
   So the cap is set high on purpose: well above a single city's drive network, a third of the nightly unit's hard cap, and small against a 188 GiB box whose free memory is mostly reclaimable ZFS ARC.
   Read `systemctl --user show streetscape-prefreeze.service -p MemoryPeak` after the first few passes and size it from that; a pass that vanishes with no mail and no `Froze N of M` line in the console log is this case, and `systemctl --user status streetscape-prefreeze.service` will say `oom-kill`.
-- To pause it during an Overpass incident: `systemctl --user disable --now streetscape-prefreeze.timer` (resume with `enable --now`; a `stop` alone is undone by the #369 watchdog within a day).
+- To pause it during an Overpass incident: `systemctl --user mask streetscape-prefreeze.service` (resume with `unmask`); there is no timer to disable, `OnSuccess=` cannot start a masked unit, and the #369 watchdog ignores `.service` units.
+- To check it worked after a night: `systemctl --user show streetscape-prefreeze.service -p ExecMainStartTimestamp -p ExecMainExitTimestamp -p Result` and `grep -E 'Freezing|Froze|already has a frozen network' logs/streetscape_service_console.log | tail -3`; a `Result=success` minutes after the night's `Done:` line is the chain working.
+
+#### Deploying #389
+
+Unit changes take effect only on a manual deploy, because the installed units are copies.
+Do it between nights, in one session with the code pull: the #369 watchdog reads the shipped `deploy/systemd/*.timer` set, so a checkout at this commit with the old timer still installed reports it `NOT INSTALLED` once.
+
+```bash
+pgrep -af '[s]cheduler .*run-due' || echo idle                 # never mid-batch
+systemctl --user is-active streetscape-prefreeze.service        # and not mid-pass (want: inactive)
+diff ~/.config/systemd/user/streetscape-tracker.service deploy/systemd/streetscape-tracker.service   # carry over any local edit, e.g. an uncommented notify OnFailure=
+systemctl --user disable --now streetscape-prefreeze.timer      # the retired trigger
+rm ~/.config/systemd/user/streetscape-prefreeze.timer
+cp deploy/systemd/streetscape-tracker.service deploy/systemd/streetscape-prefreeze.service \
+   deploy/systemd/streetscape-screen-provider.timer ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user show streetscape-tracker.service -p OnSuccess -p OnFailure   # want: streetscape-prefreeze.service on both
+systemctl --user list-timers --all | grep streetscape                          # three timers; screen next fire Mon 23:00
+.venv-makelab2/bin/python -m streetscape_metadata_tracker.scheduler --config config/scheduler.makelab1.toml timer-status   # healthy, three timers
+```
+
+The first chained pass is the next night's end; a tranche enabled the afternoon of the deploy needs the manual `--nights 1 --limit 40 --execute` pass.
 
 ### Turning the KartaView channel on in production (#248)
 

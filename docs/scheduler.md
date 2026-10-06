@@ -228,7 +228,7 @@ A child that exits with a `HOST_EXIT_CODES` status trips the per-IP **host break
 A walk whose GraphML is already frozen for the channel's `network_type` is launched despite a latched Overpass, because it never contacts it.
 **Before a walk exits 76 at all, its fetch rides out the refusal for up to the `[overpass]` retry window** (#357; ~7.5 min by default, 30 s floor between attempts, inside the 900 s fetch deadline) — so a minutes-scale flap no longer trips the breaker, and each trip that does happen costs that window of wall clock in the walk's lane, at most `1 + HOST_RECHECKS_PER_NIGHT` times a night; see "(6)" in [`provider-access.md`](provider-access.md)'s Overpass section.
 **That window is shortened per child to fit the timeout it will be SIGKILLed at** — `_run_one_city` derives the timeout before the argv and passes it to `_street_collect_cmd`, which calls `policy_for_child_timeout` — because the deadline clamp floors a late city at `_MIN_CLAMPED_TIMEOUT_S` (300 s), under the ~450 s a refusal costs, and a SIGKILL records no exit code for the breaker to read while still counting a `consecutive_failure`.
-**Stranding is recorded after the city drains**: a walk an unavailable host cost the city — the refused child itself, a breaker skip, a child that found the host busy with another local process (exit 80, most often our own daytime pre-freeze pass overrunning into the timer), or a child whose argv our own CLI rejected (exit 2, #359) —
+**Stranding is recorded after the city drains**: a walk an unavailable host cost the city — the refused child itself, a breaker skip, a child that found the host busy with another local process (exit 80, most often a hand prefreeze pass, or the chained one after a Persistent catch-up night), or a child whose argv our own CLI rejected (exit 2, #359) —
 whose grid sibling (`STREET_CHANNELS[walk]`) succeeded tonight leaves the city with a grid run and no walk and not due on the grid channel for ~83 days, so it is counted on the `Done:` line (`N city(ies) STRANDED un-walked` — not "by the breaker", since a busy host and a rejected argv strand a city too), named in the alert beside one pasteable `run-due --provider <walks> --city <id>...` per exact channel set (#362), and logged as a `STRANDED` warning per lost walk.
 Decided after the drain rather than at the skip because with lanes the sibling may still be in flight at skip time.
 **An argv our own CLI rejected is a fourth exit-code family, `ARGV_REJECTED_EXIT_CODE = 2` (issue #359)** — argparse's number, inherited rather than allocated.
@@ -257,7 +257,7 @@ A walk whose network was frozen is never stranded *by Overpass*, but a frozen ce
 A walk that lands leaves `stranded` and is counted in `HostBreaker.stranded_recovered` (`N stranded walk(s) recovered by the end-of-night retry` on the `Done:` line and in the alert); anything else **keeps the original entry**, which is never re-derived, because `_run_city_channels` strands only when the grid sibling succeeded in the same call and the retry's call carries the walk alone.
 So the `Done:` count, the subject and the named cities are what is STILL stranded.
 **`busy_hosts` follows the same rule**: a walk stranded by a busy lock (`HostBreaker.busy_stranded`) that the pass lands is taken back out of it and counted in `busy_recovered`, so the busy paragraph (whose "they stay due" would otherwise be false) and the `SKIPPED (host busy)` subject report only busy skips still outstanding; one busy again at the retry stays counted once, not twice.
-**A recovered busy strand still makes the night unhealthy**, exactly as a refusal that recovered does (both cost launches, and the lock's other holder — most often the daytime pre-freeze pass overrunning — is still worth finding): the subject says `N host(s) BUSY then recovered`, mirroring `REFUSED then recovered`, the body names the host and the recovered count, and the night exits nonzero.
+**A recovered busy strand still makes the night unhealthy**, exactly as a refusal that recovered does (both cost launches, and the lock's other holder — most often a hand prefreeze pass, or the chained one after a Persistent catch-up night — is still worth finding): the subject says `N host(s) BUSY then recovered`, mirroring `REFUSED then recovered`, the body names the host and the recovered count, and the night exits nonzero.
 A refusal whose stranded walks the pass all landed likewise still alerts `REFUSED then recovered` and exits nonzero, because the breaker's host set is monotone.
 
 **Night-length measurements include the pass**: on a night that strands a walk, the `Done:` line's elapsed hours (and so `scripts/night_length_analyze.py`'s `hours`) now include the retry pass and its at most one re-check wait, so such nights are longer by design, not from slower collection.
@@ -265,8 +265,9 @@ Retries count in `attempted`/`succeeded`, never in `processed`, and each carries
 **Pairing by date is best-effort; cost reuse holds for 7 days.**
 Nothing in `json_summarizer.py`, `analysis.py` or `www/js` joins a walk to its grid run by date: what a shared date buys is the #290 census reuse, which already tolerates `CENSUS_REUSE_MAX_AGE_S` (= `CHECKPOINT_MAX_AGE_S`, 7 days), so a census walk within a week of its grid run is still free, while `gsv_streets` pays per sample either way.
 A refusal that recovered still makes the night unhealthy, with a subject that says `REFUSED then recovered` rather than `UNAVAILABLE`, since the operator's next move differs.
-The daytime `scripts/prefreeze_street_networks.py` is the prevention: it predicts the night's walk slate through `_collect_due` (hoist and refresh reserve included, for tomorrow's UTC date), freezes the cold networks serially and paced, stops on a host condition with that host's exit code, and refuses to run beside an in-flight `run-due` unless forced.
-It runs daily at 15:00 Pacific from `streetscape-prefreeze.timer` (#355), which is not `Persistent`, so a boot-time catch-up can never land beside the 02:00 batch.
+The post-batch `scripts/prefreeze_street_networks.py` is the prevention: it predicts the night's walk slate through `_collect_due` (hoist and refresh reserve included, for the UTC date the next 02:00 Pacific fire reads), freezes the cold networks serially and paced, stops on a host condition with that host's exit code, and refuses to run beside an in-flight `run-due` unless forced.
+It is chained from the collection unit's `OnSuccess=`/`OnFailure=` (#355, #389) and starts when the night's tail ends, so its slot moves with `max_batch_hours`; a test pins its 6 h timeout an hour clear of the next fire at the production `max_batch_hours`.
+Because it starts minutes after a night that may have ended on an Overpass refusal, and this breaker lives only in the night's process, the pass asks `overpass_serving` (fail-closed, inside the host lock) before its first fetch and stops with exit 76 unless Overpass positively answers.
 Because makelab1 is shared, a `[resource_guard]` pre-flight (pure `plan_connection_limit`, Linux `/proc` read) lowers each run's `--connection-limit` when host load/free-RAM are tight — on top of the systemd unit's static CPU/RAM caps.
 
 ## Channel order, and the four rationales it did not have (issues #240, #238)
@@ -606,6 +607,7 @@ Describe partial coverage accordingly.
 That last clause is about the **cap**, not about the knob, and it stopped describing production on 2026-09-21: at `max_concurrent_channels = 2` a city runs up to two collection children at once, so the headroom is no longer untouched — it is spent deliberately, against the measurement recorded in the lanes section above.
 `max_batch_hours` 10 → 12: 10 was a "comfortably below `TimeoutStartSec`" figure with nothing behind it, and the real bracket is `TimeoutStopSec` (30 min) < `max_batch_hours` < `TimeoutStartSec` (14 h) less the bounded tail (`PUBLISH_TIMEOUT_S` + `_MEASURED_TAIL_AGGREGATE_S` + `BACKUP_TIMEOUT_S` = 1,635 s ≈ 0.45 h).
 12 clears both with 1.55 h spare and needs **no** change to the systemd unit; past ~13.5 h `TimeoutStartSec` has to move first, and two costs come with it — the publish lands later in the working day, and a longer nightly window is more sustained hours against the per-IP metered hosts, the axis Mapillary's blocks are currently suspected on (`docs/provider-access.md`).
+Step 2 of #389 moved both daytime timers out of that bracket's way (the prefreeze is chained to the night's end; the screen sits at Mon 23:00), so the next raise moves `TimeoutStartSec` and nothing else.
 Note the second-order effect the 12 h batch has on #273's cap arithmetic, recorded above: at 10 h the clock was the smaller of the two ceilings and the budget remainder was unreachable, and at 12 h that has swapped.
 
 **The GSV daily budget followed a year later than it should have (2026-09-13, #304).**
@@ -835,8 +837,8 @@ It exits 0 when it alerted (or alerting is intentionally off) and 1 only when a 
 It re-asks over the whole catalog whether a provider has any imagery in each city yet, reading a coarse count layer where 113 requests answer all 1,144 enabled cities, and writes one dated `provider_screen` row each.
 Panoramax is why it exists: its US corpora are months old rather than decades, so there is no archive to backfill and a city's growth is observable only if we were already watching when the imagery landed.
 
-It runs on its own weekly timer (`deploy/systemd/streetscape-screen-provider.timer`, Mondays at 18:00 Pacific, after a full 12 h night's latest end) rather than as a `run-due` tail step, for two reasons that both matter: the question has a different cadence from the nightly slate, and the batch's wall clock is already the binding constraint (#304).
-The timer is deliberately far from 02:00 because both take the same machine-wide Panoramax host lock — an overlap is not a race but a screen that exits **85** and records nothing that week.
+It runs on its own weekly timer (`deploy/systemd/streetscape-screen-provider.timer`, Mondays at 23:00 Pacific, after the night's latest end at any `max_batch_hours` up to ~20 h) rather than as a `run-due` tail step, for two reasons that both matter: the question has a different cadence from the nightly slate, and the batch's wall clock is already the binding constraint (#304).
+The slot is pinned at both ends — after the night's latest end, and done an hour before the next 02:00 — because both take the same machine-wide Panoramax host lock — an overlap is not a race but a screen that exits **85** and records nothing that week.
 
 Three properties are load-bearing and easy to erode:
 
@@ -861,7 +863,7 @@ The two diverge materially — budgets, absolute paths, `[publish].enabled`/`[pu
 
 **What was measured.**
 On 2026-09-23 makelab2 hung mid-night (the scheduler log stops at 06:18 PDT, load 165.5, before the tail, so nothing published) and rebooted at 08:15 PDT; the lingering user manager `user@29497.service` entered active at 08:16:09, and `autofs.service` at 08:16:14.
-Afterwards all four user timers — `streetscape-backup-check`, `streetscape-prefreeze`, `streetscape-screen-provider`, `streetscape-tracker` — read `enabled` but `inactive`, while `loginctl` reported `Linger=yes` and `systemctl --user is-system-running` reported `running`.
+Afterwards all four user timers — `streetscape-backup-check`, `streetscape-prefreeze`, `streetscape-screen-provider`, `streetscape-tracker` (four then; the prefreeze timer was retired by #389, and the watchdog's set is read from the shipped files, so it is three now) — read `enabled` but `inactive`, while `loginctl` reported `Linger=yes` and `systemctl --user is-system-running` reported `running`.
 Nothing collected or published until the operator ran `daemon-reload` and `start` by hand, and nothing alerted, because the only watchdog (`backup-status --alert`, #193) runs from one of those four timers.
 
 **The leading cause, unproven.**
@@ -905,7 +907,7 @@ The documented pause is `systemctl --user disable --now <x>.timer` (resume: `ena
 **`Persistent=` interaction.**
 A re-arm after a missed 02:00 fires the nightly batch at once, as the timer itself would at boot — intended.
 The 08:30 slot is chosen so that catch-up night (the 15 min randomized delay, `max_batch_hours`, and the unit's `TimeoutStopSec` as the tail's stand-in) still ends before the next 02:00, and so that it precedes the noon backup-check timer.
-`streetscape-prefreeze.timer` stays `Persistent=false`, so a re-arm never fires a missed afternoon pass.
+The prefreeze has no timer since #389 — it is chained from the collection unit — so a re-arm reaches it only through the night it starts.
 
 **Alternatives rejected.**
 

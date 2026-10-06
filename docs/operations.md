@@ -515,10 +515,10 @@ python -m streetscape_metadata_tracker.scheduler enable-city lons-le-saunier--bo
     --config config/scheduler.makelab1.toml --dry-run
 ```
 
-The tranche's OSM networks must be frozen during the day, so the gsv_streets walks never contact Overpass at night (#341).
-`streetscape-prefreeze.timer` already does this daily at 15:00 (up to 30 min late) with `--nights 2 --limit 40 --pause-s 120 --execute --alert`, so a tranche enabled BEFORE the timer fires needs nothing more.
-Only a tranche enabled after that day's pass needs a manual one, and it keeps the timer's `--limit 40`, because without it the plan covers every cold network in the window and Overpass volume is uncapped.
-Do not overlap the timer's pass: both take the Overpass host lock, so one of the two exits busy (80).
+The tranche's OSM networks must be frozen ahead of the night, so the gsv_streets walks never contact Overpass at night (#341).
+The chained post-batch pass (#389) runs `--nights 2 --limit 40 --pause-s 120 --execute --alert` when the night's tail ends, so a tranche enabled before that night ends is frozen by it.
+A tranche enabled during the day needs the manual pass below, and it keeps the chained pass's `--limit 40`, because without it the plan covers every cold network in the window and Overpass volume is uncapped.
+Do not overlap the chained pass (`systemctl --user is-active streetscape-prefreeze.service`): both take the Overpass host lock, so one of the two exits busy (80).
 The script is a dry run unless given `--execute`, so read the listing first and then freeze:
 
 ```bash
@@ -626,7 +626,7 @@ python scripts/prefreeze_street_networks.py --config config/scheduler.makelab1.t
 ```
 
 Without `--execute` the script only lists.
-The daily 15:00 timer runs the same pass as `--nights 2 --limit 40 --pause-s 120 --execute --alert`, so a tranche enabled before it runs is frozen by it, and the manual commands are needed only when enabling after the 15:00 timer has run; `--limit 40` keeps them to the timer's one-night ceiling.
+The chained post-batch pass runs the same pass as `--nights 2 --limit 40 --pause-s 120 --execute --alert` after every night, so a tranche enabled before a night ends is frozen by it, and the manual commands are needed only when enabling during the day; `--limit 40` keeps them to the chained pass's one-night ceiling.
 Do not run them on an afternoon that already carried a drain or a daytime walk catch-up (Overpass's ~100 queries/day guidance, `provider-access.md`).
 
 **6. Pricing, and the nights.**
@@ -661,17 +661,18 @@ python scripts/prefreeze_street_networks.py --config config/scheduler.makelab1.t
 python scripts/prefreeze_street_networks.py --config config/scheduler.makelab1.toml --nights 2 --limit 30 --execute
 ```
 
-It predicts the slate the way `run-due` builds it — `_collect_due` over the enabled channels, hoist and refresh reserve included, for **tomorrow's UTC date** (what the 02:00 Pacific timer fire reads; `--date` overrides) — and keeps the cities inside the cap that are due on a street channel and have no frozen GraphML for that channel's `network_type`.
+It predicts the slate the way `run-due` builds it — `_collect_due` over the enabled channels, hoist and refresh reserve included, for **the UTC date of the next 02:00 Pacific fire** (what that fire reads, #389; `--date` overrides) — and keeps the cities inside the cap that are due on a street channel and have no frozen GraphML for that channel's `network_type`.
 `--nights N` widens the window to N caps' worth of the stalest-first order, an approximation twice over: each night re-resolves its reservations, and a city whose every channel is skipped does not consume a cap slot, so a real night reaches past the first `max_cities_per_day` entries — `--nights 2` covers both.
 It stops at the first host refusal or busy lock and exits with that host's code (76 / 80), exactly as a collection child does; a bbox with no drivable ways is logged and the pass continues.
-It **refuses to run beside an in-flight `run-due`** unless `--force`, checked before *every* fetch rather than once — a pass is long, the timer does not wait for it, and the walk that then loses the Overpass lock exits busy and strands its city (#341) — so run it in the daytime, clear of the timer.
+It **refuses to run beside an in-flight `run-due`** unless `--force`, checked before *every* fetch rather than once — a pass is long, nothing ends it when a night starts, and the walk that then loses the Overpass lock exits busy and strands its city (#341) — so run a hand pass clear of the 02:00 fire and of the chained pass.
+Before its first fetch it asks `overpass_serving` (fail-closed, one tiny metered query, inside the host lock) and stops with exit 76 unless Overpass positively answers (#389).
 This is the one SCHEDULED script in `scripts/` that makes provider requests, and it is dry-run by default for that reason.
-Since #355 it runs daily from `deploy/systemd/streetscape-prefreeze.timer` at 15:00 Pacific, as `--nights 2 --limit 40 --pause-s 120 --execute --alert`.
+Since #355 it runs unattended as `--nights 2 --limit 40 --pause-s 120 --execute --alert`; since #389 it is chained from `streetscape-tracker.service`'s `OnSuccess=`/`OnFailure=` rather than a timer, so it starts when the night's tail ends.
 The pacing was taken against the Overpass usage policy first (CLAUDE.md, READ THIS FIRST): a regular application should stay under ~100 queries a day, and `--limit 40` is the city cap, so the pass fetches no more than one night's worth while tonight's slate always fits.
-It moves the nights' own fetches earlier and adds none; the 10 MB/day half of that figure is exceeded by a large city's network on its own, which is a pre-existing property of road walks rather than something the timer introduces.
+It moves the nights' own fetches earlier and adds none; the 10 MB/day half of that figure is exceeded by a large city's network on its own, which is a pre-existing property of road walks rather than something this pass introduces.
 `--alert` mails when a pass does not finish — a host condition, a `run-due` in flight, a crash, or a SIGTERM from the unit's `TimeoutStartSec` — naming the networks it left cold, and is silent when nothing was cold.
 The one failure it cannot report is an OOM kill, which is a SIGKILL: read `MemoryPeak` rather than waiting for a mail that cannot arrive.
-The schedule's rationale and install steps are in [`deploy/README.md`](../deploy/README.md); `tests/test_prefreeze_unit.py` pins them.
+The chain's rationale and install steps are in [`deploy/README.md`](../deploy/README.md); `tests/test_prefreeze_unit.py` pins them.
 
 **Draining the cold backlog: `--all-enabled` (issue #381).**
 The slate mode only ever sees cities *due* by the target date, and a wider `--nights` widens the date window, not dueness — so a cold city is otherwise frozen only the night it is walked, exactly when a refusal strands it (on prod 2026-09-21, 242 of 1,221 enabled cities had no frozen `drive` network).
@@ -686,12 +687,12 @@ Membership is read through `get_due_cities_with_last_success` with its staleness
 Its quarantine gate is **kept** at `max_consecutive_failures`, per channel: a quarantined channel never walks the city until an operator intervenes, so freezing for it buys nothing.
 That gate is also what ends a city whose fetch always fails (a bbox with no drivable ways writes no GraphML, so it is cold forever): the nights' own failures quarantine it, and before that it is ordered behind every clean network, so repeated passes move past it rather than re-asking it at the head of each one (PR #382 review).
 A pass whose every fetch failed still exits 0 — a city-specific failure is never a failed pass — but prints `WARNING: every planned fetch failed ... NOTHING was frozen`, because each attempt spent a query against the daily budget.
-`--limit` defaults to **20** in this mode, so the ~240-network backlog drains over ~12 afternoons by hand rather than in one burst; `--nights` or `--date` beside it exits 64, since neither enters a plan that ignores dueness.
+`--limit` defaults to **20** in this mode, so the ~240-network backlog drains over ~12 hand passes rather than in one burst; `--nights` or `--date` beside it exits 64, since neither enters a plan that ignores dueness.
 Everything else is the slate mode's code path: serial, `--pause-s` apart, the same lock and probe, the in-flight `run-due` refusal and the stop on a host condition.
-Frozen networks are immutable (#103), so this is a one-time cost, and the daily timer stays on `--nights`.
-The 20 is sized against the Overpass guidance [`provider-access.md`](provider-access.md) quotes — fewer than ~100 queries a day for an app that queries regularly — which the nightly walks and the daily 15:00 timer (up to 40) already draw on.
-The timer runs every afternoon, so a drain **always** adds to that day's count rather than replacing it, and that is why its default is half the timer's.
-Before running it, re-read the policy (READ THIS FIRST): do not raise `--limit` or lower `--pause-s` without that check, never run it the afternoon of a daytime walk catch-up, and start it only after that day's timer pass has finished.
+Frozen networks are immutable (#103), so this is a one-time cost, and the chained pass stays on `--nights`.
+The 20 is sized against the Overpass guidance [`provider-access.md`](provider-access.md) quotes — fewer than ~100 queries a day for an app that queries regularly — which the nightly walks and the chained post-batch pass (up to 40) already draw on.
+That pass runs after every night, so a drain **always** adds to that day's count rather than replacing it, and that is why its default is half the pass's.
+Before running it, re-read the policy (READ THIS FIRST): do not raise `--limit` or lower `--pause-s` without that check, never run it the afternoon of a daytime walk catch-up, and start it only after that day's chained pass has finished.
 
 **Recovering cities a refusal already stranded.**
 The alert names them and prints one `run-due --provider <walks> --city <id>...` per exact set of lost walk channels (#362), pasteable as printed — `--config` is the night's own, and it runs from the project root with the scheduler's venv active.

@@ -292,7 +292,7 @@ def test_the_schedulers_real_exit_84_line_is_a_block(tmp_path, monkeypatch, capl
 
 
 def test_a_local_timestamp_is_judged_by_its_utc_date():
-    # The weekly screen fires Monday 18:00 Pacific, which is Tuesday in UTC --
+    # The weekly screen fires Monday 23:00 Pacific, which is Tuesday in UTC --
     # the date `_record_screen_spend` charges it to.
     assert gate.local_to_utc_date("2026-10-05 18:00:00", PACIFIC) == date(2026, 10, 6)
     assert gate.local_to_utc_date("2026-10-05 16:59:59", PACIFIC) == date(2026, 10, 5)

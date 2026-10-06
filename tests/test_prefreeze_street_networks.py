@@ -757,7 +757,7 @@ def test_all_enabled_limit_1_passes_move_past_a_city_whose_fetch_keeps_failing(
     """The PR #382 review's repro: a city whose bbox has no drivable ways fails
     every fetch and writes no GraphML, so it is cold forever. Failing but not
     yet quarantined, it goes behind every clean city, so repeated --limit 1
-    passes make progress instead of re-asking it every afternoon."""
+    passes make progress instead of re-asking it on every pass."""
     cities = [_register(conn, f"City{i:02d}") for i in range(4)]
     roadless = cities[0]
     for provider in ("gsv_streets", "mapillary_streets"):

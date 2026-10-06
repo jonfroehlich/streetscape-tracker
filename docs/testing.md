@@ -872,7 +872,7 @@ and the **per-writer staging name** — that two pids derive different paths, th
 ## The user-timer watchdog (issue #369)
 
 `tests/test_user_timers.py` drives `scheduler timer-status` against `FakeSystemctl`, a pure-Python `systemctl --user` that records every call, so the call SEQUENCE is pinned and not just the verdict:
-the watched set is exactly the four shipped `.timer` files, and none found is an error rather than an empty success;
+the watched set is exactly the three shipped `.timer` files, and none found is an error rather than an empty success;
 `XDG_RUNTIME_DIR`/`DBUS_SESSION_BUS_ADDRESS` are filled only when cron lacks them;
 the active host is read from the collection unit's `ConditionHost=`, and any other host makes no call, writes no heartbeat and sends no mail;
 enabled-but-inactive timers exit 1 and are NOT started without `--rearm`;
@@ -970,7 +970,8 @@ In `tests/test_scheduler.py`, `backup-status` gates on the heartbeat only when `
   a city not due tonight not fetched (the slate is `_collect_due`'s, not "every city without a network");
   a blocked or busy host stopping the pass with that host's exit code (76/80) after one fetch, while a city-specific `DownloadError` does not stop it;
   an in-flight `run-due` refusing `--execute` unless `--force`, while a dry run never asks, and a `run-due` that appears **mid-pass** stopping it after the fetch in hand;
-  no enabled street channel meaning nothing to freeze; bad flags exiting usage; and the default date being tomorrow UTC — a literal under a frozen 17:30-PDT clock (#347), not the same expression on both sides.
+  no enabled street channel meaning nothing to freeze; bad flags exiting usage; and the default date being the UTC date of the NEXT 02:00 Pacific fire (#389) — literals under five frozen clocks, PST and PDT, before and after midnight UTC and either side of 02:00, the 17:30-PDT one being the instant the old "tomorrow UTC" formula answered a day late.
+  The fail-closed Overpass probe (#389): a negative answer stops the pass with exit 76 and nothing fetched, and alerts; it is asked exactly once a pass, inside the Overpass host lock (a busy lock is exit 80 with no probe sent), after the in-flight check, and never by a dry run, a refused pass or a pass with nothing cold — a file-wide autouse fixture answers True, since the real probe can only read the suite's DNS block as "not serving".
   `--alert` (issue #355) mails exactly once on a refusal, a busy lock, a `run-due` in flight, a crash (with the traceback, still re-raised) and a SIGTERM (exit 143, the previous handler restored), each naming the networks still cold, and never on a finished pass, an empty plan or a city-specific failure;
   the exit status is unchanged, and the SIGTERM exception is a `BaseException` so a library's `except Exception` cannot swallow it.
   `--all-enabled` (issue #381) planning cities the slate mode drops — past the cap, and walked yesterday — while skipping a disabled city, an already-frozen one and one no enabled street channel walks (an explicit exclusion, or no enrolment on an opt-in channel, where a NULL member means out);
@@ -979,15 +980,18 @@ In `tests/test_scheduler.py`, `backup-status` gates on the heartbeat only when `
   the in-flight `run-due` refusal and the host stop still firing in that mode; and its alert naming `--all-enabled` as the re-run.
   From the PR #382 review: staleness over channels with DIFFERENT timestamps (the oldest walk, not the newest, and any never-walked channel making the network never-walked); a channel at the failure cap dropped per channel, not per city;
   and the review's repro, repeated `--limit 1` passes moving past a city whose fetch always fails, a pass that froze nothing printing its WARNING, and the city dropping out once quarantined.
-- The prefreeze units (`tests/test_prefreeze_unit.py`, issue #355): the same host, interpreter, `--config`, lock dir and console log as the collection unit;
+- The prefreeze units (`tests/test_prefreeze_unit.py`, issues #355, #389): the same host, interpreter, `--config`, lock dir and console log as the collection unit;
   a sandbox no wider than the checkout (`PrivateUsers`, `NoNewPrivileges`, `PrivateTmp`, `RestrictSUIDSGID`, `ProtectSystem=strict`, one `ReadWritePaths`, an OPTIONAL `EnvironmentFile`);
   a `MemoryMax` whose VALUE sits above a floor and below the nightly unit's, with no `MemoryHigh` — an OOM here is a SIGKILL, so it is the one failure that cannot alert;
   a `TimeoutStopSec` long enough for the SIGTERM handler's mail to clear an SMTP relay's per-stage timeouts;
   an `ExecStart` that parses under the script's own parser with `--execute` and `--alert` and no `--force` or `--date`;
   `--nights >= 2`, `--limit` between the production city cap and Overpass's 100/day regular-application figure, and `--pause-s` at least the default;
-  a timer that fires after the latest a night can run — its delay, `max_batch_hours` and, as a deliberately conservative stand-in for the night's tail, the collection unit's `TimeoutStopSec`, itself re-checked against `BACKUP_TIMEOUT_S + PUBLISH_TIMEOUT_S` so the stand-in stays an over-estimate — ends a slow pass an hour before the next 02:00, lands on the same UTC day as its Pacific day in both PST and PDT, and is not `Persistent`;
+  the collection unit naming the service on BOTH `OnSuccess=` and `OnFailure=` (a night with one failed city is the common exit), and its commented opt-in notify `OnFailure=` still present and, once uncommented, accumulating beside the chain rather than displacing it;
+  no `.timer` shipping for it and no `[Install]` section on the service;
+  the pass's `TimeoutStartSec` ending it an hour before the next 02:00 from the night's latest end — the nightly delay, `max_batch_hours` and, as a deliberately conservative stand-in for the night's tail, the collection unit's `TimeoutStopSec`, itself re-checked against `BACKUP_TIMEOUT_S + PUBLISH_TIMEOUT_S` so the stand-in stays an over-estimate — the assert that fails at `max_batch_hours = 20` by design;
+  the script's fire-time constants equal to the nightly timer's `OnCalendar`;
   every shipped unit installed by a `cp` line in `deploy/README.md`, and CLAUDE.md's unit count matching the directory.
-  The same file pins the weekly Panoramax screen timer after the night's latest end, by the same bound: it shares the nightly's Panoramax host lock, and its old Monday 12:00 slot sat inside a full 12 h night (moved to 18:00 on 2026-09-25).
+  The same file pins the weekly Panoramax screen timer at both ends: after the night's latest end by the same bound, and its own latest end (delay plus `TimeoutStartSec`) an hour before the next 02:00. It shares the nightly's Panoramax host lock; its Monday 12:00 slot sat inside a full 12 h night (moved to 18:00 on 2026-09-25), and 18:00 would sit inside a 16 h one (moved to 23:00 by #389, which fails the first assert past ~20.25 h).
 - `collect --estimate` on a cold city says the network **was** fetched from Overpass and frozen, on a frozen one says no requests were issued, with `--refresh` on a frozen one says it was re-fetched, and with `--refresh` on a cold one still says fetched, never re-fetched (issue #341).
 
 - Request jitter (issue #292: the spaced pacer sleeps exactly the **shifted exponential** of the injected draw — floor `(1 − j) × mean` plus `j × mean × draw` — keeps the configured **mean** rate and reaches `CV = jitter` over 20,000 real draws, has no burst credit after an idle, exceeds the old uniform draw's hard ceiling (the property the change exists for), `jitter = 0` never draws randomness and sleeps exactly as the bucket did, disabled pacing ignores it, and `[1, ∞)` or a negative is refused by the class, the shared `jitter_fraction` argparse type and `coerce_jitter` alike;
