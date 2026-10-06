@@ -13,6 +13,7 @@ An edit that changes a rule belongs in both files; anything written since the sp
 — viewer deep-links, attribution) and `adaptCityRecord(rec, provider)` which flattens v1/v2/v3 aggregate records and emits normalized `pano_count`/`pano_age_stats`/`capture_year_histogram` keys;
 `index.js` is the overview map with one radio per registered provider (persisted as `?provider=`, re-renders without refetching);
 `city.js` streams the run's csv.gz (provider derived from the filename token; GSV rows filtered to official `© Google`, Mapillary rows all kept) and has a snapshot `<select>` filtered to the active provider's runs.
+When the run has a street-coverage artifact, the legend gains a "Street coverage" section and a top-left layer control lists Panoramas and Streets (issue #104, below).
 Data is fetched from `https://makeabilitylab.cs.washington.edu/public/streetscape-tracker/data/`, populated by `sync_data_to_server.sh` (which publishes only `*.csv.gz`/`*.json.gz` — logs, the DB, and bare CSVs are excluded).
 Mapillary attribution is required by their ToS and rendered in the Leaflet attribution control.
 `grid.html`/`streets.html`/`driving.html` are **configuration over a shared chassis**, not bespoke pages: `table-utils.js` + `table-controls.js` + `histogram-slider.js` provide sorting (nulls sink in both directions),
@@ -228,6 +229,51 @@ The overview popup's street line shows in **every** metric mode — it is the ma
 (3) `streets.html`/`streets.js`/`streets.css` — a top-level listing of published road-walks, joining the manifest (keyed by `city_id`, no display name or run filename) against the aggregate to get labels and the `city.html?file=` link.
 Deliberately not a second map.
 The manifest helpers (`fetchStreetwalkManifest`/`lookupStreetwalk`) moved from `street-coverage.js` into `streetscape-utils.js` since all three pages now need them.
+
+## Street coverage renders into the legend and the layer control (issue #104)
+
+Written after the split.
+`city.html` has ONE legend (the top-right Leaflet control) and ONE layer control (top-left `L.control.layers`); street coverage renders into them and into the bottom-right chart stack, never into a second control cluster (#104).
+The top-left street panel it replaced was deleted, not hidden, and its contents went three ways.
+
+- **The legend** gains a "Street coverage" section between the flat-only toggle and the year filter: the headline, the Color-by modes, Highlight gaps, and the per-mode chips.
+  The year list is the only unbounded section, so it stays last.
+- **The layer control** lists Panoramas and Streets, and only exists when a street layer was drawn — a one-entry control on a city without a walk would be noise.
+- **The street-type chart** moved to `#street-chart-container`, a panel stacked ABOVE the capture-date chart in `#bottom-right-panels`, so the capture-date chart keeps its corner.
+
+Why the section is rebuilt from state, never patched in place: `updateLegend` rewrites the whole legend with `innerHTML` on every interaction, so a section that is not re-derivable is wiped by the next year toggle.
+`renderStreetCoverage` therefore resolves a controller and reports a copy of its `StreetUiState` through `onChange` after every change; `city.js` stores it and rebuilds the legend, and the pure `streetLegendSectionHtml(state)` produces the section — which is also what makes it node-testable.
+The focus restore after that rebuild is generalised (by id, then year, then colour mode), or pressing Space on the Highlight-gaps checkbox drops keyboard focus to `<body>`.
+
+The Color-by group is a `role="radiogroup"` of `role="radio"` / `aria-checked` buttons wearing the `.gsv-mode-btn` pill, because it sits directly under the Imagery radiogroup of exactly that shape.
+Its container is deliberately NOT `.gsv-mode-toggle`: that class means "this run has the Google-only filter", and the e2e suite asserts its absence on Panoramax and KartaView runs, which have walks.
+
+**Panoramas is a proxy layer.**
+The pano dots are reconciled individually (`reconcile()`), not held in a LayerGroup, and the reconcile model is the only path that hides N markers in ≤ `RENDER_CAP` work.
+So `panoVisibilityLayer(setVisible)` is an empty `L.layerGroup()` whose `add`/`remove` events drive `panoDotsHidden` through `applyDesired()`; re-showing respects the mode, year, date and cap.
+
+**The control is `collapsed: false`.**
+Leaflet's collapsed control expands on hover, which is the part keyboard and touch users lose; expanded, each overlay is a natively labelled checkbox.
+
+**Chips on the light legend carry a dark hairline.**
+Measured, the covered green `#2fb974` and the gap slate `#9aa3ad` are each about 2.5:1 against the white legend, under WCAG 1.4.11's 3:1 for graphical objects; a `rgba(0,0,0,.55)` border clears it at the boundary.
+The scoped `.legend .street-chip i` rules exist to out-specify the generic 18px floating `.legend i` year-swatch rule.
+
+**One surface for the chart stack.**
+Both bottom-right panels share `.map-panel` on `#1b1f24`, the surface the street palette was validated on (`STREET_PANEL_BG`, which is also the chart's inter-bar gap colour, must stay equal to it).
+The one visible change to the capture-date chart is its surface, from `rgba(80,80,80,.9)` to `#1b1f24`; its `#ccc` ticks only gain contrast.
+Each panel collapses on its own and remembers it (`streetscape-temporal-collapsed`, `streetscape-street-chart-collapsed`).
+
+**The legend stops above the stack.**
+Both are right-anchored and the stack sits above Leaflet's controls, so on any viewport shorter than the two combined the stack covered the legend's lower sections — the new street section included, even at 1100px tall.
+`fitLegendAboveBottomPanels` sets the legend's `max-height` to end above the stack (ResizeObserver on the stack, plus window resize), with a 160px floor; the legend already scrolls.
+
+**The network is named only for a manifest walk** ("Street coverage · Roads + paths"): the derived grid artifact declares no network anywhere the page reads, so naming one would be a guess.
+
+Named follow-ups, deliberately not in #104:
+
+- Dim the legend section while Streets is unchecked in the layer control (today it stays as is).
+- Fold the diff-overlay and flat-only toggles into the layer control (each has its own count or status line in the legend today).
 
 ## Grid sample points in the aggregate
 

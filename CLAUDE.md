@@ -311,6 +311,7 @@ The raw feed archive lives outside `data/` (mirroring a vendor's file is not our
 
 **Web frontend → [`docs/frontend.md`](docs/frontend.md).**
 Static vanilla JS + Leaflet + Chart.js 4 in `www/`, no build step, fetching the published `data/`.
+`city.html` has ONE legend (the top-right Leaflet control) and ONE layer control (top-left `L.control.layers`); street coverage renders into them and into the bottom-right chart stack, never into a second control cluster (#104).
 `www/js/streetscape-utils.js` holds the provider registry and `adaptCityRecord`, which flattens v1/v2/v3 aggregate records into one normalized shape.
 It also holds `addBasemapLayer` and the CARTO key, which is **the one place a tile URL is built** — because CARTO enforces its key by watermarking the tile rather than by refusing the request: a keyless request, a wrong key and the right key under the wrong parameter name all return HTTP 200 and a byte-identical PNG stamped "API KEY REQUIRED", so no error handling anywhere can see it and a duplicated call site renders perfectly, watermarked.
 The key is bearer-style (the issuing domain is measurably not enforced), so exposure is unavoidable but abuse is not; the detection path is `tests/e2e/test_basemap_key.py`, which compares a keyed tile against a keyless one by bytes.

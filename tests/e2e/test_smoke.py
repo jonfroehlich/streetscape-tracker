@@ -375,9 +375,7 @@ def _overlay_pane_ink(page: Page) -> int:
     return page.evaluate("() => {" + _pane_ink_js("overlay") + "}")
 
 
-def test_city_page_folds_street_coverage_into_the_legend_and_layer_control(
-    page: Page, base_url
-):
+def test_city_page_folds_street_coverage_into_the_legend_and_layer_control(page: Page, base_url):
     """
     The road-walk (streetwalk) coverage artifact renders on the city page
     (#155), and since #104 it renders into the page's existing chrome rather

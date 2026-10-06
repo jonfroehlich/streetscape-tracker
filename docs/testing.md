@@ -1194,8 +1194,24 @@ Every distance and threshold is asserted at a LITERAL value placed on both sides
 
 ## Frontend node tests
 
-Frontend node tests cover the streetwalk render seam (manifest lookup + fetch-failure fallback, artifact-URL selection, key normalization, the fractional ramp, and initial view mode) by stubbing Leaflet and the panel's DOM, and `panoDateOrNull`'s reduced-precision shapes (issue #226), asserted on the LOCAL getters rather than `toISOString()`
+Frontend node tests cover the streetwalk render seam (manifest lookup + fetch-failure fallback, artifact-URL selection, key normalization, the fractional ramp, and initial view mode) by stubbing Leaflet, `L.control.layers` and the chart's DOM, and `panoDateOrNull`'s reduced-precision shapes (issue #226), asserted on the LOCAL getters rather than `toISOString()`
 — a UTC-built date and a local-built one agree on the ISO string in exactly the timezone that hides the bug, so an ISO comparison passes everywhere and protects nowhere.
+
+### The street legend section, the layer control and the chart stack (issue #104)
+
+Each test below was run against the mutation named beside it and went red.
+The chips: a fractional artifact's coverage mode shows the three-stop ramp in order and a dashed slate gap chip, and every swatch is `aria-hidden` (reorder the stops, or drop `aria-hidden`); a binary artifact shows a solid covered chip and no gradient (ignore `hasFractional`); `gapsOnly` flips the gap chip to the highlight red (drop the branch); type mode shows only the gap chip, because the chart is the type legend; age mode threads the PROVIDER into the ramp (hard-code `"gsv"`).
+The section: exactly one radio is `aria-checked`, and it is the state's mode, for all three modes (hard-code Age active, as the old panel HTML did); the provider label is ESCAPED (interpolate it raw); the gaps checkbox mirrors state; the network is named only when the state carries one (always print one); and the radiogroup is not `.gsv-mode-toggle`, which the e2e suite reads as "this run has the Google-only filter".
+`panoVisibilityLayer` maps `add` to visible and `remove` to hidden (swap them).
+`renderStreetCoverage` builds an expanded top-left control listing Panoramas then Streets, labelled "Map layers" (`collapsed: true`, or Streets first); lists Streets alone without a pano layer (an always-present `Panoramas` key); builds no control and resolves null for a missing artifact; emits its initial state exactly once, with the network named for a manifest walk and never for the grid artifact (skip the initial `emit()`, or drop the `kind` check); resolves a controller whose `setMode` restyles the layer (skip `repaint()`) and whose `setGaps` paints an uncovered edge red (stop passing `gapsOnly` to `applyStreetStyles`); and ignores an unknown or unchanged mode (accept any string).
+A source check reads `city.html`: the old `#street-coverage-container` is gone, and `#street-chart-container` starts `hidden`, inside `#bottom-right-panels`, before the temporal panel (swap the two panels).
+
+The e2e side (`test_city_page_folds_street_coverage_into_the_legend_and_layer_control`) pins what node cannot see.
+Panoramas is asserted as an ink DROP on the overlay pane, never `== 0`, because the dots share that canvas with the bounds polygon (wire the proxy backwards).
+Streets is toggled with Space on the focused checkbox, both ways.
+Highlight gaps is toggled from the keyboard and `document.activeElement` must still be the checkbox after the legend rebuild (restore focus for year buttons only, as before).
+The chart panel must sit above the capture-date panel and right-aligned with it, and collapse on its own; the legend's box must end above the stack (make `fitLegendAboveBottomPanels` a no-op — removing only its first call is an equivalent mutant, since `ResizeObserver` delivers an initial observation).
+The no-walk negative (`test_city_without_a_walk_falls_back_and_stays_clean`) asserts no section, no visible chart panel and no layer control at all, and `test_city_page_street_section_names_the_broad_network` pins "Roads + paths" under `?network=all_public`.
 
 ### The GSV query radius (issue #367)
 

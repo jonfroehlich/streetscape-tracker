@@ -15,7 +15,7 @@ An edit that changes a rule belongs in both files; anything written since the sp
 — ≥1 pano within ~25 m; tightening tracked in #95–#98) plus a by-highway-type summary.
 The network is a provider-agnostic city asset like frozen grid geometry (#103): fetched once for the frozen grid bbox, cached as unpublished GraphML under `data/osm_cache/`, registered in `street_networks`, replaced on `--refresh`.
 The package is read-only against core tables (cities/runs); it writes only `street_networks`.
-`www/js/street-coverage.js` renders the optional overlay + breakdown panel on the city page (silent no-op when the artifact is absent).
+`www/js/street-coverage.js` renders the optional overlay, its legend section, a top-left layer control and the street-type chart panel on the city page (issue #104; silent no-op when the artifact is absent).
 Roadmap: attribution quality #95/#96/#97 → pipeline `--streets` flag #100 → DB persistence #101 (**done** — see "Walk-to-walk diffs" below) + aggregate/overview surfacing #102 → HMM map-matching #98.
 
 ## Road-walk collection (`collect.py`, issue #99)
@@ -178,6 +178,7 @@ It is regenerated wherever the aggregate is (cli.py, scheduler `run-due`/`regene
 Frontend: `street-coverage.js` is source-agnostic — `normalizeStreetArtifact(fc, kind)` aliases the streetwalk keys (`median_covered_age_years`→`nearest_pano_age_years`, `totals.edges`/`edges_any_coverage`→`segments`/`covered`) so the grid path is byte-identical, and a fractional **coverage ramp** (`fractionColor`, pale→full green) graduates edges by `coverage_fraction`;
 the road-walk artifact opens on that mode, the binary grid artifact still opens on age.
 `city.js` fetches the manifest and prefers a streetwalk artifact over the grid one for the active city+provider.
+Since issue #104 there is no street panel: `renderStreetCoverage` resolves a controller that `city.js` drives from the legend's Color-by and Highlight-gaps controls, and reports its state back so the legend section is rebuilt with the rest of the legend (`docs/frontend.md`).
 
 ## Walk-to-walk diffs (`walk_diff.py`, issue #101)
 
