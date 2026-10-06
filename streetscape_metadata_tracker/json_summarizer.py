@@ -19,6 +19,7 @@ from .analysis import (
     calculate_coverage_stats,
     calculate_pano_stats,
     count_grid_points,
+    plausible_capture_mask,
 )
 from .fileutils import get_list_of_city_csv_files, load_city_csv_file
 from .geoutils import get_city_location_data, get_country_code, get_state_abbreviation
@@ -26,6 +27,27 @@ from .naming import parse_filename
 from .progress import progress
 
 logger = logging.getLogger(__name__)
+
+# ── Capture-history summaries (issue #109) ─────────────────────────────────
+#
+# A `_gsv_history_` harvest (issue #2) gets a sibling `.json.gz` summary, the
+# way every run CSV does. Its own schema, versioned separately from the per-run
+# summary (it is a census of an archive, not a sampled run), and the aggregate
+# only POINTS at it: see _capture_history_block.
+CAPTURE_HISTORY_SCHEMA_VERSION = 1
+CAPTURE_HISTORY_ENDPOINT = "GeoPhotoService.SingleImageSearch (unpublished)"
+
+# The one place this wording lives. It is published inside every summary and
+# the city page renders it VERBATIM (www/js/capture-history.js), so a reword
+# here reaches the site on the next regeneration and never forks into a
+# paraphrase in JS (the provider-screen rule, docs/frontend.md).
+CAPTURE_HISTORY_CAVEAT = (
+    "Harvested from an unpublished Google endpoint (GeoPhotoService.SingleImageSearch) "
+    "that no documented Google API exposes; there is no guarantee it keeps working. "
+    "A harvest is a one-time census of every official Google panorama surfaced by "
+    "searches at this city's grid points, deduplicated by panorama id — not part of "
+    "the dated snapshot series, and not comparable to the sampled counts beside it."
+)
 
 
 def sanitize_for_json(obj: Any) -> Any:
@@ -604,6 +626,135 @@ def generate_city_metadata_summary_as_json(
     return json_filename_with_path
 
 
+def _history_json_filename(csv_filename: str) -> str:
+    """
+    The capture-history summary's name: the harvest CSV's `.json.gz` sibling.
+
+    The ONE derivation, used by the writer and by the aggregate's reader, so
+    the catalog needs no ``json_filename`` column for it (issue #109): it is a
+    function of ``history_harvests.csv_filename``, which is already UNIQUE.
+    Works on a bare name or a full path.
+
+    Example:
+        >>> _history_json_filename("x_width_100_height_100_step_20_gsv_history_2026-04-10.csv.gz")
+        'x_width_100_height_100_step_20_gsv_history_2026-04-10.json.gz'
+    """
+    return csv_filename.rsplit(".csv.gz", 1)[0] + ".json.gz"
+
+
+def generate_history_summary_as_json(
+    csv_gz_path: str,
+    df: pd.DataFrame,
+    *,
+    city_id: str,
+    harvest_date: date,
+    provider: str = "gsv",
+    grid_points_queried: int | None = None,
+    api_requests: int | None = None,
+    started_at: str | None = None,
+    finished_at: str | None = None,
+    force_recreate_file: bool = False,
+) -> str:
+    """
+    Write the capture-history summary JSON beside a harvest CSV (issue #109).
+
+    Returns the summary's path. Like the run summarizer, an existing file is
+    left untouched (and its path returned) unless ``force_recreate_file``.
+
+    The capture-date guard is ``analysis.plausible_capture_mask`` -- the same
+    function every run statistic reads through ``dated_unique_panos`` -- with
+    the provider's floor (2007-01-01 for gsv) and the HARVEST DATE as the
+    inclusive ceiling: nothing can have been captured after the search that
+    saw it, and the endpoint's month precision is pinned to the 1st, so a true
+    date can only round toward the past.
+    ``dated_unique_panos`` itself is not called because it needs a run's
+    ``status`` column, which a harvest has no use for: the harvester keeps
+    only DATED panos, and in this endpoint a present date is the signal of
+    official Google imagery, so the third-party exclusion a run applies by
+    copyright is already true by construction here and is not re-applied
+    (there is no copyright column to apply it with).
+    The frame is deduplicated by ``pano_id`` defensively (the harvester
+    already does, keeping the first row of its date-sorted output).
+    What the mask drops is published as ``implausible_dates_dropped``, never
+    silently: an undocumented endpoint is exactly where a sentinel date would
+    arrive.
+
+    Args:
+        csv_gz_path: the harvest's `.csv.gz` path; the summary is its sibling.
+        df: the harvest as read by ``fileutils.load_history_csv_file``
+            (``capture_date`` already datetime64; a string column is parsed
+            here the same way, so a caller holding the harvester's raw frame
+            gets the identical answer).
+        city_id: the catalog city.
+        harvest_date: the harvest's date -- the mask's ceiling.
+        provider: always gsv today (the history marker is gsv-specific).
+        grid_points_queried, api_requests, started_at, finished_at: copied
+            from the caller; may be None (a backfilled early harvest).
+        force_recreate_file: rewrite an existing summary.
+
+    Example:
+        >>> generate_history_summary_as_json(path, load_history_csv_file(path),
+        ...     city_id="bend--oregon--united-states", harvest_date=date(2026, 7, 8))  # doctest: +SKIP
+        '.../bend--oregon--united-states_width_5000_height_5000_step_20_gsv_history_2026-07-08.json.gz'
+    """
+    json_path = _history_json_filename(csv_gz_path)
+    if os.path.exists(json_path) and not force_recreate_file:
+        logger.info(f"Capture-history summary already exists: {json_path}; returning...")
+        return json_path
+
+    dated = df.drop_duplicates(subset=["pano_id"]).copy()
+    if not pd.api.types.is_datetime64_any_dtype(dated["capture_date"]):
+        dated["capture_date"] = pd.to_datetime(
+            dated["capture_date"], format="ISO8601", errors="coerce"
+        )
+    mask = plausible_capture_mask(dated["capture_date"], pd.Timestamp(harvest_date), provider)
+    kept = dated.loc[mask, "capture_date"]
+
+    by_year = {int(y): int(n) for y, n in kept.dt.year.value_counts().sort_index().items()}
+    by_month = {
+        str(m): int(n) for m, n in kept.dt.strftime("%Y-%m").value_counts().sort_index().items()
+    }
+    oldest = kept.min().date().isoformat() if len(kept) else None
+    newest = kept.max().date().isoformat() if len(kept) else None
+
+    summary = {
+        "schema_version": CAPTURE_HISTORY_SCHEMA_VERSION,
+        "artifact": "capture_history",
+        "provider": provider,
+        "city_id": city_id,
+        "harvest": {
+            "harvest_date": harvest_date.isoformat(),
+            "grid_points_queried": grid_points_queried,
+            "api_requests": api_requests,
+            "started_at": started_at,
+            "finished_at": finished_at,
+        },
+        "data_file": {
+            "filename": os.path.basename(csv_gz_path),
+            "format": "csv.gz",
+            "rows": int(len(df)),
+            "size_bytes": os.path.getsize(csv_gz_path) if os.path.exists(csv_gz_path) else None,
+        },
+        "source": {
+            "endpoint": CAPTURE_HISTORY_ENDPOINT,
+            "caveat": CAPTURE_HISTORY_CAVEAT,
+        },
+        "panos": {
+            "unique_panos": int(len(dated)),
+            "plausibly_dated_panos": int(len(kept)),
+            "implausible_dates_dropped": int(len(dated) - len(kept)),
+            "oldest_capture_date": oldest,
+            "newest_capture_date": newest,
+            "years_with_imagery": len(by_year),
+        },
+        "histogram_of_capture_dates_by_year": by_year,
+        "histogram_of_capture_dates_by_month": by_month,
+    }
+    _write_json_gz_atomic(json_path, summary)
+    logger.info(f"Saved capture-history summary to: {json_path}")
+    return json_path
+
+
 def _replay_change_block(conn, run_id: int) -> dict[str, Any] | None:
     """
     Rebuild a run's ``change_from_previous_run`` block from its ``run_diffs``
@@ -748,6 +899,45 @@ def _load_city_json(json_path: str) -> dict[str, Any] | None:
     except Exception as e:
         logger.error(f"Error reading {json_path}: {e}")
         return None
+
+
+def _capture_history_block(row, data_dir: str) -> dict[str, Any] | None:
+    """
+    The aggregate's pointer to one (city, provider)'s latest harvest (issue #109).
+
+    READS the harvest's summary JSON and never builds it: the nightly tail must
+    not grow a CSV pass, and the summary is written by the harvester (or by
+    ``scripts/backfill_history_json.py`` for a harvest that predates it).
+    Returns None -- and the caller then omits the key -- when the summary is
+    missing or unreadable, warning with the command that fixes it.
+    The scalars come from the summary's ``panos`` block (post-mask), never from
+    the catalog row, so the site and the JSON it links cannot disagree.
+
+    Args:
+        row: a ``history_harvests`` row (``db.get_latest_history_harvests_all``).
+        data_dir: where the harvest CSV and its summary live.
+    """
+    json_file = _history_json_filename(row["csv_filename"])
+    json_path = os.path.join(data_dir, json_file)
+    summary = _load_city_json(json_path) if os.path.exists(json_path) else None
+    if summary is None:
+        logger.warning(
+            f"{row['city_id']} [{row['provider']}]: history harvest "
+            f"{row['csv_filename']} has no summary JSON; run "
+            f"scripts/backfill_history_json.py"
+        )
+        return None
+    panos = summary.get("panos") or {}
+    return {
+        "harvest_date": row["harvest_date"],
+        "data_file": row["csv_filename"],
+        "json_file": json_file,
+        "unique_panos": panos.get("unique_panos"),
+        "plausibly_dated_panos": panos.get("plausibly_dated_panos"),
+        "oldest_capture_date": panos.get("oldest_capture_date"),
+        "newest_capture_date": panos.get("newest_capture_date"),
+        "years_with_imagery": panos.get("years_with_imagery"),
+    }
 
 
 def _build_provider_summary(
@@ -899,12 +1089,17 @@ def generate_aggregate_v2(conn, data_dir: str) -> dict[str, Any]:
 
         { "city_id": ..., "city": {...},
           "providers": {
-              "gsv":       { "latest": {...}, "runs": [...], "change": {...} },
+              "gsv":       { "latest": {...}, "runs": [...], "change": {...},
+                             "capture_history": {...} },   # optional, #109
               "mapillary": { ... } } }
 
     Each provider block has a `latest` summary for the map display, a slim
     `runs[]` history, and a `change` block summarizing the diff between the
-    provider's two most recent runs. Global capture-date histograms are
+    provider's two most recent runs. A provider block also carries
+    `capture_history` -- a pointer to its latest harvest's summary JSON --
+    only when that (city, provider) has a harvest row AND a readable summary
+    (issue #109); a harvested city with no run at all is still not a record.
+    Global capture-date histograms are
     keyed by provider and merge each city's LATEST run only (so re-running
     a city never double-counts).
 
@@ -934,6 +1129,7 @@ def generate_aggregate_v2(conn, data_dir: str) -> dict[str, Any]:
     # One query for the catalog rather than a lookup per city (issue #301).
     exclusions_by_city = db.get_channel_exclusions_all(conn)
     early_refreshes = frozenset(db.get_early_refresh_keys(conn))
+    history_by_key = db.get_latest_history_harvests_all(conn)
     for city in progress(db.get_all_cities(conn), desc="Aggregating cities", unit="city"):
         runs_by_provider: dict[str, list] = {}
         for run in db.get_runs_for_city(conn, city.city_id, provider=None):
@@ -971,6 +1167,15 @@ def generate_aggregate_v2(conn, data_dir: str) -> dict[str, Any]:
             providers_out[provider] = _build_provider_summary(
                 runs, latest_json, data_dir, conn, early_refreshes
             )
+            # Issue #109. The schema stays 4: like `excluded_channels`, the key
+            # is ABSENT unless this (city, provider) has a harvest row AND its
+            # summary JSON loads, so an unharvested catalog publishes records
+            # byte-identical to before, and the key's presence is the signal.
+            history_row = history_by_key.get((city.city_id, provider))
+            if history_row is not None:
+                block = _capture_history_block(history_row, data_dir)
+                if block:
+                    providers_out[provider]["capture_history"] = block
             latest_run_jsons_by_provider.setdefault(provider, []).append(latest_json)
             if city_block is None:  # gsv first, so GSV's city block wins
                 city_block = latest_json["city"]
