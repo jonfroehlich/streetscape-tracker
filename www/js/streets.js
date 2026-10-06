@@ -505,7 +505,7 @@ function streetGroupKeys(id, columns = STREET_COLUMNS, { includeDelta = true } =
  *
  * It no longer has to fit the page's content measure (#350): at four collected
  * providers nothing that carries coverage, imagery age AND the walk date fits
- * 1100px, and the walk date is not optional — so the table scrolls inside its
+ * the ~1100px wrap of a 1440px window, and the walk date is not optional — so the table scrolls inside its
  * wrap and the city column is pinned (data-table.css) to keep a scrolled row
  * readable.
  *
@@ -522,7 +522,7 @@ function buildStreetPresets(columns = STREET_COLUMNS) {
     // The default. Its width grows with the number of COLLECTED providers,
     // and since #350 it is allowed to: at four providers coverage + imagery
     // age + the walk date is 12 leaves, and no arrangement of them fits the
-    // 1100px measure, because a pivoted leaf is as wide as the PROVIDER NAME
+    // ~1100px wrap of a 1440px window, because a pivoted leaf is as wide as the PROVIDER NAME
     // in its header (GSV 95px, Panoramax 113px) rather than as its values.
     //
     // What used to give way was a whole metric group (#334), and on this page
