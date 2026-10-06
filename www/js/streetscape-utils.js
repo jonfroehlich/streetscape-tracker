@@ -1283,6 +1283,8 @@ function screenVerdict(record) {
  *   pano_count      — unique provider panos (google subset for gsv)
  *   pano_age_stats  — age stats of those panos
  *   capture_year_histogram — their year histogram ({counts} shape)
+ *   capture_history — this provider's harvested capture-history pointer
+ *                     (issue #109), or null when it has none
  *
  * @param {Object} rec - One entry of cities.json.gz `cities[]`.
  * @param {string} [provider="gsv"] - Which provider's view to adapt.
@@ -1321,6 +1323,8 @@ function adaptCityRecord(rec, provider = "gsv") {
       // v1 is gsv-only and predates Mapillary's metadata block (#321).
       mapillary_meta: null,
       quality: null,
+      // v1 predates the capture-history harvest (#109) and will never gain it.
+      capture_history: null,
       pano_count: v1Counts.unique_google_panos ?? v1Counts.unique_panos,
       pano_age_stats: rec.google_panos_age_stats ?? rec.all_panos_age_stats,
       capture_year_histogram: v1Histograms.google_panos ?? v1Histograms.all_panos,
@@ -1391,6 +1395,12 @@ function adaptCityRecord(rec, provider = "gsv") {
     // (#334): a legacy run, and every other provider, reads null here.
     mapillary_meta: latest.mapillary_meta ?? null,
     quality: latest.mapillary_meta?.quality ?? null,
+    // Issue #109. A pointer to this (city, provider)'s latest harvested
+    // capture history -- read off the provider BLOCK, since a harvest is per
+    // (city, provider) like a run series. Gated on PRESENCE in the block,
+    // never on the provider name or the registry (#334): every unharvested
+    // record, and every other provider's view of a harvested city, reads null.
+    capture_history: block.capture_history ?? null,
     panorama_counts: counts,
     all_panos_age_stats: latest.all_panos_age_stats,
     google_panos_age_stats: latest.google_panos_age_stats,
