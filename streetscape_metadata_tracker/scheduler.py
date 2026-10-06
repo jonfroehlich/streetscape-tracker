@@ -5826,6 +5826,13 @@ def cmd_reconcile_walks(
     itself died. Checks each enabled city's expected artifact names for the date
     and salvages any whose coverage file is on disk with no catalog row —
     stat-per-candidate rather than a glob, since data/ holds thousands of files.
+
+    ENABLED cities only. Since issue #431 every ad-hoc registration (the
+    collector CLI, ``assess-city``) leaves a new city DISABLED, so an orphaned
+    walk on such a city is invisible here until ``enable-city`` runs; enable
+    it, then re-run this with the walk's ``--date``. (``assess-city`` itself
+    salvages inline through ``_run_city_channels``, so this bites only a killed
+    tail or a hand-run ``streetscape_street_analyzer.collect`` walk.)
     """
     conn = db.connect(cfg.db_path)
     today = target_date or clock.snapshot_date_today()
@@ -6655,6 +6662,18 @@ def _assess_answer_report(cfg: SchedulerConfig, conn, city: db.CityRow) -> str:
         # a host with no configured public base.
         link = f"city.html?file={link_run.csv_filename}&network={DEFAULT_NETWORK_TYPE}"
         lines.append(f"  City page ({link_run.provider} run)  {cfg.site_url}{link}")
+    elif not city.enabled:
+        # Issue #431: get_due_cities filters `c.enabled = 1`, so for a disabled
+        # city "the next nightly batch" never comes. This sentence explains why
+        # there is no link YET, so an operator reads it as "wait one night" —
+        # which, unqualified, would mean waiting forever.
+        lines.append(
+            "  No grid run on any provider yet, so there is no city page to link "
+            "(generate_aggregate_v2 skips a city with no runs row). This city is "
+            "DISABLED, so no nightly batch collects its GSV grid run — the link "
+            f"arrives only after `enable-city {city.city_id}` and the night that "
+            "follows it."
+        )
     else:
         lines.append(
             "  No grid run on any provider yet, so there is no city page to link "
@@ -6705,10 +6724,16 @@ def _select_assess_channels(cfg: SchedulerConfig, requested: list[str] | None) -
             else "An opt-in channel collects the cities an operator enrolled, which is a "
             "standing decision rather than a same-day answer about one city"
         )
+        # Validated before the city is resolved, so this cannot know whether
+        # the city is enabled; say what run-due needs instead (#431). run-due
+        # collects only DUE cities, and get_due_cities filters `c.enabled = 1`,
+        # so pointing a disabled city at it alone is a silent no-op.
         raise _UsageError(
             f"--provider {', '.join(rejected)}: assess-city collects only "
             f"{', '.join(ASSESS_CHANNELS)}. {why} — use "
-            f"`run-due --provider {rejected[0]}` if you really want it now."
+            f"`run-due --provider {rejected[0]}` if you really want it now "
+            f"(run-due collects only enabled, due cities; a city registered by "
+            f"assess-city or the collector CLI is DISABLED until `enable-city`)."
         )
     return selected
 
@@ -6886,11 +6911,16 @@ def cmd_assess_city(
 
     if estimate_only:
         print(
-            "\n--estimate: the city is registered (a catalog-only write; a NEW city is "
-            "registered DISABLED, see above) and no provider request was issued. "
-            "Re-run without --estimate to collect; `enable-city` puts it into the "
-            "nightly rotation once the boundary above is vetted."
+            "\n--estimate: the city is registered (a catalog-only write) and no "
+            "provider request was issued. Re-run without --estimate to collect."
         )
+        if not city.enabled:
+            # Only when it is true: an already-enabled city printed no hint above,
+            # and is already in the rotation (#431 review).
+            print(
+                f"  It is registered DISABLED (see above): `enable-city {city.city_id}` "
+                f"puts it into the nightly rotation once the boundary above is vetted."
+            )
         return 0
 
     if not assume_yes:

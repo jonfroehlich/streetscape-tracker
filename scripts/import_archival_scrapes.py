@@ -451,6 +451,15 @@ def resolve_or_register_city(
     loc = get_city_location_data(entry.query, center[0], center[1])
     if loc is None or not loc.city:
         return None, "geocoding FAILED"
+    # The geocode can land on a city the catalog already holds (an enabled,
+    # tracked one, or one an earlier entry of this pass registered): the
+    # query is never aliased, so its slug missed above. register_city is
+    # INSERT OR IGNORE, so registering would change nothing -- and calling it
+    # "NEW ... DISABLED" would print an enable-city hint that exits 64 for an
+    # enabled city, and list one new city once per spelling (#432 review).
+    existing = db.resolve_city(conn, db.derive_city_id(loc.city, loc.state, loc.country))
+    if existing is not None:
+        return existing, f"existing city (geocoded to {existing.city_id})"
     width, height = dims_from_boundingbox_raw(loc)
     city_id = db.register_city(
         conn,
@@ -599,7 +608,9 @@ def main() -> int:
     conn = db.connect(db_path)
     n_imported = n_already = n_skipped = n_redated = n_purged = 0
     report_lines = []
-    new_city_ids: list[str] = []
+    # dict, not list: insertion-ordered and de-duplicated, so the footer names
+    # each new city once however many entries resolved to it.
+    new_city_ids: dict[str, None] = {}
     stale_artifacts = []  # removed basenames, possibly still on the server
     pending_removal = set()  # csv_filenames slated for deletion this pass
 
@@ -650,7 +661,7 @@ def main() -> int:
                 n_skipped += 1
             continue
         if note.startswith("NEW city registered"):
-            new_city_ids.append(city_row.city_id)
+            new_city_ids[city_row.city_id] = None
 
         csv_filename = (
             generate_run_filename(city_row.city_id, width, height, ARCHIVAL_STEP_M, entry.run_date)

@@ -443,6 +443,42 @@ def test_a_geocoded_new_city_is_registered_disabled(conn, monkeypatch):
     assert note.startswith("NEW city registered DISABLED")
 
 
+def test_a_geocode_landing_on_an_existing_city_is_not_reported_new(conn, monkeypatch):
+    """
+    The query is never aliased, so a second spelling misses resolve_city and
+    geocodes again. register_city is INSERT OR IGNORE, so it registers nothing
+    -- and reporting it "NEW ... DISABLED" would list one city per spelling
+    and, for an ENABLED city, print an enable-city hint that exits 64.
+    """
+    mod = _import_script_module()
+    monkeypatch.setattr(mod, "get_city_location_data", lambda *a, **k: _GeoLoc())
+
+    def entry(query):
+        return mod.ArchivalDataset(
+            rel_csv="x.csv", query=query, run_date=date(2023, 1, 1), fmt="v2"
+        )
+
+    first, note = mod.resolve_or_register_city(
+        conn, entry("Geo, Testland"), (44.0, -121.0), (1000, 1000), use_nominatim=True, execute=True
+    )
+    assert note.startswith("NEW city registered DISABLED")
+    db.set_city_enabled(conn, first.city_id, True)
+
+    row, note = mod.resolve_or_register_city(
+        conn,
+        entry("Geo Downtown, Testland"),
+        (44.0, -121.0),
+        (1000, 1000),
+        use_nominatim=True,
+        execute=True,
+    )
+
+    assert row.city_id == first.city_id
+    assert row.enabled is True
+    assert not note.startswith("NEW")
+    assert "DISABLED" not in note
+
+
 def test_redate_after_manifest_date_correction(source_root, data_dir, tmp_path):
     # A manifest date correction (issue #93 follow-up: the original dates
     # came from rename-polluted `git --follow` history) re-dates the

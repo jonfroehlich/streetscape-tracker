@@ -297,6 +297,9 @@ def test_the_grid_gsv_refusal_points_at_run_due(conn, monkeypatch, tmp_path, cap
 
     assert rc == _sched.USAGE_EXIT_CODE
     assert "run-due --provider gsv" in caplog.text
+    # run-due collects only enabled, due cities, so for a city assess-city just
+    # registered (DISABLED, #431) the pointer alone is a silent no-op.
+    assert "DISABLED until `enable-city`" in caplog.text
 
 
 def test_a_config_with_no_assess_channel_is_refused(conn, monkeypatch, tmp_path):
@@ -424,6 +427,28 @@ def test_estimate_registers_but_issues_no_provider_request(conn, monkeypatch, tm
     assert not db.resolve_city(conn, CITY_ID).enabled
     assert cr.enable_hint(CITY_ID) in out
     assert _due(conn, "gsv") == []
+
+
+def test_the_estimate_stop_text_names_enable_city_only_for_a_disabled_city(
+    conn, monkeypatch, tmp_path, capsys
+):
+    """
+    The --estimate stop text points at `enable-city` (#431), and only when that
+    is true: an already-enabled city printed no hint above and is already in
+    the rotation, so "registered DISABLED, see above" would point at nothing.
+    """
+    _stub_collection(monkeypatch, conn)
+
+    _assess(tmp_path, estimate_only=True)
+    out = capsys.readouterr().out
+    assert f"`enable-city {CITY_ID}` puts it into the nightly rotation" in out
+
+    db.set_city_enabled(conn, CITY_ID, True)
+    _assess(tmp_path, estimate_only=True)
+    out = capsys.readouterr().out
+    assert "no provider request was issued" in out
+    assert "DISABLED" not in out
+    assert "enable-city" not in out
 
 
 def test_an_estimate_registered_city_becomes_due_only_after_enable_city(
@@ -1286,6 +1311,34 @@ def test_without_a_grid_run_on_any_provider_the_report_says_there_is_no_city_pag
     _stub_collection(monkeypatch, conn)
     _assess(tmp_path, requested_providers=["gsv_streets"])
     assert "no city page to link" in _report(conn, tmp_path)
+
+
+def test_the_no_city_page_sentence_says_when_the_link_arrives_in_both_states(
+    conn, monkeypatch, tmp_path
+):
+    """
+    The no-link sentence tells the operator when to come back for the link, so
+    it must agree with get_due_cities. For a DISABLED city (every ad-hoc
+    registration since #431) "the next nightly batch" never comes, and the
+    closing note of the same output says so -- one block of output must not
+    claim both. Asserted against the scheduler's own query in each state, the
+    shape test_the_closing_note_says_which_channels_are_actually_due uses.
+    """
+    _stub_collection(monkeypatch, conn)
+    _assess(tmp_path, requested_providers=["gsv_streets"])
+
+    out = _report(conn, tmp_path)
+    assert _due(conn, "gsv") == []
+    assert "no city page to link" in out
+    assert "next nightly batch" not in out
+    assert "This city is DISABLED" in out
+    assert f"enable-city {CITY_ID}" in out
+
+    db.set_city_enabled(conn, CITY_ID, True)
+    out = _report(conn, tmp_path)
+    assert _due(conn, "gsv") == [CITY_ID]
+    assert "lands on the next nightly batch" in out
+    assert "DISABLED" not in out
 
 
 def test_the_city_page_link_falls_back_to_the_gsv_grid_run(conn, monkeypatch, tmp_path):
