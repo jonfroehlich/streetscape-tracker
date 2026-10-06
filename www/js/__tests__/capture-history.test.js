@@ -55,8 +55,11 @@ function fixtureSummary(overrides = {}) {
 // --- captureHistoryYears ------------------------------------------------------
 
 test("captureHistoryYears: ascending numbers from string keys", () => {
-  // Insertion order deliberately reversed: integer-like keys happen to
-  // enumerate ascending in JS, so also feed a non-sorted array-free check.
+  // Insertion order deliberately scrambled. JS enumerates integer-like keys
+  // ascending whatever the insertion order, so the helper's explicit sort is
+  // defensive and deleting it is an equivalent mutation this cannot see; what
+  // this pins is the ORDER and the conversion to numbers, which a caller
+  // doing year arithmetic depends on.
   const years = captureHistoryYears({
     histogram_of_capture_dates_by_year: { "2024": 1, "2009": 3, "2012": 2 },
   });

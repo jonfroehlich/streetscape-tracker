@@ -536,6 +536,35 @@ def test_the_js_run_filename_regex_agrees_with_python():
         parse_filename(impossible_date)
 
 
+def test_a_history_artifact_is_not_a_run_file_in_either_language():
+    """
+    A harvested capture history (`_gsv_history_`, issues #2/#109) is published
+    beside the runs and must never pass as one, in either language.
+
+    It sits in the corpus above too, where a JS match with an unknown token is
+    merely skipped; this pins the stronger property the city page relies on:
+    the JS regex REFUSES the name outright (so ``?file=`` can never address a
+    harvest as a run), and Python raises.
+    """
+    import pathlib
+    import re
+
+    js_path = pathlib.Path(__file__).resolve().parent.parent / "www" / "js" / "streetscape-utils.js"
+    literal = re.search(
+        r"^const RUN_FILENAME_RE =\n  /(.+)/;$",
+        js_path.read_text(encoding="utf-8"),
+        re.MULTILINE,
+    )
+    assert literal, "www/js/streetscape-utils.js no longer spells `const RUN_FILENAME_RE =`"
+    js_re = re.compile(literal.group(1)[:-1] + r"\Z", re.ASCII)
+
+    for ext in (".csv.gz", ".json.gz"):
+        name = "bend--or_width_5000_height_5000_step_20_gsv_history_2026-07-05" + ext
+        assert not js_re.match(name), f"JS RUN_FILENAME_RE accepts the history artifact {name}"
+        with pytest.raises(ValueError):
+            parse_filename(name)
+
+
 def test_streetwalk_diff_regex_matches_exactly_what_the_generator_emits():
     """Pinned against the generator for every provider x network type (issue
     #265): the orphan sweep deletes only names this regex matches, so a shape

@@ -412,3 +412,22 @@ The verdict (`screenVerdict`) reads `pictures_360_upper_bound` first and `pictur
 **Why no chart.** `grid.html` loads no chart library, and the series is a handful of weekly points, so it renders as a plain table in a closed "<Provider> screen over time" disclosure under the page lead (date, cities screened, cities positive for any imagery, summed 360° bound).
 The summed bound double-counts imagery shared by neighbouring cities, so the table caption calls it a trend line, never an inventory.
 That table is a second `<table>` on the page, which is why the shared layout e2e tests scope their row locators to `.streets-table`.
+
+## Harvested capture history on the city page (issue #109)
+
+*Written after the split.*
+
+A city with a harvested GSV capture history (#2) shows a "Capture history" section in `city.html`'s legend, after "Since <date>": a year bar chart, a closed `<details>` table of the years with imagery, and the harvest's caveat.
+The helpers live in `www/js/capture-history.js` (pure, with a Node export shim, so they are unit-tested); `city.js` only wires them, because `city.js` builds a Leaflet map at load and cannot be.
+
+- **Where, and why the legend.** It adds no layout surface; the legend already rebuilds a chart on every innerHTML repaint (the run-history chart), and this chart follows the same rule — the previous Chart is destroyed before the new canvas is drawn on, or Chart.js keeps a handle to a detached canvas.
+- **Gated on presence in the adapted record, never on the provider name (#334).** The aggregate puts `capture_history` inside the provider block it belongs to, and `adaptCityRecord` reads it from the block it selected, so a Mapillary view of a harvested city reads null and shows nothing.
+- **The fetch happens only when the aggregate names a file.** An unharvested city, and every other provider's view of a harvested one, makes no request at all — no 404, no console noise; the e2e suite records requests to prove it.
+- **The summary JSON, never the CSV.** The section renders the pre-aggregated summary; a per-pano map layer would need `city.js`'s streaming pipeline to learn the history schema, and is a later slice of #109.
+- **One dataset, never overlaid.** The harvest is a census of Google's archive and the run beside it a grid sample (`PROVIDERS.gsv.panoCountingModel`), so their counts are not comparable; the caveat says so next to the chart.
+- **The caveat is shown verbatim** from the summary's `source.caveat`, whose wording lives once, in `json_summarizer.CAPTURE_HISTORY_CAVEAT` — the growth-screen rule above.
+- **Dates are rendered as the JSON's ISO strings.** Nothing is parsed with `new Date()`, which reads a bare date as UTC midnight and shows it a day early west of Greenwich.
+- **Gap years are zero bars** (`buildFilledHistogram`), coloured by age on the provider's ramp like the map's markers: a year Google did not drive the city is information.
+- **The `<details>` table is the assistive-technology path** to the chart's numbers, and the canvas carries `role="img"` with a label naming the date span.
+  The table has its own class, not `.legend-stats`: that class names the overview table, and a second match would make every locator for THE stats table ambiguous.
+- **What the guard dropped is shown**, as "N capture dates left out as implausible", only when the summary's `implausible_dates_dropped` is positive.
