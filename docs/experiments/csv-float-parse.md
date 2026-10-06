@@ -2,7 +2,8 @@
 
 **Ran:** 2026-10-05, on the DEV catalog (a laptop copy, not production) ·
 **Verdict:** no — pandas' default C parser read 4.6–5.6 % of walk latitudes and 37.3–38.6 % of longitudes one ULP off their own text.
-That moved 9 sample keys across six walk CSVs and scored 7 of them uncovered (Seattle 5 of 247,292, Corvallis `all_public` 2 of 83,928 per provider).
+That moved 9 sample keys across six walk CSVs (Seattle 5 of 247,292, Corvallis `all_public` 2 of 83,928 per provider), and the default parser scored all 9 uncovered.
+Under round-trip the two gsv walks' scores move; Corvallis mapillary `all_public`'s 2 samples cover nothing either way.
 Fixed with `float_precision="round_trip"` in `fileutils.load_city_csv_file` (issue #425); no grid statistic moves.
 
 ## The question
@@ -66,6 +67,7 @@ Memory is unchanged: the dtypes are the same.
 ## Caveats
 
 - Dev catalog only: six walk CSVs from three cities and eight dated grid runs.
+  The walks are gsv and mapillary only; no kartaview or panoramax walk CSV was measured, although both walk channels run in production.
   The production re-measure is the walk recompute's dry run after deploy, which lists every walk that moves.
 - pandas 3.0.1 on macOS.
   The misparse is in pandas' own C parser rather than libc, so it should not be platform-specific; the tests re-measure the premise so a pandas that fixes its parser is reported.

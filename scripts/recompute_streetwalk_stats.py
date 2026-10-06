@@ -273,9 +273,8 @@ class Report:
     refused: list = field(default_factory=list)
     refusal_reasons: Counter = field(default_factory=Counter)
     failed: list = field(default_factory=list)
-    notes: list = field(
-        default_factory=list
-    )  # tolerance-only matches (unexpected since #425), duplicate rows
+    # Tolerance-only matches (unexpected since #425) and duplicate rows, one note each.
+    notes: list = field(default_factory=list)
     artifacts_written: int = 0
     rows_updated: int = 0
     removed_files: list = field(default_factory=list)
@@ -466,13 +465,20 @@ def recompute_walk(row, edges, data_dir: str, report: Report) -> Recomputed:
 
     df = load_city_csv_file(csv_path)
     n_noise, n_dup = match_frame(samples, df)
-    if n_noise or n_dup:
+    # Two notes, never one: duplicate rows are an accepted state (a resumed
+    # collection can write a point twice), while a tolerance-only match is the
+    # runbook's stop signal, so a duplicate-only walk must not print its text.
+    if n_noise:
         report.notes.append(
             f"{_label(row)}: {n_noise} samples matched only within {COORD_TOLERANCE_DEG:g} deg "
             "(their 9-decimal key matches no CSV location, so the scorer's exact join scores "
             "them uncovered, here as in the collector; under the round-trip loader (#425) this "
-            "should be 0 -- a nonzero count means this CSV's text is not the sample's own repr), "
-            f"{n_dup} duplicate CSV rows ignored as the collector ignores them"
+            "should be 0 -- a nonzero count means this CSV's text is not the sample's own repr, "
+            "or the regenerated samples differ from the collected ones)"
+        )
+    if n_dup:
+        report.notes.append(
+            f"{_label(row)}: {n_dup} duplicate CSV rows ignored as the collector ignores them"
         )
 
     covered = compute_streetwalk_coverage(

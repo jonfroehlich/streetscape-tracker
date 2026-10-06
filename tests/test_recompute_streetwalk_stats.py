@@ -611,7 +611,27 @@ def test_duplicate_csv_rows_are_accepted_and_counted(tmp_path, monkeypatch, caps
     assert _run(data_dir, "--execute") == 0
     out = capsys.readouterr().out
     assert "1 unchanged" in out and "2 duplicate CSV rows" in out
+    # Duplicates are an accepted state; the tolerance clause is the runbook's
+    # stop signal, so a duplicate-only walk must not print it (#437 review).
+    assert "matched only within" not in out
     assert _walk(data_dir, D1) == before
+
+
+def test_a_tolerance_only_match_prints_the_stop_note_without_a_duplicate_clause(
+    tmp_path, monkeypatch, capsys
+):
+    """The converse of the duplicate test: a nonzero n_noise still prints the
+    runbook's stop signal, and a walk with no duplicates prints no duplicate note.
+    No real CSV the collectors write produces n_noise since #425, so the frame
+    match is stubbed to report one."""
+    data_dir = _setup(tmp_path, monkeypatch)
+    _collect(data_dir, D1, monkeypatch, old_definition=False)
+    monkeypatch.setattr(recompute_module, "match_frame", lambda samples, df: (3, 0))
+
+    assert _run(data_dir) == 0
+    out = capsys.readouterr().out
+    assert "3 samples matched only within 1e-08 deg" in out
+    assert "duplicate CSV rows" not in out
 
 
 def test_a_sample_frame_mismatch_refuses_the_whole_series(tmp_path, monkeypatch, capsys):

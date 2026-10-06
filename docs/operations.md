@@ -288,6 +288,7 @@ cd ~/streetscape-tracker && git pull          # deploy; no run-due in flight (pg
 # 1. Dry run: every walk that would change, and why. Read it before step 2.
 #    "note: ... matched only within 1e-08 deg" lines should be ABSENT under the round-trip
 #    loader; one means that CSV's text is not its sample's own repr -- stop and look.
+#    A "note: ... duplicate CSV rows ignored" line is a separate note and is harmless.
 .venv-makelab2/bin/python scripts/recompute_streetwalk_stats.py \
     --data-dir /projects/makeabilitylab/streetscape-tracker/data
 # 2. Apply: rows, coverage artifacts, walk diffs and the streetwalk manifest. Daytime, never beside
@@ -304,7 +305,9 @@ cd ~/streetscape-tracker && git pull          # deploy; no run-due in flight (pg
 
 A refused series (missing GraphML, sample-frame or edge-id mismatch) is skipped whole and makes the pass exit 1; the report names it, and `--city`/`--provider` re-run the rest.
 **No grid recompute and no `recompute_run_diffs` pass are needed for #425**: measured under both parsers, no stored grid stat, grid key or query-radius status moves, and diff detail files carry pano coordinates, which the change does not touch.
-A per-run JSON generated after the deploy can differ from one generated before in the last digit of `query_bounds`; that is not a definition change and nothing re-generates the old ones.
+A per-run JSON generated after the deploy can differ from one generated before in the last digit of `query_bounds`; that is not a definition change and nothing re-generates the old ones for it.
+A later `recompute_run_stats.py --regenerate-json` pass rewrites the per-run JSONs it rebuilds for its own reasons, so those carry the new last digit too: rsync churn, not a moved number.
+**Re-run the walk recompute after any `import-bundle` of walks collected on a pre-#425 checkout**: a bundle's walk stats are carried, not recomputed, so they land on the old definition after this pass.
 
 ## Backfilling the Mapillary quality block (issue #321)
 

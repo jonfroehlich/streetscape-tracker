@@ -97,8 +97,8 @@ def test_generated_by_names_the_run_that_wrote_the_file():
 def test_the_committed_record_still_matches_the_writeup():
     """The record and the prose are two copies of one measurement; every
     headline figure the writeup quotes is checked back against the JSON."""
-    record = json.loads((_DOCS / cfa.DOCS_METRICS_NAME).read_text())
-    prose = (_DOCS / "csv-float-parse.md").read_text()
+    record = json.loads((_DOCS / cfa.DOCS_METRICS_NAME).read_text(encoding="utf-8"))
+    prose = (_DOCS / "csv-float-parse.md").read_text(encoding="utf-8")
     flat = prose.replace(",", "")
     assert record["_about"]["generated_by"] == cfa.DOCS_GENERATED_BY
 
@@ -126,4 +126,11 @@ def test_the_committed_record_still_matches_the_writeup():
     assert f"{slow['min']:.2f}× to {slow['max']:.2f}×" in prose
     assert f"(p50 {slow['p50']:.2f})" in prose
     assert f"moved {summary['keys_shifted_total']} sample keys" in prose
+    # The verdict's uncovered count is the default parser's tolerance-only
+    # matches, summed: a missed key scores its sample uncovered.
+    uncovered = sum(
+        w["scoring"]["tolerance_only_matches"]["default"] for w in record["observations"]["walks"]
+    )
+    assert f"the default parser scored all {uncovered} uncovered" in prose
+    assert uncovered == summary["keys_shifted_total"]
     assert str(summary["grid_rows"]) in flat
