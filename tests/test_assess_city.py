@@ -1333,6 +1333,8 @@ def test_the_no_city_page_sentence_says_when_the_link_arrives_in_both_states(
     assert "next nightly batch" not in out
     assert "This city is DISABLED" in out
     assert f"enable-city {CITY_ID}" in out
+    # The gsv-exclusion caveat (#301) holds after enable-city too.
+    assert "only while the city is a gsv member" in out
 
     db.set_city_enabled(conn, CITY_ID, True)
     out = _report(conn, tmp_path)

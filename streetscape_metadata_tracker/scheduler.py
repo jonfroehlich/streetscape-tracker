@@ -6671,8 +6671,11 @@ def _assess_answer_report(cfg: SchedulerConfig, conn, city: db.CityRow) -> str:
             "  No grid run on any provider yet, so there is no city page to link "
             "(generate_aggregate_v2 skips a city with no runs row). This city is "
             "DISABLED, so no nightly batch collects its GSV grid run — the link "
-            f"arrives only after `enable-city {city.city_id}` and the night that "
-            "follows it."
+            f"arrives only after `enable-city {city.city_id}`, on the next night that "
+            "reaches it: once enabled, the grid run leads gsv's OWN stalest-first "
+            "list, which is the union's order only while the city is a gsv member; "
+            "excluded from gsv (#301) it is stranded instead and arrives through the "
+            "reservation, at [schedule].opt_in_cities_per_day per night."
         )
     else:
         lines.append(
