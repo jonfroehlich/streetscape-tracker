@@ -358,6 +358,15 @@ def test_the_scripts_fire_time_is_the_nightly_timers(units):
     )
 
 
+def test_the_scripts_fire_delay_is_the_nightly_timers(units):
+    """next_nightly_fire keeps tonight's fire pending for the timer's
+    RandomizedDelaySec (#389 final review, L1); a delay changed in the unit
+    without the script would let a pass that starts inside the new window plan
+    against tomorrow's fire and fetch into tonight's night."""
+    delay_min = _span_minutes(_one(units["nightly"], "Timer", "RandomizedDelaySec"))
+    assert pf.NIGHTLY_FIRE_DELAY.total_seconds() / 60 == delay_min
+
+
 def test_every_unit_is_installed_by_the_deploy_readme():
     """A unit with no `cp` line in deploy/README.md is a unit nobody installs --
     which is how the prefreeze script sat unscheduled after #343."""

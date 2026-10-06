@@ -97,7 +97,7 @@ def _overpass_serving(monkeypatch):
 def _daytime_clock(monkeypatch):
     """Freeze the clock at DAYTIME_UTC: `main` computes its fetch cutoff from the
     real clock (#389, F2), so without this every --execute test would fetch
-    nothing when the suite happens to run between 00:45 and 02:00 Pacific."""
+    nothing when the suite happens to run between 00:45 and 02:15 Pacific."""
     monkeypatch.setattr(clock, "_utc_clock", lambda: DAYTIME_UTC)
 
 
@@ -330,14 +330,22 @@ def test_bad_flags_exit_usage(three_cities, data_dir, monkeypatch, flags):
         # 02:30 PDT, after the fire: the only hour of a summer day where a fixed
         # UTC-8 reading (01:30, before the fire) answers differently (review N1).
         (datetime(2026, 7, 15, 9, 30, tzinfo=UTC), date(2026, 7, 16)),
+        # Inside the timer's 15 min randomized delay (L1): at 02:05 PDT tonight's
+        # night may not have started, so its fire is still the next one; at
+        # 02:16 the delay has run out and the next fire is tomorrow's.
+        (datetime(2026, 9, 1, 9, 5, tzinfo=UTC), date(2026, 9, 1)),
+        (datetime(2026, 9, 1, 9, 16, tzinfo=UTC), date(2026, 9, 2)),
         # Spring forward (2026-03-08, 02:00 PST -> 03:00 PDT). 01:59 PST, before
-        # the fire; then 03:00 PDT, the first instant after it.
+        # the fire; 03:00 PDT, the instant the nonexistent 02:00 resolves to, so
+        # still pending; 03:16 PDT, past the delay.
         (datetime(2026, 3, 8, 9, 59, tzinfo=UTC), date(2026, 3, 8)),
-        (datetime(2026, 3, 8, 10, 0, tzinfo=UTC), date(2026, 3, 9)),
+        (datetime(2026, 3, 8, 10, 0, tzinfo=UTC), date(2026, 3, 8)),
+        (datetime(2026, 3, 8, 10, 16, tzinfo=UTC), date(2026, 3, 9)),
         # Fall back (2026-11-01, 02:00 PDT -> 01:00 PST). The SECOND 01:30 (PST),
-        # still before the fire; then 02:00 PST, the fire itself.
+        # still before the fire; 02:00 PST, the fire itself, pending; 02:16 PST.
         (datetime(2026, 11, 1, 9, 30, tzinfo=UTC), date(2026, 11, 1)),
-        (datetime(2026, 11, 1, 10, 0, tzinfo=UTC), date(2026, 11, 2)),
+        (datetime(2026, 11, 1, 10, 0, tzinfo=UTC), date(2026, 11, 1)),
+        (datetime(2026, 11, 1, 10, 16, tzinfo=UTC), date(2026, 11, 2)),
     ],
     ids=[
         "17:30-PDT",
@@ -346,10 +354,14 @@ def test_bad_flags_exit_usage(three_cities, data_dir, monkeypatch, flags):
         "01:30-PST",
         "02:30-PST",
         "02:30-PDT",
+        "02:05-PDT-in-delay",
+        "02:16-PDT-past-delay",
         "spring-01:59-PST",
         "spring-03:00-PDT",
+        "spring-03:16-PDT",
         "fall-second-01:30-PST",
         "fall-02:00-PST",
+        "fall-02:16-PST",
     ],
 )
 def test_the_default_date_is_the_next_fires_utc_date(
@@ -386,13 +398,21 @@ def test_the_default_date_is_the_next_fires_utc_date(
         (datetime(2026, 9, 1, 8, 0, tzinfo=UTC), datetime(2026, 9, 1, 7, 45, tzinfo=UTC)),
         # 23:00 PST in winter: 02:00 PST is 10:00 UTC, so the cutoff is 08:45 UTC.
         (datetime(2026, 1, 15, 7, 0, tzinfo=UTC), datetime(2026, 1, 15, 8, 45, tzinfo=UTC)),
+        # 02:05 PDT, a night ending inside the timer's delay (L1): tonight's fire
+        # is still pending, so the cutoff is tonight's 00:45 -- already past.
+        (datetime(2026, 9, 1, 9, 5, tzinfo=UTC), datetime(2026, 9, 1, 7, 45, tzinfo=UTC)),
+        # 02:16 PDT, past the delay: tomorrow's.
+        (datetime(2026, 9, 1, 9, 16, tzinfo=UTC), datetime(2026, 9, 2, 7, 45, tzinfo=UTC)),
+        # Fall-back night: 02:00 PST is 10:00 UTC, so the cutoff is 01:45 PDT.
+        (datetime(2026, 10, 31, 22, 0, tzinfo=UTC), datetime(2026, 11, 1, 8, 45, tzinfo=UTC)),
     ],
-    ids=["14:45-PDT", "00:30-PDT", "01:00-PDT", "23:00-PST"],
+    ids=["14:45-PDT", "00:30-PDT", "01:00-PDT", "23:00-PST", "02:05-PDT", "02:16-PDT", "fall-back"],
 )
 def test_the_fetch_cutoff_is_the_next_fire_less_the_clearance_and_a_fetch(instant, expected):
     """Literals, never the same expression on both sides: the cutoff is the next
     02:00 Pacific less NEXT_FIRE_CLEARANCE (1 h) less one worst-case fetch
-    (OVERPASS_DEADLINE_S, 900 s) -- 00:45 Pacific."""
+    (OVERPASS_DEADLINE_S, 900 s) -- normally 00:45 Pacific -- and tonight's fire
+    stays the next one until the timer's randomized delay has run out."""
     assert pf.fetch_cutoff(instant) == expected
 
 
@@ -424,6 +444,21 @@ def test_a_pass_that_starts_past_the_cutoff_fetches_nothing_and_does_not_alert(
     assert "Froze 0 of 2 network(s); stopped at the cutoff (2026-09-16 07:45 UTC)" in (
         capsys.readouterr().out
     )
+
+
+def test_a_pass_chained_from_a_night_ending_inside_the_fire_delay_fetches_nothing(
+    three_cities, data_dir, monkeypatch, _overpass_serving
+):
+    """A late night that ends at 02:05 PDT chains a pass while tonight's timer
+    can still fire until 02:15 (RandomizedDelaySec). Planning against
+    TOMORROW's fire would fetch straight into that night (#389 final review,
+    L1); tonight's fire is still pending, so the pass is past its cutoff."""
+    monkeypatch.setattr(clock, "_utc_clock", lambda: datetime(2026, 9, 16, 9, 5, tzinfo=UTC))
+    rc, fetcher, alerts = _run_alerting(monkeypatch, _cfg(data_dir), "--execute", "--alert")
+    assert rc == 0
+    assert fetcher.calls == []
+    assert _overpass_serving == []
+    assert alerts.sent == []
 
 
 def test_a_pass_that_crosses_the_cutoff_stops_before_the_next_fetch(

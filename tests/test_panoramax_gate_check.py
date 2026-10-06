@@ -311,7 +311,7 @@ def test_a_utc_night_reads_both_local_rotations_it_spans(tmp_path, empty_ledger)
     retry = f"{dp.TILE_RETRY_LOG_PHRASE}: HTTP 503 on try 1 of 5, waiting 0.5s"
     (log_dir / f"{gate.SCHEDULER_LOG_NAME}.2026-10-05").write_text(
         _sched_line("2026-10-05 16:59:59", retry)  # UTC 10-05: another night
-        + _sched_line("2026-10-05 18:00:00", retry)  # UTC 10-06: the screen
+        + _sched_line("2026-10-05 18:00:00", retry)  # UTC 10-06: the evening after 17:00 PDT
     )
     (log_dir / f"{gate.SCHEDULER_LOG_NAME}.2026-10-06").write_text(
         _sched_line("2026-10-06 02:30:00", retry)  # UTC 10-06

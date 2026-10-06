@@ -939,7 +939,8 @@ systemctl --user show streetscape-tracker.service -p OnSuccess -p OnFailure   # 
 - The pass predicts the date the NEXT 02:00 Pacific fire will read (`next_run_date`), not "tomorrow UTC": a pass after midnight UTC is already on the fire's UTC day, and the old formula was a day late there (wrong for the opt-in rotation, #348).
 - `TimeoutStartSec=6h` ends a pass by 20:45 at 12 h and by 00:45 at 16 h, an hour or more before the next 02:00; the test bounds the night's tail by the collection unit's `TimeoutStopSec` (30 min), a number sized against the same components and about 3 min more conservative than their sum.
   That bound assumes the night started at 02:00.
-  A night that did not — a `Persistent` catch-up after a reboot, the #369 watchdog's re-arm, a hand `systemctl --user start streetscape-tracker.service` — can end late enough that a 6 h pass would still hold the Overpass lock at the next 02:00, so the script itself starts **no fetch past 00:45 Pacific** (`fetch_cutoff()`: the next fire less one worst-case 900 s fetch less an hour, computed once at the pass's start).
+  A night that did not — a `Persistent` catch-up after a reboot, the #369 watchdog's re-arm, a hand `systemctl --user start streetscape-tracker.service` — can end late enough that a 6 h pass would still hold the Overpass lock at the next 02:00, so the script itself starts **no fetch later than 1 h 15 min before the next fire**, normally 00:45 Pacific (`fetch_cutoff()`: the next fire less one worst-case 900 s fetch less an hour, computed once at the pass's start).
+  Tonight's fire counts as the next one until the timer's `RandomizedDelaySec` (15 min) has run out, so a night that ends between 02:00 and 02:15 chains a pass that fetches nothing rather than one that plans against tomorrow's fire and runs into the night about to start.
   Reaching it is a quiet exit 0 with a `stopped at the cutoff` line in the console log, never an alert: what it leaves cold, the night fetches itself.
   That test fails at `max_batch_hours = 20` on purpose: that raise must shrink this timeout or `--limit` first.
   `TimeoutStopSec=5min` is there so the SIGTERM's alert outlives systemd's 90-second default — an SMTP relay can spend 30 s per stage.
@@ -961,7 +962,7 @@ systemctl --user show streetscape-tracker.service -p OnSuccess -p OnFailure   # 
 #### Deploying #389
 
 Unit changes take effect only on a manual deploy, because the installed units are copies.
-Do it between nights, in one session with the code pull: the #369 watchdog reads the shipped `deploy/systemd/*.timer` set, so a checkout at this commit with the old timer still installed reports it `NOT INSTALLED` once.
+Do it between nights, in one session with the code pull: the #369 watchdog walks only the shipped `deploy/systemd/*.timer` set, so once the checkout is at this commit an old `streetscape-prefreeze.timer` left installed is **not reported at all** — and it would keep firing a 15:00 pass beside the chain.
 
 ```bash
 pgrep -af '[s]cheduler .*run-due' || echo idle                 # never mid-batch

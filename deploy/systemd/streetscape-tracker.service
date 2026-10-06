@@ -30,7 +30,8 @@ ConditionHost=makelab2*
 # ends by ~14:45 and would have refused (and alerted) every day once
 # max_batch_hours passes ~12.5 h; the chain tracks the night's end at any value.
 # The pass checks for an in-flight run-due before every fetch itself, starts no
-# fetch past 00:45 Pacific (so a late night's pass cannot reach the next one), and asks a
+# fetch later than 1 h 15 min before the next fire (normally 00:45 Pacific), so a
+# late night's pass cannot reach the next one, and asks a
 # fail-closed Overpass probe before its first one, since it now starts minutes
 # after a night that may have ended on an Overpass refusal. A hand
 # `systemctl --user start` of this unit chains it too, and so does `stop`
