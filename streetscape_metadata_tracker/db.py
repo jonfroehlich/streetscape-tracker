@@ -30,7 +30,7 @@ from .naming import sanitize_city_query_str
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 21
 
 # The v16 per-host ledger (issue #385). One constant, spliced into _SCHEMA
 # below AND executed by _migrate_v15_to_v16, which runs before _SCHEMA and needs
@@ -183,6 +183,14 @@ CREATE TABLE IF NOT EXISTS api_usage (
 -- docs/architecture.md. It is NOT named `enabled` — cities.enabled already is,
 -- and a duplicate column name is silently resolved the wrong way by the
 -- `SELECT c.*` + sqlite3.Row read in get_due_cities.
+--
+-- `quarantine_alerted_at` (v21, issue #424) is the UTC ISO-8601 instant at
+-- which run-due CLAIMED the right to email this pair's current failure streak
+-- (db.claim_quarantine_alerts, its only writer). NULL means "this streak has
+-- not been emailed" -- an event that has not happened, like last_success_at,
+-- so it is NOT a second exception of the `member` kind. Cleared by a recorded
+-- success and by reset_consecutive_failures (the two writers that zero the
+-- counter), never by a failure or a membership change.
 CREATE TABLE IF NOT EXISTS schedule_state (
     city_id              TEXT NOT NULL REFERENCES cities(city_id),
     provider             TEXT NOT NULL DEFAULT 'gsv',
@@ -192,6 +200,7 @@ CREATE TABLE IF NOT EXISTS schedule_state (
     consecutive_failures INTEGER NOT NULL DEFAULT 0,
     last_error           TEXT,
     member               INTEGER,
+    quarantine_alerted_at TEXT,
     PRIMARY KEY (city_id, provider)
 );
 
@@ -907,6 +916,11 @@ def init_schema(conn: sqlite3.Connection) -> None:
     if user_version == 19:
         _migrate_add_total_grid_points_column(conn)
         user_version = 20
+    # v20 -> v21 (issue #424): schedule_state.quarantine_alerted_at. Like the
+    # v20 step, it is also run unconditionally below.
+    if user_version == 20:
+        _migrate_add_quarantine_alerted_at_column(conn)
+        user_version = 21
     conn.executescript(_SCHEMA)
     # The GSV query-radius pair (issue #367) is ALSO added on every connect, not
     # only on its rung: while in flight it and PR #388 both stamped v16, so a
@@ -914,8 +928,11 @@ def init_schema(conn: sqlite3.Connection) -> None:
     # these columns, and a rung-gated step would then never fire. It is idempotent
     # per column, so on a current catalog it is one PRAGMA table_info and nothing else.
     # After executescript(_SCHEMA), so a fresh catalog (built current) is a no-op.
+    # The v20 grid-point count and the v21 quarantine alert stamp follow the same
+    # rule, for the same reason.
     _migrate_add_query_radius_columns(conn)
     _migrate_add_total_grid_points_column(conn)
+    _migrate_add_quarantine_alerted_at_column(conn)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
 
@@ -1186,21 +1203,25 @@ def _migrate_add_query_radius_columns(conn: sqlite3.Connection) -> None:
     _migrate_v13_to_v14 -- each ADD COLUMN is skipped when the column already
     exists, so an interrupted migration completes on the next connect -- and an
     absent table means the CREATE TABLE in _SCHEMA below builds it current.
-    Race-safe against concurrent first connects: see _add_missing_run_columns.
+    Race-safe against concurrent first connects: see _add_missing_columns.
 
     No DEFAULT, deliberately: NULL is "computed before the rule existed", and
     inventing a 0 would claim every historical run had been checked.
     """
-    _add_missing_run_columns(
-        conn, _QUERY_RADIUS_RUN_COLUMNS, "GSV query-radius columns (issue #367)"
+    _add_missing_columns(
+        conn, "runs", _QUERY_RADIUS_RUN_COLUMNS, "GSV query-radius columns (issue #367)"
     )
 
 
-def _add_missing_run_columns(conn: sqlite3.Connection, columns: dict[str, str], label: str) -> None:
-    """ADD each of ``columns`` (name -> SQL type) that ``runs`` lacks, race-safely.
+def _add_missing_columns(
+    conn: sqlite3.Connection, table: str, columns: dict[str, str], label: str
+) -> None:
+    """ADD each of ``columns`` (name -> SQL type) that ``table`` lacks, race-safely.
 
     The shared body of the every-connect column steps
-    (_migrate_add_query_radius_columns, _migrate_add_total_grid_points_column).
+    (_migrate_add_query_radius_columns, _migrate_add_total_grid_points_column,
+    _migrate_add_quarantine_alerted_at_column). ``table`` is a literal from
+    those callers, never user input.
     Those run on EVERY connect, so the first connect after a deploy is a race:
     the 02:00 run-due, a hand-run command and the backup timer can all open a
     pre-migration catalog at once. Done as a bare check-then-ALTER, every racer
@@ -1215,12 +1236,12 @@ def _add_missing_run_columns(conn: sqlite3.Connection, columns: dict[str, str], 
     columns present. SQLite DDL is transactional, so an ALTER that fails rolls
     back with the rest. A lock-free read comes first, so a current catalog --
     every connect but the first after a deploy -- returns without taking the
-    write lock at all. An absent ``runs`` table adds nothing: the CREATE TABLE
+    write lock at all. An absent ``table`` adds nothing: the CREATE TABLE
     in _SCHEMA builds it current.
     """
 
     def missing_columns() -> list[str]:
-        cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
+        cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
         return [c for c in columns if c not in cols] if cols else []
 
     if not missing_columns():
@@ -1230,9 +1251,9 @@ def _add_missing_run_columns(conn: sqlite3.Connection, columns: dict[str, str], 
         # Re-read under the lock: another process may have added them meanwhile.
         missing = missing_columns()
         if missing:
-            logger.info(f"Migrating catalog: adding {label} (runs: {', '.join(missing)})")
+            logger.info(f"Migrating catalog: adding {label} ({table}: {', '.join(missing)})")
             for column in missing:
-                conn.execute(f"ALTER TABLE runs ADD COLUMN {column} {columns[column]}")
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {columns[column]}")
         conn.commit()
     except BaseException:
         conn.rollback()
@@ -1248,15 +1269,38 @@ def _migrate_add_total_grid_points_column(conn: sqlite3.Connection) -> None:
     carry this column still gains it, and an absent table means the CREATE TABLE
     in _SCHEMA builds it current. Race-safe against concurrent first connects,
     which every-connect makes the normal case after a deploy: see
-    _add_missing_run_columns.
+    _add_missing_columns.
 
     No DEFAULT and no backfill from total_points, deliberately: for a census
     run total_points is a row count that overstates the grid, so copying it
     would write a wrong number under the right name. NULL is "not measured"
     until scripts/recompute_run_stats.py re-derives the row from its CSV.
     """
-    _add_missing_run_columns(
-        conn, {"total_grid_points": "INTEGER"}, "the grid-point count (issue #289)"
+    _add_missing_columns(
+        conn, "runs", {"total_grid_points": "INTEGER"}, "the grid-point count (issue #289)"
+    )
+
+
+def _migrate_add_quarantine_alerted_at_column(conn: sqlite3.Connection) -> None:
+    """Add schedule_state.quarantine_alerted_at (v21, issue #424).
+
+    Named by content and idempotent, for the same reason as
+    _migrate_add_total_grid_points_column: init_schema calls it from the
+    v20 -> v21 rung AND on every connect, so a catalog stamped v21 by a branch
+    that did not carry this column still gains it, and an absent table means the
+    CREATE TABLE in _SCHEMA builds it current. Race-safe against concurrent
+    first connects: see _add_missing_columns.
+
+    No DEFAULT and no backfill, deliberately: NULL is "this failure streak has
+    not been emailed", and a backfilled stamp would silence the one email a
+    quarantine that predates #423's alert never got. So the first night after
+    the deploy emails every standing quarantined pair once.
+    """
+    _add_missing_columns(
+        conn,
+        "schedule_state",
+        {"quarantine_alerted_at": "TEXT"},
+        "the quarantine alert stamp (issue #424)",
     )
 
 
@@ -2792,10 +2836,14 @@ def record_attempt(
                VALUES (?, ?, 0, ?, ?, 0, NULL)
                ON CONFLICT(city_id, provider) DO UPDATE SET
                  last_attempt_at = ?, last_success_at = ?,
-                 consecutive_failures = 0, last_error = NULL""",
+                 consecutive_failures = 0, last_error = NULL,
+                 quarantine_alerted_at = NULL""",
             (city_id, provider, now, now, now, now),
         )
     else:
+        # quarantine_alerted_at is deliberately KEPT (issue #424): clearing it
+        # here would let two overlapping run-dues recording a 5th and a 6th
+        # failure each claim, and email, the same streak.
         conn.execute(
             """INSERT INTO schedule_state
                (city_id, provider, day_of_cycle, last_attempt_at,
@@ -2808,6 +2856,15 @@ def record_attempt(
             (city_id, provider, now, error, now, error),
         )
     conn.commit()
+
+
+# One predicate for "this pair is quarantined", shared by get_quarantined and
+# claim_quarantine_alerts so the standing count and the alert cannot drift.
+# Binds (channel, default membership as 0/1, max_consecutive_failures).
+_QUARANTINED_WHERE = """s.provider = ?
+                     AND c.enabled = 1
+                     AND COALESCE(s.member, ?) = 1
+                     AND s.consecutive_failures >= ?"""
 
 
 def get_quarantined(
@@ -2842,21 +2899,19 @@ def get_quarantined(
     a silent default.
 
     Returns rows with ``city_id``, ``provider``, ``consecutive_failures``,
-    ``last_error`` and ``last_attempt_at``, ordered by channel then city so a
-    report built from them is stable night to night.
+    ``last_error``, ``last_attempt_at`` and ``quarantine_alerted_at`` (issue
+    #424), ordered by channel then city so a report built from them is stable
+    night to night.
     """
     out: list[sqlite3.Row] = []
     for channel in channels:
         out.extend(
             conn.execute(
-                """SELECT s.city_id, s.provider, s.consecutive_failures, s.last_error,
-                          s.last_attempt_at
+                f"""SELECT s.city_id, s.provider, s.consecutive_failures, s.last_error,
+                          s.last_attempt_at, s.quarantine_alerted_at
                    FROM schedule_state s
                    JOIN cities c ON c.city_id = s.city_id
-                   WHERE s.provider = ?
-                     AND c.enabled = 1
-                     AND COALESCE(s.member, ?) = 1
-                     AND s.consecutive_failures >= ?
+                   WHERE {_QUARANTINED_WHERE}
                    ORDER BY s.city_id""",
                 (channel, 1 if default_membership[channel] else 0, max_consecutive_failures),
             ).fetchall()
@@ -2865,13 +2920,87 @@ def get_quarantined(
     return out
 
 
+def claim_quarantine_alerts(
+    conn: sqlite3.Connection,
+    *,
+    channels: Sequence[str],
+    default_membership: dict[str, bool],
+    max_consecutive_failures: int,
+) -> list[sqlite3.Row]:
+    """Claim, and stamp, every quarantined pair whose streak is not yet emailed (issue #424).
+
+    The candidates are exactly :func:`get_quarantined`'s pairs (the shared
+    ``_QUARANTINED_WHERE``) whose ``quarantine_alerted_at`` is NULL. The gates
+    -- city enabled, channel member, counter at the cap -- are evaluated HERE,
+    at claim time, so a disabled at-cap city keeps a NULL stamp and is emailed
+    the night after it is re-enabled, and the same for a lowered cap, an
+    enrolment and a newly configured channel.
+
+    The decision to email and the stamp are one statement: a compare-and-set
+    ``UPDATE ... WHERE quarantine_alerted_at IS NULL AND consecutive_failures
+    >= cap``, and a row is claimed iff that UPDATE's ``rowcount`` is 1. A single
+    UPDATE is atomic in SQLite; two processes' UPDATEs serialize on the write
+    lock (``busy_timeout`` from :func:`connect`), and the loser re-evaluates
+    ``IS NULL`` against the committed stamp and matches nothing -- so two
+    overlapping run-due processes cannot both email a pair. The counter term makes a
+    concurrent success or ``reset-failures`` between the SELECT and the UPDATE a
+    no-op rather than an alert for a pair that is no longer quarantined.
+
+    Not ``BEGIN IMMEDIATE`` + SELECT + UPDATE (the shape of the v15 -> v16
+    migration): an explicit BEGIN raises ``cannot start a transaction within a
+    transaction`` if the caller's connection has an implicit transaction open,
+    and this sits in the nightly tail, where a raise costs every later step.
+    This helper uses only ``conn.execute`` and ``conn.commit``.
+
+    Stamp, then email: the caller sends after this returns, so a crash between
+    the two loses that email (at-most-once) -- the ``Done:`` line still counts
+    the pair and the unit's ``OnFailure=`` email reports the crash. The other
+    order would be at-least-once, which is the duplicate this column exists to
+    stop. A raise before the final ``commit()`` leaves every stamp unwritten,
+    so the next night claims them.
+
+    Returns the claimed rows (``city_id``, ``provider``,
+    ``consecutive_failures``, ``last_error``, ``last_attempt_at``), ordered by
+    channel then city.
+    """
+    now = utc_now_iso()
+    claimed: list[sqlite3.Row] = []
+    for channel in channels:
+        candidates = conn.execute(
+            f"""SELECT s.city_id, s.provider, s.consecutive_failures, s.last_error,
+                       s.last_attempt_at
+                FROM schedule_state s
+                JOIN cities c ON c.city_id = s.city_id
+                WHERE {_QUARANTINED_WHERE}
+                  AND s.quarantine_alerted_at IS NULL
+                ORDER BY s.city_id""",
+            (channel, 1 if default_membership[channel] else 0, max_consecutive_failures),
+        ).fetchall()
+        for row in candidates:
+            cur = conn.execute(
+                """UPDATE schedule_state SET quarantine_alerted_at = ?
+                   WHERE city_id = ? AND provider = ?
+                     AND quarantine_alerted_at IS NULL
+                     AND consecutive_failures >= ?""",
+                (now, row["city_id"], row["provider"], max_consecutive_failures),
+            )
+            if cur.rowcount == 1:
+                claimed.append(row)
+    conn.commit()
+    claimed.sort(key=lambda r: (r["provider"], r["city_id"]))
+    return claimed
+
+
 def reset_consecutive_failures(conn: sqlite3.Connection, city_id: str, provider: str) -> int:
     """Zero one pair's ``consecutive_failures``; return the count it held (issue #421).
 
     The operator's way out of a quarantine, so the alert's suggested fix is a
     command rather than hand-written SQL against the live catalog.
 
-    Only the counter moves. ``last_success_at`` is untouched -- a reset is not
+    The quarantine alert stamp goes with the counter (issue #424), so a pair
+    that is quarantined again after a reset is emailed again.
+
+    Only the counter and the stamp move. ``last_success_at`` is untouched -- a reset is not
     a success, and stamping one would make the pair look fresh and push its
     next attempt a whole cycle away, which is the opposite of what an operator
     clearing a quarantine wants. ``last_error`` is KEPT for the same reason a
@@ -2888,7 +3017,8 @@ def reset_consecutive_failures(conn: sqlite3.Connection, city_id: str, provider:
     if row is None or not row["consecutive_failures"]:
         return 0
     conn.execute(
-        "UPDATE schedule_state SET consecutive_failures = 0 WHERE city_id = ? AND provider = ?",
+        """UPDATE schedule_state SET consecutive_failures = 0, quarantine_alerted_at = NULL
+           WHERE city_id = ? AND provider = ?""",
         (city_id, provider),
     )
     conn.commit()

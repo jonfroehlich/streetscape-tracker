@@ -1,5 +1,5 @@
 """
-The failure quarantine, made visible (issue #421).
+The failure quarantine, made visible (issues #421 and #424).
 
 `get_due_cities` drops a (city, channel) once `consecutive_failures` reaches
 `[schedule].max_consecutive_failures`, and only a success resets it -- which a
@@ -8,20 +8,26 @@ channel each alerted, and night 6 onward was silent. These tests pin, in order:
 
 * `db.get_quarantined`: the gates it shares with dueness (enabled, member) and
   the one it reads (the cap), and `db.reset_consecutive_failures`;
-* the live night: the TRANSITION alerts once (as a subject part of the night
-  email, past `failure_threshold`), a later night does not re-alert, and the
+* `db.claim_quarantine_alerts` (#424): the persisted
+  `schedule_state.quarantine_alerted_at` stamp is claimed by a compare-and-set
+  UPDATE, so each failure streak is emailed exactly once -- including against
+  a second, overlapping claim -- and only a success or a reset clears it;
+* the live night: a claimed pair alerts once (as a subject part of the night
+  email, past `failure_threshold`), a later night does not re-alert, a pair
+  that crossed the cap BETWEEN nights is emailed the next night, and the
   `Done:` line carries the standing count only while it is nonzero;
-* a FILL failure that reaches the cap is a transition too (the after-snapshot
-  is taken behind the fill, not behind the due loop);
-* a raising quarantine snapshot -- before or after the night -- costs neither
-  the collection nor the tail, and alerts as a failed check rather than as a
-  transition nobody observed;
+* a FILL failure that reaches the cap is claimed too (the claim is taken
+  behind the fill, not behind the due loop), and a dry run claims nothing;
+* a raising claim or standing-set read costs neither the collection nor the
+  tail, and alerts as a failed check; a failed claim loses nothing;
 * the amnestied exit-code families (and a child killed by the SIGTERM
   wind-down) can never reach the cap, against a plain failure as the positive
   control that does;
 * `scheduler status` marks the quarantined pair;
-* `reset-failures`: dry run by default, `--execute` writes, and bad input
-  exits 64 having written nothing.
+* `reset-failures`: dry run by default, `--execute` writes (the stamp too),
+  and bad input exits 64 having written nothing;
+* `enroll-city` over a quarantined pair names its quarantine and alert state
+  and never touches the stamp.
 """
 
 import logging
@@ -29,11 +35,13 @@ import os
 import shlex
 import signal
 import sqlite3
+import threading
+import time
 from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
-from streetscape_metadata_tracker import db
+from streetscape_metadata_tracker import clock, db
 from streetscape_metadata_tracker import scheduler as sched
 from streetscape_metadata_tracker.alerting import AlertConfig
 from streetscape_metadata_tracker.download_common import (
@@ -71,33 +79,61 @@ def _register(conn, name):
     )
 
 
-def _cfg(**overrides):
+def _cfg(channels=("gsv", "mapillary"), **overrides):
     """gsv + mapillary, alerts on, and a threshold no ordinary night reaches.
 
     The threshold is the point: at 99 a plain failed collection sends nothing,
     so any email these tests see came from a condition that alerts on its own.
+    ``channels`` narrows the configured ``[providers.*]`` blocks.
     """
-    providers = {
+    all_providers = {
         "gsv": ProviderConfig(enabled=True, daily_request_budget=10_000_000),
         "mapillary": ProviderConfig(enabled=True, daily_request_budget=40_000),
     }
+    providers = {ch: all_providers[ch] for ch in channels}
     overrides.setdefault("alerts", AlertConfig(enabled=True, failure_threshold=99))
     overrides.setdefault("publish_enabled", False)
     return SchedulerConfig(providers=providers, **overrides)
 
 
-def _set_failures(conn, city_id, provider, n, error="boom"):
-    """A pair with ``n`` consecutive failures and no success, so it is due."""
+def _set_failures(conn, city_id, provider, n, error="boom", alerted_at=None, last_success_at=None):
+    """A pair with ``n`` consecutive failures and, by default, no success, so it is due.
+
+    ``alerted_at`` is written to ``quarantine_alerted_at`` (#424);
+    ``last_success_at`` set recent makes a pair under the cap NOT due, so a
+    night of all-successes leaves its counter alone.
+    """
     conn.execute(
         """INSERT INTO schedule_state
-           (city_id, provider, day_of_cycle, consecutive_failures, last_error)
-           VALUES (?, ?, 0, ?, ?)
+           (city_id, provider, day_of_cycle, consecutive_failures, last_error,
+            quarantine_alerted_at, last_success_at)
+           VALUES (?, ?, 0, ?, ?, ?, ?)
            ON CONFLICT(city_id, provider) DO UPDATE SET
              consecutive_failures = excluded.consecutive_failures,
-             last_error = excluded.last_error""",
-        (city_id, provider, n, error),
+             last_error = excluded.last_error,
+             quarantine_alerted_at = excluded.quarantine_alerted_at,
+             last_success_at = excluded.last_success_at""",
+        (city_id, provider, n, error, alerted_at, last_success_at),
     )
     conn.commit()
+
+
+def _stamp(conn, city_id, provider):
+    """This pair's ``quarantine_alerted_at`` (#424), or None."""
+    row = conn.execute(
+        "SELECT quarantine_alerted_at FROM schedule_state WHERE city_id = ? AND provider = ?",
+        (city_id, provider),
+    ).fetchone()
+    return None if row is None else row["quarantine_alerted_at"]
+
+
+FROZEN = datetime(2026, 7, 2, 9, 0, tzinfo=UTC)
+FROZEN_ISO = FROZEN.isoformat()
+EARLIER_STAMP = "2026-06-01T03:00:00+00:00"
+# Ten days before TODAY: recent enough that a pair under the cap is not due.
+RECENT_SUCCESS = (
+    datetime.combine(TODAY, datetime.min.time(), UTC) - timedelta(days=10)
+).isoformat()
 
 
 def _failures(conn, city_id, provider):
@@ -108,14 +144,8 @@ def _failures(conn, city_id, provider):
     return None if row is None else row["consecutive_failures"]
 
 
-def _night(monkeypatch, conn, cfg, run_one, today=TODAY, caplog=None, tail=None):
-    """Drive one real ``cmd_run_due`` with a fake collector; return (rc, alerts, done).
-
-    ``tail``, when given, is a list the night's tail steps append their names to
-    (``aggregate``, ``manifest``, ``publish``), so a test can tell a night whose
-    tail ran from one that died before it.
-    """
-    tail = [] if tail is None else tail
+def _patch_night(monkeypatch, conn, run_one, tail):
+    """Patch the collector, catalog, sleeps and tail steps; return the alert list."""
     monkeypatch.setattr(
         sched,
         "_run_one_city",
@@ -132,6 +162,18 @@ def _night(monkeypatch, conn, cfg, run_one, today=TODAY, caplog=None, tail=None)
     monkeypatch.setattr(
         sched, "send_alert", lambda c, subject, body: alerts.append((subject, body))
     )
+    return alerts
+
+
+def _night(monkeypatch, conn, cfg, run_one, today=TODAY, caplog=None, tail=None):
+    """Drive one real ``cmd_run_due`` with a fake collector; return (rc, alerts, done).
+
+    ``tail``, when given, is a list the night's tail steps append their names to
+    (``aggregate``, ``manifest``, ``publish``), so a test can tell a night whose
+    tail ran from one that died before it.
+    """
+    tail = [] if tail is None else tail
+    alerts = _patch_night(monkeypatch, conn, run_one, tail)
     if caplog is not None:
         caplog.clear()
     rc = sched.cmd_run_due(cfg, today=today)
@@ -193,24 +235,30 @@ def test_get_quarantined_is_exactly_the_pairs_dueness_drops_for_failing(conn):
     assert _quarantined_ids(conn, channels=("gsv",)) == {(at_cap, "gsv")}
 
 
-def test_reset_consecutive_failures_zeroes_only_the_counter(conn):
+def test_reset_consecutive_failures_zeroes_the_counter_and_the_stamp_only(conn):
+    """The stamp goes with the counter (#424), so a re-quarantine emails again.
+
+    Kills: dropping ``quarantine_alerted_at = NULL`` from the reset's UPDATE.
+    """
     cid = _register(conn, "Bend")
-    _set_failures(conn, cid, "gsv", CAP, error="the cause")
-    _set_failures(conn, cid, "mapillary", 2)
+    _set_failures(conn, cid, "gsv", CAP, error="the cause", alerted_at=EARLIER_STAMP)
+    _set_failures(conn, cid, "mapillary", 2, alerted_at=EARLIER_STAMP)
 
     assert db.reset_consecutive_failures(conn, cid, "gsv") == CAP
     row = conn.execute(
-        "SELECT consecutive_failures, last_error, last_success_at FROM schedule_state "
-        "WHERE city_id = ? AND provider = 'gsv'",
+        "SELECT consecutive_failures, last_error, last_success_at, quarantine_alerted_at "
+        "FROM schedule_state WHERE city_id = ? AND provider = 'gsv'",
         (cid,),
     ).fetchone()
     assert row["consecutive_failures"] == 0
+    assert row["quarantine_alerted_at"] is None
     # Kept: the only record of why it was quarantined.
     assert row["last_error"] == "the cause"
     # A reset is not a success.
     assert row["last_success_at"] is None
     # The sibling channel is untouched.
     assert _failures(conn, cid, "mapillary") == 2
+    assert _stamp(conn, cid, "mapillary") == EARLIER_STAMP
     # Nothing to reset is reported as 0, not as a write.
     assert db.reset_consecutive_failures(conn, cid, "gsv") == 0
     assert db.reset_consecutive_failures(conn, cid, "kartaview") == 0
@@ -237,6 +285,222 @@ def test_reset_consecutive_failures_commits_what_another_connection_reads(conn, 
     finally:
         other.close()
     assert n == 0
+
+
+# ── db.claim_quarantine_alerts (#424) ─────────────────────────────────────────
+
+
+def _claim(conn, channels=("gsv", "mapillary", "kartaview"), cap=CAP):
+    return db.claim_quarantine_alerts(
+        conn,
+        channels=channels,
+        default_membership=CHANNEL_DEFAULT_MEMBERSHIP,
+        max_consecutive_failures=cap,
+    )
+
+
+def _ids(rows):
+    return {(r["city_id"], r["provider"]) for r in rows}
+
+
+def test_claim_quarantine_alerts_stamps_exactly_the_unalerted_quarantined_pairs(conn, monkeypatch):
+    """Each non-claimed row differs from a claimed one in exactly one respect.
+
+    Kills: `>` for `>=`; dropping `IS NULL` from the SELECT (the second call
+    is non-empty); dropping the `enabled` or membership gate; stamping without
+    checking the UPDATE's rowcount.
+    """
+    monkeypatch.setattr(clock, "_utc_clock", lambda: FROZEN)
+    at_cap = _register(conn, "Bend")
+    stamped = _register(conn, "Corvallis")
+    under = _register(conn, "Eugene")
+    disabled = _register(conn, "Salem")
+    non_member = _register(conn, "Medford")
+    over = _register(conn, "Ashland")
+    _set_failures(conn, at_cap, "gsv", CAP)
+    _set_failures(conn, stamped, "gsv", CAP, alerted_at=EARLIER_STAMP)
+    _set_failures(conn, under, "gsv", CAP - 1)
+    _set_failures(conn, disabled, "gsv", CAP)
+    conn.execute("UPDATE cities SET enabled = 0 WHERE city_id = ?", (disabled,))
+    # kartaview is opt-in: a NULL member there is a non-member.
+    _set_failures(conn, non_member, "kartaview", CAP)
+    _set_failures(conn, over, "kartaview", CAP + 3)
+    conn.execute(
+        "UPDATE schedule_state SET member = 1 WHERE city_id = ? AND provider = 'kartaview'",
+        (over,),
+    )
+    conn.commit()
+
+    claimed = _claim(conn)
+
+    assert _ids(claimed) == {(at_cap, "gsv"), (over, "kartaview")}
+    assert [r["provider"] for r in claimed] == ["gsv", "kartaview"], "ordered by channel"
+    assert _stamp(conn, at_cap, "gsv") == FROZEN_ISO
+    assert _stamp(conn, over, "kartaview") == FROZEN_ISO
+    assert _stamp(conn, stamped, "gsv") == EARLIER_STAMP, "an existing stamp is not rewritten"
+    assert _stamp(conn, under, "gsv") is None
+    # Gated at claim time: a disabled city keeps a NULL stamp, so the night it
+    # is re-enabled is the night it is emailed.
+    assert _stamp(conn, disabled, "gsv") is None
+    assert _stamp(conn, non_member, "kartaview") is None
+    # Exactly once.
+    assert _claim(conn) == []
+
+
+def test_claim_quarantine_alerts_commits_what_another_connection_reads(conn, data_dir):
+    """The stamp is visible to a SECOND connection, i.e. to the next run-due.
+
+    Kills: deleting the claim's `conn.commit()`.
+    """
+    cid = _register(conn, "Bend")
+    _set_failures(conn, cid, "mapillary", CAP)
+
+    assert _ids(_claim(conn)) == {(cid, "mapillary")}
+
+    other = sqlite3.connect(os.path.join(data_dir, "streetscape_tracker.db"))
+    try:
+        (stamp,) = other.execute(
+            "SELECT quarantine_alerted_at FROM schedule_state WHERE city_id = ? AND provider = ?",
+            (cid, "mapillary"),
+        ).fetchone()
+    finally:
+        other.close()
+    assert stamp is not None
+
+
+def test_a_success_and_a_reset_clear_the_stamp_but_a_failure_does_not(conn):
+    """The stamp lives exactly as long as the failure streak.
+
+    A failure must NOT clear it: two overlapping run-dues recording the 5th and
+    6th failure would otherwise each claim, and email, the same streak.
+    Kills: dropping `quarantine_alerted_at = NULL` from record_attempt's success
+    branch or from reset_consecutive_failures; clearing it on a failure.
+    """
+    cid = _register(conn, "Bend")
+    _set_failures(conn, cid, "mapillary", CAP, error="the cause", alerted_at=EARLIER_STAMP)
+
+    db.record_attempt(conn, cid, success=False, error="again", provider="mapillary")
+    assert _failures(conn, cid, "mapillary") == CAP + 1
+    assert _stamp(conn, cid, "mapillary") == EARLIER_STAMP
+
+    db.record_attempt(conn, cid, success=True, provider="mapillary")
+    assert _failures(conn, cid, "mapillary") == 0
+    assert _stamp(conn, cid, "mapillary") is None
+
+    _set_failures(conn, cid, "mapillary", CAP, error="the cause", alerted_at=EARLIER_STAMP)
+    assert db.reset_consecutive_failures(conn, cid, "mapillary") == CAP
+    assert _stamp(conn, cid, "mapillary") is None
+    row = conn.execute(
+        "SELECT last_error FROM schedule_state WHERE city_id = ? AND provider = 'mapillary'",
+        (cid,),
+    ).fetchone()
+    assert row["last_error"] == "the cause"
+
+
+class _Interpose:
+    """``conn.execute``, with a hook fired once after the first SELECT: the window
+    between a claim's read and its write, which is where a second run-due lands."""
+
+    def __init__(self, real, after_select):
+        self._real, self._hook, self._fired = real, after_select, False
+
+    def execute(self, sql, params=()):
+        cur = self._real.execute(sql, params)
+        if not self._fired and sql.lstrip().upper().startswith("SELECT"):
+            self._fired = True
+            self._hook()
+        return cur
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def test_two_overlapping_claims_email_a_pair_once(conn, data_dir, monkeypatch):
+    """B claims between A's SELECT and A's UPDATE; only B's claim stands.
+
+    A has already read the pair as unalerted, so only the UPDATE's own
+    `quarantine_alerted_at IS NULL` term -- and the rowcount it decides --
+    stops A from emailing it a second time.
+    Kills: dropping `AND quarantine_alerted_at IS NULL` from the UPDATE (A
+    overwrites with T1 and returns the row); ignoring `rowcount`.
+    """
+    cid = _register(conn, "Bend")
+    _set_failures(conn, cid, "mapillary", CAP)
+    t1 = datetime(2026, 7, 2, 9, 0, tzinfo=UTC)
+    t2 = datetime(2026, 7, 2, 9, 5, tzinfo=UTC)
+    times = iter([t1])
+    monkeypatch.setattr(clock, "_utc_clock", lambda: next(times, t2))
+    b_claimed = []
+
+    def second_run_due():
+        other = db.connect(os.path.join(data_dir, "streetscape_tracker.db"))
+        try:
+            b_claimed.extend(_claim(other, channels=("mapillary",)))
+        finally:
+            other.close()
+
+    a_claimed = _claim(_Interpose(conn, second_run_due), channels=("mapillary",))
+
+    assert _ids(b_claimed) == {(cid, "mapillary")}, "B ran inside A's window and claimed"
+    assert a_claimed == []
+    assert _stamp(conn, cid, "mapillary") == t2.isoformat()
+
+
+def test_a_claim_blocked_on_another_writers_lock_defers_to_the_stamp_it_finds(conn, data_dir):
+    """A real lock wait, not an interposer: A's UPDATE waits on B's write lock.
+
+    B holds an uncommitted stamp; A reads the pair as unalerted, then its UPDATE
+    blocks (``busy_timeout``) until B commits, and re-evaluates against B's
+    stamp. Kills: dropping the UPDATE's `IS NULL` term under a real lock wait,
+    and any claim shape that raises `database is locked` instead of waiting.
+    """
+    cid = _register(conn, "Bend")
+    _set_failures(conn, cid, "mapillary", CAP)
+    path = os.path.join(data_dir, "streetscape_tracker.db")
+    ready, go, finished = threading.Event(), threading.Event(), threading.Event()
+    result = {}
+
+    def run_claim_a():
+        # sqlite3 connections are thread-bound, so A opens its own here, and
+        # before B takes the lock (connect writes the schema version).
+        a = db.connect(path)
+        try:
+            ready.set()
+            go.wait(timeout=10)
+            result["claimed"] = _claim(a, channels=("mapillary",))
+        except Exception as exc:  # reported, never swallowed: asserted below
+            result["error"] = exc
+        finally:
+            a.close()
+            finished.set()
+
+    b = db.connect(path)
+    thread = threading.Thread(target=run_claim_a, daemon=True)
+    try:
+        thread.start()
+        assert ready.wait(timeout=10)
+        b.execute("BEGIN IMMEDIATE")
+        b.execute(
+            "UPDATE schedule_state SET quarantine_alerted_at = 'B' "
+            "WHERE city_id = ? AND provider = 'mapillary'",
+            (cid,),
+        )
+        go.set()
+        time.sleep(0.3)
+        assert not finished.is_set(), "A finished while B still held the write lock"
+        b.commit()
+        thread.join(timeout=10)
+    finally:
+        if b.in_transaction:
+            b.rollback()
+        b.close()
+        go.set()
+        thread.join(timeout=10)
+
+    assert not thread.is_alive()
+    assert "error" not in result, result.get("error")
+    assert result["claimed"] == []
+    assert _stamp(conn, cid, "mapillary") == "B"
 
 
 # ── The live night ───────────────────────────────────────────────────────────
@@ -274,7 +538,74 @@ def test_the_night_a_pair_reaches_the_cap_alerts_once_naming_it_and_its_fix(
         "python -m streetscape_metadata_tracker.scheduler --config "
         f"/abs/scheduler.makelab1.toml reset-failures {cid} --channel mapillary --execute"
     ) in body
-    assert "; quarantined: 1 (mapillary 1, 1 new tonight)" in done
+    assert "; quarantined: 1 (mapillary 1, 1 alerted tonight)" in done
+    assert _stamp(conn, cid, "mapillary") is not None
+
+    # The next night: same catalog, nothing new fails -- and nothing alerts.
+    with caplog.at_level(logging.INFO, logger="streetscape_scheduler"):
+        _rc, alerts, done = _night(monkeypatch, conn, cfg, lambda city, p: True, caplog=caplog)
+    assert alerts == []
+    assert "; quarantined: 1 (mapillary 1)" in done
+    assert "alerted tonight" not in done
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["lowered-cap", "re-enabled-city", "re-enrolled-channel", "provider-block-enabled"],
+)
+def test_a_pair_quarantined_between_nights_is_emailed_the_next_night(
+    conn, monkeypatch, caplog, case
+):
+    """Nothing fails on either night; the pair enters quarantine BETWEEN them.
+
+    A before/after diff of the quarantined set sees it in both snapshots and
+    never emails it -- the #424 bug. Kills: that diff (every case); claiming
+    without the `enabled`/member gates or over channels other than
+    `enabled_providers()` (night 1 of the last three cases alerts).
+    """
+    cid = _register(conn, "Bend")
+    failures = 3 if case == "lowered-cap" else CAP
+    _set_failures(conn, cid, "mapillary", failures, last_success_at=RECENT_SUCCESS)
+    night1_cfg, night2_cfg = _cfg(), _cfg()
+    if case == "lowered-cap":
+        night2_cfg = _cfg(max_consecutive_failures=3)
+    elif case == "re-enabled-city":
+        conn.execute("UPDATE cities SET enabled = 0 WHERE city_id = ?", (cid,))
+    elif case == "re-enrolled-channel":
+        # An #301 exclusion.
+        conn.execute(
+            "UPDATE schedule_state SET member = 0 WHERE city_id = ? AND provider = 'mapillary'",
+            (cid,),
+        )
+    elif case == "provider-block-enabled":
+        night1_cfg = _cfg(channels=("gsv",))
+    conn.commit()
+
+    with caplog.at_level(logging.INFO, logger="streetscape_scheduler"):
+        _rc, alerts, done = _night(
+            monkeypatch, conn, night1_cfg, lambda city, p: True, caplog=caplog
+        )
+    assert alerts == []
+    assert _stamp(conn, cid, "mapillary") is None
+    assert "alerted tonight" not in done
+
+    if case == "re-enabled-city":
+        conn.execute("UPDATE cities SET enabled = 1 WHERE city_id = ?", (cid,))
+        conn.commit()
+    elif case == "re-enrolled-channel":
+        # What `enroll-city --clear` writes.
+        db.set_channel_membership(conn, cid, "mapillary", None, cycle_days=90)
+
+    with caplog.at_level(logging.INFO, logger="streetscape_scheduler"):
+        _rc, alerts, done = _night(
+            monkeypatch, conn, night2_cfg, lambda city, p: True, caplog=caplog
+        )
+    assert len(alerts) == 1
+    subject, body = alerts[0]
+    assert "1 QUARANTINED" in subject
+    assert f"{cid} [mapillary]: {failures} consecutive failure(s)" in body
+    assert "1 alerted tonight" in done
+    assert _stamp(conn, cid, "mapillary") is not None
 
 
 def test_a_later_night_does_not_re_alert_but_keeps_counting(conn, monkeypatch, caplog):
@@ -282,9 +613,10 @@ def test_a_later_night_does_not_re_alert_but_keeps_counting(conn, monkeypatch, c
 
     `count >= max` as the alert condition would email this night and every
     night after it; the Done line is where the standing set lives instead.
+    Kills: a claim that ignores the stamp.
     """
     cid = _register(conn, "Bend")
-    _set_failures(conn, cid, "mapillary", CAP)
+    _set_failures(conn, cid, "mapillary", CAP, alerted_at=EARLIER_STAMP)
     ran = []
 
     def run_one(city, p):
@@ -299,7 +631,20 @@ def test_a_later_night_does_not_re_alert_but_keeps_counting(conn, monkeypatch, c
     assert rc == 0
     assert alerts == []
     assert "; quarantined: 1 (mapillary 1)" in done
-    assert "new tonight" not in done
+    assert "alerted tonight" not in done
+    assert _stamp(conn, cid, "mapillary") == EARLIER_STAMP
+
+
+def test_a_dry_run_night_stamps_nothing_and_sends_nothing(conn, monkeypatch):
+    """Kills: a claim placed before the dry-run return."""
+    cid = _register(conn, "Bend")
+    _set_failures(conn, cid, "mapillary", CAP)
+    alerts = _patch_night(monkeypatch, conn, lambda city, p: True, [])
+
+    assert sched.cmd_run_due(_cfg(), dry_run=True, today=TODAY) == 0
+
+    assert alerts == []
+    assert _stamp(conn, cid, "mapillary") is None
 
 
 def test_the_done_line_says_nothing_about_quarantine_when_there_is_none(conn, monkeypatch, caplog):
@@ -310,18 +655,6 @@ def test_the_done_line_says_nothing_about_quarantine_when_there_is_none(conn, mo
         _rc, _alerts, done = _night(monkeypatch, conn, _cfg(), lambda c, p: True, caplog=caplog)
     assert done is not None
     assert "quarantined" not in done
-
-
-def test_a_pair_already_over_the_cap_that_fails_again_is_not_a_new_transition():
-    """The transition is a set difference, never a count, so a pair that some
-    path outside the due list pushed from 5 to 6 does not alert a second time."""
-    before = [{"city_id": "a", "provider": "gsv"}, {"city_id": "b", "provider": "mapillary"}]
-    after = [
-        {"city_id": "a", "provider": "gsv"},
-        {"city_id": "b", "provider": "gsv"},
-    ]
-    assert sched._newly_quarantined(before, after) == [{"city_id": "b", "provider": "gsv"}]
-    assert sched._newly_quarantined(after, after) == []
 
 
 def _killed_by_the_stop():
@@ -398,15 +731,15 @@ def test_the_positive_control_a_plain_failure_one_from_the_cap_does_quarantine(c
     assert any("QUARANTINED" in subject for subject, _body in alerts)
 
 
-def test_a_fill_failure_that_reaches_the_cap_is_reported_as_a_transition(conn, monkeypatch, caplog):
-    """The after-snapshot sits behind the FILL (issue #404), not the due loop.
+def test_a_fill_failure_that_reaches_the_cap_is_reported(conn, monkeypatch, caplog):
+    """The claim sits behind the FILL (issue #404), not the due loop.
 
     The fill admits only a city with no failure since its last success on a
     default channel, so it adds at most one -- which reaches the cap only at
     `max_consecutive_failures = 1`, the setting this test runs at. Nothing is
     due (both channels succeeded 60 days ago: past the 30-day floor, short of
     the 83-day due wall), so the ONLY failure of the night is the fill's.
-    Taking the snapshot right after `_run_city_loop` would miss it.
+    Claiming right after `_run_city_loop` would miss it until the next night.
     """
     cid = _register(conn, "Bend")
     stamp = (datetime.combine(TODAY, datetime.min.time(), UTC) - timedelta(days=60)).isoformat()
@@ -442,38 +775,49 @@ def test_a_fill_failure_that_reaches_the_cap_is_reported_as_a_transition(conn, m
     subject, body = alerts[0]
     assert "1 QUARANTINED" in subject
     assert f"{cid} [mapillary]: 1 consecutive failure(s)" in body
-    assert "; quarantined: 1 (mapillary 1, 1 new tonight)" in done
+    assert "; quarantined: 1 (mapillary 1, 1 alerted tonight)" in done
 
 
-@pytest.mark.parametrize("failing_call", ["before", "after"])
-def test_a_raising_quarantine_check_costs_neither_the_night_nor_its_tail(
-    conn, monkeypatch, caplog, failing_call
+@pytest.mark.parametrize("step", ["claim", "snapshot"])
+def test_a_raising_quarantine_step_costs_neither_the_night_nor_its_tail(
+    conn, monkeypatch, caplog, step
 ):
-    """Each snapshot raises in turn; the night still collects, publishes and alerts.
+    """The claim, then the standing-set read, each raises in turn.
 
-    BEFORE sits ahead of the pre-loop backup (a raise there was the whole
-    night); AFTER sits between the loop and `_finish_batch` (a raise there was
-    the aggregate, manifests, backup, publish and the alert). Either failure is
-    named on the Done line and alerts on its own -- `failure_threshold` is 99 and
-    every collection succeeds, so nothing else here sends mail.
+    Both sit between the fill and `_finish_batch` (a raise there was the
+    aggregate, manifests, backup, publish and the alert). Either failure is
+    named on the Done line and alerts on its own -- `failure_threshold` is 99
+    and every collection succeeds, so nothing else here sends mail.
 
-    A standing pair already at the cap is the trap for the BEFORE case: with no
-    before-set, diffing against an empty one would report it as new tonight
-    and re-alert a pair that was alerted on when it entered quarantine.
+    One unstamped pair at the cap (Corvallis) makes the two cases differ: a
+    failed CLAIM sends no alert for it and leaves the stamp NULL, so the next
+    night still claims it (nothing lost); a failed READ comes after the claim,
+    so the alert still goes out and only the standing count is missing.
+    Kills: unguarding either step; taking the snapshot before the claim and
+    returning early; dropping the `unhealthy` entry or the subject part;
+    reporting a stale set when the read failed.
     """
     cid = _register(conn, "Bend")
     standing = _register(conn, "Corvallis")
     _set_failures(conn, standing, "mapillary", CAP)
-    real = sched._quarantined_pairs
-    calls = []
+    raising = [True]
+    real_claim = sched.db.claim_quarantine_alerts
+    real_pairs = sched._quarantined_pairs
 
-    def flaky(cfg, c):
-        calls.append(1)
-        if len(calls) == (1 if failing_call == "before" else 2):
+    def flaky_claim(*a, **k):
+        if raising[0]:
             raise RuntimeError("database disk image is malformed")
-        return real(cfg, c)
+        return real_claim(*a, **k)
 
-    monkeypatch.setattr(sched, "_quarantined_pairs", flaky)
+    def flaky_pairs(cfg, c):
+        if raising[0]:
+            raise RuntimeError("database disk image is malformed")
+        return real_pairs(cfg, c)
+
+    if step == "claim":
+        monkeypatch.setattr(sched.db, "claim_quarantine_alerts", flaky_claim)
+    else:
+        monkeypatch.setattr(sched, "_quarantined_pairs", flaky_pairs)
     backups = []
     real_backup = sched.catalog_backup.write_backup
     monkeypatch.setattr(
@@ -497,30 +841,45 @@ def test_a_raising_quarantine_check_costs_neither_the_night_nor_its_tail(
             tail=tail,
         )
 
-    assert len(calls) == 2, "both snapshots were attempted"
     assert (cid, "gsv") in ran and (cid, "mapillary") in ran, "the night still collected"
     assert tail == ["aggregate", "manifest", "publish"], "and its tail still ran"
     assert len(backups) == 2, "both the pre-loop and the tail backup ran"
     assert done is not None
-    assert (
-        f"; quarantine check FAILED ({failing_call} the night: RuntimeError: "
-        "database disk image is malformed)"
-    ) in done
     assert rc == 1
     assert len(alerts) == 1
     subject, body = alerts[0]
     assert "QUARANTINE CHECK FAILED" in subject
-    assert "quarantine check FAILED" in body
-    # Never a transition read off a missing snapshot.
-    assert "QUARANTINED" not in subject.replace("QUARANTINE CHECK FAILED", "")
-    assert "new tonight" not in done
-    if failing_call == "before":
-        # The after-set is still known, so the standing count is still reported.
+    if step == "claim":
+        assert (
+            "; quarantine alert claim FAILED (RuntimeError: database disk image is malformed)"
+        ) in done
+        assert "quarantine alert claim FAILED" in body
+        # No alert read off a claim that never happened...
+        assert "QUARANTINED" not in subject.replace("QUARANTINE CHECK FAILED", "")
+        # ...but the standing set is still known and still counted.
         assert "; quarantined: 1 (mapillary 1)" in done
+        assert "alerted tonight" not in done
+        assert _stamp(conn, standing, "mapillary") is None
+
+        # Nothing was lost: the next night, with the claim working, alerts it.
+        raising[0] = False
+        with caplog.at_level(logging.INFO, logger="streetscape_scheduler"):
+            _rc, alerts, done = _night(
+                monkeypatch, conn, _cfg(), lambda city, p: True, caplog=caplog
+            )
+        assert len(alerts) == 1
+        assert "1 QUARANTINED" in alerts[0][0]
+        assert _stamp(conn, standing, "mapillary") is not None
     else:
-        # The after-set is UNKNOWN, so no standing count -- not the before-set
-        # re-reported as if it were tonight's (the standing pair makes that
-        # substitution visible: it would print "quarantined: 1").
+        assert "; quarantine check FAILED (RuntimeError: database disk image is malformed)" in (
+            done
+        )
+        assert "quarantine check FAILED" in body
+        # The claim ran first, so the alert still went out...
+        assert "1 QUARANTINED" in subject
+        assert f"{standing} [mapillary]" in body
+        assert _stamp(conn, standing, "mapillary") is not None
+        # ...but the standing set is UNKNOWN, so no count is printed.
         assert "; quarantined:" not in done
 
 
@@ -549,8 +908,10 @@ def test_the_reset_command_survives_an_apostrophe_in_the_city_id():
     ]
 
 
-@pytest.mark.parametrize("newly", [0, 1], ids=["standing-only", "with-new"])
-def test_the_quarantine_clauses_hold_no_semicolon_past_their_leading_separator(monkeypatch, newly):
+@pytest.mark.parametrize("alerted", [0, 1], ids=["standing-only", "with-alerted"])
+def test_the_quarantine_clauses_hold_no_semicolon_past_their_leading_separator(
+    monkeypatch, alerted
+):
     """The `Done:` line is split on ";" (scripts/night_length_analyze.py).
 
     So each clause's leading "; " must be its only ";" -- in the count's
@@ -561,7 +922,7 @@ def test_the_quarantine_clauses_hold_no_semicolon_past_their_leading_separator(m
         {"city_id": "b", "provider": "kartaview"},
         {"city_id": "c", "provider": "panoramax"},
     ]
-    note = sched._quarantine_summary_note(rows, rows[:newly])
+    note = sched._quarantine_summary_note(rows, rows[:alerted])
     assert note.startswith("; quarantined: 3 (")
     assert note.count(";") == 1, note
 
@@ -569,10 +930,18 @@ def test_the_quarantine_clauses_hold_no_semicolon_past_their_leading_separator(m
         raise RuntimeError("host unavailable; retry later")
 
     monkeypatch.setattr(sched, "_quarantined_pairs", boom)
-    rows_out, error = sched._quarantine_snapshot(_cfg(), None, "after")
+    rows_out, error = sched._quarantine_snapshot(_cfg(), None)
     assert rows_out is None
     clause = f"; {error}"
     assert clause.count(";") == 1, clause
+    assert "host unavailable, retry later" in clause
+
+    monkeypatch.setattr(sched.db, "claim_quarantine_alerts", lambda *a, **k: boom(None, None))
+    rows_out, error = sched._claim_quarantine_alerts(_cfg(), None)
+    assert rows_out is None
+    clause = f"; {error}"
+    assert clause.count(";") == 1, clause
+    assert clause.startswith("; quarantine alert claim FAILED (")
     assert "host unavailable, retry later" in clause
 
 
@@ -607,20 +976,24 @@ def _reset(monkeypatch, conn, city, channel, execute=False):
 
 
 def test_reset_failures_is_a_dry_run_without_execute(conn, monkeypatch, capsys):
+    """Kills: dropping the preview's `alerted:` line."""
     cid = _register(conn, "Bend")
-    _set_failures(conn, cid, "mapillary", CAP, error="the cause")
+    _set_failures(conn, cid, "mapillary", CAP, error="the cause", alerted_at=EARLIER_STAMP)
 
     assert _reset(monkeypatch, conn, cid, "mapillary") == 0
     out = capsys.readouterr().out
     assert _failures(conn, cid, "mapillary") == CAP, "a preview writes nothing"
+    assert _stamp(conn, cid, "mapillary") == EARLIER_STAMP, "a preview writes nothing"
+    assert f"alerted:      {EARLIER_STAMP}" in out
     assert "QUARANTINED" in out
     assert "the cause" in out
     assert "DRY RUN" in out
 
 
 def test_reset_failures_execute_clears_the_quarantine_and_the_pair_is_due_again(conn, monkeypatch):
+    """Kills: dropping the stamp from the reset's UPDATE."""
     cid = _register(conn, "Bend")
-    _set_failures(conn, cid, "mapillary", CAP)
+    _set_failures(conn, cid, "mapillary", CAP, alerted_at=EARLIER_STAMP)
     due_kw = dict(
         today=TODAY,
         cycle_days=90,
@@ -634,6 +1007,7 @@ def test_reset_failures_execute_clears_the_quarantine_and_the_pair_is_due_again(
     assert _reset(monkeypatch, conn, cid, "mapillary", execute=True) == 0
 
     assert _failures(conn, cid, "mapillary") == 0
+    assert _stamp(conn, cid, "mapillary") is None
     assert cid in {c.city_id for c in db.get_due_cities(conn, **due_kw)}
 
 
@@ -664,6 +1038,37 @@ def test_reset_failures_bad_input_exits_64_and_writes_nothing(
         assert _reset(monkeypatch, conn, query, channel, execute=True) == USAGE_EXIT_CODE
     assert _failures(conn, cid, "mapillary") == failures
     assert says in caplog.text
+
+
+# ── enroll-city ──────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("stamped", [False, True], ids=["unalerted", "alerted"])
+def test_enroll_city_names_a_quarantined_pair_it_enrols(conn, monkeypatch, capsys, stamped):
+    """Enrolling over an at-cap row tells the operator, and never touches the stamp.
+
+    Kills: dropping the NOTE; clearing (or setting) the stamp on enrol.
+    """
+    cid = _register(conn, "Bend")
+    _set_failures(conn, cid, "mapillary", CAP, alerted_at=EARLIER_STAMP if stamped else None)
+    conn.execute(
+        "UPDATE schedule_state SET member = 0 WHERE city_id = ? AND provider = 'mapillary'",
+        (cid,),
+    )
+    conn.commit()
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+
+    assert sched.cmd_enroll_city(_cfg(), cid, channel="mapillary", clear=True) == 0
+    out = capsys.readouterr().out
+
+    assert "QUARANTINED" in out
+    assert "reset-failures" in out
+    if stamped:
+        assert f"Already alerted at {EARLIER_STAMP}" in out
+        assert _stamp(conn, cid, "mapillary") == EARLIER_STAMP
+    else:
+        assert "Not yet alerted; the next run-due emails it once." in out
+        assert _stamp(conn, cid, "mapillary") is None
 
 
 def test_reset_failures_is_wired_into_the_cli(monkeypatch):
