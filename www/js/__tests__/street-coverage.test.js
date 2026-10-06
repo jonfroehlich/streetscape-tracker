@@ -8,6 +8,15 @@ const assert = require("node:assert/strict");
 
 global.STREETSCAPE_DATA_BASE_URL = "https://example.test/data/";
 global.getColor = (age, provider) => `color(${age},${provider})`;
+// The legend-section builders (issue #104) also read these streetscape-utils.js
+// globals; minimal stand-ins with the real escaping contract.
+global.escapeHtml = (s) =>
+  String(s).replace(
+    /[&<>"']/g,
+    (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]
+  );
+global.PROVIDERS = { gsv: { label: "Google Street View" }, mapillary: { label: "Mapillary" } };
+global.streetNetworkLabel = (n) => ({ drive: "Roads", all_public: "Roads + paths" })[n] ?? n;
 
 const {
   streetsUrlForDataFile,
@@ -24,6 +33,11 @@ const {
   fractionColor,
   normalizeStreetArtifact,
   renderStreetCoverage,
+  streetLegendChipsHtml,
+  streetLegendSectionHtml,
+  panoVisibilityLayer,
+  STREET_PARTIAL_LOW_COLOR,
+  STREET_PARTIAL_MID_COLOR,
   STREET_UNCOVERED_COLOR,
   STREET_COVERED_COLOR,
   STREET_COVERED_NODATE_COLOR,
@@ -357,13 +371,19 @@ test("normalizeStreetArtifact: a streetwalk artifact with no fractional signal i
 
 // ── renderStreetCoverage: artifact discovery + initial mode ──────────────────
 //
-// The panel is skipped in these tests (buildStreetCoveragePanel early-returns
-// when #street-coverage-container is absent), so they exercise exactly the
-// fetch/normalize/style seam without needing a DOM or Chart.js.
+// The chart is skipped in these tests (buildStreetCoverageChart early-returns
+// when #street-chart-container is absent), so they exercise exactly the
+// fetch/normalize/style/layer-control seam without needing a DOM or Chart.js.
 
 /** Minimal Leaflet + DOM stubs; returns a handle on what the renderer built. */
 function stubRenderEnv(fetchImpl) {
-  const captured = { urls: [], geoJsonOpts: null, added: 0 };
+  const captured = { urls: [], geoJsonOpts: null, added: 0, styleFn: null };
+  captured.controlEl = {
+    attrs: {},
+    setAttribute(k, v) {
+      this.attrs[k] = v;
+    },
+  };
   global.fetchGzippedJson = async (url) => {
     captured.urls.push(url);
     return fetchImpl(url);
@@ -373,9 +393,30 @@ function stubRenderEnv(fetchImpl) {
     geoJSON: (fc, opts) => {
       captured.geoJsonOpts = opts;
       captured.fc = fc;
-      return {
+      const layer = {
         addTo: () => {
           captured.added += 1;
+          return layer;
+        },
+        setStyle: (fn) => {
+          captured.styleFn = fn;
+        },
+      };
+      captured.layer = layer;
+      return layer;
+    },
+    control: {
+      layers: (base, overlays, opts) => {
+        captured.layersControl = { base, overlays, opts };
+        return { addTo: () => ({ getContainer: () => captured.controlEl }) };
+      },
+    },
+    layerGroup: () => {
+      const handlers = {};
+      return {
+        on: (ev, fn) => (handlers[ev] = fn),
+        handlers,
+        addTo() {
           return this;
         },
       };
@@ -548,6 +589,257 @@ test("renderStreetCoverage: an artifact with no features or no metadata block ad
   );
   assert.equal(env.added, 0);
   teardownRenderEnv();
+});
+
+// ── Issue #104: the legend section, the layer control and the controller ────
+
+/** A StreetUiState with sensible defaults; override per test. */
+function uiState(overrides = {}) {
+  return {
+    mode: "coverage",
+    gapsOnly: false,
+    hasFractional: true,
+    provider: "gsv",
+    providerLabel: "Google Street View",
+    networkLabel: null,
+    coveredPct: 85.1,
+    covered: 2,
+    segments: 2,
+    ...overrides,
+  };
+}
+
+/** Every `<i ...>` opening tag in an HTML string. */
+const chipTags = (html) => html.match(/<i\b[^>]*>/g) || [];
+
+test("streetLegendChipsHtml: coverage mode on a fractional artifact shows the three-stop ramp and a dashed slate gap chip", () => {
+  const html = streetLegendChipsHtml(uiState());
+  const stops = [STREET_PARTIAL_LOW_COLOR, STREET_PARTIAL_MID_COLOR, STREET_COVERED_COLOR].join(",");
+  assert.equal(stops, "#e2f5ea,#7ccf9f,#2fb974");
+  assert.ok(html.includes(`linear-gradient(90deg,${stops})`), html);
+  assert.ok(html.includes("partial → full"));
+  assert.ok(/<i class="dashed" style="color:#9aa3ad"/.test(html), html);
+  // The swatches are decorative: the chip text carries the meaning.
+  const tags = chipTags(html);
+  assert.equal(tags.length, 2);
+  for (const tag of tags) assert.ok(tag.includes('aria-hidden="true"'), tag);
+});
+
+test("streetLegendChipsHtml: coverage mode on a binary artifact shows a solid covered chip, not the ramp", () => {
+  const html = streetLegendChipsHtml(uiState({ hasFractional: false }));
+  assert.ok(html.includes(`background:${STREET_COVERED_COLOR}`), html);
+  assert.ok(!html.includes("linear-gradient"), html);
+  assert.ok(html.includes(">covered<"), html);
+});
+
+test("streetLegendChipsHtml: gapsOnly flips the gap chip to the highlight red", () => {
+  const on = streetLegendChipsHtml(uiState({ gapsOnly: true }));
+  const off = streetLegendChipsHtml(uiState({ gapsOnly: false }));
+  assert.ok(on.includes(`color:${STREET_GAP_HIGHLIGHT_COLOR}`), on);
+  assert.ok(!on.includes(`color:${STREET_UNCOVERED_COLOR}`), on);
+  assert.ok(off.includes(`color:${STREET_UNCOVERED_COLOR}`), off);
+});
+
+test("streetLegendChipsHtml: type mode shows only the gap chip (the chart is the type legend)", () => {
+  const html = streetLegendChipsHtml(uiState({ mode: "type" }));
+  assert.equal(chipTags(html).length, 1);
+  assert.ok(html.includes("no coverage"));
+});
+
+test("streetLegendChipsHtml: age mode threads the PROVIDER into the ramp", () => {
+  const html = streetLegendChipsHtml(uiState({ mode: "age", provider: "mapillary" }));
+  assert.ok(
+    html.includes(
+      "linear-gradient(90deg,color(0,mapillary),color(3,mapillary),color(6,mapillary),color(10,mapillary))"
+    ),
+    html
+  );
+  assert.ok(html.includes("newer → older"));
+});
+
+test("streetLegendSectionHtml: exactly one radio is checked and it is the state's mode", () => {
+  for (const mode of ["age", "coverage", "type"]) {
+    const html = streetLegendSectionHtml(uiState({ mode }));
+    assert.ok(html.includes('role="radiogroup"'));
+    assert.equal((html.match(/role="radio"/g) || []).length, 3);
+    const checked = html.match(/<button[^>]*aria-checked="true"[^>]*>/g) || [];
+    assert.equal(checked.length, 1, `${mode}: ${checked}`);
+    assert.ok(checked[0].includes(`data-mode="${mode}"`), checked[0]);
+    assert.ok(checked[0].includes("active"), checked[0]);
+    // .gsv-mode-toggle means "this run has the Google-only filter" (the e2e
+    // suite asserts its ABSENCE on Panoramax/KartaView runs, which have walks).
+    assert.ok(!html.includes("gsv-mode-toggle"), html);
+  }
+});
+
+test("streetLegendSectionHtml: the gaps checkbox mirrors state and the headline carries pct, counts and the ESCAPED provider label", () => {
+  const off = streetLegendSectionHtml(uiState({ providerLabel: "<b>X</b>" }));
+  assert.ok(off.includes("&lt;b&gt;X&lt;/b&gt;"), off);
+  assert.ok(!off.includes("<b>X</b>"), off);
+  assert.ok(off.includes("85.1%"));
+  assert.ok(/2 of\s+2 segments covered/.test(off), off);
+  const box = (html) => html.match(/<input[^>]*id="street-gaps-toggle"[^>]*>/)[0];
+  assert.ok(!/\schecked[\s>]/.test(box(off)), box(off));
+  const on = streetLegendSectionHtml(uiState({ gapsOnly: true }));
+  assert.ok(/\schecked[\s>]/.test(box(on)), box(on));
+});
+
+test("streetLegendSectionHtml: names the network only when given one", () => {
+  const header = (html) => html.match(/<div class="legend-year-header">([^<]*)<\/div>/)[1];
+  assert.equal(
+    header(streetLegendSectionHtml(uiState({ networkLabel: "Roads + paths" }))),
+    "Street coverage · Roads + paths"
+  );
+  assert.equal(header(streetLegendSectionHtml(uiState({ networkLabel: null }))), "Street coverage");
+});
+
+test("panoVisibilityLayer: add → visible, remove → hidden", () => {
+  stubRenderEnv(() => null);
+  const seen = [];
+  const proxy = panoVisibilityLayer((v) => seen.push(v));
+  proxy.handlers.add();
+  proxy.handlers.remove();
+  assert.deepEqual(seen, [true, false]);
+  teardownRenderEnv();
+});
+
+test("renderStreetCoverage: builds an expanded top-left layer control with Panoramas then Streets", async () => {
+  const env = stubRenderEnv(() => streetwalkArtifact());
+  const panoLayer = { pano: true };
+  await renderStreetCoverage(env.map, GRID_RUN, "gsv", { streetwalkFile: WALK_FILE, panoLayer });
+  const { base, overlays, opts } = env.layersControl;
+  assert.equal(base, null);
+  assert.deepEqual(Object.keys(overlays), ["Panoramas", "Streets"]);
+  assert.equal(overlays.Panoramas, panoLayer);
+  assert.equal(overlays.Streets, env.layer);
+  assert.deepEqual(opts, { position: "topleft", collapsed: false });
+  assert.equal(env.controlEl.attrs["aria-label"], "Map layers");
+  assert.equal(env.controlEl.attrs.role, "group");
+  teardownRenderEnv();
+});
+
+test("renderStreetCoverage: without a pano layer the control lists Streets alone", async () => {
+  const env = stubRenderEnv(() => gridArtifact());
+  await renderStreetCoverage(env.map, GRID_RUN, "gsv", {});
+  assert.deepEqual(Object.keys(env.layersControl.overlays), ["Streets"]);
+  teardownRenderEnv();
+});
+
+test("renderStreetCoverage: a missing artifact builds no layer control and resolves null", async () => {
+  const env = stubRenderEnv(() => {
+    throw new Error("404");
+  });
+  const changes = [];
+  const result = await renderStreetCoverage(env.map, GRID_RUN, "gsv", {
+    streetwalkFile: WALK_FILE,
+    panoLayer: {},
+    onChange: (s) => changes.push(s),
+  });
+  assert.equal(result, null);
+  assert.equal(env.layersControl, undefined);
+  assert.equal(env.added, 0);
+  assert.deepEqual(changes, []);
+  teardownRenderEnv();
+});
+
+test("renderStreetCoverage: emits the initial state once the overlay exists", async () => {
+  let env = stubRenderEnv(() => streetwalkArtifact());
+  let changes = [];
+  await renderStreetCoverage(env.map, GRID_RUN, "gsv", {
+    streetwalkFile: WALK_FILE,
+    networkType: "all_public",
+    onChange: (s) => changes.push(s),
+  });
+  assert.equal(changes.length, 1);
+  assert.equal(changes[0].mode, "coverage");
+  assert.equal(changes[0].hasFractional, true);
+  assert.equal(changes[0].networkLabel, "Roads + paths");
+  assert.equal(changes[0].providerLabel, "Google Street View");
+  assert.equal(changes[0].coveredPct, 98.4);
+  assert.equal(changes[0].covered, 2); // aliased from edges_any_coverage
+  assert.equal(changes[0].segments, 2); // aliased from edges
+  teardownRenderEnv();
+
+  // The derived grid artifact declares no network, so none is named even
+  // when the caller passes one.
+  env = stubRenderEnv(() => gridArtifact());
+  changes = [];
+  await renderStreetCoverage(env.map, GRID_RUN, "gsv", {
+    networkType: "all_public",
+    onChange: (s) => changes.push(s),
+  });
+  assert.equal(changes.length, 1);
+  assert.equal(changes[0].mode, "age");
+  assert.equal(changes[0].networkLabel, null);
+  teardownRenderEnv();
+});
+
+test("renderStreetCoverage: resolves a controller whose setMode restyles the layer and reports the new state", async () => {
+  const env = stubRenderEnv(() => streetwalkArtifact());
+  const changes = [];
+  const ctl = await renderStreetCoverage(env.map, GRID_RUN, "gsv", {
+    streetwalkFile: WALK_FILE,
+    onChange: (s) => changes.push(s),
+  });
+  ctl.setMode("type");
+  assert.equal(changes.length, 2);
+  assert.equal(changes.at(-1).mode, "type");
+  assert.equal(ctl.getState().mode, "type");
+  const feature = { properties: { highway: "residential", covered: true } };
+  assert.equal(env.styleFn(feature).color, streetTypeColor("residential"));
+  // The reported state is a copy: mutating it cannot reach into the controller.
+  changes.at(-1).mode = "age";
+  assert.equal(ctl.getState().mode, "type");
+  teardownRenderEnv();
+});
+
+test("renderStreetCoverage: setGaps(true) paints an uncovered edge red and reports gapsOnly", async () => {
+  const env = stubRenderEnv(() => streetwalkArtifact());
+  const changes = [];
+  const ctl = await renderStreetCoverage(env.map, GRID_RUN, "gsv", {
+    streetwalkFile: WALK_FILE,
+    onChange: (s) => changes.push(s),
+  });
+  ctl.setGaps(true);
+  const gap = { properties: { covered: false, highway: "service" } };
+  assert.equal(env.styleFn(gap).color, STREET_GAP_HIGHLIGHT_COLOR);
+  assert.equal(changes.at(-1).gapsOnly, true);
+  ctl.setGaps(false);
+  assert.equal(env.styleFn(gap).color, STREET_UNCOVERED_COLOR);
+  assert.equal(changes.at(-1).gapsOnly, false);
+  teardownRenderEnv();
+});
+
+test("renderStreetCoverage: setMode with an unknown or unchanged mode is a no-op", async () => {
+  const env = stubRenderEnv(() => streetwalkArtifact());
+  const changes = [];
+  const ctl = await renderStreetCoverage(env.map, GRID_RUN, "gsv", {
+    streetwalkFile: WALK_FILE,
+    onChange: (s) => changes.push(s),
+  });
+  ctl.setMode("bogus");
+  ctl.setMode("coverage"); // already the mode
+  assert.equal(changes.length, 1); // only the initial emit
+  assert.equal(env.styleFn, null); // never restyled
+  assert.equal(ctl.getState().mode, "coverage");
+  teardownRenderEnv();
+});
+
+test("city.html: the street panel is gone and the chart panel starts hidden above the temporal plot", () => {
+  const html = require("node:fs").readFileSync(require("node:path").join(__dirname, "../../city.html"), "utf8");
+  assert.ok(!html.includes("street-coverage-container"));
+  const panel = html.match(/<div id="street-chart-container"[^>]*>/);
+  assert.ok(panel, "chart panel missing");
+  assert.ok(/\shidden[\s>]/.test(panel[0]), panel[0]);
+  const stack = html.indexOf('id="bottom-right-panels"');
+  const chart = html.indexOf('id="street-chart-container"');
+  const temporal = html.indexOf('id="temporal-plot-container"');
+  assert.ok(stack !== -1 && stack < chart && chart < temporal, { stack, chart, temporal });
+  // Both panels sit inside the stack: nothing closes it before the temporal one.
+  const stackBody = html.slice(stack, temporal);
+  const opens = (stackBody.match(/<div\b/g) || []).length;
+  const closes = (stackBody.match(/<\/div>/g) || []).length;
+  assert.ok(opens - closes >= 1, "temporal panel is outside #bottom-right-panels");
 });
 
 // --- gap highlight ("Highlight gaps" toggle) --------------------------------

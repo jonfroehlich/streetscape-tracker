@@ -17,6 +17,8 @@ Assertions (seeded from the manual run):
   * 0-pano city shows ``—``, not the Unix epoch date (#122 / #69)
   * road-walk street coverage renders from the sidecar manifest, opening on the
     fractional ramp; a city with no walk renders none, silently (#155)
+  * that coverage renders into the legend, the layer control and the
+    bottom-right chart stack, all keyboard-operable (#104)
   * street coverage is discoverable from the site root: the shared header, the
     streets.html listing, the "Street coverage" overview metric, and the
     always-on popup line
@@ -366,37 +368,51 @@ def test_zero_pano_city_shows_dash_not_epoch(page: Page, base_url):
     assert errors == []
 
 
-def test_city_page_renders_the_road_walk_street_overlay(page: Page, base_url):
+def _overlay_pane_ink(page: Page) -> int:
+    """Non-transparent pixel count on Leaflet's default overlay-pane canvas,
+    where the pano dots draw (it is shared with the cyan bounds polygon, so it
+    never reaches 0 — callers compare before/after instead)."""
+    return page.evaluate("() => {" + _pane_ink_js("overlay") + "}")
+
+
+def test_city_page_folds_street_coverage_into_the_legend_and_layer_control(page: Page, base_url):
     """
     The road-walk (streetwalk) coverage artifact renders on the city page
-    (#155). Alpha City is the only fixture city with a walk, so this also
-    proves the manifest lookup found it — the artifact filename is NOT
-    derivable from the run filename, which is the whole reason the manifest
-    exists.
+    (#155), and since #104 it renders into the page's existing chrome rather
+    than a panel of its own: a "Street coverage" section in the main legend, a
+    top-left Leaflet layer control (Panoramas + Streets), and the street-type
+    chart stacked above the capture-date chart. Alpha City is the only fixture
+    city with a walk, so this also proves the manifest lookup found it — the
+    artifact filename is NOT derivable from the run filename, which is the
+    whole reason the manifest exists.
     """
     errors = _capture_errors(page)
     page.goto(f"{base_url}/city.html?file={ALPHA_LATEST}")
 
-    panel = page.locator("#street-coverage-container")
-    expect(panel).to_be_visible()
+    # One control cluster per job: the old top-left panel is gone, and the
+    # section lives inside the main legend.
+    section = page.locator(".legend #street-legend-section")
+    expect(section).to_be_visible()
+    expect(page.locator("#street-coverage-container")).to_have_count(0)
 
     # Headline reads the streetwalk totals through the key aliasing
     # (edges/edges_any_coverage → segments/covered): 85.1% of street-km covered
     # by length, 2 of 2 edges with some coverage. Stated in the positive — the
-    # complement (uncovered_pct_by_length, 14.9) is deliberately NOT what the
-    # panel quotes.
-    headline = page.locator("#street-coverage-headline")
+    # complement (uncovered_pct_by_length, 14.9) is deliberately NOT quoted.
+    headline = section.locator(".street-headline")
     expect(headline).to_contain_text("85.1%")
     expect(headline).to_contain_text("has Google Street View imagery")
     expect(headline).to_contain_text("2 of 2 segments covered")
+    # Alpha's default walk is the 'drive' network, named in the header.
+    expect(section.locator(".legend-year-header")).to_contain_text("Street coverage · Roads")
 
-    # A fractional artifact opens on the graduated Coverage ramp, not Age.
-    expect(page.locator('.street-mode-btn[data-mode="coverage"]')).to_have_attribute(
-        "aria-pressed", "true"
-    )
-    expect(page.locator('.street-mode-btn[data-mode="age"]')).to_have_attribute(
-        "aria-pressed", "false"
-    )
+    # A fractional artifact opens on the graduated Coverage ramp, not Age. The
+    # colour modes are a radiogroup, like the Imagery one above them.
+    expect(section.locator('[role="radiogroup"]')).to_have_count(1)
+    coverage_btn = page.locator('.street-mode-btn[data-mode="coverage"]')
+    age_btn = page.locator('.street-mode-btn[data-mode="age"]')
+    expect(coverage_btn).to_have_attribute("aria-checked", "true")
+    expect(age_btn).to_have_attribute("aria-checked", "false")
     expect(page.locator("#street-legend")).to_contain_text("partial → full")
 
     # The edges are drawn into the dedicated pane, which sits BELOW the pano
@@ -405,32 +421,133 @@ def test_city_page_renders_the_road_walk_street_overlay(page: Page, base_url):
     # per-edge ramp colors are unit-tested in www/js/__tests__.
     _expect_street_ink(page, drawn=True)  # pane canvas must not be blank
 
-    # The by-highway breakdown chart renders (residential + service).
+    # The by-highway chart renders (residential + service) in its own panel,
+    # stacked ABOVE the capture-date chart and right-aligned with it.
     chart = page.locator("#street-coverage-chart")
     expect(chart).to_be_visible()
     box = chart.bounding_box()
     assert box and box["width"] > 0 and box["height"] > 0
+    chart_box = page.locator("#street-chart-container").bounding_box()
+    temporal_box = page.locator("#temporal-plot-container").bounding_box()
+    assert chart_box["y"] + chart_box["height"] <= temporal_box["y"], (chart_box, temporal_box)
+    chart_right = chart_box["x"] + chart_box["width"]
+    temporal_right = temporal_box["x"] + temporal_box["width"]
+    assert abs(chart_right - temporal_right) < 2, (chart_box, temporal_box)
+
+    # The stack must not cover the legend's lower sections (where the street
+    # section lives): the legend's box ends above the stack, and scrolls.
+    stack = page.locator("#bottom-right-panels")
+    legend = page.locator(".legend")
+    page.wait_for_function(
+        "() => document.querySelector('.legend').getBoundingClientRect().bottom"
+        " <= document.getElementById('bottom-right-panels').getBoundingClientRect().top"
+    )
+    section.scroll_into_view_if_needed()
+    section_box = section.bounding_box()
+    assert section_box["y"] + section_box["height"] <= stack.bounding_box()["y"] + 1
+    assert legend.bounding_box()["height"] > 0
+
+    # The layer control: expanded (never hover-to-open, which keyboard and
+    # touch users lose), below the fixed header, Panoramas then Streets.
+    ctl = page.locator(".leaflet-control-layers")
+    expect(ctl).to_have_count(1)
+    expect(ctl).to_be_visible()
+    expect(ctl).to_have_class(re.compile(r"\bleaflet-control-layers-expanded\b"))
+    expect(ctl).to_have_attribute("aria-label", "Map layers")
+    boxes = ctl.locator("input.leaflet-control-layers-selector")
+    expect(boxes).to_have_count(2)
+    expect(boxes.nth(0)).to_be_checked()
+    expect(boxes.nth(1)).to_be_checked()
+    labels = [t.strip() for t in ctl.locator("label").all_inner_texts()]
+    assert labels == ["Panoramas", "Streets"], labels
+    header_bottom = page.locator(".site-header").bounding_box()
+    header_bottom = header_bottom["y"] + header_bottom["height"]
+    assert ctl.bounding_box()["y"] >= header_bottom
+
+    # Streets toggles from the KEYBOARD, both ways.
+    streets_cb = ctl.locator("label", has_text="Streets").locator("input")
+    streets_cb.focus()
+    page.keyboard.press("Space")
+    expect(streets_cb).not_to_be_checked()
+    _expect_street_ink(page, drawn=False)
+    page.keyboard.press("Space")
+    expect(streets_cb).to_be_checked()
+    _expect_street_ink(page, drawn=True)
+
+    # Panoramas goes through the reconcile model. The dots share the overlay
+    # pane's canvas with the bounds polygon, so assert a DROP, then recovery.
+    before = _overlay_pane_ink(page)
+    assert before > 0
+    pano_cb = ctl.locator("label", has_text="Panoramas").locator("input")
+    pano_cb.uncheck()
+    page.wait_for_function(
+        "(b) => (() => {" + _pane_ink_js("overlay") + "})() < b",
+        arg=before,
+    )
+    pano_cb.check()
+    page.wait_for_function(
+        "(b) => (() => {" + _pane_ink_js("overlay") + "})() >= b",
+        arg=before,
+    )
 
     # Switching to Age keeps the overlay alive (the median-age alias path).
-    page.locator('.street-mode-btn[data-mode="age"]').click()
+    age_btn.click()
     expect(page.locator('.street-mode-btn[data-mode="age"]')).to_have_attribute(
-        "aria-pressed", "true"
+        "aria-checked", "true"
+    )
+    expect(page.locator('.street-mode-btn[data-mode="coverage"]')).to_have_attribute(
+        "aria-checked", "false"
+    )
+    expect(page.locator("#street-legend")).to_contain_text("newer → older")
+    _expect_street_ink(page, drawn=True)
+
+    # "Highlight gaps" from the keyboard: the legend rebuilds on every change,
+    # and focus must land back on the checkbox rather than drop to <body>. The
+    # no-coverage chip flips to the highlight red and back; the overlay stays
+    # drawn throughout.
+    gaps = page.locator("#street-gaps-toggle")
+    expect(gaps).not_to_be_checked()
+    gaps.focus()
+    page.keyboard.press("Space")
+    expect(page.locator("#street-gaps-toggle")).to_be_checked()
+    assert page.evaluate("document.activeElement.id") == "street-gaps-toggle"
+    expect(page.locator("#street-legend i.dashed")).to_have_attribute(
+        "style", re.compile("#ff5252")
+    )
+    _expect_street_ink(page, drawn=True)
+    page.keyboard.press("Space")
+    expect(page.locator("#street-gaps-toggle")).not_to_be_checked()
+    assert page.evaluate("document.activeElement.id") == "street-gaps-toggle"
+    expect(page.locator("#street-legend i.dashed")).to_have_attribute(
+        "style", re.compile("#9aa3ad")
     )
     _expect_street_ink(page, drawn=True)
 
-    # The layer toggle removes the overlay and puts it back.
-    page.locator("#street-layer-toggle").uncheck()
-    _expect_street_ink(page, drawn=False)
-    page.locator("#street-layer-toggle").check()
-    _expect_street_ink(page, drawn=True)
+    # The chart panel collapses on its own, like the capture-date one.
+    toggle = page.locator("#street-chart-toggle")
+    toggle.click()
+    expect(page.locator("#street-chart-container")).to_have_class(re.compile(r"\bcollapsed\b"))
+    expect(toggle).to_have_attribute("aria-expanded", "false")
+    expect(chart).to_be_hidden()
+    toggle.click()
+    expect(toggle).to_have_attribute("aria-expanded", "true")
+    expect(chart).to_be_visible()
 
-    # "Highlight gaps" restyles in place (uncovered → red, covered faded) —
-    # the overlay must stay drawn through the toggle, both ways.
-    gaps = page.locator("#street-gaps-toggle")
-    expect(gaps).not_to_be_checked()
-    gaps.check()
-    _expect_street_ink(page, drawn=True)
-    gaps.uncheck()
+    assert errors == []
+
+
+def test_city_page_street_section_names_the_broad_network(page: Page, base_url):
+    """
+    ``?network=all_public`` draws the broad walk, and the legend header says
+    so — a different street-km denominator, which the reader must be told.
+    """
+    errors = _capture_errors(page)
+    page.goto(f"{base_url}/city.html?file={ALPHA_LATEST}&network=all_public")
+
+    section = page.locator(".legend #street-legend-section")
+    expect(section).to_be_visible()
+    expect(section.locator(".legend-year-header")).to_contain_text("Roads + paths")
+    expect(section.locator(".street-headline")).to_contain_text("85.1%")
     _expect_street_ink(page, drawn=True)
 
     assert errors == []
@@ -861,7 +978,7 @@ def test_streets_page_lists_published_road_walks(page: Page, base_url):
     # And it actually lands on the city page with the overlay.
     link.click()
     page.wait_for_url(f"**/city.html?file={ALPHA_LATEST}&network=drive")
-    expect(page.locator("#street-coverage-container")).to_be_visible()
+    expect(page.locator("#street-legend-section")).to_be_visible()
 
     assert errors == []
 
@@ -1073,8 +1190,12 @@ def test_city_without_a_walk_falls_back_and_stays_clean(page: Page, base_url):
     page.goto(f"{base_url}/city.html?file={ZERO_CITY}")
 
     expect(page.locator("table.legend-stats")).to_be_visible()  # page finished
-    expect(page.locator("#street-coverage-container")).to_be_hidden()
     assert _street_pane_ink(page) == 0
+    # No walk, no street controls (#104): no legend section, no chart panel,
+    # and no layer control at all — a one-entry control would be noise.
+    expect(page.locator("#street-legend-section")).to_have_count(0)
+    expect(page.locator("#street-chart-container")).to_be_hidden()
+    expect(page.locator(".leaflet-control-layers")).to_have_count(0)
 
     assert errors == []
 
