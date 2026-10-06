@@ -730,6 +730,113 @@ function defaultFilterValues(filters) {
   return values;
 }
 
+// ── Sidebar collapse (issue #438) ─────────────────────────────────────────
+
+/**
+ * The localStorage key for the docked sidebar's collapsed state. One key for
+ * all three table pages: it is a reader's preference about the layout, not
+ * part of any one page's view.
+ */
+const SIDEBAR_COLLAPSED_KEY = "streetscape.sidebarCollapsed";
+
+/**
+ * The browser's localStorage, or null where it is missing or throws on access
+ * (a private window, blocked site data, Node).
+ *
+ * @returns {?Storage}
+ */
+function defaultSidebarStorage() {
+  try {
+    return typeof localStorage !== "undefined" ? localStorage : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Read the stored collapsed state. Anything unreadable means "expanded", so
+ * a broken store can never hide the filters.
+ *
+ * Deliberately NOT in the URL: `createTableControls` owns the query string as
+ * the shareable VIEW, and a link someone sends should not hide the
+ * recipient's filters.
+ *
+ * @param {?{getItem: function(string): ?string}} storage
+ * @returns {boolean}
+ */
+function readSidebarCollapsed(storage) {
+  try {
+    return storage?.getItem(SIDEBAR_COLLAPSED_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Store the collapsed state; a failed write is ignored (the toggle still
+ * works for this page view).
+ *
+ * @param {?{setItem: function(string, string): void}} storage
+ * @param {boolean} collapsed
+ */
+function writeSidebarCollapsed(storage, collapsed) {
+  try {
+    storage?.setItem(SIDEBAR_COLLAPSED_KEY, collapsed ? "1" : "0");
+  } catch {
+    // Storage full or blocked: the preference just won't outlive the page.
+  }
+}
+
+/**
+ * How many filters are currently narrowing the rows: a non-blank search, plus
+ * every filter that is set to something other than its default. A select
+ * sitting at its `defaultValue` (streets.html's network type) is not counted
+ * — it is the page's resting state, and "Clear all" resets to it.
+ *
+ * Shown on the collapsed rail, because filters hidden behind a collapsed
+ * panel otherwise remove rows with nothing on screen to say so.
+ *
+ * @param {{query: string, values: Object}} state
+ * @param {Object[]} filters - Filter descriptors.
+ * @returns {number}
+ * @example
+ * activeFilterCount({ query: "seattle", values: { network: "drive" } },
+ *   [{ key: "network", type: "select", defaultValue: "drive" }]); // 1
+ */
+function activeFilterCount({ query, values }, filters) {
+  let count = query && query.trim() ? 1 : 0;
+  for (const filter of filters) {
+    const value = values[filter.key];
+    if (isFilterUnset(filter, value)) continue;
+    if (filter.defaultValue != null && value === filter.defaultValue) continue;
+    count += 1;
+  }
+  return count;
+}
+
+/**
+ * Paint the toggle for the given state. Its accessible name comes from its
+ * visible text; `aria-expanded` carries the open/closed state.
+ *
+ * @param {Element} toggleEl - The `.sidebar-toggle` button.
+ * @param {{collapsed: boolean, active: number}} state
+ */
+function renderSidebarToggle(toggleEl, { collapsed, active }) {
+  toggleEl.setAttribute("aria-expanded", String(!collapsed));
+  if (!collapsed) {
+    toggleEl.innerHTML =
+      '<span aria-hidden="true">&laquo;</span> <span class="sidebar-toggle-label">Hide filters</span>';
+    return;
+  }
+  const badge =
+    active > 0
+      ? `<span class="sidebar-badge">${active}<span class="visually-hidden"> active</span></span>`
+      : "";
+  toggleEl.innerHTML =
+    '<span aria-hidden="true">&raquo;</span> <span class="sidebar-toggle-label">Show filters</span>' +
+    badge;
+}
+
 /**
  * Wrap the controls container in the sidebar chrome, and reveal the layout.
  *
@@ -763,7 +870,15 @@ function mountSidebar(rootEl) {
   const asideEl = document.createElement("aside");
   asideEl.className = "table-sidebar";
   asideEl.setAttribute("aria-label", "Search and filters");
+  // The docked-sidebar collapse toggle (#438). Hidden by CSS below the
+  // breakpoint, where the <details> summary is the toggle instead.
+  const toggleEl = document.createElement("button");
+  toggleEl.type = "button";
+  toggleEl.className = "sidebar-toggle";
+  toggleEl.setAttribute("aria-controls", "table-sidebar-panel");
+  asideEl.append(toggleEl);
   const detailsEl = document.createElement("details");
+  detailsEl.id = "table-sidebar-panel";
   detailsEl.className = "sidebar-disclosure";
   detailsEl.open = true;
   const summaryEl = document.createElement("summary");
@@ -808,6 +923,28 @@ function createTableControls({
   // Wired here rather than on DOMContentLoaded: the disclosure it needs does
   // not exist until mountSidebar has run.
   wireSidebarDisclosure(layoutEl ?? undefined);
+
+  // The docked sidebar's collapse (#438). The class is on the aside so CSS can
+  // both hide the panel and shrink the page offset (`:has()`), and only above
+  // the breakpoint — below it the class does nothing.
+  const asideEl = rootEl.closest(".table-sidebar");
+  const toggleEl = asideEl?.querySelector(".sidebar-toggle");
+  const sidebarStorage = defaultSidebarStorage();
+  let sidebarCollapsed = readSidebarCollapsed(sidebarStorage);
+  function refreshSidebarToggle() {
+    if (!toggleEl) return;
+    asideEl.classList.toggle("table-sidebar--collapsed", sidebarCollapsed);
+    renderSidebarToggle(toggleEl, {
+      collapsed: sidebarCollapsed,
+      active: activeFilterCount(state, filters),
+    });
+  }
+  toggleEl?.addEventListener("click", () => {
+    sidebarCollapsed = !sidebarCollapsed;
+    writeSidebarCollapsed(sidebarStorage, sidebarCollapsed);
+    refreshSidebarToggle();
+  });
+  refreshSidebarToggle();
   const searchEl = rootEl.querySelector("#table-search");
   const presetEl = rootEl.querySelector("#table-preset");
 
@@ -1027,6 +1164,7 @@ function createTableControls({
     table.setRows(filtered);
     repaintHistograms();
     updateUrl();
+    refreshSidebarToggle();
     onChange?.(filtered, allRows, { values: { ...state.values }, preset: state.preset });
   }
 
@@ -1271,5 +1409,10 @@ if (typeof module !== "undefined" && module.exports) {
     createTableControls,
     syncSidebarDisclosure,
     wireSidebarDisclosure,
+    SIDEBAR_COLLAPSED_KEY,
+    readSidebarCollapsed,
+    writeSidebarCollapsed,
+    activeFilterCount,
+    renderSidebarToggle,
   };
 }

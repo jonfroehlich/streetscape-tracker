@@ -1885,8 +1885,9 @@ def test_the_table_and_its_filters_are_on_the_first_screen(page: Page, base_url,
 def test_the_filter_sidebar_spans_the_full_viewport_height(page: Page, base_url, path):
     """ "Always there" means it does not scroll away, and "full extent" means it
     is a column rather than a short card with grey below it. Both come from the
-    sidebar itself being the sticky, full-height panel — a flex chain through
-    the <details> does not survive Chromium's ::details-content box."""
+    sidebar itself being the full-height panel — a flex chain through the
+    <details> does not survive Chromium's ::details-content box. Since #438 it
+    is docked: fixed to the window's left edge, directly under the 44px header."""
     errors = _capture_errors(page)
     page.set_viewport_size({"width": 1440, "height": 900})
     page.goto(f"{base_url}/{path}")
@@ -1896,11 +1897,14 @@ def test_the_filter_sidebar_spans_the_full_viewport_height(page: Page, base_url,
         """() => {
              const a = document.querySelector('.table-sidebar');
              const c = getComputedStyle(a);
-             return {h: a.getBoundingClientRect().height, viewport: window.innerHeight,
+             const r = a.getBoundingClientRect();
+             return {h: r.height, left: r.left, top: r.top, viewport: window.innerHeight,
                      position: c.position, background: c.backgroundColor};
            }"""
     )
-    assert box["position"] == "sticky"
+    assert box["position"] == "fixed"
+    assert box["left"] == 0, f"sidebar is not docked to the window edge (left={box['left']})"
+    assert box["top"] == 44, f"sidebar does not start under the header (top={box['top']})"
     assert box["h"] > box["viewport"] * 0.85, f"sidebar is only {box['h']}px of {box['viewport']}px"
     # The container is the panel, so the height is visible rather than notional.
     assert box["background"] not in ("rgba(0, 0, 0, 0)", "transparent"), box["background"]
@@ -1921,7 +1925,8 @@ def test_filter_sidebar_sits_beside_the_table_and_collapses_on_narrow_screens(
     page: Page, base_url, path
 ):
     """Issue #250's layout: a ~280px filter column beside the table at desktop
-    width, collapsing to a "Filters" disclosure below 900px. The one state that
+    width (docked to the window's left edge since #438), collapsing to a
+    "Filters" disclosure below 900px. The one state that
     must be unreachable is "collapsed, then widened" — the summary is hidden at
     desktop width, so a panel left closed would strand filters that are in the
     URL and cannot be seen or changed."""
@@ -1938,11 +1943,11 @@ def test_filter_sidebar_sits_beside_the_table_and_collapses_on_narrow_screens(
         """() => {
              const a = document.querySelector('.table-sidebar').getBoundingClientRect();
              const t = document.querySelector('.streets-table-wrap').getBoundingClientRect();
-             return {aRight: a.right, tLeft: t.left, aTop: a.top, tTop: t.top};
+             return {aRight: a.right, tLeft: t.left, aBottom: a.bottom, tTop: t.top};
            }"""
     )
     assert boxes["aRight"] <= boxes["tLeft"] + 1, "sidebar overlaps the table"
-    assert abs(boxes["aTop"] - boxes["tTop"]) < 40, "sidebar is not on the table's row"
+    assert boxes["aBottom"] > boxes["tTop"], "sidebar is not beside the table"
     # At this width the disclosure is a plain panel, with no toggle to find.
     expect(page.locator(".sidebar-disclosure > summary")).to_be_hidden()
     expect(table).to_be_visible()
@@ -1960,6 +1965,136 @@ def test_filter_sidebar_sits_beside_the_table_and_collapses_on_narrow_screens(
     page.set_viewport_size({"width": 1440, "height": 900})
     expect(page.locator("#table-search")).to_be_visible()
     expect(page.locator(".sidebar-disclosure > summary")).to_be_hidden()
+
+    assert errors == []
+
+
+def _wrap_overflow(page: Page) -> float:
+    """How far the table overflows its scrolling wrap (<= 0 means it fits)."""
+    return page.evaluate(
+        """() => {
+             const wrap = document.querySelector('.streets-table-wrap');
+             return wrap.scrollWidth - wrap.clientWidth;
+           }"""
+    )
+
+
+@pytest.mark.parametrize("path", ["grid.html", "streets.html", "driving.html"])
+def test_the_docked_sidebar_collapses_to_a_rail_and_remembers_it(page: Page, base_url, path):
+    """#438: the docked filters collapse to a narrow rail, handing the width to
+    the table. The toggle stays in place (so focus is never lost), reports its
+    state through aria-expanded, takes the controls out of the tab order, and
+    the choice survives a reload."""
+    errors = _capture_errors(page)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    page.goto(f"{base_url}/{path}")
+    expect(page.locator(".streets-table tbody tr").first).to_be_visible()
+
+    toggle = page.locator(".sidebar-toggle")
+    wrap_width = "() => document.querySelector('.streets-table-wrap').clientWidth"
+    expect(toggle).to_be_visible()
+    expect(toggle).to_have_attribute("aria-expanded", "true")
+    expect(toggle).to_have_attribute("aria-controls", "table-sidebar-panel")
+    expect(page.locator("#table-sidebar-panel")).to_have_count(1)
+    before = page.evaluate(wrap_width)
+
+    toggle.click()
+    expect(toggle).to_have_attribute("aria-expanded", "false")
+    expect(toggle).to_be_focused()
+    expect(page.locator("#table-search")).to_be_hidden()
+    aside_width = page.evaluate(
+        "() => document.querySelector('.table-sidebar').getBoundingClientRect().width"
+    )
+    assert aside_width <= 48, f"collapsed rail is {aside_width}px wide"
+    gained = page.evaluate(wrap_width) - before
+    assert gained >= 230, f"collapsing gave the table only {gained}px"
+
+    page.reload()
+    expect(page.locator(".streets-table tbody tr").first).to_be_visible()
+    expect(page.locator(".sidebar-toggle")).to_have_attribute("aria-expanded", "false")
+    expect(page.locator("#table-search")).to_be_hidden()
+
+    page.locator(".sidebar-toggle").click()
+    expect(page.locator("#table-search")).to_be_visible()
+
+    assert errors == []
+
+
+def test_the_collapsed_preference_is_shared_across_pages_but_not_on_narrow_screens(
+    page: Page, base_url
+):
+    """One stored preference for all three pages — it is about the layout, not
+    one page's view. Below the breakpoint the <details> owns the filters, so a
+    stored "collapsed" must never hide them there."""
+    errors = _capture_errors(page)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    page.goto(f"{base_url}/grid.html")
+    expect(page.locator(".streets-table tbody tr").first).to_be_visible()
+    page.locator(".sidebar-toggle").click()
+
+    page.goto(f"{base_url}/streets.html")
+    expect(page.locator(".streets-table tbody tr").first).to_be_visible()
+    expect(page.locator(".sidebar-toggle")).to_have_attribute("aria-expanded", "false")
+    expect(page.locator("#table-search")).to_be_hidden()
+
+    page.set_viewport_size({"width": 600, "height": 900})
+    expect(page.locator(".sidebar-toggle")).to_be_hidden()
+    expect(page.locator(".sidebar-disclosure > summary")).to_be_visible()
+    expect(page.locator("#table-search")).to_be_visible()
+
+    assert errors == []
+
+
+def test_the_collapsed_rail_counts_the_filters_it_hides(page: Page, base_url):
+    """Collapsed filters still remove rows, so the rail says how many are
+    active — and a filter at its default (streets.html's network) is not one."""
+    errors = _capture_errors(page)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    page.goto(f"{base_url}/streets.html")
+    expect(page.locator(".streets-table tbody tr").first).to_be_visible()
+    toggle = page.locator(".sidebar-toggle")
+
+    toggle.click()
+    expect(toggle.locator(".sidebar-badge")).to_have_count(0)
+
+    toggle.click()
+    page.fill("#table-search", "a")
+    toggle.click()
+    expect(toggle.locator(".sidebar-badge")).to_have_text("1 active")
+
+    # A filter that arrives in the URL is applied after the toggle is first
+    # painted, so the count has to follow the filters, not just the clicks.
+    page.goto(f"{base_url}/streets.html?q=a")
+    expect(page.locator(".streets-table tbody tr").first).to_be_visible()
+    expect(page.locator(".sidebar-toggle .sidebar-badge")).to_have_text("1 active")
+
+    assert errors == []
+
+
+def test_collapsing_the_sidebar_fits_every_streets_preset_at_1600px(page: Page, base_url):
+    """#438's laptop/scaled-monitor band: at a 1600px window the open sidebar
+    leaves the default too narrow, and collapsing it must make EVERY preset fit.
+    The open-sidebar overflow is asserted first, or a fixture too narrow to
+    overflow would make the collapsed fit vacuous."""
+    errors = _capture_errors(page)
+    page.set_viewport_size({"width": 1600, "height": 900})
+    page.goto(f"{base_url}/streets.html")
+    expect(page.locator(".streets-table tbody tr").first).to_be_visible()
+    assert _wrap_overflow(page) > 0, "the default fits with the sidebar open; nothing to test"
+
+    toggle = page.locator(".sidebar-toggle")
+    values = page.locator("#table-preset option").evaluate_all("opts => opts.map(o => o.value)")
+    assert len(values) >= 2, f"expected several presets, got {values}"
+    for value in values:
+        # The preset picker lives in the panel, so open it to switch, then
+        # collapse it again to measure.
+        page.select_option("#table-preset", value)
+        toggle.click()
+        overflow = _wrap_overflow(page)
+        assert overflow <= 0, (
+            f"preset {value!r} overflows by {overflow}px with the sidebar collapsed"
+        )
+        toggle.click()
 
     assert errors == []
 
