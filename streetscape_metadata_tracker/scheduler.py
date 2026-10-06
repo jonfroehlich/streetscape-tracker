@@ -4585,15 +4585,27 @@ def cmd_enroll_city(
     failures = row["consecutive_failures"] if row else 0
     if failures >= cfg.max_consecutive_failures:
         stamp = row["quarantine_alerted_at"]
-        print(
-            f"  NOTE  {failures} consecutive failure(s): QUARANTINED, so run-due skips this "
-            f"pair until `{_reset_failures_command(cfg, city.city_id, channel)}`. "
-            + (
-                f"Already alerted at {stamp}; enrolling does not re-alert."
-                if stamp
-                else "Not yet alerted; the next run-due emails it once."
+        # The claim gates on exactly these three (db.claim_quarantine_alerts),
+        # so "the next run-due emails it" is true only when all three hold.
+        member = after if after is not None else CHANNEL_DEFAULT_MEMBERSHIP[channel]
+        claimable = bool(member) and city.enabled and channel in cfg.enabled_providers()
+        reset = _reset_failures_command(cfg, city.city_id, channel)
+        if claimable:
+            skip_note = f"QUARANTINED, so run-due skips this pair until `{reset}`."
+        else:
+            # Excluded, disabled or unconfigured: run-due skips it for THAT reason
+            # first, and saying "until reset-failures" would promise otherwise.
+            skip_note = (
+                "QUARANTINED: once the city is enabled, a member of this channel and the "
+                f"channel is configured, run-due still skips it until `{reset}`."
             )
-        )
+        if stamp:
+            alert_note = f"Already alerted at {stamp}; enrolling does not re-alert."
+        elif claimable:
+            alert_note = "Not yet alerted; the next run-due emails it once."
+        else:
+            alert_note = "Not yet alerted; it is emailed once, the first night all three hold."
+        print(f"  NOTE  {failures} consecutive failure(s): {skip_note} {alert_note}")
     if not city.enabled:
         # Reached only on the --remove/--clear path, which is allowed here on
         # purpose. Say so, or "I excluded it and nothing changed" reads as the
@@ -13050,25 +13062,38 @@ def _claim_quarantine_alerts(cfg: SchedulerConfig, conn) -> tuple[list | None, s
     like ``_quarantined_pairs``, so a ``--provider mapillary`` catch-up emails a
     KartaView quarantine that arose between nights too (still once). It sits
     between the fill and ``_finish_batch``, so a raise here must not cost the
-    tail: it is logged and returned as a ``Done:``-line clause. A raise before
-    the claim's ``commit()`` leaves every stamp unwritten, so nothing is lost --
-    the next night claims them.
+    tail: it is logged and returned as a ``Done:``-line clause. A raising claim
+    rolls its stamps back before it propagates (``db.claim_quarantine_alerts``),
+    so nothing is lost -- the next night claims them.
+
+    Every claimed pair is logged by name, at WARNING, the moment its stamp is
+    committed. From then on that streak's one email can still be lost -- a crash
+    anywhere in the tail before the send, a ``send_alert`` that fails (it
+    returns False and never raises), or ``[alerts].enabled = false`` -- and the
+    scheduler log, whose tail ``notify-failure`` emails, is then the only record
+    of which pairs were consumed.
     """
     try:
-        return (
-            db.claim_quarantine_alerts(
-                conn,
-                channels=cfg.enabled_providers(),
-                default_membership=CHANNEL_DEFAULT_MEMBERSHIP,
-                max_consecutive_failures=cfg.max_consecutive_failures,
-            ),
-            None,
+        claimed = db.claim_quarantine_alerts(
+            conn,
+            channels=cfg.enabled_providers(),
+            default_membership=CHANNEL_DEFAULT_MEMBERSHIP,
+            max_consecutive_failures=cfg.max_consecutive_failures,
         )
     except Exception as exc:
         logger.exception("Quarantine alert claim failed")
         # Same ";" escape as _quarantine_snapshot, for the same parser.
         reason = f"{type(exc).__name__}: {exc}".replace(";", ",")
         return None, f"quarantine alert claim FAILED ({reason})"
+    for row in claimed:
+        logger.warning(
+            "Quarantine alert claimed: %s [%s] at %d consecutive failure(s); "
+            "stamped, and tonight's email is its only alert",
+            row["city_id"],
+            row["provider"],
+            row["consecutive_failures"],
+        )
+    return claimed, None
 
 
 def _quarantine_summary_note(quarantined: Sequence, alerted: Sequence) -> str:

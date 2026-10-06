@@ -19,7 +19,9 @@ channel each alerted, and night 6 onward was silent. These tests pin, in order:
 * a FILL failure that reaches the cap is claimed too (the claim is taken
   behind the fill, not behind the due loop), and a dry run claims nothing;
 * a raising claim or standing-set read costs neither the collection nor the
-  tail, and alerts as a failed check; a failed claim loses nothing;
+  tail, and alerts as a failed check; a failed claim loses nothing, even when
+  it raises after stamping (it rolls back), and a reset or success landing
+  inside a claim is not claimed; every claimed pair is logged by name;
 * the amnestied exit-code families (and a child killed by the SIGTERM
   wind-down) can never reach the cap, against a plain failure as the positive
   control that does;
@@ -27,7 +29,8 @@ channel each alerted, and night 6 onward was silent. These tests pin, in order:
 * `reset-failures`: dry run by default, `--execute` writes (the stamp too),
   and bad input exits 64 having written nothing;
 * `enroll-city` over a quarantined pair names its quarantine and alert state
-  and never touches the stamp.
+  and never touches the stamp, and promises an email only when the claim's
+  gates would allow one.
 """
 
 import logging
@@ -501,6 +504,111 @@ def test_a_claim_blocked_on_another_writers_lock_defers_to_the_stamp_it_finds(co
     assert "error" not in result, result.get("error")
     assert result["claimed"] == []
     assert _stamp(conn, cid, "mapillary") == "B"
+
+
+def _other_stamp(data_dir, city_id, provider):
+    """The stamp as a SECOND connection reads it, i.e. as the next run-due would."""
+    other = sqlite3.connect(os.path.join(data_dir, "streetscape_tracker.db"))
+    try:
+        (stamp,) = other.execute(
+            "SELECT quarantine_alerted_at FROM schedule_state WHERE city_id = ? AND provider = ?",
+            (city_id, provider),
+        ).fetchone()
+    finally:
+        other.close()
+    return stamp
+
+
+class _RaiseOnUpdate:
+    """``conn.execute``, raising on the ``n``-th UPDATE -- after earlier ones stamped."""
+
+    def __init__(self, real, n):
+        self._real, self._n, self._seen = real, n, 0
+
+    def execute(self, sql, params=()):
+        if sql.lstrip().upper().startswith("UPDATE"):
+            self._seen += 1
+            if self._seen == self._n:
+                raise sqlite3.OperationalError("disk I/O error")
+        return self._real.execute(sql, params)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def test_a_claim_that_raises_after_stamping_rolls_every_stamp_back(conn, data_dir):
+    """The second UPDATE raises after the first has stamped; the tail then commits.
+
+    In the night the claim shares its connection with `_finish_batch`, whose
+    `prune_host_usage` commits. Without a rollback that commit persists the
+    first stamp, so that pair reads as emailed and never is. A write the caller
+    left pending before the claim must survive (it is committed on entry, and
+    the rollback discards only the claim's stamps).
+    Kills: dropping the `except: conn.rollback()`; dropping the entry commit.
+    """
+    first = _register(conn, "Bend")
+    second = _register(conn, "Corvallis")
+    _set_failures(conn, first, "mapillary", CAP)
+    _set_failures(conn, second, "mapillary", CAP)
+    # A caller's write, still uncommitted when the claim starts.
+    conn.execute(
+        "UPDATE schedule_state SET last_error = 'pending caller write' "
+        "WHERE city_id = ? AND provider = 'mapillary'",
+        (first,),
+    )
+    assert conn.in_transaction
+
+    with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+        _claim(_RaiseOnUpdate(conn, 2), channels=("mapillary",))
+
+    assert not conn.in_transaction, "the failed claim left a transaction (and the lock) open"
+    db.prune_host_usage(conn, datetime(2000, 1, 1, tzinfo=UTC))  # the tail's commit
+    conn.commit()
+    assert _other_stamp(data_dir, first, "mapillary") is None
+    assert _other_stamp(data_dir, second, "mapillary") is None
+    row = conn.execute(
+        "SELECT last_error FROM schedule_state WHERE city_id = ? AND provider = 'mapillary'",
+        (first,),
+    ).fetchone()
+    assert row["last_error"] == "pending caller write"
+    # Nothing was lost: the next claim takes both.
+    assert _ids(_claim(conn, channels=("mapillary",))) == {
+        (first, "mapillary"),
+        (second, "mapillary"),
+    }
+
+
+@pytest.mark.parametrize("cleared_by", ["reset", "success"])
+def test_a_streak_cleared_between_the_claims_read_and_write_is_not_claimed(
+    conn, data_dir, cleared_by
+):
+    """A `reset-failures` or a success lands between the claim's SELECT and UPDATE.
+
+    The claim has already read the pair as quarantined and unalerted, and the
+    clear also NULLs the stamp -- so only the UPDATE's own
+    `consecutive_failures >= cap` term stops it. Without that term the claim
+    emails a pair that is no longer quarantined, and leaves a stamp on the
+    fresh streak, which silences that pair's NEXT real quarantine.
+    Kills: dropping `AND consecutive_failures >= ?` from the UPDATE.
+    """
+    cid = _register(conn, "Bend")
+    _set_failures(conn, cid, "mapillary", CAP)
+
+    def clear_it():
+        other = db.connect(os.path.join(data_dir, "streetscape_tracker.db"))
+        try:
+            if cleared_by == "reset":
+                assert db.reset_consecutive_failures(other, cid, "mapillary") == CAP
+            else:
+                db.record_attempt(other, cid, success=True, provider="mapillary")
+        finally:
+            other.close()
+
+    claimed = _claim(_Interpose(conn, clear_it), channels=("mapillary",))
+
+    assert claimed == []
+    assert _failures(conn, cid, "mapillary") == 0, "the clear landed"
+    assert _stamp(conn, cid, "mapillary") is None
 
 
 # ── The live night ───────────────────────────────────────────────────────────
@@ -1069,6 +1177,74 @@ def test_enroll_city_names_a_quarantined_pair_it_enrols(conn, monkeypatch, capsy
     else:
         assert "Not yet alerted; the next run-due emails it once." in out
         assert _stamp(conn, cid, "mapillary") is None
+
+
+@pytest.mark.parametrize("case", ["removed", "disabled-city", "unconfigured-channel"])
+def test_enroll_city_does_not_promise_an_email_the_claim_will_not_send(
+    conn, monkeypatch, capsys, case
+):
+    """An unstamped at-cap pair the claim cannot take is not "emailed next run-due".
+
+    The claim gates on member, enabled and a configured channel, so after
+    `--remove`, on a disabled city, or on a channel with no `[providers.*]`
+    block, that sentence is false -- and so is "skips this pair until
+    reset-failures", since it is skipped for the other reason first.
+    Kills: computing the NOTE without any one of the three gates.
+    """
+    cid = _register(conn, "Bend")
+    cfg = _cfg()  # gsv + mapillary configured; kartaview is not
+    # Each case fails exactly one gate: the other two hold after the command.
+    if case == "unconfigured-channel":
+        channel, kwargs = "kartaview", {}  # a bare enrol on an opt-in channel
+    elif case == "removed":
+        channel, kwargs = "mapillary", {"remove": True}
+    else:
+        # --clear back to mapillary's default (member), on a disabled city.
+        channel, kwargs = "mapillary", {"clear": True}
+    _set_failures(conn, cid, channel, CAP)
+    if case == "disabled-city":
+        conn.execute(
+            "UPDATE schedule_state SET member = 0 WHERE city_id = ? AND provider = 'mapillary'",
+            (cid,),
+        )
+        conn.execute("UPDATE cities SET enabled = 0 WHERE city_id = ?", (cid,))
+        conn.commit()
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+
+    assert sched.cmd_enroll_city(cfg, cid, channel=channel, **kwargs) == 0
+    out = capsys.readouterr().out
+
+    assert "QUARANTINED" in out
+    assert "reset-failures" in out
+    assert "the next run-due emails it once" not in out
+    assert "run-due skips this pair until" not in out
+    assert "the first night all three hold" in out
+    assert _stamp(conn, cid, channel) is None
+
+
+def test_the_claim_logs_every_pair_it_stamps_by_name(conn, monkeypatch, caplog):
+    """Once stamped, a crash, a failed send or `[alerts].enabled = false` loses the
+    streak's only email; the scheduler log is then the record of which pairs.
+
+    Kills: dropping the per-pair `logger.warning` in `_claim_quarantine_alerts`.
+    """
+    cid = _register(conn, "Bend")
+    other = _register(conn, "Corvallis")
+    _set_failures(conn, cid, "mapillary", CAP + 2)
+    _set_failures(conn, other, "mapillary", CAP - 1)
+
+    with caplog.at_level(logging.WARNING, logger="streetscape_scheduler"):
+        rows, error = sched._claim_quarantine_alerts(_cfg(), conn)
+
+    assert error is None
+    assert _ids(rows) == {(cid, "mapillary")}
+    claimed_lines = [
+        r.getMessage() for r in caplog.records if "Quarantine alert claimed" in r.getMessage()
+    ]
+    assert claimed_lines == [
+        f"Quarantine alert claimed: {cid} [mapillary] at {CAP + 2} consecutive failure(s); "
+        "stamped, and tonight's email is its only alert"
+    ]
 
 
 def test_reset_failures_is_wired_into_the_cli(monkeypatch):

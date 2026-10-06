@@ -757,6 +757,8 @@ A separate email was rejected (the night email already carries every other condi
 **Both steps are guarded**: the claim (`_claim_quarantine_alerts`) and then the standing-set read (`_quarantine_snapshot`), both between the fill and `_finish_batch`, so an unguarded raise in either would cost the whole tail — aggregate, manifests, backup, publish and the alert — for a reporting step.
 A raise is logged, named on the `Done:` line as `; quarantine alert claim FAILED (<error>)` or `; quarantine check FAILED (<error>)` — with any `;` in `<error>` turned into `,`, because the `Done:` line is split on `;` (`scripts/night_length_analyze.py`) and the clause's leading separator must be its only one — and alerts on its own as a `QUARANTINE CHECK FAILED` subject part.
 A failed claim rolls back its stamps, so nothing is lost: the next night claims the same pairs.
+That holds for a raise after some UPDATEs have already stamped, too: the claim calls `conn.rollback()` before the exception propagates, because the connection is shared with `_finish_batch`, whose `prune_host_usage` commit would otherwise persist those stamps for pairs that were never emailed (PR #435 review).
+Any write the caller left pending is committed on entry, so the rollback discards only the claim's own stamps.
 A failed read drops that night's standing count but not the email, because the claim runs first.
 
 **What the stamp catches, and what it still does not**, named rather than argued away.
@@ -767,7 +769,7 @@ a re-enabled city whose counter was already at the cap;
 a re-enrolled channel (`enroll-city --clear`, or a bare enrol on an opt-in channel) over a row whose counter was already at the cap;
 and enabling a `[providers.X]` block, which brings that channel's at-cap rows into the claim at once.
 Still not caught:
-a crash between the claim's commit and the send loses that one email (the `Done:` count and `notify-failure` cover it);
+once a stamp commits, that streak's one email can still be lost — a crash anywhere in the tail before the send (aggregate, manifests, backup, publish), a `send_alert` that fails (it returns False and never raises), or `[alerts].enabled = false`; each claimed pair is therefore logged by name at WARNING the moment it is stamped (`Quarantine alert claimed: <city> [<channel>] ...`), so the scheduler log, whose tail `notify-failure` emails, records which streaks were consumed, and the `Done:` count still carries them;
 the same streak re-reaching a RAISED cap is not emailed again, since only a success or a reset clears the stamp (each extra failed night still emails on prod, where `failure_threshold = 1`);
 and the first night after the v21 deploy emails every standing quarantined pair once, by design, since the migration backfills nothing and a pair quarantined before #423 shipped was never emailed at all.
 
@@ -781,6 +783,7 @@ An unknown channel, an unresolvable city and a pair with nothing to reset all ex
 A disabled city or a non-member is allowed and noted, since the counter still gates the pair the moment it is enabled or enrolled.
 The preview also prints the alert stamp (`alerted:`).
 `enroll-city` over an at-cap row prints the pair's quarantine state and whether it was already alerted, and never touches the stamp: the stamp means "this streak was emailed", and enrolling does not change the streak.
+It promises "the next run-due emails it once" only when the claim could take the pair — the city enabled, a member of the channel after the command, and the channel configured; after `--remove`, on a disabled city or on an unconfigured channel it says the pair is emailed the first night all three hold instead.
 Fix the cause first: a cleared pair that still fails is quarantined again after five more nights, and alerts again then.
 
 ## The subcommand roster, and the production config (added 2026-08-25)

@@ -2950,14 +2950,17 @@ def claim_quarantine_alerts(
     migration): an explicit BEGIN raises ``cannot start a transaction within a
     transaction`` if the caller's connection has an implicit transaction open,
     and this sits in the nightly tail, where a raise costs every later step.
-    This helper uses only ``conn.execute`` and ``conn.commit``.
+    This helper uses only ``conn.execute``, ``conn.commit`` and ``conn.rollback``.
 
     Stamp, then email: the caller sends after this returns, so a crash between
     the two loses that email (at-most-once) -- the ``Done:`` line still counts
     the pair and the unit's ``OnFailure=`` email reports the crash. The other
     order would be at-least-once, which is the duplicate this column exists to
-    stop. A raise before the final ``commit()`` leaves every stamp unwritten,
-    so the next night claims them.
+    stop. A raise anywhere before the final ``commit()`` -- including after
+    some UPDATEs have stamped -- is rolled back before it propagates, so every
+    stamp stays unwritten and the next night claims them. Any write the caller
+    left pending on ``conn`` is committed on entry, so that rollback discards
+    only this claim's stamps.
 
     Returns the claimed rows (``city_id``, ``provider``,
     ``consecutive_failures``, ``last_error``, ``last_attempt_at``), ordered by
@@ -2965,28 +2968,42 @@ def claim_quarantine_alerts(
     """
     now = utc_now_iso()
     claimed: list[sqlite3.Row] = []
-    for channel in channels:
-        candidates = conn.execute(
-            f"""SELECT s.city_id, s.provider, s.consecutive_failures, s.last_error,
-                       s.last_attempt_at
-                FROM schedule_state s
-                JOIN cities c ON c.city_id = s.city_id
-                WHERE {_QUARANTINED_WHERE}
-                  AND s.quarantine_alerted_at IS NULL
-                ORDER BY s.city_id""",
-            (channel, 1 if default_membership[channel] else 0, max_consecutive_failures),
-        ).fetchall()
-        for row in candidates:
-            cur = conn.execute(
-                """UPDATE schedule_state SET quarantine_alerted_at = ?
-                   WHERE city_id = ? AND provider = ?
-                     AND quarantine_alerted_at IS NULL
-                     AND consecutive_failures >= ?""",
-                (now, row["city_id"], row["provider"], max_consecutive_failures),
-            )
-            if cur.rowcount == 1:
-                claimed.append(row)
-    conn.commit()
+    # The caller's own pending writes are committed first -- the success path
+    # below would commit them anyway -- so the rollback further down discards
+    # this claim's stamps and nothing of the caller's.
+    if conn.in_transaction:
+        conn.commit()
+    try:
+        for channel in channels:
+            candidates = conn.execute(
+                f"""SELECT s.city_id, s.provider, s.consecutive_failures, s.last_error,
+                           s.last_attempt_at
+                    FROM schedule_state s
+                    JOIN cities c ON c.city_id = s.city_id
+                    WHERE {_QUARANTINED_WHERE}
+                      AND s.quarantine_alerted_at IS NULL
+                    ORDER BY s.city_id""",
+                (channel, 1 if default_membership[channel] else 0, max_consecutive_failures),
+            ).fetchall()
+            for row in candidates:
+                cur = conn.execute(
+                    """UPDATE schedule_state SET quarantine_alerted_at = ?
+                       WHERE city_id = ? AND provider = ?
+                         AND quarantine_alerted_at IS NULL
+                         AND consecutive_failures >= ?""",
+                    (now, row["city_id"], row["provider"], max_consecutive_failures),
+                )
+                if cur.rowcount == 1:
+                    claimed.append(row)
+        conn.commit()
+    except BaseException:
+        # Without this, stamps written before the raise sit in an open implicit
+        # transaction on the SHARED connection, and the tail's next commit
+        # (prune_host_usage, in _finish_batch) persists them: those pairs read as
+        # emailed and are never emailed. It also releases the write lock, which
+        # the open transaction would otherwise hold through the whole tail.
+        conn.rollback()
+        raise
     claimed.sort(key=lambda r: (r["provider"], r["city_id"]))
     return claimed
 
