@@ -45,22 +45,19 @@ per reason in the summary:
   the coordinates while renumbering the OSM nodes, and the walk diff keys on
   `edge_id`), and every regenerated sample must lie within COORD_TOLERANCE_DEG
   of exactly one of the CSV's unique query locations, and every one of those
-  locations must be hit. A tolerance, not exact 9-decimal keys, because a
-  handful of samples per large walk (5 of Seattle's 247,292 on the dev
-  catalog) sit within one ULP of `quantize_coord`'s half-way boundary, and the
-  CSV value that comes back through `fileutils.load_city_csv_file` -- pandas'
-  default C float parser, which is not correctly rounded -- lands one ULP
-  across it. The CSV TEXT is exact (Python's `float()` of it reproduces the
-  regenerated sample bit for bit); the noise is the loader's parse.
-  The tolerance is for this VALIDATION only. Every collector reads its CSV back
-  through that same loader before scoring, so `compute_streetwalk_coverage`'s
-  9-decimal key join misses those samples in the collector too, and scores
-  them uncovered. The recompute deliberately reproduces that, scoring the
-  samples it regenerated against the loader's frame, so a recomputed walk is
-  exactly what `collect.py` writes today; changing that is a definition change
-  for the scorer or the loader, not for this tool. Duplicate CSV rows (one
-  location twice) are accepted and counted, exactly as the collector's
-  own `drop_duplicates(keep="first")` accepts them.
+  locations must be hit. A tolerance, not exact 9-decimal keys, so the check
+  cannot refuse a series over a sub-ULP difference with a message that reads
+  like a refreshed network. Since issue #425 `fileutils.load_city_csv_file`
+  reads coordinates correctly rounded (`float_precision="round_trip"`), so on
+  every CSV the collectors write the tolerance is never needed: the CSV text is
+  `repr` of the sample float and parses back to it exactly. A sample that
+  matches only within the tolerance is still accepted and COUNTED (`n_noise`),
+  exactly as the collector accepts it -- `compute_streetwalk_coverage`'s exact
+  key join scores it uncovered in both -- but the report flags it, because
+  under the round-trip loader a nonzero count means the CSV's text is not the
+  sample's own repr. Duplicate CSV rows (one location twice) are accepted and
+  counted, exactly as the collector's own `drop_duplicates(keep="first")`
+  accepts them.
 - **NULL column / missing CSV / recompute error.** A NULL
   `spacing_m`/`match_dist_m`/`coverage_filename` (nothing to reproduce the
   collection with, or nowhere to publish it), a missing snapshot CSV, or any
@@ -276,7 +273,7 @@ class Report:
     refused: list = field(default_factory=list)
     refusal_reasons: Counter = field(default_factory=Counter)
     failed: list = field(default_factory=list)
-    notes: list = field(default_factory=list)  # float-noise matches, duplicate rows
+    notes: list = field(default_factory=list)  # tolerance-only matches (unexpected since #425), duplicate rows
     artifacts_written: int = 0
     rows_updated: int = 0
     removed_files: list = field(default_factory=list)
@@ -372,9 +369,10 @@ def match_frame(samples, df):
     takes them -- one per 9-decimal key, first row wins -- so ``n_dup`` counts the
     rows it would drop too. Every sample must hit exactly one location within the
     tolerance and every location must be hit; otherwise WalkRefused.
-    ``n_noise`` counts samples whose exact key differed (the loader's parse
-    noise). The samples are NOT moved onto the CSV's coordinates: the collector
-    scores those samples uncovered, and so must the recompute (module docstring).
+    ``n_noise`` counts samples whose exact 9-decimal key matched no CSV location
+    (0 on any CSV the collectors wrote, since #425's round-trip loader). The
+    samples are NOT moved onto the CSV's coordinates: the scorer's exact join
+    misses them in the collector and so must miss them here (module docstring).
     """
     keys = [quantize_coord(la, lo) for la, lo in zip(df["query_lat"], df["query_lon"], strict=True)]
     first = {}
@@ -469,7 +467,9 @@ def recompute_walk(row, edges, data_dir: str, report: Report) -> Recomputed:
     if n_noise or n_dup:
         report.notes.append(
             f"{_label(row)}: {n_noise} samples matched only within {COORD_TOLERANCE_DEG:g} deg "
-            "(the CSV loader's parse noise; scored uncovered, as the collector scores them), "
+            "(their 9-decimal key matches no CSV location, so the scorer's exact join scores "
+            "them uncovered, here as in the collector; under the round-trip loader (#425) this "
+            "should be 0 -- a nonzero count means this CSV's text is not the sample's own repr), "
             f"{n_dup} duplicate CSV rows ignored as the collector ignores them"
         )
 

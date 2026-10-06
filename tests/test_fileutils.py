@@ -9,6 +9,10 @@ pre-2026 runs carry MONTH precision and are never rewritten, so every date in
 them coerced to NaT while the pano counts stayed perfect. That is the failure
 mode these tests exist for: a catalog row that looks fully populated and
 internally consistent, with NULL oldest/newest/median.
+
+The same reader must hand back the coordinates on disk, too (issue #425): the
+road-walk scorer keys samples to rows on a 9-decimal rounding, so a parse one
+ULP off its own text scores a sample uncovered.
 """
 
 import os
@@ -197,3 +201,38 @@ def test_a_gsv_road_walk_is_never_filtered_by_the_loader(data_dir):
     loaded = load_city_csv_file(path)
     assert loaded["status"].iloc[0] == "OK"
     assert "query_distance_m" not in loaded.columns
+
+
+# --- issue #425: coordinates load as their own text --------------------------
+
+# A longitude from a real walk CSV (Seattle, dev catalog): pandas' default C
+# parser returns the float one ULP below float() of this text, and that lands
+# round(x, 9) on -122.268117222 instead of -122.268117223 -- a different
+# quantize_coord key, so the sample would miss its own row (issue #425).
+BOUNDARY_LON_TEXT = "-122.26811722250001"
+BOUNDARY_LAT = 47.67595068398769
+
+
+def test_a_coordinate_the_default_parser_misplaces_loads_as_its_own_text(data_dir):
+    """The loader is round-trip: a loaded coordinate equals float() of its text,
+    so the 9-decimal key every scorer uses is the key of what was written."""
+    exact = float(BOUNDARY_LON_TEXT)
+    assert repr(exact) == BOUNDARY_LON_TEXT  # the writer's repr IS this text
+    path = os.path.join(data_dir, "walk.csv.gz")
+    write_city_csv_gz(
+        make_city_df([("p1", "2024-01-01")], run_date=RUN_DATE, grid_origin=(BOUNDARY_LAT, exact)),
+        path,
+    )
+    # The premise, re-measured: the default parser gets this text wrong. If this
+    # assertion ever fails, pandas fixed its parser; retire the premise and keep
+    # the contract below.
+    default = pd.read_csv(path, usecols=["query_lon"])["query_lon"].iloc[0]
+    assert default != exact, "pandas' default C parser now round-trips this text"
+    assert round(float(default), 9) != round(exact, 9)
+
+    for raw in (False, True):
+        loaded = load_city_csv_file(path, raw=raw)
+        lat, lon = loaded["query_lat"].tolist()[0], loaded["query_lon"].tolist()[0]
+        assert lon == exact
+        assert lat == BOUNDARY_LAT
+        assert (round(lat, 9), round(lon, 9)) == (round(BOUNDARY_LAT, 9), round(exact, 9))

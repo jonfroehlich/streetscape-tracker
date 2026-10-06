@@ -83,6 +83,9 @@ def load_city_csv_file(
     errors="coerce" does not suppress). Nothing can write that today —
     standardize_capture_date returns YYYY-MM-DD or None, and both census
     decoders strftime("%Y-%m-%d") — so it is stated rather than guarded.
+    Coordinates are read correctly rounded (``float_precision="round_trip"``,
+    issue #425), so a loaded ``query_lat``/``query_lon`` equals ``float()`` of
+    its text.
 
     Args:
         csv_path: Path to the CSV file (can be either .csv or .csv.gz)
@@ -141,10 +144,21 @@ def load_city_csv_file(
         # ignores dtype keys for columns a file doesn't have, so GSV runs and
         # legacy files load unchanged, while each census provider's extras are
         # coerced by ITS schema rather than by whichever module opened the file.
+        #
+        # float_precision="round_trip" (issue #425): pandas' default C parser is
+        # not correctly rounded and lands ~5% of latitudes and ~37% of longitudes
+        # one ULP off their own text. Every walk collector reads its CSV back
+        # through here and compute_streetwalk_coverage joins samples to rows on a
+        # 9-decimal key, so a one-ULP miss scores a sample UNCOVERED. The text is
+        # exact (repr of the float that was written), so the correct read is the
+        # text's value. Reaches the np.float64 columns only; nullable Float64
+        # columns (pano_lat/pano_lon) take another path and are unchanged.
+        # Cost: +15-35% parse wall-clock, no memory (measured, 16.6M rows: 29->35 s).
         df = pd.read_csv(
             csv_path,
             dtype=dtypes_for_run_path(csv_path) if dtypes is None else dtypes,
             compression=compression,
+            float_precision="round_trip",
         )
 
         # Convert query_timestamp (ISO 8601 with timezone)

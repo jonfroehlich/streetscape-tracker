@@ -102,9 +102,10 @@ def _graph(extra_edge=False, footway=False, node_offset=0):
 
 # The north end of a single-sample edge, found by search: the edge's one
 # sample then sits one ULP from a 9-decimal half-way point, and pandas' default
-# C float parser (what fileutils.load_city_csv_file reads with) puts the CSV's
-# copy of it on the OTHER side, while Python's correctly rounded float() of the
-# same text reproduces the sample exactly. The test re-measures this premise.
+# C float parser puts the CSV's copy of it on the OTHER side, while Python's
+# correctly rounded float() of the same text reproduces the sample exactly --
+# which is why fileutils.load_city_csv_file reads round-trip (#425). The test
+# re-measures this premise.
 BOUNDARY_NORTH_LAT = 44.0501200169994
 
 
@@ -489,8 +490,8 @@ def test_the_filters_select_whole_series_and_nothing_else(tmp_path, monkeypatch)
 
 def test_match_frame_tolerates_one_ulp_across_the_half_way_boundary():
     """Two coordinates one ULP apart on either side of quantize_coord's half-way
-    point have DIFFERENT 9-decimal keys; they are still one location, and the
-    returned samples carry the CSV's coordinates so the scorer's key join hits."""
+    point have DIFFERENT 9-decimal keys; they are still one location, so the
+    match is accepted and counted as noise."""
     # The float nearest 44.0512345675 rounds up and its lower neighbour down.
     hi_side = 44.0512345675
     lo_side = float(np.nextafter(hi_side, -math.inf))
@@ -541,41 +542,51 @@ def _keys(lats, lons):
 
 
 @pytest.mark.parametrize("provider", ("gsv", "mapillary"))
-def test_a_sample_the_loader_parses_across_the_boundary_scores_as_the_collector_scores_it(
+def test_a_sample_the_default_parser_would_misplace_is_scored_covered_by_collector_and_recompute_alike(
     tmp_path, monkeypatch, capsys, provider
 ):
-    """A REAL collector run whose one boundary sample comes back through
-    load_city_csv_file one ULP across quantize_coord's half-way point. The
-    collector's key join misses it, so it scores that sample uncovered; the
-    recompute must too, so it equals a --force collection under the same
-    definition. Substituting the CSV's coordinates into the samples would
-    score it covered and break the equality."""
+    """A REAL collector run whose one boundary sample pandas' default C float
+    parser would read one ULP across quantize_coord's half-way point (issue
+    #425). The loader reads round-trip, so the collector's key join hits it and
+    scores that edge covered; the recompute agrees, needing no tolerance-only
+    match, and equals a --force collection under the same definition.
+
+    The old coordinate-substitution mutation (moving samples onto the CSV's
+    coordinates) is a no-op here now that the loader returns the sample's own
+    value; "samples are never moved" is pinned by
+    test_match_frame_tolerates_one_ulp_across_the_half_way_boundary instead."""
     data_dir = _setup(tmp_path, monkeypatch)
     graph_path = _freeze(data_dir, graph=_boundary_graph())
     _collect(data_dir, D1, monkeypatch, old_definition=True, provider=provider)
     before = _walk(data_dir, D1, provider=provider)
     csv_path = os.path.join(data_dir, before["csv_filename"])
 
-    # The premise, measured on this run's own CSV: its text is exact (Python's
-    # correctly rounded parse reproduces every regenerated sample), and the
-    # loader's parse moves exactly one key -- the boundary sample's.
+    # The premise, measured on this run's own CSV: its text is exact, and the
+    # DEFAULT parser moves exactly one key -- the boundary sample's.
     samples = generate_samples(dsn.graph_to_edges(ox.load_graphml(graph_path)), 15)
     sample_keys = _keys(samples["lat"], samples["lon"])
     with gzip.open(csv_path, "rt") as fh:
-        exact = pd.read_csv(fh, float_precision="round_trip")
-    loaded = load_city_csv_file(csv_path)
-    assert set(_keys(exact["query_lat"], exact["query_lon"])) == set(sample_keys)
-    missed = set(sample_keys) - set(_keys(loaded["query_lat"], loaded["query_lon"]))
-    assert len(missed) == 1
-    (boundary,) = samples[[k in missed for k in sample_keys]].itertuples()
+        default = pd.read_csv(fh)
+    missed_by_default = set(sample_keys) - set(_keys(default["query_lat"], default["query_lon"]))
+    assert len(missed_by_default) == 1, "pandas' default C parser now round-trips this text"
+    (boundary,) = samples[[k in missed_by_default for k in sample_keys]].itertuples()
     assert boundary.edge_id == "1_2"
     assert float(repr(boundary.lat)) == boundary.lat
-    # And the collector scored it uncovered: that edge is all of the gap.
+
+    # The contract: the loader hands back every sample's own key.
+    loaded = load_city_csv_file(csv_path)
+    assert set(_keys(loaded["query_lat"], loaded["query_lon"])) == set(sample_keys)
+
+    # The collector scored the boundary edge covered; the gap is the other
+    # edge, all NO_DATE under the old definition, so the recompute still moves.
+    collected = _artifact(data_dir, D1, provider=provider)
+    edge = next(f for f in collected["features"] if f["properties"]["edge_id"] == "1_2")
+    assert edge["properties"]["coverage_fraction"] == 1.0
     assert before["coverage_pct_by_length"] < 100.0
 
     assert _run(data_dir, "--execute") == 0
     out = capsys.readouterr().out
-    assert "1 samples matched only within" in out and "scored uncovered" in out
+    assert "matched only within" not in out
     recomputed_row = _walk(data_dir, D1, provider=provider)
     recomputed_artifact = _artifact(data_dir, D1, provider=provider)
     assert recomputed_row["coverage_pct_by_length"] > before["coverage_pct_by_length"]  # NO_DATE
@@ -587,7 +598,7 @@ def test_a_sample_the_loader_parses_across_the_boundary_scores_as_the_collector_
     }
     assert recomputed_artifact == _artifact(data_dir, D1, provider=provider)
     edge = next(f for f in recomputed_artifact["features"] if f["properties"]["edge_id"] == "1_2")
-    assert edge["properties"]["coverage_fraction"] == 0.0
+    assert edge["properties"]["coverage_fraction"] == 1.0
 
 
 def test_duplicate_csv_rows_are_accepted_and_counted(tmp_path, monkeypatch, capsys):
