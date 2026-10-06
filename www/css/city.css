@@ -262,34 +262,53 @@
   margin-top: 5px;
 }
 
-/* ── Temporal chart (bottom-right, collapsible) ─────────────── */
-#temporal-plot-container {
+/* ── Bottom-right panel stack (collapsible) ─────────────────────
+   The street-type chart (issue #104, hidden until a run has a street
+   artifact) sits above the capture-date chart, so the capture-date chart
+   keeps its corner. Both share one surface, the dataviz-validated #1b1f24 —
+   the street palette was validated on it, and STREET_PANEL_BG (the chart's
+   inter-bar gap colour, street-coverage.js) must stay equal to it. */
+#bottom-right-panels {
   position: absolute;
   bottom: 20px;
   right: 20px;
-  background: rgba(80, 80, 80, 0.9);
-  border-radius: 4px;
-  box-shadow: 0 0 15px rgba(0, 0, 0, 0.2);
   z-index: 1000;
-  width: 400px;
-  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
 }
 
-#temporal-plot-head {
+.map-panel {
+  width: 400px;
+  background: #1b1f24;
+  border-radius: 4px;
+  box-shadow: 0 0 15px rgba(0, 0, 0, 0.35);
+  overflow: hidden;
+  color: #e6e6e6;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+/* Explicit, because a flex item's display is easy to override by accident. */
+.map-panel[hidden] {
+  display: none;
+}
+
+.map-panel-head {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: 8px;
   padding: 6px 6px 6px 10px;
 }
 
-#temporal-plot-title {
+.map-panel-title {
+  flex: 1;
   font-size: 12px;
   font-weight: 600;
   color: #eee;
 }
 
-#temporal-plot-toggle {
+.map-panel-head > button[aria-expanded] {
   flex: none;
   width: 22px;
   height: 22px;
@@ -303,202 +322,38 @@
   cursor: pointer;
 }
 
-#temporal-plot-toggle:hover {
+.map-panel-head > button[aria-expanded]:hover {
   background: rgba(255, 255, 255, 0.12);
 }
 
-#temporal-plot-toggle:focus-visible {
-  outline: 2px solid #1a73e8;
-  outline-offset: 1px;
-}
-
-/* Body holds the Chart.js canvas; needs an explicit height so the chart
-   (maintainAspectRatio:false) has a box to fill. */
-#temporal-plot-body {
-  position: relative;
-  height: 190px;
-  padding: 0 10px 10px;
-}
-
-/* Collapsed: only the header bar shows, and the panel shrinks to its width. */
-#temporal-plot-container.collapsed {
-  width: auto;
-}
-
-#temporal-plot-container.collapsed #temporal-plot-body {
-  display: none;
-}
-
-/* ── OSM street-coverage panel (top-left, below back link) ─────
-   Dark surface (dataviz #1b1f24): the covered green and uncovered slate both
-   clear 3:1 against it, fixing the old gray-on-gray legibility problem. */
-#street-coverage-container {
-  position: absolute;
-  top: 56px;
-  left: 10px;
-  width: 300px;
-  background: #1b1f24;
-  color: #e6e6e6;
-  border-radius: 4px;
-  padding: 10px;
-  box-shadow: 0 0 15px rgba(0, 0, 0, 0.35);
-  z-index: 1000;
-  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
-  display: none;
-}
-
-#street-coverage-header {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  font-size: 14px;
-}
-
-.street-toggle {
-  font-size: 12px;
-  color: #c3c2b7;
-  cursor: pointer;
-}
-
-.street-toggle input {
-  vertical-align: middle;
-  margin-right: 3px;
-}
-
-#street-coverage-headline {
-  margin: 6px 0;
-  font-size: 12px;
-  line-height: 1.4;
-  color: #d6d6d0;
-  text-wrap: balance; /* no widowed last word in the headline sentence */
-}
-
-.street-headline-pct {
-  font-size: 18px;
-  font-weight: 700;
-  color: #fff;
-}
-
-.street-headline-sub {
-  display: block;
-  color: #a9a9a4;
-  font-size: 11px;
-}
-
-/* Panel section rhythm: a hairline above each grouped block. */
-.street-panel-section {
-  padding-top: 8px;
-  border-top: 1px solid #2b3138;
-}
-
-/* View-mode segmented control + the layer checkboxes, one grouped block */
-.street-controls {
-  margin: 8px 0 6px;
-}
-
-/* All three checkboxes live on one row (wrapping on narrow panels) so the
-   layer switches read as one group rather than being scattered around the
-   panel. */
-.street-toggles {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 2px 12px;
-}
-
-.street-mode {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  margin-bottom: 6px;
-}
-
-.street-mode-label {
-  font-size: 11px;
-  color: #a9a9a4;
-  margin-right: 2px;
-}
-
-.street-mode-btn {
-  flex: 1;
-  font: inherit;
-  font-size: 11px;
-  color: #d6d6d0;
-  background: #2b3138;
-  border: 1px solid #3a4149;
-  border-radius: 3px;
-  padding: 3px 6px;
-  cursor: pointer;
-}
-
-.street-mode-btn:hover {
-  background: #333a42;
-}
-
-.street-mode-btn.is-active {
-  color: #fff;
-  background: #3987e5;
-  border-color: #3987e5;
-}
-
-.street-mode-btn:focus-visible {
+.map-panel-head > button:focus-visible {
   outline: 2px solid #7fb0f0;
   outline-offset: 1px;
 }
 
-.street-dots-toggle,
-.street-gaps-toggle {
-  display: inline-block;
+.map-panel-body {
+  position: relative;
+  padding: 0 10px 10px;
 }
 
-.street-legend {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px 12px;
-  font-size: 11px;
-  color: #c3c2b7;
-  margin-bottom: 6px;
+/* The capture-date body needs an explicit height so the chart
+   (maintainAspectRatio:false) has a box to fill. The street chart's wrapper
+   is sized inline by street-coverage.js, one row per street type. */
+#temporal-plot-body {
+  height: 190px;
 }
 
-.street-legend i {
-  display: inline-block;
-  width: 12px;
-  height: 12px;
-  margin-right: 4px;
-  vertical-align: middle;
-  border-radius: 2px;
+#street-chart-wrap {
+  position: relative;
 }
 
-/* Non-motorized ways are drawn a step thinner on the map (styleStreetByType);
-   the swatch echoes that, since thickness — not hue — is what separates them
-   from the other classes sharing the minor gray. */
-.street-legend i.thin {
-  height: 5px;
-  border-radius: 1px;
+/* Collapsed: only the header bar shows, and the panel shrinks to its width. */
+.map-panel.collapsed {
+  width: auto;
 }
 
-/* Uncovered swatch is drawn dashed to match the map lines. The hue rides in
-   on the chip's inline `color` (set by the swatch helper), so the same chip
-   renders slate normally and red while "Highlight gaps" is on. */
-.street-legend i.dashed {
-  background-image: repeating-linear-gradient(
-    90deg,
-    currentColor 0 3px,
-    transparent 3px 6px
-  );
-  background-color: transparent !important;
-  border: 1px solid currentColor;
-}
-
-#street-chart-head {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  margin-bottom: 2px;
-}
-
-#street-chart-title {
-  font-size: 11px;
-  color: #a9a9a4;
+.map-panel.collapsed .map-panel-body {
+  display: none;
 }
 
 #street-clear-selection {
@@ -516,7 +371,80 @@
   color: #fff;
 }
 
-#street-chart-wrap {
-  position: relative;
-  height: 180px;
+/* ── Street-coverage legend section (issue #104) ────────────────
+   Rendered into the main legend by streetLegendSectionHtml. The colour-by
+   buttons reuse the .gsv-mode-btn pill of the Imagery radiogroup above. */
+/* Two classes, so it out-specifies `.legend .legend-meta`'s grey and margins. */
+.legend .street-headline {
+  margin: 2px 0 6px;
+  color: #333;
+}
+
+.street-headline-pct {
+  font-size: 15px;
+  font-weight: 700;
+}
+
+.street-headline-sub {
+  display: block;
+  color: #666;
+  font-size: 11px;
+}
+
+.street-mode {
+  margin-bottom: 6px;
+}
+
+.street-gaps-toggle {
+  display: block;
+  cursor: pointer;
+}
+
+.street-gaps-toggle input {
+  vertical-align: middle;
+  margin-right: 3px;
+}
+
+.street-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  font-size: 11px;
+  color: #333;
+  margin-top: 6px;
+}
+
+/* Chips are 12px squares with a dark hairline: the covered green (#2fb974)
+   and the gap slate (#9aa3ad) are both about 2.5:1 against the white legend,
+   under WCAG 1.4.11's 3:1 for graphical objects, so the border is what clears
+   it. Out-specifies the generic 18px floating `.legend i` year-swatch rule. */
+.legend .street-chip i {
+  float: none;
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  margin-right: 4px;
+  vertical-align: middle;
+  border-radius: 2px;
+  border: 1px solid rgba(0, 0, 0, 0.55);
+  cursor: default;
+  transition: none;
+}
+
+/* Non-motorized ways are drawn a step thinner on the map (styleStreetByType). */
+.legend .street-chip i.thin {
+  height: 5px;
+  border-radius: 1px;
+}
+
+/* The no-coverage chip is drawn dashed, like the map lines. Its hue rides in
+   on the chip's inline `color`, so the same chip renders slate normally and
+   red while "Highlight gaps" is on; the dark hairline stays for contrast. */
+.legend .street-chip i.dashed {
+  background-image: repeating-linear-gradient(
+    90deg,
+    currentColor 0 3px,
+    transparent 3px 6px
+  );
+  background-color: transparent !important;
 }

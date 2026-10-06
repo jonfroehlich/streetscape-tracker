@@ -1,7 +1,8 @@
-/* exported switchRun, toggleYear, setGsvMode, toggleFlatOnly, setRenderAll, toggleDiffOverlay */
+/* exported switchRun, toggleYear, setGsvMode, toggleFlatOnly, setRenderAll, toggleDiffOverlay, setStreetMode, toggleStreetGaps */
 // (switchRun/toggleYear/setGsvMode/toggleFlatOnly/setRenderAll/toggleDiffOverlay
-// are invoked from onchange/onclick attributes in the HTML this file
-// generates, so ESLint can't see those string references.)
+// and the street section's setStreetMode/toggleStreetGaps are invoked from
+// onchange/onclick attributes in the legend HTML, so ESLint can't see those
+// string references.)
 /**
  * city.js
  * Per-city detail-view logic for Streetscape City Explorer.
@@ -99,6 +100,8 @@ let onMap = new Set();          // markers currently added to the Leaflet map
 let desiredShown = new Set();   // markers that SHOULD be drawn right now
 let renderAllOverride = false;  // user opted out of the cap ("Render all")
 let panoDotsHidden = false;     // streets overlay hid the pano layer
+let streetUi = null;            // StreetUiState (street-coverage.js), or null: no street artifact
+let streetController = null;    // what renderStreetCoverage resolved to, or null
 
 // Mode-scoped caches, rebuilt by rebuildModeCaches() on load and on setGsvMode.
 // "In mode" = markerInMode(): Google-only (default) vs all-GSV; for non-GSV and
@@ -525,6 +528,12 @@ function updateLegend(years) {
       </button>`;
   }
 
+  // ── Section 3c: Street coverage (issue #104) ──────────────
+  // Present once renderStreetCoverage has drawn an overlay. Re-derived from
+  // the reported state on every rebuild, like every other section here, since
+  // the innerHTML swap below would otherwise wipe it.
+  if (streetUi) html += streetLegendSectionHtml(streetUi);
+
   // ── Section 4: Interactive year filter ────────────────────
   if (sortedYears.length > 0) {
     html += `
@@ -556,19 +565,50 @@ function updateLegend(years) {
     });
   }
 
-  // Replacing innerHTML destroys the focused element; if focus was on a
-  // year button, put it back on the same year so keyboard users don't get
-  // dropped to <body> on every toggle.
-  const focusedYear = div.contains(document.activeElement)
-    ? document.activeElement.dataset?.year
-    : null;
+  // Replacing innerHTML destroys the focused element; put focus back on the
+  // equivalent control so keyboard users don't get dropped to <body> on every
+  // toggle (the street section's checkbox and radios rebuild the legend too).
+  const focusSelector = legendFocusSelectorFor(
+    div.contains(document.activeElement) ? document.activeElement : null
+  );
   div.innerHTML = html;
-  if (focusedYear != null) {
-    div.querySelector(`.year-item[data-year="${focusedYear}"]`)?.focus();
-  }
+  if (focusSelector) div.querySelector(focusSelector)?.focus();
 
   // The innerHTML swap above destroyed any previous chart canvas — rebuild.
   rebuildRunHistoryChart();
+}
+
+/**
+ * A selector that finds a legend control's replacement after an innerHTML
+ * rebuild: by id when it has one (e.g. #street-gaps-toggle), else the same
+ * year button, else the same street colour-mode radio.
+ *
+ * @param {?HTMLElement} el - The focused element inside the legend, or null.
+ * @returns {?string} A CSS selector, or null when there is nothing to restore.
+ */
+function legendFocusSelectorFor(el) {
+  if (!el) return null;
+  if (el.id) return `[id="${el.id}"]`;
+  if (el.dataset?.year != null) return `.year-item[data-year="${el.dataset.year}"]`;
+  if (el.dataset?.mode) return `.street-mode-btn[data-mode="${el.dataset.mode}"]`;
+  return null;
+}
+
+/**
+ * Legend radiogroup → street colour mode (street-coverage.js owns the
+ * restyle, and reports back through onChange, which rebuilds the legend).
+ * @param {string} mode - "age" | "coverage" | "type".
+ */
+function setStreetMode(mode) {
+  streetController?.setMode(mode);
+}
+
+/**
+ * Legend checkbox → "Highlight gaps".
+ * @param {boolean} on - The checkbox's new state.
+ */
+function toggleStreetGaps(on) {
+  streetController?.setGaps(on);
 }
 
 /**
@@ -1145,7 +1185,13 @@ function createTemporalPlot(canvas) {
     plugins: [verticalLinePlugin],
   });
   temporalChartGlobal = chart;
-  setupTemporalToggle(chart);
+  setupCollapsiblePanel({
+    containerId: "temporal-plot-container",
+    toggleId: "temporal-plot-toggle",
+    storageKey: "streetscape-temporal-collapsed",
+    what: "capture-date chart",
+    onExpand: () => chart.resize(),
+  });
 
   /** Apply (or toggle off) the date filter for one capture date. */
   function selectFilterDate(date) {
@@ -1222,35 +1268,47 @@ function createTemporalPlot(canvas) {
 }
 
 /**
- * Wire the temporal panel's minimize/expand button. Collapsing hides the chart
- * body so it stops covering the map; the choice persists across runs/reloads in
- * localStorage. Chart.js is resized on expand because it can't measure a
- * display:none parent.
+ * Wire a bottom-right .map-panel's minimize/expand button (the capture-date
+ * chart, and since issue #104 the street-type chart above it). Collapsing
+ * hides the panel body so it stops covering the map; the choice persists
+ * across runs/reloads in localStorage under `storageKey`. `onExpand` exists
+ * because Chart.js can't measure a display:none parent, so a chart has to be
+ * resized when its body comes back.
  *
- * @param {Chart} chart - The temporal Chart.js instance.
+ * @example
+ *   setupCollapsiblePanel({
+ *     containerId: "temporal-plot-container", toggleId: "temporal-plot-toggle",
+ *     storageKey: "streetscape-temporal-collapsed", what: "capture-date chart",
+ *     onExpand: () => chart.resize(),
+ *   });
+ *
+ * @param {Object} opts
+ * @param {string} opts.containerId - The .map-panel element's id.
+ * @param {string} opts.toggleId - The header button's id.
+ * @param {string} opts.storageKey - localStorage key ("1" = collapsed).
+ * @param {string} opts.what - Noun phrase for the button's label ("Minimize <what>").
+ * @param {function(): void} [opts.onExpand] - Called whenever the body is shown.
  */
-function setupTemporalToggle(chart) {
-  const container = document.getElementById("temporal-plot-container");
-  const toggle = document.getElementById("temporal-plot-toggle");
+function setupCollapsiblePanel({ containerId, toggleId, storageKey, what, onExpand }) {
+  const container = document.getElementById(containerId);
+  const toggle = document.getElementById(toggleId);
   if (!container || !toggle) return;
 
-  const KEY = "streetscape-temporal-collapsed";
   const apply = (collapsed) => {
     container.classList.toggle("collapsed", collapsed);
     toggle.setAttribute("aria-expanded", String(!collapsed));
-    toggle.setAttribute("aria-label",
-      collapsed ? "Expand capture-date chart" : "Minimize capture-date chart");
+    toggle.setAttribute("aria-label", `${collapsed ? "Expand" : "Minimize"} ${what}`);
     toggle.textContent = collapsed ? "+" : "–";
-    if (!collapsed) chart.resize();
+    if (!collapsed && onExpand) onExpand();
   };
 
   let collapsed = false;
-  try { collapsed = localStorage.getItem(KEY) === "1"; } catch { /* storage may be blocked */ }
+  try { collapsed = localStorage.getItem(storageKey) === "1"; } catch { /* storage may be blocked */ }
   apply(collapsed);
 
   toggle.addEventListener("click", () => {
     collapsed = !collapsed;
-    try { localStorage.setItem(KEY, collapsed ? "1" : "0"); } catch { /* storage may be blocked */ }
+    try { localStorage.setItem(storageKey, collapsed ? "1" : "0"); } catch { /* storage may be blocked */ }
     apply(collapsed);
   });
 }
@@ -1877,9 +1935,16 @@ async function loadData() {
     // this page has always shown. A broad 'all_public' walk covers a much larger
     // network — different street-km denominator, not a better number for the
     // same thing — so it is selected deliberately, never fallen back to.
-    // The setPanoDotsVisible hook lets the panel show/hide the pano markers (a
-    // coarse show-all/hide-all) so the streets can be read on their own; it goes
-    // through the reconcile model so re-showing respects the mode/year/date/cap.
+    //
+    // The overlay has no panel of its own (issue #104): it renders into the
+    // legend (a "Street coverage" section re-derived from the state reported
+    // through onChange), a top-left layer control (Panoramas + Streets) and the
+    // street-type chart stacked above the capture-date chart. "Panoramas" is a
+    // proxy layer whose add/remove goes through the reconcile model, so
+    // re-showing respects the mode/year/date/cap and hiding stays ≤ cap work.
+    //
+    // Deliberately NOT awaited: an overlay failure must not turn into "Failed
+    // to load city data" for a page that has already rendered.
     const streetwalk = cityIdGlobal
       ? lookupStreetwalk(
           await fetchStreetwalkManifest(),
@@ -1888,13 +1953,32 @@ async function loadData() {
           streetNetworkType
         )
       : null;
+    const panoLayer = panoVisibilityLayer((visible) => {
+      panoDotsHidden = !visible;
+      applyDesired();
+    }).addTo(map); // on the map from the start, so its checkbox starts checked
     renderStreetCoverage(map, targetFile, providerGlobal, {
       streetwalkFile: streetwalk?.coverage_filename,
-      setPanoDotsVisible: (visible) => {
-        panoDotsHidden = !visible;
-        applyDesired();
+      networkType: streetwalk ? streetNetworkType : null,
+      panoLayer,
+      onChange: (state) => {
+        streetUi = state;
+        updateLegend(Object.keys(markersByYear).map(Number));
       },
-    });
+    })
+      .then((controller) => {
+        streetController = controller;
+        if (controller?.chart) {
+          setupCollapsiblePanel({
+            containerId: "street-chart-container",
+            toggleId: "street-chart-toggle",
+            storageKey: "streetscape-street-chart-collapsed",
+            what: "street-type chart",
+            onExpand: () => controller.chart.resize(),
+          });
+        }
+      })
+      .catch((e) => console.warn("Street-coverage overlay failed:", e));
 
   } catch (error) {
     console.error("Error loading or parsing city data:", error);

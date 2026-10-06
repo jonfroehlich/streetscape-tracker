@@ -18,21 +18,28 @@
  * segments flip to an unmissable red while covered ones fade to a whisper —
  * the direct answer to "which streets have no imagery?".
  *
- * The panel also renders a "coverage by street type" stacked bar chart whose
- * covered bars wear each row's type hue with a matching swatch beside the row
- * label — the chart doubles as the type legend. Clicking a chart segment
- * spotlights the matching street segments on the map (all others dim);
- * hovering previews the same. A "Pano dots" toggle hides the pano markers so
- * the streets can be read on their own.
+ * Since issue #104 the overlay has no panel of its own; it renders into the
+ * page's existing chrome, in three places:
+ *
+ *   - the main legend gains a "Street coverage" section (headline, Color-by,
+ *     Highlight gaps, chips) — built by the pure streetLegendSectionHtml from a
+ *     StreetUiState that renderStreetCoverage reports through `onChange`;
+ *   - a top-left Leaflet layer control lists "Panoramas" (a proxy layer, see
+ *     panoVisibilityLayer) and "Streets";
+ *   - a bottom-right "coverage by street type" stacked bar chart, stacked above
+ *     the capture-date chart. Its covered bars wear each row's type hue with a
+ *     matching swatch beside the row label — the chart doubles as the type
+ *     legend. Clicking a chart segment spotlights the matching street segments
+ *     on the map (all others dim); hovering previews the same.
  *
  * The artifact is optional: most cities have no streets file yet, so a missing
- * file is a silent no-op (the rest of the page is unaffected).
+ * file is a silent no-op (no layer, no control, no section, no chart).
  *
  * Color choices are the dataviz skill's validated dark palette (see
  * validate_palette.js): a green/slate presence-absence pair for coverage and
- * the 8-slot categorical theme for street type. The panel is dark so both the
- * covered green and the uncovered slate clear 3:1 against it — fixing the old
- * green-vs-gray and gray-on-gray legibility problems.
+ * the 8-slot categorical theme for street type. The map and the chart panel are
+ * dark, and both the covered green and the uncovered slate clear 3:1 against
+ * them; on the light legend the chips carry a dark hairline border instead.
  *
  * Relies on globals from streetscape-utils.js: STREETSCAPE_DATA_BASE_URL,
  * PROVIDERS, getColor, fetchGzippedJson. Loaded before city.js, which calls
@@ -47,7 +54,7 @@ const STREET_COVERED_NODATE_COLOR = "#2fb974";
 const STREET_COVERED_COLOR = "#2fb974";
 /** Segments with no imagery coverage — slate, drawn dashed. Brightened from
  *  the original #767c85, which sat too close to the dark basemap: gaps are a
- *  finding, not background. Clears 3:1 on both the dark panel and basemap. */
+ *  finding, not background. Clears 3:1 on both the dark chart panel and basemap. */
 const STREET_UNCOVERED_COLOR = "#9aa3ad";
 
 /** Uncovered segments while "Highlight gaps" is on: an unmissable red. Safe
@@ -67,7 +74,8 @@ const STREET_PARTIAL_LOW_COLOR = "#e2f5ea";
  *  from a fully-driven one. Green channel stays monotone across all three. */
 const STREET_PARTIAL_MID_COLOR = "#7ccf9f";
 
-/** Panel surface color; also used as the inter-segment gap color in the chart. */
+/** Chart panel surface (the bottom-right .map-panel stack, city.css); also the
+ *  inter-bar gap colour in the street-type chart, so the two must match. */
 const STREET_PANEL_BG = "#1b1f24";
 
 /**
@@ -118,7 +126,7 @@ function fractionColor(frac) {
  *     thinner in type mode (they are physically narrower ways). Thickness is
  *     the only free channel left: dash already means "uncovered" and opacity
  *     already means "not spotlighted".
- *   - To isolate one specific class, click its bar in the breakdown panel — the
+ *   - To isolate one specific class, click its bar in the street-type chart — the
  *     existing spotlight filters the map by {highway, covered}, which scales to
  *     any number of classes without a single new hue.
  */
@@ -363,7 +371,7 @@ function applyStreetStyles(layer, mode, provider, selection, gapsOnly = false) {
 
 /**
  * Normalize either street-coverage artifact into the single internal shape the
- * styling + panel code consumes, so one renderer serves both:
+ * styling, legend and chart code consumes, so one renderer serves both:
  *
  *   - grid-attribution `_streets.json.gz` (from `analyze`) — already in shape;
  *     binary per-edge `covered`, no fractional signal.
@@ -395,7 +403,7 @@ function normalizeStreetArtifact(fc, kind) {
   const meta = fc.properties && fc.properties.metadata;
   if (meta && meta.totals && kind === "streetwalk") {
     const t = meta.totals;
-    // The panel headline reads `segments`/`covered`; the road-walk totals name
+    // The legend headline reads `segments`/`covered`; the road-walk totals name
     // these `edges`/`edges_any_coverage` (an edge with ≥1 covered sample).
     if (t.segments == null) t.segments = t.edges;
     if (t.covered == null) t.covered = t.edges_any_coverage;
@@ -405,22 +413,199 @@ function normalizeStreetArtifact(fc, kind) {
 }
 
 /**
- * Fetch and render the street-coverage overlay and breakdown panel.
- * Silently returns if no streets artifact exists for this run.
+ * The street section's view state, as city.js holds it between legend
+ * rebuilds. `renderStreetCoverage` reports a fresh copy through
+ * `options.onChange` after every change, and `streetLegendSectionHtml` turns it
+ * back into markup — the legend is rebuilt with innerHTML on every click, so
+ * the section has to be re-derivable from this alone (issue #104).
+ *
+ * @typedef {Object} StreetUiState
+ * @property {"age"|"coverage"|"type"} mode - Current colour mode.
+ * @property {boolean} gapsOnly - "Highlight gaps" toggle.
+ * @property {boolean} hasFractional - Road-walk artifact with per-edge fractions.
+ * @property {string} provider - Registry key of the run being viewed.
+ * @property {string} providerLabel - PROVIDERS[provider].label (escaped by the builder).
+ * @property {?string} networkLabel - streetNetworkLabel(networkType) for a
+ *   manifest walk; null for the derived grid artifact, which declares none.
+ * @property {number} coveredPct - totals.coverage_pct_by_length.
+ * @property {number} covered - totals.covered (aliased from edges_any_coverage).
+ * @property {number} segments - totals.segments (aliased from edges).
+ */
+
+/** The three colour modes, in the order the legend radiogroup lists them. */
+const STREET_MODES = [
+  {
+    mode: "age",
+    label: "Age",
+    title: "Color covered streets by how old their imagery is (same scale as the pano dots)",
+  },
+  {
+    mode: "coverage",
+    label: "Amount",
+    title:
+      "Color covered streets by how much of their length is covered — pale (barely sampled) to full green (driven end to end)",
+  },
+  {
+    mode: "type",
+    label: "Type",
+    title: "Color streets by their OSM classification (motorway, residential, …)",
+  },
+];
+
+/**
+ * One legend chip. Dashed chips paint their stripes and border with
+ * currentColor, so `color` (not background) carries the hue — that is what
+ * lets the "no coverage" chip flip to the gap-highlight red. The swatch is
+ * decorative (the label carries the meaning), hence aria-hidden.
+ * @param {string} background - A CSS background value (colour or gradient).
+ * @param {string} label - Visible chip text.
+ * @param {boolean} [dashed=false] - Draw as the dashed no-coverage line.
+ * @param {boolean} [thin=false] - Draw as a thin line (non-motorized ways).
+ * @returns {string} HTML.
+ */
+function streetChipHtml(background, label, dashed = false, thin = false) {
+  const cls = [dashed ? "dashed" : "", thin ? "thin" : ""].filter(Boolean).join(" ");
+  const style = dashed ? `color:${background}` : `background:${background}`;
+  const clsAttr = cls ? ` class="${cls}"` : "";
+  return `<span class="street-chip"><i${clsAttr} style="${style}" aria-hidden="true"></i>${label}</span>`;
+}
+
+/**
+ * Chip HTML for the current colour mode. Pure: everything it reads is on the
+ * state, so the legend can re-derive it on every rebuild.
+ *
+ *   - coverage: the pale→full ramp on a fractional (road-walk) artifact, the
+ *     solid covered green on the binary grid artifact; plus the gap chip.
+ *   - type: only the gap chip — the street-type chart IS the type legend
+ *     (type-coloured bars with swatched row labels).
+ *   - age: the provider's newest→oldest ramp; plus the gap chip.
+ *
+ * @param {StreetUiState} state
+ * @returns {string} HTML.
+ */
+function streetLegendChipsHtml(state) {
+  const gapColor = state.gapsOnly ? STREET_GAP_HIGHLIGHT_COLOR : STREET_UNCOVERED_COLOR;
+  const gapChip = streetChipHtml(gapColor, "no coverage", true);
+  if (state.mode === "coverage") {
+    if (state.hasFractional) {
+      const stops = [STREET_PARTIAL_LOW_COLOR, STREET_PARTIAL_MID_COLOR, STREET_COVERED_COLOR].join(
+        ","
+      );
+      return streetChipHtml(`linear-gradient(90deg,${stops})`, "partial → full") + gapChip;
+    }
+    return streetChipHtml(STREET_COVERED_COLOR, "covered") + gapChip;
+  }
+  if (state.mode === "type") return gapChip;
+  const stops = [0, 3, 6, 10].map((a) => getColor(a, state.provider)).join(",");
+  return streetChipHtml(`linear-gradient(90deg,${stops})`, "newer → older") + gapChip;
+}
+
+/**
+ * The legend's "Street coverage" section (issue #104): header, headline,
+ * Color-by radiogroup, Highlight-gaps checkbox and the per-mode chips. Pure,
+ * so it is node-testable; city.js inserts it into the legend on every rebuild.
+ *
+ * The headline is stated in the positive — "98.9% of street-km has imagery" —
+ * the same orientation as the coverage numbers everywhere else on the site.
+ * The Color-by group is a radiogroup like the Imagery one directly above it in
+ * the legend: two adjacent same-shaped controls expose the same role.
+ *
+ * @param {StreetUiState} state
+ * @returns {string} HTML, starting with the section divider.
+ */
+function streetLegendSectionHtml(state) {
+  const header = state.networkLabel
+    ? `Street coverage · ${escapeHtml(state.networkLabel)}`
+    : "Street coverage";
+  const buttons = STREET_MODES.map(({ mode, label, title }) => {
+    const on = mode === state.mode;
+    return `
+        <button type="button" class="gsv-mode-btn street-mode-btn${on ? " active" : ""}"
+                role="radio" aria-checked="${on}" data-mode="${mode}"
+                title="${title}"
+                onclick="setStreetMode('${mode}')">${label}</button>`;
+  }).join("");
+  return `
+    <div class="legend-divider"></div>
+    <div id="street-legend-section">
+      <div class="legend-year-header">${header}</div>
+      <p class="legend-meta street-headline">
+        <strong class="street-headline-pct">${state.coveredPct}%</strong>
+        of street-km has ${escapeHtml(state.providerLabel)} imagery
+        <span class="street-headline-sub">(${Number(state.covered).toLocaleString()} of
+        ${Number(state.segments).toLocaleString()} segments covered)</span>
+      </p>
+      <div class="gsv-mode-toggle street-mode" role="radiogroup" aria-label="Color streets by">${buttons}
+      </div>
+      <label class="street-gaps-toggle legend-meta"
+             title="Spotlight the streets with NO imagery in red; everything covered fades back">
+        <input type="checkbox" id="street-gaps-toggle"${state.gapsOnly ? " checked" : ""}
+               onchange="toggleStreetGaps(this.checked)"> Highlight gaps
+      </label>
+      <div class="street-legend" id="street-legend">${streetLegendChipsHtml(state)}</div>
+    </div>`;
+}
+
+/**
+ * A Leaflet layer the layer control can toggle that stands in for the pano
+ * dots. The dots are reconciled individually by city.js (not a LayerGroup), so
+ * this empty group only RELAYS: Leaflet fires `add`/`remove` on it when the
+ * control's checkbox flips, and `setVisible` routes that through the reconcile
+ * model, which is the only path that hides N markers in ≤ RENDER_CAP work.
+ *
+ * @example
+ *   const panoLayer = panoVisibilityLayer((v) => { panoDotsHidden = !v; applyDesired(); })
+ *     .addTo(map); // on the map from the start, so its checkbox starts checked
+ *
+ * @param {function(boolean):void} setVisible - Called with true on add, false on remove.
+ * @returns {L.LayerGroup}
+ */
+function panoVisibilityLayer(setVisible) {
+  const proxy = L.layerGroup();
+  proxy.on("add", () => setVisible(true));
+  proxy.on("remove", () => setVisible(false));
+  return proxy;
+}
+
+/**
+ * What `renderStreetCoverage` resolves to once the overlay exists: the handle
+ * city.js drives from the legend's controls.
+ *
+ * @typedef {Object} StreetCoverageController
+ * @property {L.GeoJSON} layer - The street layer.
+ * @property {L.Control.Layers} layersControl - The top-left layer control.
+ * @property {?Chart} chart - The street-type chart, or null without a DOM.
+ * @property {?{type: string, covered: boolean}} selection - Pinned chart spotlight.
+ * @property {function(): StreetUiState} getState - A copy of the current state.
+ * @property {function(string): void} setMode - Switch colour mode (unknown modes are ignored).
+ * @property {function(boolean): void} setGaps - Toggle "Highlight gaps".
+ * @property {function(?{type: string, covered: boolean}): void} setSelection - Pin/clear a spotlight.
+ */
+
+/**
+ * Fetch and render the street-coverage overlay, its layer control and its
+ * street-type chart. The legend section is NOT built here: this reports state
+ * through `options.onChange` and city.js re-derives the section from it with
+ * `streetLegendSectionHtml` on every legend rebuild (issue #104).
  *
  * Prefers the road-walk (streetwalk) artifact when the caller supplies its
  * filename (via `options.streetwalkFile`, from the manifest); otherwise falls
  * back to deriving the grid-attribution `_streets.json.gz` from the run file.
+ * Resolves null — touching nothing — when no usable artifact exists.
  *
  * @param {L.Map} map - The Leaflet map (pano markers already added).
  * @param {string} dataFile - The active run's CSV filename.
- * @param {string} provider - Provider key ("gsv" | "mapillary").
+ * @param {string} provider - Provider registry key.
  * @param {Object} [options] - Optional hooks from the caller.
  * @param {string} [options.streetwalkFile] - Road-walk coverage artifact filename
  *   (from the streetwalk manifest); when set, render it instead of the grid file.
- * @param {function(boolean):void} [options.setPanoDotsVisible] - Show/hide the
- *   pano dot markers (owned by city.js); enables the "Show pano dots" toggle.
- * @returns {Promise<void>}
+ * @param {?string} [options.networkType] - The walk's OSM network type; named in
+ *   the legend header, and only for a manifest walk (the grid artifact has none).
+ * @param {L.Layer} [options.panoLayer] - The pano-dot proxy (panoVisibilityLayer),
+ *   already on the map; listed in the layer control as "Panoramas".
+ * @param {function(StreetUiState): void} [options.onChange] - Called with a copy of
+ *   the state once the overlay exists and after every change.
+ * @returns {Promise<?StreetCoverageController>}
  */
 async function renderStreetCoverage(map, dataFile, provider, options = {}) {
   const kind = options.streetwalkFile ? "streetwalk" : "grid";
@@ -432,19 +617,19 @@ async function renderStreetCoverage(map, dataFile, provider, options = {}) {
     fc = await fetchGzippedJson(url);
   } catch (e) {
     console.info("No street-coverage artifact for this run (skipping):", e.message);
-    return;
+    return null;
   }
-  if (!fc || !fc.features || !fc.features.length) return;
+  if (!fc || !fc.features || !fc.features.length) return null;
 
   const { meta, hasFractional } = normalizeStreetArtifact(fc, kind);
 
   // Guard against a malformed artifact (partial upload, schema mismatch): the
-  // panel is driven entirely by properties.metadata.{totals,coverage_by_highway},
-  // so bail out of the whole overlay if that block is absent rather than throw
-  // an unhandled rejection from this un-awaited call.
+  // legend section and chart are driven entirely by
+  // properties.metadata.{totals,coverage_by_highway}, so bail out of the whole
+  // overlay if that block is absent rather than throw from this un-awaited call.
   if (!meta || !meta.totals || !meta.coverage_by_highway) {
     console.warn("Street-coverage artifact missing its metadata block (skipping overlay).");
-    return;
+    return null;
   }
 
   // For the fractional (road-walk) artifact the coverage ramp is the payoff, so
@@ -473,210 +658,125 @@ async function renderStreetCoverage(map, dataFile, provider, options = {}) {
     },
   }).addTo(map);
 
-  buildStreetCoveragePanel(map, layer, meta, provider, {
-    ...options,
+  // ── Layer control (top-left) ─────────────────────────────────
+  // Expanded, never collapsed: Leaflet's collapsed control expands on hover,
+  // which is the part keyboard and touch users lose. Created only here, so a
+  // city without a street artifact gets no one-entry control. Panoramas first,
+  // Streets last (DOM order is reading order).
+  const overlays = {};
+  if (options.panoLayer) overlays.Panoramas = options.panoLayer;
+  overlays.Streets = layer;
+  const layersControl = L.control
+    .layers(null, overlays, { position: "topleft", collapsed: false })
+    .addTo(map);
+  const controlEl = layersControl.getContainer();
+  controlEl.setAttribute("role", "group");
+  controlEl.setAttribute("aria-label", "Map layers");
+
+  const totals = meta.totals;
+  const state = {
+    mode: initialMode,
+    gapsOnly: false,
     hasFractional,
-    initialMode,
-  });
+    provider,
+    providerLabel: PROVIDERS[provider]?.label ?? provider,
+    networkLabel:
+      kind === "streetwalk" && options.networkType
+        ? streetNetworkLabel(options.networkType)
+        : null,
+    coveredPct: totals.coverage_pct_by_length,
+    covered: totals.covered,
+    segments: totals.segments,
+  };
+
+  /** Repaint the street layer for the current mode/selection/gaps state. */
+  function repaint() {
+    applyStreetStyles(layer, state.mode, provider, controller.selection, state.gapsOnly);
+  }
+
+  /** Report a copy of the state so city.js can rebuild the legend section. */
+  function emit() {
+    if (typeof options.onChange === "function") options.onChange({ ...state });
+  }
+
+  /** Show the chart's "clear" button only while a spotlight is pinned. */
+  function syncClearButton() {
+    const btn = document.getElementById("street-clear-selection");
+    if (btn) btn.hidden = controller.selection == null;
+  }
+
+  /** @type {StreetCoverageController} */
+  const controller = {
+    layer,
+    layersControl,
+    chart: null,
+    selection: null,
+    getState: () => ({ ...state }),
+    setMode(mode) {
+      if (!STREET_MODES.some((m) => m.mode === mode) || mode === state.mode) return;
+      state.mode = mode;
+      repaint();
+      emit();
+    },
+    setGaps(on) {
+      const next = Boolean(on);
+      if (next === state.gapsOnly) return;
+      state.gapsOnly = next;
+      if (next && controller.selection) {
+        // The gap highlight replaces the spotlight — clear it rather than
+        // leave a pinned chart selection that no longer matches the map.
+        controller.selection = null;
+        syncClearButton();
+        if (controller.chart) paintChartSelection(controller.chart, null);
+      }
+      repaint();
+      emit();
+    },
+    setSelection(next) {
+      controller.selection = next;
+      syncClearButton();
+      repaint();
+    },
+  };
+
+  controller.chart = buildStreetCoverageChart(controller, meta, provider);
+  emit();
+  return controller;
 }
 
 /**
- * Build the top-left panel: headline, view-mode control, layer toggles, a
- * per-mode legend, and a stacked covered-vs-uncovered length bar chart by
- * street type (click a segment to spotlight it on the map).
+ * Build the stacked covered-vs-uncovered length bar chart by street type in
+ * the bottom-right `#street-chart-container` panel, and unhide that panel.
+ * Hovering a bar previews its {type, covered} spotlight on the map; clicking
+ * pins it (the panel's "clear" button unpins).
  *
- * @param {L.Map} map - The map (for the show/hide toggles).
- * @param {L.GeoJSON} layer - The street layer to restyle/toggle.
+ * Returns null without touching anything when the panel is not in the page —
+ * which is what keeps renderStreetCoverage's node tests DOM-free.
+ *
+ * @param {StreetCoverageController} controller - Owns the layer, state and selection.
  * @param {Object} meta - The artifact's `properties.metadata` block.
- * @param {string} provider - Provider key (for the human label).
- * @param {Object} options - Caller hooks (see renderStreetCoverage).
+ * @param {string} provider - Provider key (for the age styler).
+ * @returns {?Chart}
  */
-function buildStreetCoveragePanel(map, layer, meta, provider, options) {
-  const container = document.getElementById("street-coverage-container");
-  if (!container) return;
-  const providerLabel = PROVIDERS[provider]?.label ?? provider;
-  const totals = meta.totals;
+function buildStreetCoverageChart(controller, meta, provider) {
+  const container = document.getElementById("street-chart-container");
+  if (!container) return null;
+  const { layer } = controller;
   const byType = meta.coverage_by_highway;
 
   // Chart rows follow the canonical class hierarchy, the same order the
   // artifact writes coverage_by_highway in — one order everywhere.
   const types = orderedStreetTypes(byType);
-
-  // Shared view state, mutated by the controls below. The road-walk artifact
-  // opens on the fractional coverage ramp; the grid artifact on the age scale.
-  const hasFractional = Boolean(options.hasFractional);
-  let mode = options.initialMode || "age";
-  let selection = null; // {type, covered} spotlight, or null
-  let gapsOnly = false; // "Highlight gaps" toggle
-
-  // Stated in the positive — "98.9% of street-km has imagery", not "1.1% has
-  // none" — and the same orientation for every provider, so this number reads
-  // the same way as the coverage percentages everywhere else on the site (the
-  // overview popup, streets.html). `coverage_pct_by_length` is what both
-  // artifacts measure; `uncovered_pct_by_length` is only its complement.
-  const coveredPct = totals.coverage_pct_by_length;
-  container.innerHTML = `
-    <div id="street-coverage-header">
-      <strong>Street coverage</strong>
-    </div>
-    <p id="street-coverage-headline">
-      <span class="street-headline-pct">${coveredPct}%</span>
-      <span class="street-headline-text">of street-km
-      has ${providerLabel} imagery</span>
-      <span class="street-headline-sub">
-        (${totals.covered.toLocaleString()} of
-        ${totals.segments.toLocaleString()} segments covered)
-      </span>
-    </p>
-    <div class="street-controls street-panel-section">
-      <div class="street-mode" role="group" aria-label="Color streets by">
-        <span class="street-mode-label">Color by</span>
-        <button type="button" class="street-mode-btn is-active" data-mode="age" aria-pressed="true"
-                title="Color covered streets by how old their imagery is (same scale as the pano dots)">Age</button>
-        <button type="button" class="street-mode-btn" data-mode="coverage" aria-pressed="false"
-                title="Color covered streets by how much of their length is covered — pale (barely sampled) to full green (driven end to end)">Amount</button>
-        <button type="button" class="street-mode-btn" data-mode="type" aria-pressed="false"
-                title="Color streets by their OSM classification (motorway, residential, …)">Type</button>
-      </div>
-      <div class="street-toggles">
-        <label class="street-toggle" title="Show or hide the street lines">
-          <input type="checkbox" id="street-layer-toggle" checked> Streets
-        </label>
-        <label class="street-toggle street-dots-toggle" title="Show or hide the panorama dot markers">
-          <input type="checkbox" id="street-dots-toggle" checked> Pano dots
-        </label>
-        <label class="street-toggle street-gaps-toggle"
-               title="Spotlight the streets with NO imagery in red; everything covered fades back">
-          <input type="checkbox" id="street-gaps-toggle"> Highlight gaps
-        </label>
-      </div>
-    </div>
-    <div class="street-legend" id="street-legend"></div>
-    <div id="street-chart-head">
-      <span id="street-chart-title">Coverage by street type (km)</span>
-      <button type="button" id="street-clear-selection" hidden>✕ clear</button>
-    </div>
-    <div id="street-chart-wrap"><canvas id="street-coverage-chart"></canvas></div>
-  `;
-  container.style.display = "block";
-
-  const legendEl = document.getElementById("street-legend");
-
-  // ── Legend (rebuilt per mode) ──────────────────────────────────
-  // Dashed chips paint their stripes/border with currentColor, so `color`
-  // (not background) carries the hue — that lets the "no coverage" chip flip
-  // to the gap-highlight red when the gaps toggle is on.
-  const swatch = (color, label, dashed = false, thin = false) => {
-    const cls = [dashed ? "dashed" : "", thin ? "thin" : ""].filter(Boolean).join(" ");
-    const style = dashed ? `color:${color}` : `background:${color}`;
-    return `<span><i class="${cls}" style="${style}"></i>${label}</span>`;
-  };
-
-  function renderLegend() {
-    const gapColor = gapsOnly ? STREET_GAP_HIGHLIGHT_COLOR : STREET_UNCOVERED_COLOR;
-    const gapChip = swatch(gapColor, "no coverage", true);
-    if (mode === "coverage") {
-      if (hasFractional) {
-        // Fractional (road-walk): a pale→full green ramp chip plus uncovered.
-        const stops =
-          [STREET_PARTIAL_LOW_COLOR, STREET_PARTIAL_MID_COLOR, STREET_COVERED_COLOR].join(",");
-        legendEl.innerHTML =
-          `<span><i style="background:linear-gradient(90deg,${stops})"></i>partial → full</span>` +
-          gapChip;
-      } else {
-        legendEl.innerHTML = swatch(STREET_COVERED_COLOR, "covered") + gapChip;
-      }
-    } else if (mode === "type") {
-      // The chart below IS the type legend (type-colored bars + swatched row
-      // labels), so the map legend only needs the one style the chart rows
-      // can't show: the dashed no-coverage line.
-      legendEl.innerHTML = gapChip;
-    } else {
-      // Age: a small newest→oldest gradient chip plus the uncovered swatch.
-      const stops = [0, 3, 6, 10].map((a) => getColor(a, provider)).join(",");
-      legendEl.innerHTML =
-        `<span><i style="background:linear-gradient(90deg,${stops})"></i>newer → older</span>` +
-        gapChip;
-    }
-  }
-
-  /** Repaint the street layer for the current mode/selection/gaps state. */
-  function repaint() {
-    applyStreetStyles(layer, mode, provider, selection, gapsOnly);
-  }
-
-  // ── View-mode buttons ──────────────────────────────────────────
-  const modeButtons = Array.from(container.querySelectorAll(".street-mode-btn"));
-  // Sync the active button to the initial mode (the HTML hardcodes Age active).
-  modeButtons.forEach((b) => {
-    const active = b.dataset.mode === mode;
-    b.classList.toggle("is-active", active);
-    b.setAttribute("aria-pressed", String(active));
-  });
-  modeButtons.forEach((btn) => {
-    btn.addEventListener("click", () => {
-      mode = btn.dataset.mode;
-      modeButtons.forEach((b) => {
-        const active = b === btn;
-        b.classList.toggle("is-active", active);
-        b.setAttribute("aria-pressed", String(active));
-      });
-      renderLegend();
-      repaint();
-    });
-  });
-
-  // ── Layer / pano-dot / gaps toggles ────────────────────────────
-  document.getElementById("street-layer-toggle").addEventListener("change", (e) => {
-    if (e.target.checked) layer.addTo(map);
-    else map.removeLayer(layer);
-  });
-
-  const dotsToggle = document.getElementById("street-dots-toggle");
-  if (typeof options.setPanoDotsVisible === "function") {
-    dotsToggle.addEventListener("change", (e) => {
-      options.setPanoDotsVisible(e.target.checked);
-    });
-  } else {
-    // No hook wired up (e.g. tests): hide the control rather than dangle it.
-    dotsToggle.closest(".street-dots-toggle").style.display = "none";
-  }
-
-  document.getElementById("street-gaps-toggle").addEventListener("change", (e) => {
-    gapsOnly = e.target.checked;
-    if (gapsOnly && selection) {
-      // The gap highlight replaces the spotlight — clear it rather than
-      // leave a pinned chart selection that no longer matches the map.
-      selection = null;
-      clearBtn.hidden = true;
-      paintChartSelection(chart, null);
-    }
-    renderLegend();
-    repaint();
-  });
-
-  // ── Selection plumbing ─────────────────────────────────────────
-  const clearBtn = document.getElementById("street-clear-selection");
-  function setSelection(next) {
-    selection = next;
-    clearBtn.hidden = next == null;
-    repaint();
-  }
-  clearBtn.addEventListener("click", () => {
-    setSelection(null);
-    paintChartSelection(chart, null);
-  });
-
-  renderLegend();
-
-  // ── Stacked bar chart ──────────────────────────────────────────
   const coveredKm = types.map((t) => byType[t].length_km_covered);
   const uncoveredKm = types.map((t) => byType[t].length_km - byType[t].length_km_covered);
 
+  // Chart.js cannot measure a `hidden` parent, so unhide before constructing.
+  container.hidden = false;
+
   // Size the chart to fit one labeled row per street type (Chart.js otherwise
   // auto-skips y labels once rows get short).
-  document.getElementById("street-chart-wrap").style.height =
-    `${Math.max(120, types.length * 30 + 44)}px`;
+  const wrap = document.getElementById("street-chart-wrap");
+  wrap.style.height = `${Math.max(120, types.length * 30 + 44)}px`;
 
   const chart = new Chart(document.getElementById("street-coverage-chart"), {
     type: "bar",
@@ -686,8 +786,7 @@ function buildStreetCoveragePanel(map, layer, meta, provider, options) {
         {
           // Covered length wears each row's TYPE hue (with a matching swatch
           // beside the row label, via streetTypeSwatchPlugin) — the chart is
-          // its own legend, replacing the old separate Covered/No-coverage
-          // Chart.js legend that duplicated the map chips.
+          // its own type legend.
           label: "Covered",
           data: coveredKm,
           backgroundColor: types.map((t) => streetTypeColor(t)),
@@ -714,18 +813,19 @@ function buildStreetCoveragePanel(map, layer, meta, provider, options) {
       onHover: (evt, elements) => {
         evt.native.target.style.cursor = elements.length ? "pointer" : "default";
         // Preview only when nothing is pinned and the gaps view isn't on.
-        if (selection || gapsOnly) return;
+        const { mode, gapsOnly } = controller.getState();
+        if (controller.selection || gapsOnly) return;
         const hovered = elements.length ? selectionFor(elements[0]) : null;
         applyStreetStyles(layer, mode, provider, hovered);
       },
       onClick: (evt, elements) => {
-        if (gapsOnly || !elements.length) return;
+        if (controller.getState().gapsOnly || !elements.length) return;
         const clicked = selectionFor(elements[0]);
         if (!clicked) return; // zero-length segment
-        const same =
-          selection && selection.type === clicked.type && selection.covered === clicked.covered;
-        setSelection(same ? null : clicked);
-        paintChartSelection(chart, selection);
+        const sel = controller.selection;
+        const same = sel && sel.type === clicked.type && sel.covered === clicked.covered;
+        controller.setSelection(same ? null : clicked);
+        paintChartSelection(chart, controller.selection);
       },
       scales: {
         x: {
@@ -763,8 +863,14 @@ function buildStreetCoveragePanel(map, layer, meta, provider, options) {
 
   // Reset the map spotlight when the pointer leaves the chart (unless pinned
   // or the gaps view owns the styling).
-  document.getElementById("street-chart-wrap").addEventListener("mouseleave", () => {
-    if (!selection && !gapsOnly) applyStreetStyles(layer, mode, provider, null);
+  wrap.addEventListener("mouseleave", () => {
+    const { mode, gapsOnly } = controller.getState();
+    if (!controller.selection && !gapsOnly) applyStreetStyles(layer, mode, provider, null);
+  });
+
+  document.getElementById("street-clear-selection").addEventListener("click", () => {
+    controller.setSelection(null);
+    paintChartSelection(chart, null);
   });
 
   /**
@@ -779,6 +885,8 @@ function buildStreetCoveragePanel(map, layer, meta, provider, options) {
     if (!value) return null;
     return { type, covered };
   }
+
+  return chart;
 }
 
 /**
@@ -933,11 +1041,14 @@ const streetTypeSwatchPlugin = {
 
 // Node/CommonJS export shim for the unit tests (issue #123). This is a no-op
 // in the browser, where these symbols are plain globals loaded via <script>.
-// renderStreetCoverage/buildStreetCoveragePanel need Leaflet + DOM, so only the
-// pure helpers are unit-tested.
+// renderStreetCoverage is tested against Leaflet stubs; its chart builder needs
+// a DOM + Chart.js and returns early without one.
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     streetsUrlForDataFile,
+    streetLegendChipsHtml,
+    streetLegendSectionHtml,
+    panoVisibilityLayer,
     styleStreetFeature,
     styleStreetByCoverage,
     styleStreetByType,
