@@ -49,16 +49,46 @@ function captureHistoryYears(summary) {
 }
 
 /**
- * Bar-chart series for the year histogram, gap-filled through `currentYear`.
+ * The last year the chart's gap-fill may run through: the HARVEST's year.
+ *
+ * A harvest is a one-time census as of its harvest date, so a year after it
+ * was never observed -- a zero bar there would claim "Google did not drive
+ * here" about a year nobody looked at. The viewer's clock is therefore NOT
+ * the end of the range (it is still what bars are aged against).
+ * Falls back to `currentYear` only when the summary carries no readable
+ * harvest date, and never ends before the newest year with imagery, so a bar
+ * the summary does hold is never cut off.
+ *
+ * @param {?Object} summary - A capture-history summary JSON.
+ * @param {number} currentYear - The viewer's year; the fallback end.
+ * @returns {number} The inclusive last year of the filled range.
+ *
+ * @example
+ *   captureHistoryEndYear({ harvest: { harvest_date: "2026-04-10" },
+ *     histogram_of_capture_dates_by_year: { 2009: 1 } }, 2028);
+ *   // 2026
+ */
+function captureHistoryEndYear(summary, currentYear) {
+  const harvestYear = Number(String(summary?.harvest?.harvest_date ?? "").slice(0, 4));
+  const end = Number.isInteger(harvestYear) && harvestYear > 0 ? harvestYear : currentYear;
+  const years = captureHistoryYears(summary);
+  return years.length > 0 ? Math.max(end, years[years.length - 1]) : end;
+}
+
+/**
+ * Bar-chart series for the year histogram, gap-filled through the HARVEST year.
  *
  * A year with no imagery renders as a zero bar rather than being skipped: a
  * year Google did not drive the city is information, not missing data.
+ * The fill stops at the harvest's year (captureHistoryEndYear), never the
+ * viewer's: a year after the harvest was not observed, so it gets no bar.
  * Each bar is coloured by its AGE (currentYear - year) on the provider's
  * ramp, the same encoding the map's markers use.
  *
  * @param {?Object} summary - A capture-history summary JSON.
  * @param {string} provider - Provider key, for the colour ramp.
- * @param {number} currentYear - Last year of the filled range.
+ * @param {number} currentYear - The viewer's year: what bars are aged
+ *   against, and the fill's end only when the harvest date is unreadable.
  * @returns {{labels: string[], counts: number[], colors: string[]}}
  *   Parallel arrays, empty when the summary has no years.
  */
@@ -66,7 +96,10 @@ function captureHistoryBars(summary, provider, currentYear) {
   if (captureHistoryYears(summary).length === 0) {
     return { labels: [], counts: [], colors: [] };
   }
-  const filled = buildFilledHistogram(summary.histogram_of_capture_dates_by_year, currentYear);
+  const filled = buildFilledHistogram(
+    summary.histogram_of_capture_dates_by_year,
+    captureHistoryEndYear(summary, currentYear)
+  );
   const years = Object.keys(filled)
     .map(Number)
     .sort((a, b) => a - b);
@@ -137,7 +170,7 @@ function captureHistoryLegendHtml(summary, provider) {
   const dropped = panos.implausible_dates_dropped ?? 0;
   if (dropped > 0) {
     html += `
-      <p class="legend-meta" style="margin:4px 0 0">${escapeHtml(pluralCount(dropped, "capture date", "capture dates"))} left out as implausible (before such imagery existed, or after the harvest).</p>`;
+      <p class="legend-meta" style="margin:4px 0 0">${escapeHtml(pluralCount(dropped, "capture date", "capture dates"))} left out as implausible or unreadable (before such imagery existed, after the harvest, or not a valid date).</p>`;
   }
   return html;
 }
@@ -189,6 +222,7 @@ if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     CAPTURE_HISTORY_CANVAS_ID,
     captureHistoryYears,
+    captureHistoryEndYear,
     captureHistoryBars,
     captureHistoryLegendHtml,
     rebuildCaptureHistoryChart,

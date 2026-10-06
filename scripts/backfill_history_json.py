@@ -24,6 +24,11 @@ Dry run by default. Every harvest row is reported as one of:
   * missing CSV -- the cataloged CSV is not in --data-dir; reported, never
     guessed at, and the script then exits 1.
 
+A --data-dir that is not a directory, or a catalog that does not exist, is
+refused with exit 2 before anything is opened: `db.connect` would otherwise
+create an empty catalog and the script would report "0 rows", which reads as
+"no harvests, nothing to do" (#436 review).
+
 Then run `python -m streetscape_metadata_tracker.scheduler regenerate-aggregate
 --publish` to surface the summaries on the site.
 
@@ -120,6 +125,20 @@ def main(argv=None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     db_path = args.db_path or db.get_default_db_path(args.data_dir)
+    # Refuse a missing --data-dir or catalog BEFORE db.connect, which would
+    # create both (directory and a fresh empty schema) and then report
+    # "0 rows" -- the exact output the deploy note reads as "no harvests,
+    # nothing to do". A mistyped prod path must fail loudly, and a dry run
+    # must never write a file.
+    if not os.path.isdir(args.data_dir):
+        print(f"Refusing: --data-dir {args.data_dir!r} is not a directory.", file=sys.stderr)
+        return 2
+    if not os.path.isfile(db_path):
+        print(
+            f"Refusing: no catalog at {db_path!r} (wrong --data-dir or --db-path?).",
+            file=sys.stderr,
+        )
+        return 2
     conn = db.connect(db_path)
     try:
         city_id = None

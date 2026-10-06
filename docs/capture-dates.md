@@ -103,6 +103,7 @@ The floor is the provider's (2007-01-01 for gsv), and the ceiling is the **harve
 `dated_unique_panos` is not called because it needs a run's `status` column; the third-party exclusion it applies by copyright is already true here by construction, since the harvester keeps only dated panos and a present date is this endpoint's official-imagery signal.
 The frame is deduplicated by `pano_id` defensively.
 What the guard drops is **published**, as `panos.implausible_dates_dropped`, never silent — an undocumented endpoint is exactly where a sentinel date would arrive.
+That count includes dates the loader could not parse (coerced to NaT, which the mask rejects), so it means "implausible or unreadable", not only "out of range".
 The harvest CSV is never rewritten; its one reader is `fileutils.load_history_csv_file`, which pins `format="ISO8601"` with `errors="coerce"` for the #226 reason above.
 A harvest that predates the summary gains one from `scripts/backfill_history_json.py` ([`operations.md`](operations.md)); the aggregate reads summaries and never builds them.
 Still deferred (issue #109): a per-pano map layer of historical panos, harvest-to-harvest diffs, and an overview metric.

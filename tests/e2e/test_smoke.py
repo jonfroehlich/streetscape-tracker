@@ -389,6 +389,47 @@ def test_city_page_shows_the_harvested_capture_history(page: Page, base_url):
     assert errors == []
 
 
+def test_capture_history_chart_is_destroyed_on_every_legend_repaint(page: Page, base_url):
+    """Repainting the legend must not leak Chart.js instances (#436 review).
+
+    updateLegend swaps the legend's innerHTML on every map click and year
+    toggle; without `previousChart?.destroy()` each repaint strands a Chart
+    holding a detached canvas.
+    """
+    errors = _capture_errors(page)
+    page.goto(f"{base_url}/city.html?file={ALPHA_LATEST}")
+    expect(page.locator("#capture-history-chart")).to_be_visible()
+
+    count_js = "Object.keys(Chart.instances).length"
+    before = page.evaluate(count_js)
+    for _ in range(5):
+        page.evaluate("updateLegend(Object.keys(markersByYear).map(Number))")
+    assert page.evaluate(count_js) == before
+    assert page.evaluate(
+        "Object.values(Chart.instances).every((c) => document.body.contains(c.canvas))"
+    )
+    assert errors == []
+
+
+def test_capture_history_chart_ends_at_the_harvest_year_not_the_viewers(page: Page, base_url):
+    """Viewed in 2028, a 2026 harvest's chart still ends at 2026 (#436 review).
+
+    A year after the harvest was never observed, so it gets no (zero) bar.
+    """
+    page.clock.set_fixed_time("2028-06-01T12:00:00Z")
+    errors = _capture_errors(page)
+    page.goto(f"{base_url}/city.html?file={ALPHA_LATEST}")
+    expect(page.locator("#capture-history-chart")).to_be_visible()
+
+    labels = page.evaluate(
+        "Chart.getChart(document.getElementById('capture-history-chart')).data.labels"
+    )
+    assert page.evaluate("new Date().getFullYear()") == 2028  # the clock took
+    assert labels[0] == "2009"
+    assert labels[-1] == "2026", labels
+    assert errors == []
+
+
 def test_city_page_shows_no_capture_history_for_an_unharvested_city(page: Page, base_url):
     """No harvest, no section -- and no fetch at all, so no 404 to log."""
     errors = _capture_errors(page)

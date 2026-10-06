@@ -379,3 +379,29 @@ def test_backfill_exits_zero_when_every_csv_is_present(conn, data_dir):
     result = _run_backfill(data_dir, "--execute", "--city", city_id)
     assert result.returncode == 0, result.stdout + result.stderr
     assert os.path.exists(_history_json_filename(path))
+
+
+def test_backfill_refuses_a_missing_data_dir_and_creates_nothing(tmp_path):
+    """A mistyped --data-dir must not read as "0 rows, nothing to do" (#436 review)."""
+    missing = tmp_path / "typo" / "data"
+    result = _run_backfill(str(missing))
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "Refusing" in result.stderr
+    assert "0 rows" not in result.stdout
+    assert not (tmp_path / "typo").exists(), "a refused dry run must create nothing"
+
+
+def test_backfill_refuses_a_data_dir_with_no_catalog_and_creates_none(data_dir):
+    """An existing directory with no catalog (the code checkout's ./data) is refused too."""
+    result = _run_backfill(data_dir)
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "no catalog" in result.stderr
+    assert "0 rows" not in result.stdout
+    assert os.listdir(data_dir) == [], "no empty catalog may be left behind"
+
+
+def test_backfill_reports_zero_rows_for_a_real_catalog_with_no_harvests(conn, data_dir):
+    """The refusal is about a MISSING catalog; an empty-of-harvests one still answers 0."""
+    result = _run_backfill(data_dir)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "0 rows: 0 would write, 0 up to date, 0 missing CSV" in result.stdout

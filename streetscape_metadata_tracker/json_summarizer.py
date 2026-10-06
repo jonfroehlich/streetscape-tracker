@@ -678,6 +678,9 @@ def generate_history_summary_as_json(
     What the mask drops is published as ``implausible_dates_dropped``, never
     silently: an undocumented endpoint is exactly where a sentinel date would
     arrive.
+    That count also includes dates the loader could not parse (coerced to NaT,
+    which the mask rejects), so it reads "implausible OR unreadable", never
+    only "out of range" -- the city page words it that way.
 
     Args:
         csv_gz_path: the harvest's `.csv.gz` path; the summary is its sibling.

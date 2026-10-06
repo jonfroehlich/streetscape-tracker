@@ -428,6 +428,10 @@ The helpers live in `www/js/capture-history.js` (pure, with a Node export shim, 
 - **The caveat is shown verbatim** from the summary's `source.caveat`, whose wording lives once, in `json_summarizer.CAPTURE_HISTORY_CAVEAT` — the growth-screen rule above.
 - **Dates are rendered as the JSON's ISO strings.** Nothing is parsed with `new Date()`, which reads a bare date as UTC midnight and shows it a day early west of Greenwich.
 - **Gap years are zero bars** (`buildFilledHistogram`), coloured by age on the provider's ramp like the map's markers: a year Google did not drive the city is information.
+  **The fill ends at the HARVEST's year, never the viewer's** (`captureHistoryEndYear`): a harvest is a census as of its date, so a later year was never observed, and a zero bar there would assert an absence nobody saw.
+  Age colouring still reads the viewer's clock.
 - **The `<details>` table is the assistive-technology path** to the chart's numbers, and the canvas carries `role="img"` with a label naming the date span.
   The table has its own class, not `.legend-stats`: that class names the overview table, and a second match would make every locator for THE stats table ambiguous.
-- **What the guard dropped is shown**, as "N capture dates left out as implausible", only when the summary's `implausible_dates_dropped` is positive.
+- **What the guard dropped is shown**, as "N capture dates left out as implausible or unreadable", only when the summary's `implausible_dates_dropped` is positive.
+  "Unreadable" because the count includes dates the loader coerced to NaT, which the mask rejects too.
+- **The summary fetch is started, not awaited, where the record is found**, and awaited just before the first full legend paint, so it overlaps the run's metadata and CSV instead of adding a serial round trip.

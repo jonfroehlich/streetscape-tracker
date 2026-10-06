@@ -231,6 +231,7 @@ Incidental coverage of a deprecated spelling trains readers to ignore the notice
   a duplicated `pano_id` counts once (no dedup fails it); an empty harvest publishes nulls and empty histograms, never `NaT`; an existing summary is left alone without `force_recreate_file`;
   the harvester script writes the summary after cataloging, run through `_run` with a stubbed harvester (skipping the call fails it);
   `scripts/backfill_history_json.py` runs as a subprocess: a dry run writes nothing and exits 1 for a missing CSV, `--execute` writes once, a second run is "up to date", and `--force` rewrites (executing on a dry run, or ignoring `--force`, fails it);
+  a `--data-dir` that does not exist, or that holds no catalog, is refused with exit 2, prints no `0 rows`, and creates neither the directory nor an empty catalog (removing either refusal fails its test), while a real catalog with no harvests still answers `0 rows` with exit 0;
   and `ParsedHistoryFilename.provider` is `"gsv"`.
 - GSV batch downloader's quota-throttling behavior (OVER_QUERY_LIMIT retry, sub-threshold residual written back as a failure row, over-threshold abort
   — the `fetch_gsv_pano_metadata_async` primitive is monkeypatched to serve responses from memory)
@@ -1326,8 +1327,9 @@ Every assertion above was mutation-checked; the table is in the PR body.
 
 `capture-history.test.js` pins the city page's section helpers under the REAL `buildFilledHistogram` and a `getColor` stub that names the age and provider it was asked for.
 `captureHistoryYears` returns ascending numbers, and `[]` for a missing summary or an empty histogram (its explicit sort is defensive: JS enumerates integer-like keys ascending anyway, so deleting it is an equivalent mutation).
-`captureHistoryBars` gap-fills through the current year with zero bars and colours each by its AGE (2009 at 2026 is `color(17,gsv)`; colouring by index fails it).
-`captureHistoryLegendHtml` is empty without a harvest; otherwise it carries the canvas id, `role="img"`, an `aria-label` naming both dates, one table row per year WITH imagery (4, not the 18 filled bars), the caveat verbatim, and the dropped-dates line only when dates were dropped; a hostile caveat and harvest date are escaped.
+`captureHistoryBars` gap-fills with zero bars through the HARVEST's year, not the viewer's: a 2026 harvest viewed in 2028 ends at 2026 (filling through `currentYear` fails it), and each bar is coloured by its AGE against the viewer's year (2009 in 2028 is `color(19,gsv)`; colouring by index, or by age against the harvest year, fails it).
+`captureHistoryEndYear` falls back to the viewer's year only for a missing or unreadable harvest date, and never ends before the newest year the summary holds.
+`captureHistoryLegendHtml` is empty without a harvest; otherwise it carries the canvas id, `role="img"`, an `aria-label` naming both dates, one table row per year WITH imagery (4, not the 18 filled bars), the caveat verbatim, and the dropped-dates line only when dates were dropped, worded "implausible or unreadable" because the count includes NaT; a hostile caveat and harvest date are escaped.
 `streetscape-utils.test.js` pins `adaptCityRecord.capture_history`: the gsv block's own pointer, null for the same city's Mapillary view (a record-level read fails it), and null — never undefined — on v1 and unharvested records; and that a harvest filename resolves to no provider and is not a valid run.
 The Python half of that last pin is `test_a_history_artifact_is_not_a_run_file_in_either_language` in `tests/test_naming.py`, which runs the JS `RUN_FILENAME_RE` itself (widening its token class to `[a-z_]+` fails it).
 
@@ -1526,6 +1528,7 @@ Alpha City's GSV block points at a six-pano harvest with one impossible 2611 dat
 The integer-column sweep skips the history marker: a harvest is a per-pano census, and `dtypes_for_run_path` would read it with a schema it does not have.
 `test_the_fixture_carries_a_gsv_capture_history_for_the_multi_provider_row` pins the pointer to Alpha's gsv block and nowhere else, with five plausibly dated panos over four years and a newest date that is not 2611 (removing the guard and rebuilding the fixture fails it).
 Three browser tests read it: the section renders with four table rows and no 2611, and fetches the summary exactly once; an unharvested city and Alpha's Mapillary view render no section and request no `_gsv_history_` URL at all, recorded with `page.on("request")` (a fetch derived from the run's name instead of the pointer fails the first; a record-level read fails the second).
+Two more drive the chart itself: five forced `updateLegend` repaints leave `Chart.instances` the same size with every canvas attached (removing `previousChart?.destroy()` fails it), and with the browser clock fixed at 2028 the chart's labels still end at 2026, the fixture's harvest year (passing the wall-clock year as the fill's end fails it).
 
 ## The Mapillary user-activity tool
 

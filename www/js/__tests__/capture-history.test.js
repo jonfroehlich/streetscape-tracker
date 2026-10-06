@@ -24,6 +24,7 @@ global.buildFilledHistogram = require("../streetscape-utils.js").buildFilledHist
 const {
   CAPTURE_HISTORY_CANVAS_ID,
   captureHistoryYears,
+  captureHistoryEndYear,
   captureHistoryBars,
   captureHistoryLegendHtml,
 } = require("../capture-history.js");
@@ -75,20 +76,42 @@ test("captureHistoryYears: [] for a missing summary or an empty histogram", () =
 
 // --- captureHistoryBars ---------------------------------------------------------
 
-test("captureHistoryBars: gap years render as zero bars through currentYear", () => {
-  const bars = captureHistoryBars(fixtureSummary(), "gsv", 2026);
+test("captureHistoryBars: gap years render as zero bars through the HARVEST year", () => {
+  // Viewed in 2028, a 2026 harvest must still end at 2026: 2027 and 2028 were
+  // never observed, and a zero bar there would claim Google did not drive.
+  const bars = captureHistoryBars(fixtureSummary(), "gsv", 2028);
   assert.equal(bars.labels.length, 2026 - 2009 + 1);
   assert.equal(bars.labels[0], "2009");
   assert.equal(bars.labels.at(-1), "2026");
+  assert.ok(!bars.labels.includes("2027") && !bars.labels.includes("2028"));
   assert.equal(bars.counts[bars.labels.indexOf("2010")], 0);
   assert.equal(bars.counts[bars.labels.indexOf("2012")], 2);
   assert.equal(bars.counts.reduce((a, b) => a + b, 0), 5);
 });
 
-test("captureHistoryBars: each bar is coloured by its AGE on the provider's ramp", () => {
-  const bars = captureHistoryBars(fixtureSummary(), "gsv", 2026);
-  assert.equal(bars.colors[bars.labels.indexOf("2009")], "color(17,gsv)");
-  assert.equal(bars.colors[bars.labels.indexOf("2026")], "color(0,gsv)");
+test("captureHistoryBars: each bar is coloured by its AGE against the VIEWER's year", () => {
+  // The fill ends at the harvest year, but age is still read off the clock:
+  // in 2028 a 2026 capture is two years old.
+  const bars = captureHistoryBars(fixtureSummary(), "gsv", 2028);
+  assert.equal(bars.colors[bars.labels.indexOf("2009")], "color(19,gsv)");
+  assert.equal(bars.colors[bars.labels.indexOf("2026")], "color(2,gsv)");
+});
+
+test("captureHistoryEndYear: the harvest year, not the viewer's", () => {
+  assert.equal(captureHistoryEndYear(fixtureSummary(), 2028), 2026);
+});
+
+test("captureHistoryEndYear: falls back to the viewer's year without a readable harvest date", () => {
+  assert.equal(captureHistoryEndYear(fixtureSummary({ harvest: {} }), 2028), 2028);
+  assert.equal(captureHistoryEndYear(fixtureSummary({ harvest: { harvest_date: "n/a" } }), 2028), 2028);
+  assert.equal(captureHistoryEndYear(fixtureSummary({ harvest: undefined }), 2028), 2028);
+});
+
+test("captureHistoryEndYear: never ends before the newest year the summary holds", () => {
+  // The Python guard makes this impossible today; the floor is so a bar the
+  // summary does carry can never be silently cut off the chart.
+  const summary = fixtureSummary({ harvest: { harvest_date: "2020-01-01" } });
+  assert.equal(captureHistoryEndYear(summary, 2028), 2024);
 });
 
 test("captureHistoryBars: empty series when there are no years", () => {
@@ -125,6 +148,9 @@ test("captureHistoryLegendHtml: the caveat is the summary's own, verbatim", () =
 
 test("captureHistoryLegendHtml: the dropped-dates line appears only when dates were dropped", () => {
   assert.match(captureHistoryLegendHtml(fixtureSummary(), "gsv"), /1 capture date left out/);
+  // The count includes dates the loader could not parse (NaT), so the line
+  // must not explain every drop as out of range (#436 review).
+  assert.match(captureHistoryLegendHtml(fixtureSummary(), "gsv"), /implausible or unreadable/);
   const clean = fixtureSummary();
   clean.panos = { ...clean.panos, implausible_dates_dropped: 0 };
   assert.doesNotMatch(captureHistoryLegendHtml(clean, "gsv"), /left out/);

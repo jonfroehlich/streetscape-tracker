@@ -1558,6 +1558,12 @@ async function loadData() {
     providerGlobal = resolvedProvider;
     map.attributionControl.addAttribution(PROVIDERS[providerGlobal].attribution);
 
+    // Issue #109: the harvest summary's fetch is STARTED below and awaited
+    // just before the first full legend paint, so it overlaps the run's
+    // metadata and CSV instead of adding a serial round trip. It resolves to
+    // null (never rejects) for a city with no harvest or a failed fetch.
+    let captureHistoryPromise = Promise.resolve(null);
+
     // Locate this city's run history for the snapshot selector — only the
     // active provider's runs, so the <select> never mixes provider series
     if (rawCities) {
@@ -1574,13 +1580,12 @@ async function loadData() {
       // other provider's view of a harvested one -- fetches nothing (no 404,
       // no console noise). `record` is the record adapted for providerGlobal.
       if (record?.capture_history?.json_file) {
-        try {
-          captureHistoryGlobal = await fetchGzippedJson(
-            STREETSCAPE_DATA_BASE_URL + record.capture_history.json_file);
-        } catch (e) {
+        captureHistoryPromise = fetchGzippedJson(
+          STREETSCAPE_DATA_BASE_URL + record.capture_history.json_file
+        ).catch((e) => {
           console.info("No capture-history summary for this city (skipping):", e.message);
-          captureHistoryGlobal = null;
-        }
+          return null;
+        });
       }
     }
 
@@ -1890,6 +1895,8 @@ async function loadData() {
     totalPanosGlobal = totalInMode;
     applyDesired();
 
+    // Long since settled in practice (it raced the whole CSV stream).
+    captureHistoryGlobal = await captureHistoryPromise;
     updateLegend(Object.keys(markersByYear).map(Number));
 
     createTemporalPlot(document.getElementById("temporal-plot"));
