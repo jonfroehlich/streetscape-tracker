@@ -14,6 +14,7 @@ from datetime import UTC, date, datetime
 
 import pytest
 
+from streetscape_metadata_tracker import city_registration as cr
 from streetscape_metadata_tracker import db
 from streetscape_metadata_tracker import scheduler as _sched
 from streetscape_metadata_tracker.boundary_audit import rect_in_boundary_frac
@@ -188,6 +189,22 @@ def _stub_collection(monkeypatch, conn, *, outcome=None):
     return ran
 
 
+def _due(conn, provider, today=date(2026, 8, 18)):
+    """The city_ids ``provider``'s nightly queue would hold on ``today``."""
+    return [
+        c.city_id
+        for c in db.get_due_cities(
+            conn,
+            today=today,
+            cycle_days=90,
+            grace_days=10,
+            max_consecutive_failures=5,
+            default_membership=_sched.CHANNEL_DEFAULT_MEMBERSHIP[provider],
+            provider=provider,
+        )
+    ]
+
+
 def _assess(tmp_path, **kwargs):
     """Run the command with confirmation pre-answered and publishing off."""
     kwargs.setdefault("assume_yes", True)
@@ -329,7 +346,9 @@ def test_registers_an_unknown_city_with_capped_geometry_and_an_alias(
     city = db.resolve_city(conn, CITY_ID)
     assert city is not None
     assert (city.grid_width_m, city.grid_height_m) == (3892, 4182)
-    assert city.enabled  # so the nightly batch picks up the GSV grid run
+    # Issue #431: an unvetted boundary stays out of the rotation until
+    # `enable-city`, even on the collecting (--yes) path.
+    assert not city.enabled
     # The user's query slug resolves too, so a second invocation never re-geocodes.
     assert db.resolve_city(conn, QUERY).city_id == CITY_ID
     assert _no_geocode["loc"] == 1
@@ -400,6 +419,31 @@ def test_estimate_registers_but_issues_no_provider_request(conn, monkeypatch, tm
     for channel in ASSESS_CHANNELS:
         assert channel in out
     assert "no provider request was issued" in out
+    # Issue #431: registered DISABLED, says so with the one way in, and so the
+    # next night's gsv queue does not hold it.
+    assert not db.resolve_city(conn, CITY_ID).enabled
+    assert cr.enable_hint(CITY_ID) in out
+    assert _due(conn, "gsv") == []
+
+
+def test_an_estimate_registered_city_becomes_due_only_after_enable_city(
+    conn, monkeypatch, tmp_path
+):
+    """
+    The documented operator path end to end (issue #431): `--estimate` leaves
+    nothing due, and `enable-city` is what puts the gsv grid run at the head of
+    the next night. The second half is what keeps the first `== []` from being
+    vacuous -- the same query does see the city once it is enabled.
+    """
+    _stub_collection(monkeypatch, conn)
+
+    _assess(tmp_path, estimate_only=True)
+    assert _due(conn, "gsv") == []
+
+    rc = _sched.cmd_enable_city(_cfg(tmp_path), CITY_ID, opt_in=False)
+
+    assert rc == 0
+    assert _due(conn, "gsv") == [CITY_ID]
 
 
 def test_the_preflight_prices_every_channel_against_todays_remaining_budget(
@@ -799,22 +843,16 @@ def test_the_closing_note_says_which_channels_are_actually_due(conn, monkeypatch
     _assess(tmp_path)
 
     out = capsys.readouterr().out
-    tomorrow = date(2026, 8, 18)
-    due = {
-        p: [
-            c.city_id
-            for c in db.get_due_cities(
-                conn,
-                today=tomorrow,
-                cycle_days=90,
-                grace_days=10,
-                max_consecutive_failures=5,
-                default_membership=_sched.CHANNEL_DEFAULT_MEMBERSHIP[p],
-                provider=p,
-            )
-        ]
-        for p in ("gsv", *ASSESS_CHANNELS)
-    }
+    due = {p: _due(conn, p) for p in ("gsv", *ASSESS_CHANNELS)}
+    # Disabled (#431): nothing is due until enable-city...
+    assert due["gsv"] == []
+    assert all(due[c] == [] for c in ASSESS_CHANNELS)
+    assert "this city is DISABLED" in out
+    assert f"enable-city {CITY_ID}" in out
+    # ...and once it is enabled, gsv alone: the channels collected here have
+    # their clocks started, so the wording below holds in both states.
+    db.set_city_enabled(conn, CITY_ID, True)
+    due = {p: _due(conn, p) for p in ("gsv", *ASSESS_CHANNELS)}
     assert due["gsv"] == [CITY_ID]
     assert all(due[c] == [] for c in ASSESS_CHANNELS)
 
@@ -872,6 +910,9 @@ def test_repeated_failures_leave_the_city_collectable_by_the_nightly_batch(
 
     for _ in range(6):
         _assess(tmp_path)
+    # The city is registered disabled (#431); enabling it is the operator step
+    # that hands it to the nightly batch, which is what this test is about.
+    db.set_city_enabled(conn, CITY_ID, True)
 
     _due_cfg = _cfg(tmp_path)
     due = _sched._collect_due(
@@ -1375,8 +1416,9 @@ def test_production_config_publishes_locally(tmp_path):
 def test_assess_channels_never_includes_the_gsv_grid_run():
     """
     The expensive half stays on the nightly cycle, where the batch deadline and
-    city cap bound it. A newly registered city is enabled with last_success_at
-    NULL, so it leads the next night's stalest-first queue on its own.
+    city cap bound it. A newly registered city is DISABLED until `enable-city`
+    (#431); once enabled, its last_success_at is NULL, so it leads the next
+    night's stalest-first queue on its own.
     """
     assert set(ASSESS_CHANNELS) == {"gsv_streets", "mapillary", "mapillary_streets"}
     # And every assess channel must be a channel the scheduler knows how to run.
@@ -1729,16 +1771,19 @@ def test_a_city_touched_on_any_opt_in_channel_is_not_re_enrolled(
 
 def test_a_nightly_gsv_attempt_between_estimate_and_yes_still_enrols(conn, monkeypatch, tmp_path):
     """
-    The gap round 1 of the review found: `--estimate` registers the city
-    ENABLED, a never-collected city leads gsv's queue, and a 02:00 run between
-    the two commands stamps `last_attempt_at`. An any-channel history gate then
-    read the `--yes` run as a re-assessment — the Montréal/Ottawa failure,
-    through the documented order.
+    The gap round 1 of the review found: a never-collected enabled city leads
+    gsv's queue, so a 02:00 run between `--estimate` and `--yes` stamps
+    `last_attempt_at`. An any-channel history gate then read the `--yes` run as
+    a re-assessment — the Montréal/Ottawa failure. Before #431 `--estimate`
+    alone opened the gap (it registered the city enabled); since then the
+    documented order `--estimate` -> `enable-city` -> a night -> `--yes` still
+    reaches it, so the keying must survive.
     """
     _stub_collection(monkeypatch, conn)
     _screen(monkeypatch, 42)
 
     _assess(tmp_path, estimate_only=True)
+    db.set_city_enabled(conn, CITY_ID, True)
     db.record_attempt(conn, CITY_ID, success=True, provider="gsv")
     _assess(tmp_path)
 
@@ -2000,3 +2045,71 @@ def test_assess_city_passes_the_guard_when_it_spends_no_shared_key(
     with pytest.raises(_PastTheGuard):
         _sched.cmd_assess_city(_cfg(tmp_path), QUERY, today=TODAY, assume_yes=True, **kwargs)
     assert asked == []
+
+
+# --------------------------------------------------------------------------
+# a new city is registered DISABLED (issue #431)
+# --------------------------------------------------------------------------
+
+
+def test_assessing_an_already_disabled_city_prints_the_enable_hint_once(
+    conn, monkeypatch, tmp_path, capsys
+):
+    """
+    Keyed on `not city.enabled`, not `newly_registered`: a frame city
+    (register_frame.py) or an earlier --estimate also left the city disabled,
+    and the second run on an unvetted city must say so too.
+    """
+    db.register_city(conn, **_CITY_ROW, enabled=False)
+    _stub_collection(monkeypatch, conn)
+
+    _assess(tmp_path)
+
+    out = capsys.readouterr().out
+    assert "Already registered" in out
+    assert out.count(cr.enable_hint(CITY_ID)) == 1
+    assert "this city is DISABLED" in out
+
+
+def test_assessing_an_enabled_city_prints_no_enable_hint(conn, monkeypatch, tmp_path, capsys):
+    """Every #431 sentence is conditional on the city being disabled."""
+    db.register_city(conn, **_CITY_ROW)  # the default: enabled
+    _stub_collection(monkeypatch, conn)
+    _screen(monkeypatch, 42)
+
+    _assess(tmp_path)
+
+    out = capsys.readouterr().out
+    assert "Already registered" in out
+    assert cr.enable_hint(CITY_ID) not in out
+    assert "this city is DISABLED" not in out
+    # The opt-in pairs were enrolled, so the timing sentence was printed -- in
+    # its enabled form.
+    assert "arrive with this city's first nightly run," in out
+    assert "first nightly run after" not in out
+
+
+def test_enable_city_after_an_assessment_reports_the_pairs_already_set(
+    conn, monkeypatch, tmp_path, capsys
+):
+    """
+    `assess-city --yes` enrols the opt-in pairs on a city it left disabled
+    (#374, #431); `enable-city` afterwards must compose with that -- report the
+    pairs `already_set`, screen nothing a second time, and flip `enabled`.
+    """
+    _stub_collection(monkeypatch, conn)
+    calls = _screen(monkeypatch, 42)
+    _assess(tmp_path)
+    out = capsys.readouterr().out
+    assert "first nightly run after `enable-city" in out
+    n = len(calls)
+    assert n > 0  # the assessment's own screen, so the equality below is not vacuous
+
+    rc = _sched.cmd_enable_city(_cfg(tmp_path), CITY_ID)
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert out.count("already_set") >= len(OPT_IN)
+    assert db.resolve_city(conn, CITY_ID).enabled is True
+    assert len(calls) == n
+    assert {c: _members(conn).get(c) for c in OPT_IN} == dict.fromkeys(OPT_IN, 1)
