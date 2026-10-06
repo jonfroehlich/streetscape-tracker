@@ -36,7 +36,7 @@ Walk CSVs (dev catalog; every off value is exactly one ULP: 7.1e-15° for latitu
 | Corvallis mapillary/all_public 2026-07-27 | 83,928 | 3,892 (4.6 %) | 31,359 (37.4 %) | 2 |
 | Corvallis gsv/all_public 2026-07-27 | 83,928 | 3,892 (4.6 %) | 31,359 (37.4 %) | 2 |
 
-Across the six files the latitude share runs 4.6 % to 5.6 % (p50 4.6 %) and the longitude share 37.3 % to 38.6 % (p50 37.7 %).
+Across the six files the latitude share runs 4.6 % to 5.6 % (p50 4.6 %) and the longitude share 37.3 % to 38.6 % (p50 37.6 %).
 The issue's "21–22 % of query coordinates" is the pooled share over both columns (0.21 here); the per-column split is the shape worth keeping.
 
 Scoring, default → round-trip loader:

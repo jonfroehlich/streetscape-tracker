@@ -115,11 +115,15 @@ def test_the_committed_record_still_matches_the_writeup():
     for side in ("default", "round_trip"):
         assert f"{seattle['scoring'][side]['length_km_covered']}" in flat
 
+    # Ranges are matched as the whole "min to max" phrase: each end alone also
+    # appears in the per-file table, so a drifted range would still pass.
     summary = record["summary"]
     for dist in ("lat_off_share", "lon_off_share"):
-        for end in ("min", "max"):
-            assert f"{100 * summary[dist][end]:.1f} %" in prose, (dist, end)
-    assert f"{summary['keys_shifted_total']} " in flat
-    for end in ("min", "max"):
-        assert f"{summary['grid_load_slowdown'][end]:.2f}" in flat
+        lo, hi, mid = (100 * summary[dist][k] for k in ("min", "max", "p50"))
+        assert f"{lo:.1f} % to {hi:.1f} % (p50 {mid:.1f} %)" in prose, dist
+        assert f"{lo:.1f}–{hi:.1f} %" in prose, f"the verdict's {dist} range"
+    slow = summary["grid_load_slowdown"]
+    assert f"{slow['min']:.2f}× to {slow['max']:.2f}×" in prose
+    assert f"(p50 {slow['p50']:.2f})" in prose
+    assert f"moved {summary['keys_shifted_total']} sample keys" in prose
     assert str(summary["grid_rows"]) in flat
