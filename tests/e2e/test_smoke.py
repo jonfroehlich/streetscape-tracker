@@ -71,6 +71,11 @@ ZERO_CITY = "zero-city--zerostate--testland_width_100_height_100_step_20_2026-04
 # The published diff detail between Alpha City's two runs (real compute_run_diff
 # output: one pano_added row), fetched by the city page's change overlay.
 ALPHA_DIFF = "alpha-city--alphastate--testland_diff_2026-01-15_to_2026-04-15.csv.gz"
+# Alpha City's harvested capture-history summary (#109), which the aggregate
+# names on Alpha's GSV block only.
+ALPHA_HISTORY_JSON = (
+    "alpha-city--alphastate--testland_width_100_height_100_step_20_gsv_history_2026-04-10.json.gz"
+)
 
 # Substrings of expected third-party console noise to ignore (analytics/CDN),
 # so "console clean" tracks OUR code, not the network environment. The
@@ -347,6 +352,64 @@ def test_city_page_multirun_gsv_renders_chart_and_snapshot_select(page: Page, ba
     expect(select).to_be_visible()
     expect(select.locator("option")).to_have_count(2)
 
+    assert errors == []
+
+
+def _record_requests(page: Page):
+    """Every request URL the page makes, in order."""
+    urls = []
+    page.on("request", lambda req: urls.append(req.url))
+    return urls
+
+
+def test_city_page_shows_the_harvested_capture_history(page: Page, base_url):
+    """Issue #109: the legend's capture-history section, from the summary JSON."""
+    errors = _capture_errors(page)
+    requests = _record_requests(page)
+    page.goto(f"{base_url}/city.html?file={ALPHA_LATEST}")
+
+    canvas = page.locator("#capture-history-chart")
+    expect(canvas).to_be_visible()
+    box = canvas.bounding_box()
+    assert box and box["width"] > 0 and box["height"] > 0
+
+    legend = page.locator(".legend")
+    expect(legend).to_contain_text("across 4 years")
+    expect(legend).to_contain_text("unpublished")  # the caveat, verbatim
+    # The impossible 2611 date was dropped by the summary AND reported.
+    expect(legend).to_contain_text("1 capture date left out")
+
+    # The AT path: the <details> table lists the years WITH imagery.
+    page.locator("details.capture-history-table summary").click()
+    rows = page.locator("table.capture-history-counts tbody tr")
+    expect(rows).to_have_count(4)
+    assert "2611" not in page.locator("table.capture-history-counts").inner_text()
+
+    assert sum(url.endswith(ALPHA_HISTORY_JSON) for url in requests) == 1
+    assert errors == []
+
+
+def test_city_page_shows_no_capture_history_for_an_unharvested_city(page: Page, base_url):
+    """No harvest, no section -- and no fetch at all, so no 404 to log."""
+    errors = _capture_errors(page)
+    requests = _record_requests(page)
+    page.goto(f"{base_url}/city.html?file={ZERO_CITY}")
+    expect(page.locator("table.legend-stats")).to_be_visible()  # page finished
+
+    expect(page.locator("#capture-history-chart")).to_have_count(0)
+    assert not [url for url in requests if "_gsv_history_" in url]
+    assert errors == []
+
+
+def test_capture_history_is_gated_on_the_provider_not_the_city(page: Page, base_url):
+    """Alpha City's Mapillary view: the same city, but not the harvested block."""
+    errors = _capture_errors(page)
+    requests = _record_requests(page)
+    page.goto(f"{base_url}/city.html?file={ALPHA_MAPILLARY_LATEST}")
+    expect(page.locator("table.legend-stats")).to_be_visible()  # page finished
+
+    expect(page.locator("#capture-history-chart")).to_have_count(0)
+    assert not [url for url in requests if "_gsv_history_" in url]
     assert errors == []
 
 

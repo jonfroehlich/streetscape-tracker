@@ -14,6 +14,8 @@ Everything lands in ``tests/e2e/fixture/`` and is tiny enough to commit:
   * ``<city_id>_..._<date>.csv.gz`` + sibling ``.json.gz`` per run
   * ``streetwalks.json.gz``         road-walk manifest (#155), 1 walk
   * ``<city_id>_..._streetwalk_sp15_<date>_coverage.json.gz``
+  * ``<city_id>_..._gsv_history_<date>.csv.gz`` + sibling ``.json.gz``
+                                    a harvested capture history (#109)
   * ``provider_screen.json.gz``     Panoramax growth screen (#316), read by
                                     grid.html since #349
 
@@ -66,16 +68,21 @@ from streetscape_metadata_tracker.diff import (  # noqa: E402
     generate_diff_filename,
     write_diff_detail,
 )
-from streetscape_metadata_tracker.fileutils import load_city_csv_file  # noqa: E402
+from streetscape_metadata_tracker.fileutils import (  # noqa: E402
+    load_city_csv_file,
+    load_history_csv_file,
+)
 from streetscape_metadata_tracker.json_summarizer import (  # noqa: E402
     generate_aggregate_v2,
     generate_city_metadata_summary_as_json,
     generate_driving_plan_summary,
+    generate_history_summary_as_json,
     generate_provider_screen_summary,
     generate_streetwalk_manifest,
 )
 from tests.conftest import (  # noqa: E402
     make_city_df,
+    make_history_df,
     make_kartaview_city_df,
     make_mapillary_city_df,
     make_panoramax_city_df,
@@ -591,6 +598,55 @@ def build():
             grid_origin=(44.00, -121.00),
         )
         _record_real_diff(conn, alpha, r1, r2, date(2026, 1, 15), date(2026, 4, 15))
+
+        # 1b) A harvested GSV capture history (issues #2/#109), and the summary
+        # the city page renders from. On ALPHA because it is the four-provider
+        # city: its Mapillary/KartaView/Panoramax views of the SAME city are
+        # what prove the section is gated on the provider block, not the city.
+        # One impossible date (#213's shape, deliberately) so the plausibility
+        # guard is exercised end to end: the summary must drop it AND report
+        # the drop. The date precedes the latest run, and is irrelevant to the
+        # run series either way -- a harvest is out of band.
+        harvest_date = date(2026, 4, 10)
+        history_name = naming.generate_history_filename(alpha, W, H, STEP, harvest_date) + ".csv.gz"
+        history_path = os.path.join(FIXTURE_DIR, history_name)
+        write_city_csv_gz(
+            make_history_df(
+                [
+                    ("h2009", "2009-06-01", 44.0001, -121.0001),
+                    ("h2012a", "2012-06-01", 44.0002, -121.0002),
+                    ("h2012b", "2012-08-01", 44.0003, -121.0003),
+                    ("h2018", "2018-06-01", 44.0004, -121.0004),
+                    ("h2024", "2024-06-01", 44.0005, -121.0005),
+                    ("hbad", "2611-01-01", 44.0006, -121.0006),
+                ]
+            ),
+            history_path,
+        )
+        harvest_stats = {
+            "grid_points_queried": 36,
+            "api_requests": 36,
+            "started_at": "2026-04-10T01:00:00+00:00",
+            "finished_at": "2026-04-10T01:03:00+00:00",
+        }
+        db.register_history_harvest(
+            conn,
+            city_id=alpha,
+            harvest_date=harvest_date,
+            csv_filename=history_name,
+            unique_panos=6,
+            oldest_capture_date="2009-06-01",
+            newest_capture_date="2611-01-01",  # the raw max, as the harvester records it
+            **harvest_stats,
+        )
+        generate_history_summary_as_json(
+            history_path,
+            load_history_csv_file(history_path),
+            city_id=alpha,
+            harvest_date=harvest_date,
+            force_recreate_file=True,
+            **harvest_stats,
+        )
 
         # ...plus a Mapillary run of the SAME city on the SAME date. This is
         # what makes Alpha City a two-provider city, and until issue #250 the

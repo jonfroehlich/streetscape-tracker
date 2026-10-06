@@ -128,7 +128,7 @@ function captureHistoryLegendHtml(summary, provider) {
       </div>
       <details class="capture-history-table">
         <summary>Counts by year</summary>
-        <table class="legend-stats" aria-label="Harvested panoramas by capture year">
+        <table class="capture-history-counts" aria-label="Harvested panoramas by capture year">
           <thead><tr><th scope="col">Year</th><th scope="col">Panoramas</th></tr></thead>
           <tbody>${rows}</tbody>
         </table>

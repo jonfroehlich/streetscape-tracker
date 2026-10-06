@@ -121,6 +121,32 @@
   outline-offset: 2px;
 }
 
+/* Deliberately NOT .legend-stats: that class names the overview table, and the
+   e2e suite (and any reader) locates THE stats table by it. Same look. */
+.capture-history-counts {
+  border-collapse: collapse;
+  font-size: 12px;
+  width: 100%;
+  color: #333;
+}
+
+.capture-history-counts th,
+.capture-history-counts td {
+  padding: 2px 4px 2px 0;
+  line-height: 1.5;
+  text-align: left;
+}
+
+.capture-history-counts th {
+  color: #666;
+  font-weight: normal;
+}
+
+.capture-history-counts td:last-child,
+.capture-history-counts th:last-child {
+  text-align: right;
+}
+
 .capture-history-caveat {
   font-style: italic;
 }
