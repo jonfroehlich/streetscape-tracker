@@ -30,10 +30,11 @@
    to a 1160px wrap at ANY window width, so a 27" monitor scrolled the default
    sideways beside ~1000px of empty screen. The filters are now docked to the
    window's left edge (below), the content sits left-aligned beside them, and
-   each block is capped at 1640px. Measured live at four providers the widest
-   preset (Kilometres) is 1489px, so that fits with room to spare; the cap
-   exists because the table is `width: 100%`, so on an ultrawide extra width
-   would only stretch every leaf.
+   each block is capped at 1760px. Measured live, the widest preset on any of
+   the three pages is driving.html's Plan (~1640px; the widest streets preset,
+   Kilometres, is 1489px at four providers), so that fits with headroom; the
+   cap exists because the table is `width: 100%`, so on an ultrawide extra
+   width would only stretch every leaf.
    The padding is tighter than the prose pages' because the point of the
    compact page head is to put the table and its filters on the first screen. */
 .streets-main {
@@ -41,7 +42,7 @@
 }
 
 .streets-main > * {
-  max-width: 1640px;
+  max-width: 1760px;
 }
 
 .streets-main h1 {
@@ -646,18 +647,25 @@
    the table. The page content moves right of it and is LEFT-aligned rather
    than centred, so there is no gap between the filters and the table.
 
-   The offset is reserved unconditionally rather than keyed on the sidebar
-   existing: the sidebar is mounted only once the data has loaded, so a keyed
-   offset would shove the heading sideways on every page load. The cost is a
-   blank gutter beside the status line on a page with nothing published.
+   The offset never depends on the sidebar having mounted, which happens only
+   once the data has loaded: anything keyed on the sidebar would shove the
+   heading sideways on every page load. So the open offset is unconditional
+   (the cost is a blank gutter beside a nothing-published status line), and
+   the COLLAPSED state is keyed on `html[data-sidebar="collapsed"]`, which an
+   inline <head> script sets from localStorage before first paint, rather
+   than on a class the sidebar's own JS would add later.
 
    Collapsed, the panel becomes a 44px rail holding only the toggle, and the
    offset shrinks to match — at a 1600px window that is what lets every
    streets preset fit unscrolled. `display: none` on the disclosure takes the
    controls out of the tab order and the accessibility tree with it. The
    collapse is scoped to this media query, so a stored preference can never
-   hide the filters on a narrow screen, where the <details> owns them. */
-@media (min-width: 901px) {
+   hide the filters on a narrow screen, where the <details> owns them.
+
+   Range syntax (`width > 900px` / `width <= 900px`) rather than a
+   min-width: 901px / max-width: 900px pair, which leaves a fractional-width
+   seam (browser zoom) where neither layout applies. */
+@media (width > 900px) {
   .table-sidebar {
     position: fixed;
     top: 44px;
@@ -689,6 +697,11 @@
     font-weight: bold;
     text-align: left;
     cursor: pointer;
+    /* grid.html's filter list is taller than the panel; the toggle must not
+       scroll away with it. */
+    position: sticky;
+    top: 0;
+    z-index: 1;
   }
 
   .sidebar-toggle:hover {
@@ -700,18 +713,18 @@
     outline-offset: -2px;
   }
 
-  .table-sidebar--collapsed {
+  html[data-sidebar="collapsed"] .table-sidebar {
     width: 44px;
     overflow: hidden;
   }
 
-  .table-sidebar--collapsed .sidebar-disclosure {
+  html[data-sidebar="collapsed"] .sidebar-disclosure {
     display: none;
   }
 
   /* The rail is one tall button: easy to hit, and its label reads down the
      edge of the window rather than being clipped to "F…". */
-  .table-sidebar--collapsed .sidebar-toggle {
+  html[data-sidebar="collapsed"] .sidebar-toggle {
     flex-direction: column;
     justify-content: flex-start;
     gap: 8px;
@@ -720,11 +733,11 @@
     border-bottom: 0;
   }
 
-  .table-sidebar--collapsed .sidebar-toggle-label {
+  html[data-sidebar="collapsed"] .sidebar-toggle-label {
     writing-mode: vertical-rl;
   }
 
-  .streets-main:has(.table-sidebar--collapsed) {
+  html[data-sidebar="collapsed"] .streets-main {
     padding-left: 68px; /* 44px rail + 24px gap */
   }
 
@@ -740,7 +753,21 @@
   }
 }
 
-@media (max-width: 900px) {
+/* A printout is a page of the table, not of the controls: a fixed panel
+   would repeat on every printed page, and a landscape sheet is wide enough
+   to take the docked branch above. */
+@media print {
+  .table-sidebar {
+    display: none;
+  }
+
+  .streets-main,
+  html[data-sidebar="collapsed"] .streets-main {
+    padding-left: 20px;
+  }
+}
+
+@media (width <= 900px) {
   /* A docked column makes no sense on a narrow screen, so the sidebar is a
      plain block above the table, and the card chrome goes back onto the
      controls: .table-controls is the card again. */

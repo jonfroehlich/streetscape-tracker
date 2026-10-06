@@ -31,7 +31,7 @@
  * but only table-controls.js talks to it.
  *
  * The page renders through the same chassis as grid.html and streets.html and
- * now shares their layout too: a sticky filter sidebar, a one-sentence lead
+ * now shares their layout too: a docked filter sidebar, a one-sentence lead
  * with the explanation in a disclosure, and histogram-slider filters. What it
  * does NOT share is the pivot — those two carry one row per city with a
  * sub-column per provider, this one carries one row per place and a flat

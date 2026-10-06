@@ -1943,11 +1943,13 @@ def test_filter_sidebar_sits_beside_the_table_and_collapses_on_narrow_screens(
         """() => {
              const a = document.querySelector('.table-sidebar').getBoundingClientRect();
              const t = document.querySelector('.streets-table-wrap').getBoundingClientRect();
-             return {aRight: a.right, tLeft: t.left, aBottom: a.bottom, tTop: t.top};
+             return {aRight: a.right, tLeft: t.left};
            }"""
     )
-    assert boxes["aRight"] <= boxes["tLeft"] + 1, "sidebar overlaps the table"
-    assert boxes["aBottom"] > boxes["tTop"], "sidebar is not beside the table"
+    gap = boxes["tLeft"] - boxes["aRight"]
+    # Beside it, not under it and not drifted away from it: the content offset
+    # is 24px past the 280px panel.
+    assert 0 <= gap <= 30, f"sidebar-to-table gap is {gap}px"
     # At this width the disclosure is a plain panel, with no toggle to find.
     expect(page.locator(".sidebar-disclosure > summary")).to_be_hidden()
     expect(table).to_be_visible()
@@ -2072,29 +2074,130 @@ def test_the_collapsed_rail_counts_the_filters_it_hides(page: Page, base_url):
 
 
 def test_collapsing_the_sidebar_fits_every_streets_preset_at_1600px(page: Page, base_url):
-    """#438's laptop/scaled-monitor band: at a 1600px window the open sidebar
-    leaves the default too narrow, and collapsing it must make EVERY preset fit.
-    The open-sidebar overflow is asserted first, or a fixture too narrow to
-    overflow would make the collapsed fit vacuous."""
+    """#438's laptop/scaled-monitor band: at a 1600px window every streets
+    preset must fit unscrolled once the sidebar is collapsed.
+
+    A preset that ALSO fits with the sidebar open proves nothing about the
+    collapse, so each preset is measured both ways and the default — the
+    preset a reader lands on — is required to be one that only the collapse
+    makes fit. The others are still asserted to fit."""
     errors = _capture_errors(page)
     page.set_viewport_size({"width": 1600, "height": 900})
     page.goto(f"{base_url}/streets.html")
     expect(page.locator(".streets-table tbody tr").first).to_be_visible()
-    assert _wrap_overflow(page) > 0, "the default fits with the sidebar open; nothing to test"
 
     toggle = page.locator(".sidebar-toggle")
     values = page.locator("#table-preset option").evaluate_all("opts => opts.map(o => o.value)")
     assert len(values) >= 2, f"expected several presets, got {values}"
+    open_overflow = {}
     for value in values:
-        # The preset picker lives in the panel, so open it to switch, then
-        # collapse it again to measure.
+        # The preset picker lives in the panel, so switch while it is open,
+        # then collapse it to measure.
         page.select_option("#table-preset", value)
+        open_overflow[value] = _wrap_overflow(page)
         toggle.click()
         overflow = _wrap_overflow(page)
         assert overflow <= 0, (
             f"preset {value!r} overflows by {overflow}px with the sidebar collapsed"
         )
         toggle.click()
+
+    assert open_overflow[values[0]] > 0, (
+        f"the default fits at 1600px with the sidebar open, so the collapse is untested: {open_overflow}"
+    )
+
+    assert errors == []
+
+
+def _store_collapsed(page: Page) -> None:
+    """Pre-set the stored "filters collapsed" preference before any page script runs."""
+    page.add_init_script("localStorage.setItem('streetscape.sidebarCollapsed', '1')")
+
+
+@pytest.mark.parametrize("path", ["grid.html", "streets.html", "driving.html"])
+def test_a_stored_collapse_applies_before_the_data_loads(page: Page, base_url, path):
+    """The sidebar mounts only once the data has loaded, so a collapse read
+    there would shift the page 236px sideways on every load (the review of
+    #439 measured it). The inline <head> script applies it before first paint;
+    the proof is a load whose data NEVER arrives, which must already have the
+    collapsed offset, and a full load whose heading sits at the same spot."""
+    _store_collapsed(page)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    h1_left = "() => document.querySelector('.streets-main h1').getBoundingClientRect().left"
+
+    page.route("**/streetscape-tracker/data/**", lambda route: route.abort())
+    page.goto(f"{base_url}/{path}")
+    expect(page.locator(".table-sidebar")).to_have_count(0)
+    before = page.evaluate(h1_left)
+    assert page.evaluate("() => document.documentElement.dataset.sidebar") == "collapsed"
+    page.unroute("**/streetscape-tracker/data/**")
+
+    page.goto(f"{base_url}/{path}")
+    expect(page.locator(".streets-table tbody tr").first).to_be_visible()
+    after = page.evaluate(h1_left)
+    assert before == after, f"heading moved from {before}px to {after}px once the sidebar mounted"
+    assert after < 100, f"collapsed offset not applied (heading at {after}px)"
+
+
+def test_the_toggle_stays_reachable_when_the_filter_list_scrolls(page: Page, base_url):
+    """grid.html's filters are taller than a 900px window, so the panel
+    scrolls; the toggle must not scroll away with them."""
+    errors = _capture_errors(page)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    page.goto(f"{base_url}/grid.html")
+    expect(page.locator(".streets-table tbody tr").first).to_be_visible()
+
+    scrolled = page.evaluate(
+        """() => {
+             const a = document.querySelector('.table-sidebar');
+             a.scrollTop = a.scrollHeight;
+             return a.scrollTop;
+           }"""
+    )
+    assert scrolled > 0, "the filter panel does not scroll here, so this proves nothing"
+    top = page.evaluate(
+        "() => document.querySelector('.sidebar-toggle').getBoundingClientRect().top"
+    )
+    assert 40 <= top <= 50, f"toggle scrolled to top={top}px"
+    page.locator(".sidebar-toggle").click()
+    expect(page.locator("#table-search")).to_be_hidden()
+
+    assert errors == []
+
+
+def test_the_content_is_capped_on_an_ultrawide(page: Page, base_url):
+    """The table is `width: 100%`, so past the widest preset extra window width
+    would only stretch every leaf. The cap is 1760px: driving.html's Plan
+    preset, the widest on the site, measured ~1640px on production."""
+    errors = _capture_errors(page)
+    page.set_viewport_size({"width": 2560, "height": 1440})
+    page.goto(f"{base_url}/streets.html")
+    expect(page.locator(".streets-table tbody tr").first).to_be_visible()
+
+    width = page.evaluate("() => document.querySelector('.streets-table-wrap').clientWidth")
+    assert width == 1760, f"the table wrap is {width}px at a 2560px window"
+
+    assert errors == []
+
+
+@pytest.mark.parametrize("collapsed", [False, True])
+def test_a_printout_carries_no_sidebar(page: Page, base_url, collapsed):
+    """A landscape sheet is wide enough to take the docked branch, and a fixed
+    panel repeats on every printed page — so print hides it and drops the
+    offset, whichever state the reader left it in."""
+    errors = _capture_errors(page)
+    if collapsed:
+        _store_collapsed(page)
+    page.set_viewport_size({"width": 1100, "height": 900})
+    page.goto(f"{base_url}/streets.html")
+    expect(page.locator(".streets-table tbody tr").first).to_be_visible()
+    page.emulate_media(media="print")
+
+    expect(page.locator(".table-sidebar")).to_be_hidden()
+    left = page.evaluate(
+        "() => document.querySelector('.streets-table-wrap').getBoundingClientRect().left"
+    )
+    assert left <= 30, f"the table starts at {left}px on the printout"
 
     assert errors == []
 
@@ -2113,7 +2216,7 @@ def test_a_page_with_nothing_published_shows_no_empty_sidebar(page: Page, base_u
     Not a defensive branch: every one of these is a real state of a real
     deployment — driving.html before its first `scheduler fetch-driving-plan`,
     streets.html before the first road walk, plus a transient 404 on any of
-    them. The sidebar is a `position: sticky` full-viewport-height white card,
+    them. The sidebar is a full-viewport-height white panel (docked since #438),
     so an unconditional one meant a viewport-tall empty panel beside a
     one-line "nothing published yet" message, and an empty `aria-label`led
     landmark for anyone navigating by landmark.
@@ -2148,12 +2251,12 @@ def test_a_page_with_nothing_published_shows_no_empty_sidebar(page: Page, base_u
     # must hold is that it is DECLARED hidden and stays that way — otherwise a
     # later page that authors trailing content inside .table-content (as
     # driving.html does, with its revision history and limits sections) gets a
-    # 20px-gap grid column and a sticky sidebar slot around it.
+    # visible layout with an empty docked-sidebar gutter beside it.
     assert page.locator(".table-layout").get_attribute("hidden") is not None
     assert (
         page.evaluate("() => getComputedStyle(document.querySelector('.table-layout')).display")
         == "none"
-    ), "the [hidden] attribute lost to the layout's own display: grid"
+    ), "the [hidden] attribute lost to the layout's own display: block"
 
     # A 404 on driving_plan.json.gz is logged by driving.js on purpose, and
     # streets.html's cities.json.gz path warns; neither is a page error.
@@ -2351,41 +2454,35 @@ def test_every_streets_preset_fits_unscrolled_on_a_large_monitor(page: Page, bas
 
     Until #438 the page was capped at 1500px, so the wrap was 1160px however
     wide the window was and the four-provider default scrolled on a 27"
-    monitor beside ~1000px of empty screen. The cap is now sized to the widest
-    preset, so this walks EVERY preset rather than the default alone — a cap
-    that fit Overview but not Kilometres would pass a default-only check.
+    monitor beside ~1000px of empty screen. Every preset is walked rather than
+    the default alone, since a layout that fit Overview but not Kilometres
+    would pass a default-only check.
 
-    The vacuity guard matters: the same presets must overflow at 1440px, or
-    the fixture is too narrow to tell a 1500px cap from a 1920px one and the
-    fit below would be green against either.
+    A preset that also fits at 1440px is no evidence about the wide layout, so
+    each is measured at both widths, and the default is required to be one
+    that overflows at 1440px — otherwise the fixture is too narrow to tell the
+    old capped layout from this one.
     """
     errors = _capture_errors(page)
-    presets = page.locator("#table-preset option")
-
-    def overflows():
-        return page.evaluate(
-            """() => {
-                 const wrap = document.querySelector('.streets-table-wrap');
-                 return wrap.scrollWidth - wrap.clientWidth;
-               }"""
-        )
-
-    page.set_viewport_size({"width": 1920, "height": 1080})
+    page.set_viewport_size({"width": 1440, "height": 900})
     page.goto(f"{base_url}/streets.html")
     expect(page.locator(".streets-table tbody tr").first).to_be_visible()
-    values = presets.evaluate_all("opts => opts.map(o => o.value)")
+    values = page.locator("#table-preset option").evaluate_all("opts => opts.map(o => o.value)")
     assert len(values) >= 2, f"expected several presets, got {values}"
 
+    narrow_overflow = {}
     for value in values:
         page.select_option("#table-preset", value)
-        overflow = overflows()
-        assert overflow <= 0, f"preset {value!r} overflows its wrap by {overflow}px at 1920px wide"
-
-    page.set_viewport_size({"width": 1440, "height": 900})
-    page.select_option("#table-preset", values[0])
-    assert overflows() > 0, (
-        "the default preset fits at 1440px, so this fixture cannot tell the page cap apart"
+        narrow_overflow[value] = _wrap_overflow(page)
+    assert narrow_overflow[values[0]] > 0, (
+        f"the default fits at 1440px, so this fixture cannot tell the layouts apart: {narrow_overflow}"
     )
+
+    page.set_viewport_size({"width": 1920, "height": 1080})
+    for value in values:
+        page.select_option("#table-preset", value)
+        overflow = _wrap_overflow(page)
+        assert overflow <= 0, f"preset {value!r} overflows its wrap by {overflow}px at 1920px wide"
 
     assert errors == []
 

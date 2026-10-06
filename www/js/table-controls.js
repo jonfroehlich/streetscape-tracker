@@ -815,25 +815,34 @@ function activeFilterCount({ query, values }, filters) {
 }
 
 /**
- * Paint the toggle for the given state. Its accessible name comes from its
- * visible text; `aria-expanded` carries the open/closed state.
+ * Paint the toggle for the given state.
+ *
+ * The accessible name is a STABLE "Filters" (plus the badge's count) and
+ * `aria-expanded` alone carries open/closed — a name that also flipped between
+ * "Hide filters" and "Show filters" would double-encode the state ("Hide
+ * filters, expanded"). The action is spelled out for sighted readers in the
+ * chevron and the `title` tooltip instead.
+ *
+ * A no-op when nothing changed, since this runs on every `apply()` — every
+ * debounced keystroke and slider drag.
  *
  * @param {Element} toggleEl - The `.sidebar-toggle` button.
  * @param {{collapsed: boolean, active: number}} state
  */
 function renderSidebarToggle(toggleEl, { collapsed, active }) {
+  const shownActive = collapsed ? active : 0;
+  const key = `${collapsed}:${shownActive}`;
+  if (toggleEl.dataset.rendered === key) return;
+  toggleEl.dataset.rendered = key;
   toggleEl.setAttribute("aria-expanded", String(!collapsed));
-  if (!collapsed) {
-    toggleEl.innerHTML =
-      '<span aria-hidden="true">&laquo;</span> <span class="sidebar-toggle-label">Hide filters</span>';
-    return;
-  }
+  toggleEl.title = collapsed ? "Show filters" : "Hide filters";
+  const chevron = collapsed ? "&raquo;" : "&laquo;";
   const badge =
-    active > 0
-      ? `<span class="sidebar-badge">${active}<span class="visually-hidden"> active</span></span>`
+    shownActive > 0
+      ? `<span class="sidebar-badge">${shownActive}<span class="visually-hidden"> active</span></span>`
       : "";
   toggleEl.innerHTML =
-    '<span aria-hidden="true">&raquo;</span> <span class="sidebar-toggle-label">Show filters</span>' +
+    `<span aria-hidden="true">${chevron}</span> <span class="sidebar-toggle-label">Filters</span>` +
     badge;
 }
 
@@ -924,16 +933,19 @@ function createTableControls({
   // not exist until mountSidebar has run.
   wireSidebarDisclosure(layoutEl ?? undefined);
 
-  // The docked sidebar's collapse (#438). The class is on the aside so CSS can
-  // both hide the panel and shrink the page offset (`:has()`), and only above
-  // the breakpoint — below it the class does nothing.
+  // The docked sidebar's collapse (#438). The state lives on <html> as
+  // `data-sidebar="collapsed"`, which the page's inline <head> script has
+  // ALREADY set from storage before first paint — so the page offset is right
+  // before this sidebar exists. The CSS keyed on it applies only above the
+  // breakpoint; below it the attribute does nothing.
   const asideEl = rootEl.closest(".table-sidebar");
   const toggleEl = asideEl?.querySelector(".sidebar-toggle");
   const sidebarStorage = defaultSidebarStorage();
   let sidebarCollapsed = readSidebarCollapsed(sidebarStorage);
   function refreshSidebarToggle() {
     if (!toggleEl) return;
-    asideEl.classList.toggle("table-sidebar--collapsed", sidebarCollapsed);
+    if (sidebarCollapsed) document.documentElement.dataset.sidebar = "collapsed";
+    else delete document.documentElement.dataset.sidebar;
     renderSidebarToggle(toggleEl, {
       collapsed: sidebarCollapsed,
       active: activeFilterCount(state, filters),
@@ -1369,11 +1381,11 @@ function syncSidebarDisclosure(detailsEl, isWide) {
  * data has not loaded and the sidebar does not exist yet.
  *
  * @param {Document|Element} [root]
- * @param {string} [query] - Must mirror the `max-width: 900px` breakpoint in
+ * @param {string} [query] - Must mirror the `width <= 900px` breakpoint in
  *   data-table.css; the two are one decision expressed twice.
  * @returns {?Object} The media-query list, for tests.
  */
-function wireSidebarDisclosure(root, query = "(min-width: 901px)") {
+function wireSidebarDisclosure(root, query = "(width > 900px)") {
   const scope = root ?? (typeof document !== "undefined" ? document : null);
   if (!scope || typeof window === "undefined" || !window.matchMedia) return null;
   const detailsEl = scope.querySelector(".sidebar-disclosure");

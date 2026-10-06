@@ -736,21 +736,45 @@ test("activeFilterCount: counts the search, a moved default, a set select, a ran
   assert.equal(activeFilterCount({ query: "", values: { network: "drive", cov: { min: 1 } } }, COUNT_FILTERS), 1);
 });
 
-test("renderSidebarToggle: aria-expanded tracks the state, and the badge only shows when collapsed and active", () => {
+test("renderSidebarToggle: a stable name, aria-expanded for the state, and the badge only when collapsed and active", () => {
   const attrs = {};
-  const el = { setAttribute: (k, v) => (attrs[k] = v), innerHTML: "" };
+  const el = { setAttribute: (k, v) => (attrs[k] = v), innerHTML: "", title: "", dataset: {} };
   renderSidebarToggle(el, { collapsed: false, active: 3 });
   assert.equal(attrs["aria-expanded"], "true");
-  assert.match(el.innerHTML, /Hide filters/);
+  assert.equal(el.title, "Hide filters");
+  assert.match(el.innerHTML, /class="sidebar-toggle-label">Filters</);
   assert.doesNotMatch(el.innerHTML, /sidebar-badge/);
 
   renderSidebarToggle(el, { collapsed: true, active: 0 });
   assert.equal(attrs["aria-expanded"], "false");
-  assert.match(el.innerHTML, /Show filters/);
+  assert.equal(el.title, "Show filters");
+  assert.match(el.innerHTML, /class="sidebar-toggle-label">Filters</);
   assert.doesNotMatch(el.innerHTML, /sidebar-badge/);
 
   renderSidebarToggle(el, { collapsed: true, active: 2 });
   assert.match(el.innerHTML, /class="sidebar-badge">2<span class="visually-hidden"> active<\/span>/);
+});
+
+test("renderSidebarToggle: an unchanged state does not rewrite the button", () => {
+  // It runs on every apply() — every keystroke and slider drag.
+  let writes = 0;
+  const el = {
+    setAttribute: () => {},
+    title: "",
+    dataset: {},
+    set innerHTML(_v) {
+      writes += 1;
+    },
+  };
+  renderSidebarToggle(el, { collapsed: true, active: 1 });
+  renderSidebarToggle(el, { collapsed: true, active: 1 });
+  assert.equal(writes, 1);
+  // While expanded the count is not shown, so a count change is not a change.
+  renderSidebarToggle(el, { collapsed: false, active: 1 });
+  renderSidebarToggle(el, { collapsed: false, active: 4 });
+  assert.equal(writes, 2);
+  renderSidebarToggle(el, { collapsed: true, active: 4 });
+  assert.equal(writes, 3);
 });
 
 // --- resolveFilters: the provider scope -------------------------------------
