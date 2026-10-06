@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Freeze the street networks of the next night's road-walk cities during the day
-(issue #341).
+Freeze the street networks of the next night's road-walk cities ahead of the
+night (issue #341); in production, right after the previous night ends (#389).
 
 A road walk on a FROZEN network never contacts Overpass: ``fetch_graph`` returns
 the cached GraphML before it takes the Overpass host lock or probes ``/status``.
@@ -16,7 +16,8 @@ What it does, in order:
 1. Loads the SAME scheduler config the night will run under (``--config``), so
    the slate it predicts is the slate ``run-due`` would build: ``_collect_due``
    over the enabled channels, hoist and refresh reserve included, for the date
-   the next timer fire will use (``--date``, default tomorrow UTC).
+   the next nightly fire will use (``--date``, default the UTC date of the next
+   02:00 Pacific fire, ``next_run_date``).
 2. Keeps the cities inside the night's city cap that are due on at least one
    street channel and have NO frozen GraphML for that channel's configured
    ``network_type``. ``--nights N`` widens the window to N caps' worth of the
@@ -37,6 +38,16 @@ What it does, in order:
    the same host lock, ``/status`` pre-flight, retry policy and deadline every
    walk uses. Overpass's own slot pacing applies on top (osmnx sleeps off the
    wait the server advertises before each query).
+   Before the FIRST fetch it also asks the night breaker's own fail-CLOSED
+   question, ``download_common.overpass_serving`` (one tiny metered query,
+   inside the Overpass host lock), and stops with exit 76 unless Overpass
+   positively answers (issue #389). The walk's ``/status`` pre-flight is
+   fail-OPEN by design, so on its own a ban that presents as a refused
+   connection -- the 2026-08-14 shape -- would cost the first fetch its whole
+   retry window before the pass stopped. Since #389 the pass starts minutes
+   after a night that may have ended with Overpass latched, and the night's
+   breaker lives in the night's process, so this probe is what carries that
+   question across.
 
 It stops at the first host-level refusal or busy lock and exits with that host's
 code (76 blocked / 80 busy), exactly as a collection child does — a refused
@@ -50,10 +61,12 @@ fetching when the 02:00 timer fires. The night and the pass would be two
 Overpass talkers from one IP, which the host lock would serialize but which is
 still the profile that earned the 2026-08-14 ban — and the walk that loses the
 lock exits busy and strands its city for ~83 days (the very failure #341 is
-about). Run it in the daytime, well clear of the timer.
+about). Run a hand pass clear of the 02:00 fire and of the chained pass
+(``systemctl --user is-active streetscape-prefreeze.service``).
 
-In production it runs daily from ``deploy/systemd/streetscape-prefreeze.timer``
-(issue #355), with ``--alert`` so a pass that does not finish -- a host
+In production it is chained from ``streetscape-tracker.service``'s
+``OnSuccess=``/``OnFailure=`` (issues #355, #389), so it starts when the night's
+tail ends, at whatever hour that is, with ``--alert`` so a pass that does not finish -- a host
 condition, a run-due in flight, a crash, a SIGTERM from the unit's timeout --
 emails the ``[alerts]`` recipient instead of silently leaving tonight's networks
 cold. A pass with nothing cold exits 0 and sends nothing, so the steady state is
@@ -71,7 +84,7 @@ cost. Everything else -- serial and paced, the host lock and probe, the
 in-flight refusal, the stop on a host condition -- is the same code path.
 ``--limit`` defaults to 20 in this mode, and ``--nights`` and ``--date`` are
 refused beside it (neither means anything to a pass that ignores dueness). The
-daily timer stays on the slate mode, and it runs EVERY afternoon, so a drain's
+chained pass stays on the slate mode and runs after every night, so a drain's
 fetches always add to its count.
 
 Nothing is published and no imagery request is made. The catalog gains a
@@ -87,7 +100,7 @@ Usage:
     # Look two nights ahead, cap the pass at 30 fetches:
     python scripts/prefreeze_street_networks.py --config ... --nights 2 --limit 30 --execute
 
-    # Drain the whole catalog's cold backlog, 20 networks per afternoon (#381):
+    # Drain the whole catalog's cold backlog, 20 networks per pass (#381):
     python scripts/prefreeze_street_networks.py --config ... --all-enabled --execute
 """
 
@@ -99,7 +112,8 @@ import socket
 import sys
 import time
 import traceback
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -108,10 +122,14 @@ from streetscape_metadata_tracker.alerting import send_alert  # noqa: E402
 from streetscape_metadata_tracker.download_common import (  # noqa: E402
     HOST_BY_BUSY_EXIT_CODE,
     HOST_BY_EXIT_CODE,
+    HOST_OVERPASS,
     DownloadError,
+    HostBlockedError,
     HostUnavailableError,
     host_exit_code,
+    overpass_serving,
 )
+from streetscape_metadata_tracker.host_lock import host_lock  # noqa: E402
 from streetscape_metadata_tracker.naming import network_cache_path  # noqa: E402
 from streetscape_metadata_tracker.scheduler import (  # noqa: E402
     CHANNEL_DEFAULT_MEMBERSHIP,
@@ -136,28 +154,76 @@ DEFAULT_PAUSE_S = 120
 
 # --all-enabled's --limit when none is given (issue #381). Overpass's guidance
 # for an app that queries regularly is under ~100 queries a day
-# (docs/provider-access.md), and the nightly walks plus the daily 15:00 timer
-# (up to 40) already spend part of that -- and the timer runs every afternoon,
-# so a drain ALWAYS adds to its count. Measured on prod 2026-09-21 the backlog
-# was 242 cold networks, so this drains it over ~12 afternoons, not one burst.
+# (docs/provider-access.md), and the nightly walks plus the chained post-batch
+# pass (up to 40) already spend part of that -- and that pass runs after every
+# night, so a drain ALWAYS adds to its count. Measured on prod 2026-09-21 the
+# backlog was 242 cold networks, so this drains it over ~12 passes, not one burst.
 DEFAULT_ALL_ENABLED_LIMIT = 20
 
+# The nightly timer's OnCalendar, restated: `*-*-* 02:00:00 America/Los_Angeles`
+# in deploy/systemd/streetscape-tracker.timer. tests/test_prefreeze_unit.py pins
+# the two together; a timer moved without these is a pass predicting the wrong
+# night. Hour/minute ints rather than datetime.time: this module imports `time`.
+NIGHTLY_FIRE_HOUR = 2
+NIGHTLY_FIRE_MINUTE = 0
+NIGHTLY_FIRE_ZONE = "America/Los_Angeles"
 
-def next_run_date() -> date:
+
+def next_run_date(now: datetime | None = None) -> date:
     """
     The catalog date the next nightly ``run-due`` will compute dueness for.
 
-    ``cmd_run_due`` reads ``clock.snapshot_date_today()`` (the UTC date) at 02:00 Pacific, which
-    is 09:00 or 10:00 UTC the NEXT UTC day for a pass run during a Pacific
-    afternoon. Tomorrow UTC is right for that case and one day late for a
-    pass run after midnight UTC, and the error is on the safe side: dueness is
-    monotone in the date, so a later date can only ADD cities at the staleness
-    threshold, never drop one the night will actually reach. The one exception
-    is the opt-in reservation's channel rotation (#348), whose start is the
-    date's ordinal: a one-day-late date starts it one channel further along,
-    so a stranded opt-in city predicted here may differ from the night's.
+    ``cmd_run_due`` reads ``clock.snapshot_date_today()`` -- the UTC date -- when
+    the 02:00 Pacific timer fires, so the right date is the UTC date of the NEXT
+    02:00 Pacific instant after ``now``, not "tomorrow UTC": a pass that starts
+    after midnight UTC (16:00 PST / 17:00 PDT) is on the fire's own UTC day
+    already. The old formula was a day late there, and the error was not safe
+    for the opt-in reservation's channel rotation (#348), whose start is the
+    date's ordinal (issue #389). The 15-minute randomized delay never crosses a
+    UTC date (09:00-10:15 UTC).
+
+    Example: at 2026-09-01 00:30 UTC (17:30 PDT on 08-31) the next fire is
+    2026-09-01 02:00 PDT = 09:00 UTC, so this returns ``date(2026, 9, 1)``.
     """
-    return clock.snapshot_date_today() + timedelta(days=1)
+    now = now if now is not None else clock.utc_now()
+    local = now.astimezone(ZoneInfo(NIGHTLY_FIRE_ZONE))
+    fire = local.replace(
+        hour=NIGHTLY_FIRE_HOUR, minute=NIGHTLY_FIRE_MINUTE, second=0, microsecond=0
+    )
+    if fire <= local:
+        fire += timedelta(days=1)
+    return fire.astimezone(UTC).date()
+
+
+def _require_overpass_serving() -> None:
+    """
+    Raise ``HostBlockedError`` unless Overpass POSITIVELY serves this host now.
+
+    The pass's one fail-CLOSED gate (issue #389), asked once, before the first
+    fetch. ``download_common.overpass_serving`` is the night breaker's own reset
+    test: True only for an interpreter 200 that echoes this call's nonce, so a
+    refused connection, a timeout, a 429/403/406/5xx or an odd body all stop the
+    pass. That is the opposite of the walk's ``/status`` pre-flight, which is
+    fail-open by design -- and the 2026-08-14 ban presented as a refused TCP
+    connection, which that pre-flight lets through into a whole retry window.
+
+    Why it is needed at all: since #389 the pass is chained to the END of the
+    night, so it starts minutes after a night that may have ended with Overpass
+    latched, instead of hours later. The breaker is in-memory in the night's
+    process and is gone by then; this re-asks its question, once a pass.
+
+    Inside the Overpass host lock, so the probe is never a second concurrent
+    talker beside a local walk (a held lock raises ``HostBusyError``, exit 80).
+    """
+    with host_lock(HOST_OVERPASS):
+        if not overpass_serving():
+            raise HostBlockedError(
+                "Overpass did not positively answer the fail-closed probe "
+                "(download_common.overpass_serving: refused, timed out, throttled or an "
+                "unexpected body); stopping before the first fetch rather than paying its "
+                "retry window against a host that may be refusing this IP (issue #389).",
+                host=HOST_OVERPASS,
+            )
 
 
 def plan_prefreeze(
@@ -292,7 +358,11 @@ def run_prefreeze(
 
     The in-flight check runs before EVERY fetch (after the pause, so it sees
     the world the fetch will run in), not once up front: the pass is long and
-    the timer does not wait for it.
+    nothing ends it when a night starts.
+
+    Before the FIRST fetch, after that check, Overpass must also pass the
+    fail-closed probe (``_require_overpass_serving``); a negative answer stops
+    the pass like any host refusal, with exit 76 and nothing fetched.
     """
     frozen = failed = 0
     for index, (city, network_type, channels) in enumerate(planned):
@@ -318,6 +388,8 @@ def run_prefreeze(
             ", ".join(channels),
         )
         try:
+            if index == 0:
+                _require_overpass_serving()
             fetch_graph(
                 city,
                 cfg.data_dir,
@@ -393,7 +465,7 @@ def _alert(
 ) -> None:
     """Email ``what`` plus the pass's own output through ``[alerts]``. Never raises."""
     body = [
-        "The daytime street-network prefreeze pass (issues #341, #355) did not finish.",
+        "The post-batch street-network prefreeze pass (issues #341, #355, #389) did not finish.",
         "Every network it left cold is one Overpass refusal tonight away from stranding",
         "its city's walk for ~83 days. Re-run it by hand once the cause is cleared:",
         f"  scripts/prefreeze_street_networks.py --config <prod.toml> {mode} --execute",
@@ -422,7 +494,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--date",
-        help="Catalog date to compute dueness for (YYYY-MM-DD; default: tomorrow UTC, which is what the next 02:00 Pacific timer fire reads)",
+        help="Catalog date to compute dueness for (YYYY-MM-DD; default: the UTC date the next 02:00 Pacific nightly fire reads)",
     )
     p.add_argument(
         "--nights",

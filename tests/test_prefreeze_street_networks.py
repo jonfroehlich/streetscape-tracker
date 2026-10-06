@@ -1,19 +1,22 @@
 """Tests for scripts/prefreeze_street_networks.py (issue #341).
 
-The daytime pass that freezes the next night's walk networks so a mid-night
+The post-batch pass that freezes the next night's walk networks so a mid-night
 Overpass refusal has nothing left to strand. Pinned: dry-run by default, the
 slate is the night's own (`_collect_due`, not the raw due list), only COLD
 networks are fetched and keyed on each channel's network_type, fetches are
 serial and paced, a host condition stops the pass with that host's exit code
-while a city-specific failure does not, and a run-due in flight refuses it.
+while a city-specific failure does not, a run-due in flight refuses it, and
+the first fetch waits on a fail-CLOSED Overpass probe (#389).
 
 No network: `fetch_graph` is replaced by a recorder that writes the GraphML
-path it would have frozen.
+path it would have frozen, and `overpass_serving` answers True unless a test
+says otherwise.
 """
 
+import contextlib
 import os
 import sys
-from datetime import date
+from datetime import UTC, date, datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -67,6 +70,23 @@ def _cfg(data_dir, **overrides):
     )
     base.update(overrides)
     return SchedulerConfig(**base)
+
+
+@pytest.fixture(autouse=True)
+def _overpass_serving(monkeypatch):
+    """The fail-closed probe (#389) answers "serving" unless a test says not.
+
+    Left real it could never answer True here -- the suite blocks DNS, and a
+    fail-closed probe reads that as "not serving" -- so every --execute test
+    would stop before its first fetch. Returns the list of calls."""
+    calls = []
+
+    def serving(*args, **kwargs):
+        calls.append((args, kwargs))
+        return True
+
+    monkeypatch.setattr(pf, "overpass_serving", serving)
+    return calls
 
 
 @pytest.fixture
@@ -281,19 +301,125 @@ def test_bad_flags_exit_usage(three_cities, data_dir, monkeypatch, flags):
     assert fetcher.calls == []
 
 
-def test_the_default_date_is_tomorrow_utc(pacific_local_zone, frozen_utc_clock):
-    """cmd_run_due reads the UTC date at 02:00 Pacific, i.e. the NEXT UTC day
-    for a pass run in a Pacific afternoon. Later is the safe error: dueness is
-    monotone in the date.
+@pytest.mark.parametrize(
+    "instant, expected",
+    [
+        # 17:30 PDT on 08-31 (conftest's EVENING_UTC): the case "tomorrow UTC"
+        # got WRONG (09-02). The next fire is 09-01 02:00 PDT = 09:00 UTC.
+        (datetime(2026, 9, 1, 0, 30, tzinfo=UTC), date(2026, 9, 1)),
+        # 14:45 PDT -- where the chain lands after a 12 h night; agrees with the old formula.
+        (datetime(2026, 9, 1, 21, 45, tzinfo=UTC), date(2026, 9, 2)),
+        # 18:45 PDT -- where the chain lands after a 16 h night; the old formula said 09-03.
+        (datetime(2026, 9, 2, 1, 45, tzinfo=UTC), date(2026, 9, 2)),
+        # 01:30 PST, 30 min before the fire: tonight's fire is today's.
+        (datetime(2026, 1, 15, 9, 30, tzinfo=UTC), date(2026, 1, 15)),
+        # 02:30 PST, 30 min after the fire: the next one is tomorrow's.
+        (datetime(2026, 1, 15, 10, 30, tzinfo=UTC), date(2026, 1, 16)),
+    ],
+    ids=["17:30-PDT", "14:45-PDT", "18:45-PDT", "01:30-PST", "02:30-PST"],
+)
+def test_the_default_date_is_the_next_fires_utc_date(
+    pacific_local_zone, frozen_utc_clock, instant, expected
+):
+    """cmd_run_due reads the UTC date when the 02:00 Pacific timer fires, so
+    the pass predicts the UTC date of the NEXT such fire (#389) -- not
+    "tomorrow UTC", which is a day late for a pass after midnight UTC, the
+    normal case once the chained pass follows a night longer than ~14 h.
 
-    A literal under a frozen 17:30-PDT clock (#347), not the same expression on
-    both sides: 2026-09-01 UTC + 1, where a local read would give 08-31 + 1."""
-    from datetime import date
+    Literals under a frozen clock (#347), never the same expression on both
+    sides; the local zone is pinned to Pacific so a local-calendar read shows."""
+    frozen_utc_clock(instant)
+    assert pf.next_run_date() == expected
+    # The explicit-argument form answers the same, so the clock is the only input.
+    assert pf.next_run_date(instant) == expected
 
-    from tests.conftest import EVENING_UTC
 
-    frozen_utc_clock(EVENING_UTC)
-    assert pf.next_run_date() == date(2026, 9, 2)
+# ── The fail-closed Overpass probe before the first fetch (issue #389) ────────
+#
+# The chained pass starts minutes after a night that may have ended with
+# Overpass refusing this IP, and the night's breaker died with its process.
+
+
+def test_a_negative_probe_stops_the_pass_before_any_fetch(
+    three_cities, data_dir, monkeypatch, _overpass_serving
+):
+    """Fail-CLOSED: anything but a positive answer is exit 76 and NO fetch --
+    the walk's own /status pre-flight is fail-open, so without this a ban that
+    presents as a refused connection costs the first fetch a whole retry window."""
+    asked = []
+    monkeypatch.setattr(pf, "overpass_serving", lambda *a, **k: asked.append(1) or False)
+    rc, fetcher, alerts = _run_alerting(monkeypatch, _cfg(data_dir), "--execute", "--alert")
+    assert rc == 76
+    assert fetcher.calls == [], "a fetch after a negative probe is the retry hazard"
+    assert asked == [1], "asked exactly once: a refusing host is not asked again"
+    [(subject, body)] = alerts.sent
+    assert "overpass REFUSED" in subject
+    assert "2 planned network(s) still cold" in body
+
+
+def test_the_probe_is_asked_once_per_pass_inside_the_overpass_lock(
+    three_cities, data_dir, monkeypatch, _overpass_serving
+):
+    """Once, not per fetch (it is a metered query, and every later fetch has
+    the walk's own pre-flight); and inside host_lock(HOST_OVERPASS), so it is
+    never a second concurrent talker beside a local walk."""
+    held = []
+
+    @contextlib.contextmanager
+    def recording_lock(host):
+        held.append(host)
+        try:
+            yield
+        finally:
+            held.remove(host)
+
+    def serving(*args, **kwargs):
+        assert held == [HOST_OVERPASS], "the probe ran outside the Overpass host lock"
+        _overpass_serving.append((args, kwargs))
+        return True
+
+    monkeypatch.setattr(pf, "host_lock", recording_lock)
+    monkeypatch.setattr(pf, "overpass_serving", serving)
+    rc, fetcher, _ = _run(monkeypatch, _cfg(data_dir), "--execute")
+    assert rc == 0
+    assert len(fetcher.calls) == 2
+    assert len(_overpass_serving) == 1
+
+
+def test_a_busy_overpass_lock_stops_the_probe_as_busy(
+    three_cities, data_dir, monkeypatch, _overpass_serving
+):
+    """A local walk holding the lock is exit 80, and the probe is never sent."""
+
+    @contextlib.contextmanager
+    def busy_lock(host):
+        raise HostBusyError("another process holds the Overpass lock", host=host)
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(pf, "host_lock", busy_lock)
+    rc, fetcher, _ = _run(monkeypatch, _cfg(data_dir), "--execute")
+    assert rc == 80
+    assert fetcher.calls == []
+    assert _overpass_serving == []
+
+
+def test_the_probe_is_not_spent_when_nothing_will_be_fetched(
+    three_cities, data_dir, monkeypatch, _overpass_serving
+):
+    """A dry run, a run-due in flight, and an all-frozen window send nothing:
+    the probe is a metered query, owed only by a pass about to fetch."""
+    rc, _, _ = _run(monkeypatch, _cfg(data_dir))
+    assert rc == 0
+    rc, _, _ = _run(monkeypatch, _cfg(data_dir), "--execute", in_flight="pid 4242: run-due")
+    assert rc == USAGE_EXIT_CODE
+    assert _overpass_serving == []
+
+    rc, fetcher, _ = _run(monkeypatch, _cfg(data_dir), "--execute")
+    assert rc == 0 and len(fetcher.calls) == 2
+    _overpass_serving.clear()
+    rc, fetcher, _ = _run(monkeypatch, _cfg(data_dir), "--execute")
+    assert rc == 0 and fetcher.calls == []
+    assert _overpass_serving == [], "nothing cold, so nothing to ask"
 
 
 # ── --alert: a pass that does not finish is never silent (issue #355) ─────────
