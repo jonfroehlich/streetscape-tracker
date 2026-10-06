@@ -281,7 +281,7 @@ Nothing published reads `total_grid_points`, so the backfill republishes nothing
 `scripts/recompute_streetwalk_stats.py` is the walk twin of the stats recompute above, and like it the repair is a deploy step, not a follow-up.
 From the night the code lands every NEW walk is scored under the round-trip loader (#425) and the `NO_DATE` rule (#257), while every older row keeps the old definition, and each series' next walk diff publishes the difference as a coverage delta on `streets.html`.
 One pass applies both definitions, because the tool recomputes under whatever the current code does; if a pass already ran for #262, the same command is idempotent and only the series #425 moves will change.
-Measured on the dev catalog (not prod), #425 moves a handful of samples per large walk — Seattle +5 fully covered edges and +0.075 km (98.4 → 98.5 % by length), Corvallis `all_public` +1 edge — so expect small, sparse moves; a large one is a different problem.
+Measured on the dev catalog (not prod), #425 moves a handful of samples per large walk — Seattle +5 fully covered edges and +0.075 km (98.4 → 98.5 % by length), Corvallis gsv `all_public` +1 edge — so expect small, sparse moves; a large one is a different problem.
 
 ```bash
 cd ~/streetscape-tracker && git pull          # deploy; no run-due in flight (pgrep -af '[s]cheduler .*run-due')
