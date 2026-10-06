@@ -10509,7 +10509,7 @@ def _run_city_channels(
                         # A busy skip strands a city exactly as a refusal does
                         # (issue #341): the grid sibling still lands and the walk
                         # does not. The lock's other holder is most often a hand
-                        # prefreeze pass, or the chained one after a catch-up night.
+                        # prefreeze pass, or the chained one beside a hand-started night.
                         lost_to_host.append(provider)
                         lost_to_busy[provider] = busy_host
                         logger.warning(
@@ -13372,7 +13372,7 @@ def _finish_batch(
         f"{_host_names(busy_recovered)} was busy with another process on this machine; "
         f"the end-of-night retry walked them once the lock freed, so nothing is outstanding "
         f"(issue #380). The lock's other holder is most often a hand prefreeze pass, or the "
-        f"chained one after a Persistent catch-up night — find it (its pid is in locks/*.lock.owner and in the "
+        f"chained one beside a night started by hand mid-pass — find it (its pid is in locks/*.lock.owner and in the "
         f"child log tail above) and check whether it should have been running (issue #208)."
         if busy_recovered
         else ""

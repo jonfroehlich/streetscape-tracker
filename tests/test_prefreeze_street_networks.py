@@ -5,8 +5,9 @@ Overpass refusal has nothing left to strand. Pinned: dry-run by default, the
 slate is the night's own (`_collect_due`, not the raw due list), only COLD
 networks are fetched and keyed on each channel's network_type, fetches are
 serial and paced, a host condition stops the pass with that host's exit code
-while a city-specific failure does not, a run-due in flight refuses it, and
-the first fetch waits on a fail-CLOSED Overpass probe (#389).
+while a city-specific failure does not, a run-due in flight refuses it, the
+first fetch waits on a fail-CLOSED Overpass probe (#389), and no fetch starts
+past the cutoff that keeps a late pass clear of the next 02:00 fire (#389, F2).
 
 No network: `fetch_graph` is replaced by a recorder that writes the GraphML
 path it would have frozen, and `overpass_serving` answers True unless a test
@@ -16,14 +17,14 @@ says otherwise.
 import contextlib
 import os
 import sys
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest  # noqa: E402
 
 from scripts import prefreeze_street_networks as pf  # noqa: E402
-from streetscape_metadata_tracker import db  # noqa: E402
+from streetscape_metadata_tracker import clock, db  # noqa: E402
 from streetscape_metadata_tracker.download_common import (  # noqa: E402
     HOST_OVERPASS,
     DownloadError,
@@ -38,6 +39,9 @@ from streetscape_metadata_tracker.scheduler import (  # noqa: E402
 )
 
 TODAY = date(2026, 9, 16)
+# 14:45 PDT on TODAY: where the chain lands after a 12 h night, and far from the
+# cutoff, so a pass under test is never cut short by the hour the suite runs at.
+DAYTIME_UTC = datetime(2026, 9, 16, 21, 45, tzinfo=UTC)
 
 
 def _register(conn, name):
@@ -87,6 +91,14 @@ def _overpass_serving(monkeypatch):
 
     monkeypatch.setattr(pf, "overpass_serving", serving)
     return calls
+
+
+@pytest.fixture(autouse=True)
+def _daytime_clock(monkeypatch):
+    """Freeze the clock at DAYTIME_UTC: `main` computes its fetch cutoff from the
+    real clock (#389, F2), so without this every --execute test would fetch
+    nothing when the suite happens to run between 00:45 and 02:00 Pacific."""
+    monkeypatch.setattr(clock, "_utc_clock", lambda: DAYTIME_UTC)
 
 
 @pytest.fixture
@@ -315,8 +327,30 @@ def test_bad_flags_exit_usage(three_cities, data_dir, monkeypatch, flags):
         (datetime(2026, 1, 15, 9, 30, tzinfo=UTC), date(2026, 1, 15)),
         # 02:30 PST, 30 min after the fire: the next one is tomorrow's.
         (datetime(2026, 1, 15, 10, 30, tzinfo=UTC), date(2026, 1, 16)),
+        # 02:30 PDT, after the fire: the only hour of a summer day where a fixed
+        # UTC-8 reading (01:30, before the fire) answers differently (review N1).
+        (datetime(2026, 7, 15, 9, 30, tzinfo=UTC), date(2026, 7, 16)),
+        # Spring forward (2026-03-08, 02:00 PST -> 03:00 PDT). 01:59 PST, before
+        # the fire; then 03:00 PDT, the first instant after it.
+        (datetime(2026, 3, 8, 9, 59, tzinfo=UTC), date(2026, 3, 8)),
+        (datetime(2026, 3, 8, 10, 0, tzinfo=UTC), date(2026, 3, 9)),
+        # Fall back (2026-11-01, 02:00 PDT -> 01:00 PST). The SECOND 01:30 (PST),
+        # still before the fire; then 02:00 PST, the fire itself.
+        (datetime(2026, 11, 1, 9, 30, tzinfo=UTC), date(2026, 11, 1)),
+        (datetime(2026, 11, 1, 10, 0, tzinfo=UTC), date(2026, 11, 2)),
     ],
-    ids=["17:30-PDT", "14:45-PDT", "18:45-PDT", "01:30-PST", "02:30-PST"],
+    ids=[
+        "17:30-PDT",
+        "14:45-PDT",
+        "18:45-PDT",
+        "01:30-PST",
+        "02:30-PST",
+        "02:30-PDT",
+        "spring-01:59-PST",
+        "spring-03:00-PDT",
+        "fall-second-01:30-PST",
+        "fall-02:00-PST",
+    ],
 )
 def test_the_default_date_is_the_next_fires_utc_date(
     pacific_local_zone, frozen_utc_clock, instant, expected
@@ -332,6 +366,102 @@ def test_the_default_date_is_the_next_fires_utc_date(
     assert pf.next_run_date() == expected
     # The explicit-argument form answers the same, so the clock is the only input.
     assert pf.next_run_date(instant) == expected
+
+
+# ── The cutoff: no fetch starts that could overlap the next night (#389, F2) ──
+#
+# The chain starts the pass whenever a night ends, and a night that did not
+# start at 02:00 (a Persistent catch-up after a reboot, a hand start) can end
+# close enough to the next 02:00 that a pass would still hold the Overpass lock.
+
+
+@pytest.mark.parametrize(
+    "instant, expected",
+    [
+        # 14:45 PDT: tomorrow's 02:00 PDT (09:00 UTC) less 1 h less 900 s.
+        (datetime(2026, 9, 1, 21, 45, tzinfo=UTC), datetime(2026, 9, 2, 7, 45, tzinfo=UTC)),
+        # 00:30 PDT: TONIGHT's fire, so the cutoff is 15 min away.
+        (datetime(2026, 9, 1, 7, 30, tzinfo=UTC), datetime(2026, 9, 1, 7, 45, tzinfo=UTC)),
+        # 01:00 PDT: the cutoff (00:45) is already behind it.
+        (datetime(2026, 9, 1, 8, 0, tzinfo=UTC), datetime(2026, 9, 1, 7, 45, tzinfo=UTC)),
+        # 23:00 PST in winter: 02:00 PST is 10:00 UTC, so the cutoff is 08:45 UTC.
+        (datetime(2026, 1, 15, 7, 0, tzinfo=UTC), datetime(2026, 1, 15, 8, 45, tzinfo=UTC)),
+    ],
+    ids=["14:45-PDT", "00:30-PDT", "01:00-PDT", "23:00-PST"],
+)
+def test_the_fetch_cutoff_is_the_next_fire_less_the_clearance_and_a_fetch(instant, expected):
+    """Literals, never the same expression on both sides: the cutoff is the next
+    02:00 Pacific less NEXT_FIRE_CLEARANCE (1 h) less one worst-case fetch
+    (OVERPASS_DEADLINE_S, 900 s) -- 00:45 Pacific."""
+    assert pf.fetch_cutoff(instant) == expected
+
+
+def _clock_advanced_by_sleep(monkeypatch, start, step):
+    """A clock that starts at ``start`` and moves ``step`` per ``time.sleep``
+    (the inter-fetch pause), so a pass can cross its cutoff mid-pass."""
+    now = [start]
+    monkeypatch.setattr(clock, "_utc_clock", lambda: now[0])
+
+    def sleep(seconds):
+        now[0] += step
+
+    return sleep
+
+
+def test_a_pass_that_starts_past_the_cutoff_fetches_nothing_and_does_not_alert(
+    three_cities, data_dir, monkeypatch, capsys, _overpass_serving
+):
+    """A pass chained from a catch-up night that ended at 01:00 Pacific: one
+    fetch now could hold the Overpass lock at 02:00, where the night's first
+    cold walks would exit busy and strand. So nothing is fetched, no probe is
+    spent, and it is a quiet 0 -- the night fetches those networks itself."""
+    monkeypatch.setattr(clock, "_utc_clock", lambda: datetime(2026, 9, 16, 8, 0, tzinfo=UTC))
+    rc, fetcher, alerts = _run_alerting(monkeypatch, _cfg(data_dir), "--execute", "--alert")
+    assert rc == 0
+    assert fetcher.calls == []
+    assert _overpass_serving == [], "a pass past its cutoff owes no probe"
+    assert alerts.sent == [], "reaching the cutoff is not a failure"
+    assert "Froze 0 of 2 network(s); stopped at the cutoff (2026-09-16 07:45 UTC)" in (
+        capsys.readouterr().out
+    )
+
+
+def test_a_pass_that_crosses_the_cutoff_stops_before_the_next_fetch(
+    three_cities, data_dir, monkeypatch
+):
+    """Started at 00:40 PDT, five minutes before the cutoff; the 120 s pause is
+    made to advance the clock 10 min, to 00:50 -- past the cutoff, still an hour
+    and more before the fire. The first fetch runs; the second never starts."""
+    sleep = _clock_advanced_by_sleep(
+        monkeypatch, datetime(2026, 9, 16, 7, 40, tzinfo=UTC), timedelta(minutes=10)
+    )
+    monkeypatch.setattr(pf.time, "sleep", sleep)
+    fetcher = _Fetcher()
+    monkeypatch.setattr(pf, "load_scheduler_config", lambda path: _cfg(data_dir))
+    monkeypatch.setattr(pf, "fetch_graph", fetcher)
+    monkeypatch.setattr(pf, "_run_due_in_flight", lambda: None)
+    rc = pf.main(["--date", TODAY.isoformat(), "--execute"])
+    assert rc == 0
+    assert fetcher.calls == [(three_cities[0], "drive")]
+
+
+def test_the_cutoff_is_fixed_at_the_passs_start_not_reread_per_fetch(
+    three_cities, data_dir, monkeypatch
+):
+    """Started at 00:40 PDT, the pause jumps the clock to 02:30 PDT -- past the
+    fire. Re-reading the cutoff then would find TOMORROW's 02:00 and fetch on,
+    beside the night that just started; held from the start, it stops."""
+    sleep = _clock_advanced_by_sleep(
+        monkeypatch, datetime(2026, 9, 16, 7, 40, tzinfo=UTC), timedelta(hours=1, minutes=50)
+    )
+    monkeypatch.setattr(pf.time, "sleep", sleep)
+    fetcher = _Fetcher()
+    monkeypatch.setattr(pf, "load_scheduler_config", lambda path: _cfg(data_dir))
+    monkeypatch.setattr(pf, "fetch_graph", fetcher)
+    monkeypatch.setattr(pf, "_run_due_in_flight", lambda: None)
+    rc = pf.main(["--date", TODAY.isoformat(), "--execute"])
+    assert rc == 0
+    assert fetcher.calls == [(three_cities[0], "drive")]
 
 
 # ── The fail-closed Overpass probe before the first fetch (issue #389) ────────

@@ -93,6 +93,11 @@ ExecStart=%h/streetscape-tracker/.venv-makelab2/bin/python %h/streetscape-tracke
 # something is wrong, and the SIGTERM it sends is caught and alerted (--alert),
 # never silent. Killing a fetch mid-flight is safe: the GraphML is written to .tmp
 # and renamed in (#341), and the host lock is an flock the kernel releases.
+# This arithmetic assumes the night started at 02:00. One that did not (a
+# Persistent catch-up after a reboot, a hand start) can end late enough that
+# 6 h reaches the next 02:00, so the script also starts no fetch past 00:45
+# Pacific (fetch_cutoff: the next fire less one 900 s fetch less an hour) and
+# exits 0 there, quietly -- the night fetches what it left cold.
 TimeoutStartSec=6h
 # The SIGTERM above has to outlive the alert it triggers. systemd's default is
 # 90 s, and the [alerts] SMTP path can spend 30 s per stage (connect, STARTTLS,

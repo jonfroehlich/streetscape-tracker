@@ -64,6 +64,16 @@ lock exits busy and strands its city for ~83 days (the very failure #341 is
 about). Run a hand pass clear of the 02:00 fire and of the chained pass
 (``systemctl --user is-active streetscape-prefreeze.service``).
 
+The in-flight check only notices a night that has ALREADY started, after the
+fetch in hand; so every ``--execute`` pass, hand or chained, also stops
+launching fetches at ``fetch_cutoff()``: the last start whose worst-case fetch
+(``OVERPASS_DEADLINE_S``) still ends ``NEXT_FIRE_CLEARANCE`` (1 h) before the
+next 02:00 Pacific fire -- 00:45 Pacific. That is what bounds a pass chained
+from a night that started late (a Persistent catch-up after a reboot, or a hand
+``systemctl start``), which can otherwise end close enough to 02:00 that the
+pass would still hold the Overpass lock then. Reaching the cutoff is a quiet
+exit 0, not an alert: what it leaves cold the night fetches itself.
+
 In production it is chained from ``streetscape-tracker.service``'s
 ``OnSuccess=``/``OnFailure=`` (issues #355, #389), so it starts when the night's
 tail ends, at whatever hour that is, with ``--alert`` so a pass that does not finish -- a host
@@ -141,7 +151,10 @@ from streetscape_metadata_tracker.scheduler import (  # noqa: E402
     is_street_channel,
     load_scheduler_config,
 )
-from streetscape_street_analyzer.download_street_network import fetch_graph  # noqa: E402
+from streetscape_street_analyzer.download_street_network import (  # noqa: E402
+    OVERPASS_DEADLINE_S,
+    fetch_graph,
+)
 
 logger = logging.getLogger("prefreeze_street_networks")
 
@@ -168,6 +181,57 @@ NIGHTLY_FIRE_HOUR = 2
 NIGHTLY_FIRE_MINUTE = 0
 NIGHTLY_FIRE_ZONE = "America/Los_Angeles"
 
+# How far clear of the next nightly fire the pass's LAST fetch must end (issue
+# #389 review, F2). The chain starts the pass whenever a night ends, and a night
+# that did not start at 02:00 -- a Persistent catch-up after a reboot, the #369
+# watchdog's re-arm, a hand `systemctl start` -- can end late enough that a
+# 6 h pass would still hold the Overpass lock at the next 02:00, where the
+# night's first cold walks would exit busy (80) and strand. So no fetch is
+# STARTED unless its worst case (OVERPASS_DEADLINE_S) ends this far before the
+# fire; with the defaults the last launch is at 00:45 Pacific. The hour is the
+# same clearance the unit's TimeoutStartSec is sized to leave on a 02:00 night.
+NEXT_FIRE_CLEARANCE = timedelta(hours=1)
+
+
+def next_nightly_fire(now: datetime | None = None) -> datetime:
+    """
+    The aware UTC instant of the next 02:00 Pacific nightly fire after ``now``.
+
+    The nominal instant: the timer's 15-minute randomized delay only ever makes
+    the real start later, so this is the earliest a night can begin. Computed in
+    the fire's own zone, so a pass across a DST change gets the right offset.
+    Same-zone datetime arithmetic is wall-clock arithmetic, which is what
+    "02:00 tomorrow" means; the UTC conversion then resolves the offset.
+
+    Example: at 2026-09-01 00:30 UTC (17:30 PDT on 08-31) this returns
+    2026-09-01 09:00 UTC (02:00 PDT).
+    """
+    now = now if now is not None else clock.utc_now()
+    local = now.astimezone(ZoneInfo(NIGHTLY_FIRE_ZONE))
+    fire = local.replace(
+        hour=NIGHTLY_FIRE_HOUR, minute=NIGHTLY_FIRE_MINUTE, second=0, microsecond=0
+    )
+    if fire <= local:
+        fire += timedelta(days=1)
+    return fire.astimezone(UTC)
+
+
+def fetch_cutoff(now: datetime | None = None) -> datetime:
+    """
+    The last instant a fetch may START and still end clear of the next night.
+
+    ``next_nightly_fire(now) - NEXT_FIRE_CLEARANCE - OVERPASS_DEADLINE_S``:
+    a fetch launched at the cutoff ends, at its 900 s deadline, an hour before
+    the next 02:00 (issue #389 review, F2). Computed ONCE per pass, from the
+    pass's start: re-reading it per fetch would roll it to TOMORROW's fire
+    the moment 02:00 passed, which is exactly when it must hold.
+
+    Example: a pass starting at 2026-09-01 07:30 UTC (00:30 PDT) gets a cutoff
+    of 07:45 UTC (00:45 PDT); one starting at 08:00 UTC (01:00 PDT) is already
+    past its cutoff and fetches nothing.
+    """
+    return next_nightly_fire(now) - NEXT_FIRE_CLEARANCE - timedelta(seconds=OVERPASS_DEADLINE_S)
+
 
 def next_run_date(now: datetime | None = None) -> date:
     """
@@ -185,14 +249,7 @@ def next_run_date(now: datetime | None = None) -> date:
     Example: at 2026-09-01 00:30 UTC (17:30 PDT on 08-31) the next fire is
     2026-09-01 02:00 PDT = 09:00 UTC, so this returns ``date(2026, 9, 1)``.
     """
-    now = now if now is not None else clock.utc_now()
-    local = now.astimezone(ZoneInfo(NIGHTLY_FIRE_ZONE))
-    fire = local.replace(
-        hour=NIGHTLY_FIRE_HOUR, minute=NIGHTLY_FIRE_MINUTE, second=0, microsecond=0
-    )
-    if fire <= local:
-        fire += timedelta(days=1)
-    return fire.astimezone(UTC).date()
+    return next_nightly_fire(now).date()
 
 
 def _require_overpass_serving() -> None:
@@ -344,7 +401,13 @@ def plan_prefreeze_all_enabled(conn, cfg) -> list[tuple[db.CityRow, str, list[st
 
 
 def run_prefreeze(
-    conn, cfg, planned, *, pause_s: float, force: bool = False
+    conn,
+    cfg,
+    planned,
+    *,
+    pause_s: float,
+    force: bool = False,
+    cutoff: datetime | None = None,
 ) -> tuple[int, int, int | None]:
     """
     Fetch each planned network in order, serially, ``pause_s`` apart.
@@ -363,11 +426,31 @@ def run_prefreeze(
     Before the FIRST fetch, after that check, Overpass must also pass the
     fail-closed probe (``_require_overpass_serving``); a negative answer stops
     the pass like any host refusal, with exit 76 and nothing fetched.
+
+    ``cutoff`` (``fetch_cutoff()``, from ``main``) is the last instant a fetch
+    may start: past it the pass stops QUIETLY -- ``stop_code`` None, no probe,
+    no alert -- leaving the rest cold for the night's own walks to fetch, which
+    is the pre-#341 behaviour rather than a failure (issue #389 review, F2).
+    The caller tells a cutoff stop from a finished pass by
+    ``frozen + failed < len(planned)``. None means no cutoff.
     """
     frozen = failed = 0
     for index, (city, network_type, channels) in enumerate(planned):
         if index:
             time.sleep(pause_s)
+        if cutoff is not None and clock.utc_now() >= cutoff:
+            logger.warning(
+                "Past this pass's cutoff (%s UTC: the last start whose fetch ends %s before "
+                "the next nightly fire); stopping with %d of %d frozen and the rest left for "
+                "the night's own walks. Not a failure: the night started at an odd hour "
+                "(a catch-up after a reboot, or a hand start), and a fetch now could still "
+                "hold the Overpass lock at the next 02:00.",
+                cutoff.strftime("%Y-%m-%d %H:%M"),
+                NEXT_FIRE_CLEARANCE,
+                frozen,
+                len(planned),
+            )
+            break
         in_flight = _run_due_in_flight()
         if in_flight and not force:
             logger.error(
@@ -576,6 +659,9 @@ def main(argv=None) -> int:
 
     cfg = load_scheduler_config(args.config)
     today = date.fromisoformat(args.date) if args.date else next_run_date()
+    # From the pass's START, once: see fetch_cutoff. Independent of --date, which
+    # picks the slate; the cutoff is about the real clock and the real next fire.
+    cutoff = fetch_cutoff()
 
     # Everything the pass prints, so an alert carries the pass's own account
     # rather than a pointer to a log somebody has to go and find.
@@ -585,7 +671,7 @@ def main(argv=None) -> int:
     try:
         if args.alert:
             previous_handler = signal.signal(signal.SIGTERM, _raise_terminated)
-        return _run_pass(args, cfg, today, report, planned)
+        return _run_pass(args, cfg, today, report, planned, cutoff)
     except Terminated:
         # Only reachable under --alert: that is the only mode that installs the handler.
         logger.error("Terminated by SIGTERM mid-pass (TimeoutStartSec, or a stop).")
@@ -623,7 +709,7 @@ def main(argv=None) -> int:
             signal.signal(signal.SIGTERM, previous_handler)
 
 
-def _run_pass(args, cfg, today: date, report: list[str], planned: list) -> int:
+def _run_pass(args, cfg, today: date, report: list[str], planned: list, cutoff: datetime) -> int:
     """The pass itself; fills ``report`` and ``planned`` in for ``main``'s alerts."""
 
     def say(line: str) -> None:
@@ -673,9 +759,11 @@ def _run_pass(args, cfg, today: date, report: list[str], planned: list) -> int:
             return 0
 
         frozen, failed, stop_code = run_prefreeze(
-            conn, cfg, planned, pause_s=args.pause_s, force=args.force
+            conn, cfg, planned, pause_s=args.pause_s, force=args.force, cutoff=cutoff
         )
-        if stop_code is None and frozen == 0 and failed:
+        # run_prefreeze stops early with no stop_code ONLY at the cutoff.
+        cut_short = stop_code is None and frozen + failed < len(planned)
+        if stop_code is None and not cut_short and frozen == 0 and failed:
             # Not a failed pass by this script's conventions (a city-specific
             # failure never is, and the night would fail those cities the same
             # way), so the exit stays 0 -- but "Froze 0" must not read as a clean
@@ -693,6 +781,11 @@ def _run_pass(args, cfg, today: date, report: list[str], planned: list) -> int:
                 if stop_code == USAGE_EXIT_CODE
                 else "; stopped early on a host condition"
                 if stop_code is not None
+                else (
+                    f"; stopped at the cutoff ({cutoff:%Y-%m-%d %H:%M} UTC) so as not to "
+                    "overlap the next night -- the rest are left for its own walks"
+                )
+                if cut_short
                 else ""
             )
         )
