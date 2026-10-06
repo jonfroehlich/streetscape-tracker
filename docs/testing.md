@@ -61,6 +61,7 @@ already gone wrong once:
 - The loader as the query-radius seam (`tests/test_fileutils.py`): a gsv run's far pano loads as `OUT_OF_RADIUS` by default and as the provider's own `OK` under `raw=True`, with no derived column; a Mapillary-named file with the same far pano is untouched, which pins that the gate reads the file's own provider token.
   A gsv ROAD WALK (a name from `generate_streetwalk_filename`) with the same far pano is untouched too, which pins that the gate reads the file's KIND as well as its provider.
   `tests/test_archival_import.py`'s round-trip column check reads `raw=True`, since it pins what is on disk.
+- `tests/test_archival_import.py` also pins #431: a city the import registers — from a manifest identity through the subprocess, and from a geocode through the imported module's `resolve_or_register_city` — has `enabled = 0`, is absent from gsv's due list until `set_city_enabled` (the second half keeps that absence from being vacuous), and the report names it with `enable_hint`.
 - Every call site's choice of seam, pinned one by one, because each was green under its own mutation until round 1 of the #392 review:
   the collector's recorded diff (`test_diff.py::test_the_collectors_recorded_diff_sees_no_churn_from_a_far_pano`, through `cli._compute_and_record_diff`, which reloads the previous run itself) records 0 added and 0 removed when the same far pano is in both runs;
   an imported gsv run (`test_import_bundle.py`) is cataloged at the filtered coverage with `status_out_of_radius` 1 and diffs against this host's previous run with no churn, the importer's frame being the diff's new side;
@@ -180,9 +181,12 @@ The preview's output must carry the center in the run's `centered at` form plus 
 A second spelling with no alias that geocodes to an existing `city_id` is previewed and resolved as that registered city — frozen center and dimensions, the overrides-ignored warning, no `Grid center` log line, an alias added by the registration but not the preview, and `newly_registered` False — because `register_city`'s `INSERT OR IGNORE` would otherwise keep the old row under a center both paths had reported.
 `tests/test_assess_city.py` keeps the size-without-center refusal, now asserting the corrected reason and the absence of the old one.
 
+`tests/test_city_center.py` also pins issue #431 through the same call site: a new city's stored row has `enabled = 0` and is absent from `get_due_cities` until `set_city_enabled` (the second half keeps the dueness assertion from being vacuous), a new spelling of an enabled city leaves its `enabled` untouched (`INSERT OR IGNORE`), and the registration log carries `DISABLED` plus `city_registration.enable_hint`'s sentence.
+
 ## `--provider` is a channel list (issue #247)
 
 `tests/test_cli_policy.py` pins the grid CLI's `--provider` flag, and (issue #290) the CLI seam of the census cache: the downloader is handed one `CensusCache` policy built by `crawl_store_for` — its path keyed on the PROVIDER (KartaView gets its own, gsv gets none), `reuse` False only under `--refetch-census` and untouched by `--force`, and the run's `run_date` riding along so a backdated snapshot refuses an entry observed after it; the `runs` row records who paid and when, a gsv run leaves both NULL, and a reused census says so in the printed summary.
+Issue #431 on the CLI path: a run on a NEW city still collects (nothing there reads `cities.enabled`), registers it disabled, prints `enable_hint`, and leaves it out of gsv's due list while the catalog's never-collected enabled city is in it; a run on an enabled city prints no hint, so the line is pinned as conditional rather than unconditional.
 The default expands to `gsv,mapillary` and **does not** include KartaView, while `--provider all` reaches the provider the default leaves out.
 That asymmetry is the point: `all` derived from `naming.KNOWN_PROVIDERS` cannot silently OMIT a fourth provider, where a redefined `both` would have silently INCLUDED KartaView, adding a third mandatory credential and an hours-long serial sweep to every bare `streetscape_tracker.py "City"`.
 
@@ -1002,13 +1006,17 @@ In `tests/test_scheduler.py`, `backup-status` gates on the heartbeat only when `
 refusal — with `USAGE_EXIT_CODE` and **without opening the catalog**
 — of every unpaired `--width/--height`/`--lat/--lng` combination, of `--provider gsv` with a message naming `run-due`, of an unknown/disabled/empty channel, and of a config where no assess channel is enabled;
 a non-TTY stdin without `--yes` refusing rather than hanging on `input()`, *after* the free pre-flight has still registered the city;
-`--estimate` registering but leaving `api_usage` untouched;
+`--estimate` registering the city DISABLED (#431), printing `enable_hint` and leaving `api_usage` untouched;
+a city becoming gsv-due only after `enable-city`;
+the closing note agreeing with `get_due_cities` in both states (nothing due while disabled, gsv alone after `set_city_enabled`);
+the hint printed once for an already-disabled city and never for an enabled one, whose opt-in timing sentence keeps its enabled form;
+`enable-city` after an assessment reporting all four opt-in pairs `already_set` with no second screen request;
 registration capping at the 40 km ceiling and aliasing the query slug so a second run never re-geocodes;
 `rect_in_boundary_frac` measuring the **rectangle** rather than the city
 — 1.0 inside, ≈0.5 half-overlapping, 0.0 disjoint, and None for the Point that Nominatim returns for many places, which must never render as 0%
 — plus the low-fraction warning naming the NKY precedent and a **raising geocoder not failing the run**, exercised through the real probe rather than a stub that returns None;
 `test_assess_city_never_defers_for_a_deadline`: every listed channel is collected even when each one's derived need exceeds any night, because this path passes no batch deadline (issue #373; fails if assess-city passes one);
-success starting only the collected channels' clocks while `gsv` stays absent so the nightly batch still does the grid run, and a failure recording **no** `consecutive_failures`, with six failed runs leaving the city still returned by `get_due_cities`;
+success starting only the collected channels' clocks while `gsv` stays absent so the nightly batch still does the grid run (once enabled), and a failure recording **no** `consecutive_failures`, with six failed runs leaving the city still returned by `get_due_cities`;
 a Mapillary tile block leaving the GSV walk collected while `mapillary_streets` is never asked, an Overpass refusal skipping both walks but not the grid census, and a busy exit skipping one channel only;
 a channel whose argv our own CLI rejected (issue #359) exiting 1 with `N channel(s) REJECTED by our own CLI` in the summary and no `consecutive_failures`, since it records no attempt and would otherwise score the run complete;
 the tail regenerating before publishing, not publishing when nothing succeeded, and publishing a partial success anyway;

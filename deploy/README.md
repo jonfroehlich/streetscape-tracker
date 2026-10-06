@@ -473,7 +473,8 @@ Notes:
   through the host lock and, if the batch holds it, fail fast with exit 79 —
   re-run them later. The command never marks the city failed.
 - **It does not run the GSV grid run.** That is the expensive half, and it needs
-  no help: a newly registered city is enabled with no successful run yet, so it
+  no help: a newly registered city is DISABLED (#431) until
+  `scheduler enable-city CITY`, after which, with no successful run yet, it
   leads the next night's stalest-first queue. The channels it *does* collect
   record a success, so they are not due again for a cycle — the closing report
   says so, along with the paired-snapshot cost that carries (same as
