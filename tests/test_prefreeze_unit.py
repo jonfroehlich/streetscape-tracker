@@ -358,13 +358,23 @@ def test_the_scripts_fire_time_is_the_nightly_timers(units):
     )
 
 
-def test_the_scripts_fire_delay_is_the_nightly_timers(units):
+# systemd.timer(5): AccuracySec= "Defaults to 1min" when the unit sets none.
+SYSTEMD_DEFAULT_ACCURACY_SEC = "1min"
+
+
+def test_the_scripts_fire_slack_is_the_nightly_timers(units):
     """next_nightly_fire keeps tonight's fire pending for the timer's
-    RandomizedDelaySec (#389 final review, L1); a delay changed in the unit
-    without the script would let a pass that starts inside the new window plan
-    against tomorrow's fire and fetch into tonight's night."""
-    delay_min = _span_minutes(_one(units["nightly"], "Timer", "RandomizedDelaySec"))
-    assert pf.NIGHTLY_FIRE_DELAY.total_seconds() / 60 == delay_min
+    RandomizedDelaySec PLUS its AccuracySec (#389 final review, L1): both delay
+    the real elapse, and the timer sets no AccuracySec, so systemd's 1 min
+    default applies. A slack changed in the unit without the script would let a
+    pass that starts inside the new window plan against tomorrow's fire and
+    fetch into tonight's night."""
+    timer = units["nightly"]
+    delay_min = _span_minutes(_one(timer, "Timer", "RandomizedDelaySec"))
+    accuracy = timer.get("Timer", {}).get("AccuracySec", [])
+    assert len(accuracy) <= 1, f"expected at most one AccuracySec= in [Timer], got {accuracy}"
+    accuracy_min = _span_minutes(accuracy[0] if accuracy else SYSTEMD_DEFAULT_ACCURACY_SEC)
+    assert pf.NIGHTLY_FIRE_SLACK.total_seconds() / 60 == delay_min + accuracy_min
 
 
 def test_every_unit_is_installed_by_the_deploy_readme():

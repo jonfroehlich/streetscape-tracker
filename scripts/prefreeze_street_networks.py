@@ -69,9 +69,10 @@ fetch in hand; so every ``--execute`` pass, hand or chained, also stops
 launching fetches at ``fetch_cutoff()``: the last start whose worst-case fetch
 (``OVERPASS_DEADLINE_S``) still ends ``NEXT_FIRE_CLEARANCE`` (1 h) before the
 next 02:00 Pacific fire -- 1 h 15 min before it, normally 00:45 Pacific (01:45
-PDT on the fall-back night). Until the timer's randomized delay has run out
-(02:15), tonight's fire still counts as the next one, so a pass that starts
-between 02:00 and 02:15 is already past its cutoff. That is what bounds a pass chained
+PDT on the fall-back night). Until the timer's slack has run out
+(``NIGHTLY_FIRE_SLACK``: RandomizedDelaySec 15 min + systemd's default
+AccuracySec 1 min, so 02:16), tonight's fire still counts as the next one, so a
+pass that starts between 02:00 and 02:16 is already past its cutoff. That is what bounds a pass chained
 from a night that started late (a Persistent catch-up after a reboot, or a hand
 ``systemctl start``), which can otherwise end close enough to 02:00 that the
 pass would still hold the Overpass lock then. Reaching the cutoff is a quiet
@@ -183,11 +184,14 @@ DEFAULT_ALL_ENABLED_LIMIT = 20
 NIGHTLY_FIRE_HOUR = 2
 NIGHTLY_FIRE_MINUTE = 0
 NIGHTLY_FIRE_ZONE = "America/Los_Angeles"
-# The same timer's RandomizedDelaySec=15m: the real start lands anywhere in
-# [02:00, 02:15], so tonight's fire is still PENDING until 02:15 -- a pass that
-# starts at 02:05 must not plan against tomorrow's fire while tonight's night is
-# about to start (#389 final review, L1). Pinned to the timer by the same test.
-NIGHTLY_FIRE_DELAY = timedelta(minutes=15)
+# How late after 02:00 the same timer can really start the night: its
+# RandomizedDelaySec=15m plus systemd's AccuracySec, which the timer leaves at
+# the 1 min default -- so the real start lands anywhere in [02:00, ~02:16], and
+# tonight's fire is still PENDING until then. A pass that starts at 02:05 must
+# not plan against tomorrow's fire while tonight's night is about to start
+# (#389 final review, L1). tests/test_prefreeze_unit.py pins this to the SUM of
+# the two values read from the timer file (AccuracySec defaulting to 1 min).
+NIGHTLY_FIRE_SLACK = timedelta(minutes=16)
 
 # How far clear of the next nightly fire the pass's LAST fetch must end (issue
 # #389 review, F2). The chain starts the pass whenever a night ends, and a night
@@ -206,26 +210,32 @@ def next_nightly_fire(now: datetime | None = None) -> datetime:
     """
     The aware UTC instant of the next 02:00 Pacific nightly fire, as of ``now``.
 
-    The nominal instant: the timer's randomized delay only ever makes the real
-    start later, so this is the earliest a night can begin. But tonight's fire
-    stays the "next" one until that delay has run out (``NIGHTLY_FIRE_DELAY``,
-    02:15): between 02:00 and 02:15 the night may not have started yet, so the
-    answer is tonight's 02:00 -- already past -- and never tomorrow's (#389 final
-    review, L1). Computed in the fire's own zone, so a pass across a DST change
-    gets the right offset; the pending test compares INSTANTS, so on the
-    spring-forward night the nonexistent 02:00 resolves to 03:00 PDT and stays
-    pending until 03:15.
+    The nominal instant: the timer's randomized delay and accuracy only ever
+    make the real start later, so this is the earliest a night can begin. But
+    tonight's fire stays the "next" one until that slack has run out
+    (``NIGHTLY_FIRE_SLACK``, 02:16): between 02:00 and 02:16 the night may not
+    have started yet, so the answer is tonight's 02:00 -- already past -- and
+    never tomorrow's (#389 final review, L1). Computed in the fire's own zone,
+    so a pass across a DST change gets the right offset; the pending test
+    compares INSTANTS.
+
+    The spring-forward night has no 02:00. zoneinfo's fold=0 reading puts it at
+    10:00 UTC (03:00 PDT), pending until 03:16; that is zoneinfo's answer, NOT a
+    verified account of what systemd does with a nonexistent OnCalendar time --
+    it may skip that night instead. If it does, this errs on the safe side: a
+    pass that starts in that window plans against a night that never comes and
+    fetches nothing, so the cost is one lost prefreeze window, once a year.
 
     Example: at 2026-09-01 00:30 UTC (17:30 PDT on 08-31) this returns
     2026-09-01 09:00 UTC (02:00 PDT); at 09:05 UTC (02:05 PDT) it returns the
-    same instant, and from 09:15 UTC it returns 2026-09-02 09:00 UTC.
+    same instant, and from 09:16 UTC it returns 2026-09-02 09:00 UTC.
     """
     now = now if now is not None else clock.utc_now()
     local = now.astimezone(ZoneInfo(NIGHTLY_FIRE_ZONE))
     fire = local.replace(
         hour=NIGHTLY_FIRE_HOUR, minute=NIGHTLY_FIRE_MINUTE, second=0, microsecond=0
     )
-    if fire.astimezone(UTC) + NIGHTLY_FIRE_DELAY <= now:
+    if fire.astimezone(UTC) + NIGHTLY_FIRE_SLACK <= now:
         fire += timedelta(days=1)
     return fire.astimezone(UTC)
 
@@ -237,7 +247,7 @@ def fetch_cutoff(now: datetime | None = None) -> datetime:
     ``next_nightly_fire(now) - NEXT_FIRE_CLEARANCE - OVERPASS_DEADLINE_S``:
     a fetch launched at the cutoff ends, at its 900 s deadline, an hour before
     the next 02:00 (issue #389 review, F2) -- 1 h 15 min before the fire,
-    normally 00:45 Pacific. From 02:00 to 02:15 the next fire is still tonight's
+    normally 00:45 Pacific. From 02:00 to 02:16 the next fire is still tonight's
     (``next_nightly_fire``), so a pass starting then is past its cutoff. Computed ONCE per pass, from the
     pass's start: re-reading it per fetch would roll it to TOMORROW's fire
     the moment 02:00 passed, which is exactly when it must hold.
