@@ -354,6 +354,7 @@ Keep any list a doc enumerates **alphabetical**, so two branches adding an entry
   Rules, rationale and failure modes: [`docs/experiments/README.md`](docs/experiments/README.md).
   Existing writeups — keep this list alphabetical, and answer "should we sample finer or differently?" from them before re-running anything:
 
+  - `belgium-screen.md`
   - `capture-date-precision.md`
   - `carto-basemap-key.md`
   - `grid-density.md`

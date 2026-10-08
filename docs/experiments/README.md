@@ -19,6 +19,14 @@ A measured question that is NOT about provider access still belongs here, block-
 
 So far, alphabetically — keep that order, so two branches adding a writeup usually insert at different points and merge cleanly:
 
+### `belgium-screen.md`
+
+The 2026-10-08 screen of all of Belgium for a deployment inquiry about Beringen, when only Brussels was tracked: two Mapillary z6 sequence tiles plus two Panoramax z6 grid tiles, four requests, scored over the 373 GeoNames places of ≥ 10,000 people.
+It chose `belgium_inquiry_cities.csv` (Antwerp, Mechelen, Beringen).
+Outside Brussels-Capital, dense recent Mapillary 360° capture is essentially the Antwerp agglomeration, and in every dense place there one creator holds 62–100% of the length — so a high density can be one sweep, and the share belongs beside it.
+Panoramax's 360° bounds rank places differently (Mechelen, Boom/Rumst, Leuven, Braine-l'Alleud/Waterloo), and its largest all-picture bounds (Menen, Mouscron, Wervik) are 86–92% flat, which is why a screen reads the 360° bound and never the picture count.
+The derivation is an offline replay of the research script that reproduced its output byte for byte; the tiles it replays are not committed, so the per-place CSV is the earliest re-runnable step.
+
 ### `capture-date-precision.md`
 
 Issue #226 — what capture-date formats are actually on disk, and what the loader's strict `'%Y-%m-%d'` cost.
