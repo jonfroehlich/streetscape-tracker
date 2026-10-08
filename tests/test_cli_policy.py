@@ -184,6 +184,92 @@ def test_force_overrides_skip(monkeypatch, catalog):
     assert db.get_api_usage(conn, RUN_DATE) == 25
 
 
+# ── A new city is registered DISABLED (issue #431) ──────────────────────────
+
+
+class _NewtownLoc:
+    """The subset of a geoutils location object registration reads."""
+
+    city = "Newtown"
+    state = None
+    state_code = None
+    country = "Testland"
+    country_code = "tl"
+    latitude = 44.10
+    longitude = -121.20
+    bbox_center = (44.11, -121.21)
+
+
+def _stub_geocode(monkeypatch):
+    from streetscape_metadata_tracker import city_registration as cr
+
+    monkeypatch.setattr(cr, "get_city_location_data", lambda query, *a, **k: _NewtownLoc())
+    monkeypatch.setattr(cr, "get_search_dimensions", lambda query, w, h: (100.0, 100.0))
+
+
+def _due_gsv(conn, today=date(2026, 7, 2)):
+    return [
+        c.city_id
+        for c in db.get_due_cities(
+            conn,
+            today=today,
+            cycle_days=90,
+            grace_days=10,
+            max_consecutive_failures=5,
+            default_membership=True,
+            provider="gsv",
+        )
+    ]
+
+
+def test_a_new_city_run_registers_it_disabled_prints_the_hint_and_still_collects(
+    monkeypatch, catalog, capsys
+):
+    """
+    Issue #431 on the collector CLI: the run itself happens (nothing on this
+    path reads cities.enabled), but the city it registers is DISABLED, the
+    operator is told the one command that enables it, and gsv's nightly queue
+    does not hold it. The catalog's own city IS due, so the absence is not an
+    artifact of a query that sees nothing.
+    """
+    from streetscape_metadata_tracker import city_registration as cr
+
+    conn, city_id, data_dir = catalog
+    _stub_geocode(monkeypatch)
+    calls = []
+    gsv_configs(monkeypatch)
+    monkeypatch.setattr(cli, "download_gsv_metadata_async", stub_downloader(calls))
+
+    rc = run_cli(monkeypatch, "Newtown, Testland", data_dir)
+
+    assert rc == 0
+    assert len(calls) == 1, "a disabled city is still collectable on demand"
+    new = db.resolve_city(conn, "Newtown, Testland")
+    assert new is not None and new.city_id != city_id
+    assert new.enabled is False
+    assert cr.enable_hint(new.city_id) in capsys.readouterr().out
+    due = _due_gsv(conn)
+    assert city_id in due
+    assert new.city_id not in due
+
+
+def test_a_run_on_an_enabled_city_prints_no_enable_hint(monkeypatch, catalog, capsys):
+    """The hint is conditional on the city being disabled, not printed on every run."""
+    from streetscape_metadata_tracker import city_registration as cr
+
+    conn, city_id, data_dir = catalog
+    calls = []
+    gsv_configs(monkeypatch)
+    monkeypatch.setattr(cli, "download_gsv_metadata_async", stub_downloader(calls))
+
+    assert run_cli(monkeypatch, city_id, data_dir) == 0
+
+    out = capsys.readouterr().out
+    assert "City: " in out  # the run reached the line the hint would follow
+    assert cr.enable_hint(city_id) not in out
+    assert "registered DISABLED" not in out
+
+
 def test_max_requests_per_minute_threads_to_downloader(monkeypatch, catalog):
     conn, city_id, data_dir = catalog
     calls = []

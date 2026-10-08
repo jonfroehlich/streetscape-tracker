@@ -27,18 +27,18 @@ Legacy pre-2026 undated files are registered as `is_baseline=1` runs by `scripts
 
 ## The catalog
 
-The SQLite catalog `data/streetscape_tracker.db` (`streetscape_metadata_tracker/db.py`, stdlib sqlite3/WAL, no ORM; schema v20, auto-migrated on connect) is the operational source of truth.
+The SQLite catalog `data/streetscape_tracker.db` (`streetscape_metadata_tracker/db.py`, stdlib sqlite3/WAL, no ORM; schema v21, auto-migrated on connect) is the operational source of truth.
 It is **local-only and never rsynced** — it lives in exactly one place, which is why the dated backups in [`catalog-backups.md`](catalog-backups.md) exist.
 
 | Table | Key / uniqueness | Holds |
 |---|---|---|
-| `cities` | `city_id` PK | Canonical identity + **frozen grid geometry** (center, width, height, step), `enabled` flag |
+| `cities` | `city_id` PK | Canonical identity + **frozen grid geometry** (center, width, height, step), `enabled` flag (a NEW city registers `0` on every ad-hoc path since #431 — `assess-city`, the collector CLI, the archival import — as `register_frame.py` always has; `import-bundle --enable` and `migrate_to_db.py` still register enabled; `scheduler enable-city` flips it) |
 | `city_aliases` | `alias_slug` PK | Legacy slugs (e.g. `albany--ny`) → `city_id`, so the same query never re-geocodes |
 | `runs` | UNIQUE(city_id, provider, run_date) | Per-run stats incl. the #213 capture-date columns and the v14 census provenance; `unique_google_panos` is NULL for non-gsv runs; `total_points` and `status_*` are **ROW** counts and `total_grid_points` (v20) is the grid size — see "Row counts are not grid points" below |
 | `run_diffs` | UNIQUE(from_run_id, to_run_id) | Run-to-run change counters + detail filename |
 | `api_usage` | PK(usage_date, provider) | Daily request-budget ledger; **additive** (`add_api_usage`); streets channels metered under their own strings (#99) |
 | `host_usage` | index(host, recorded_at) | Timestamped per-HOST spend (#385, v16), one row per `add_api_usage` on a channel in `CHANNEL_METERED_HOST`; read over a rolling 24 h by the `[hosts.*]` budget gate, pruned after 30 days |
-| `schedule_state` | PK(city_id, provider) | Stagger day, last attempt/success, `consecutive_failures` (reset only by a success), `member` (per-channel membership, #248) |
+| `schedule_state` | PK(city_id, provider) | Stagger day, last attempt/success, `consecutive_failures` (reset by a success or `reset-failures`), `member` (per-channel membership, #248), `quarantine_alerted_at` (when the night emailed this failure streak, #424, v21) |
 | `history_harvests` | UNIQUE(city_id, provider, harvest_date) | Out-of-band GSV capture-history harvests (#2) |
 | `street_networks` | UNIQUE(city_id, network_type) | Frozen OSM networks (#103); GraphML lives unpublished under `data/osm_cache/` |
 | `street_walks` | UNIQUE(city_id, provider, network_type, run_date) | Road-walk collection runs (#99) — a second modality with its own unit of observation |
@@ -86,6 +86,13 @@ It is purely additive (no migration function, the `CREATE TABLE IF NOT EXISTS` b
 
 v20 added `runs.total_grid_points` ([#289](https://github.com/jonfroehlich/streetscape-tracker/issues/289)), under the ordinary rule: NULL means "not measured", until `scripts/recompute_run_stats.py` re-derives the row from its CSV — never a copy of `total_points`, which for a census run is the wrong number.
 Like the v17 pair, the step is named by content (`_migrate_add_total_grid_points_column`), idempotent, and run on its v19 → v20 rung **and** on every connect, so a catalog another in-flight branch stamped v20 still gains the column.
+
+v21 added `schedule_state.quarantine_alerted_at` ([#424](https://github.com/jonfroehlich/streetscape-tracker/issues/424)): the UTC instant at which `run-due` claimed the right to email this pair's current failure streak.
+NULL means "this streak has not been emailed" — an event that has not happened, the same shape as `last_success_at` NULL meaning "never succeeded" — so it is **not** a second exception of the v13 `member` kind.
+Two writers clear it, exactly the two that zero `consecutive_failures`: a recorded success (`record_attempt`) and `reset_consecutive_failures`; a failure and a membership change never do.
+One writer sets it: `claim_quarantine_alerts`, a compare-and-set `UPDATE ... WHERE quarantine_alerted_at IS NULL` whose rowcount is the decision to email (see [`scheduler.md`](scheduler.md), "The failure quarantine, made visible").
+The step is named by content (`_migrate_add_quarantine_alerted_at_column`) and runs on its v20 → v21 rung **and** on every connect, through `_add_missing_columns` (the generalized `_add_missing_run_columns`, which now takes the table).
+The migration backfills nothing, so the first night after the deploy emails every standing quarantined pair once.
 
 ### Row counts are not grid points (#289)
 

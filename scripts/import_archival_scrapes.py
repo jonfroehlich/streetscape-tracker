@@ -21,7 +21,9 @@ schema plus a per-run JSON summary, registered against the catalog:
    rate-limited Nominatim with the archival bbox center as
    disambiguation (e.g. Hamilton, New Zealand vs Hamilton, Ohio) and
    registered with a freshly geocoded rectangle at the default 20 m step
-   (the archival 30 m grid lives only in the run's filename).
+   (the archival 30 m grid lives only in the run's filename), and
+   DISABLED (issue #431) — enable with `scheduler enable-city` after
+   vetting the rectangle.
 4. Register the run with is_baseline=1. No diffs are computed: archival
    runs are each city's earliest, and cli.py only auto-diffs consecutive
    same-geometry runs anyway.
@@ -61,6 +63,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from streetscape_metadata_tracker import db  # noqa: E402
 from streetscape_metadata_tracker.analysis import calculate_run_stats  # noqa: E402
+from streetscape_metadata_tracker.city_registration import enable_hint  # noqa: E402
 from streetscape_metadata_tracker.config import METADATA_DTYPES  # noqa: E402
 from streetscape_metadata_tracker.fileutils import load_city_csv_file  # noqa: E402
 from streetscape_metadata_tracker.geoutils import (  # noqa: E402
@@ -419,7 +422,7 @@ def resolve_or_register_city(
         city_name, state_name, country_name = entry.identity
         if not execute:
             cid = db.derive_city_id(city_name, state_name, country_name)
-            return None, f"NEW: would register from manifest identity ({cid})"
+            return None, f"NEW: would register from manifest identity ({cid}), disabled"
         city_id = db.register_city(
             conn,
             city_name=city_name,
@@ -432,20 +435,31 @@ def resolve_or_register_city(
             grid_width_m=extent[0],
             grid_height_m=extent[1],
             step_m=NEW_CITY_STEP_M,
+            # issue #431: an unvetted rectangle stays out of the nightly rotation
+            enabled=False,
         )
         return (
             db.resolve_city(conn, city_id),
-            f"NEW city registered from manifest identity ({extent[0]}x{extent[1]}m)",
+            f"NEW city registered DISABLED from manifest identity ({extent[0]}x{extent[1]}m)",
         )
 
     if not use_nominatim:
         return None, "needs geocoding (--no-nominatim)"
     if not execute:
-        return None, "NEW: would geocode + register"
+        return None, "NEW: would geocode + register, disabled"
 
     loc = get_city_location_data(entry.query, center[0], center[1])
     if loc is None or not loc.city:
         return None, "geocoding FAILED"
+    # The geocode can land on a city the catalog already holds (an enabled,
+    # tracked one, or one an earlier entry of this pass registered): the
+    # query is never aliased, so its slug missed above. register_city is
+    # INSERT OR IGNORE, so registering would change nothing -- and calling it
+    # "NEW ... DISABLED" would print an enable-city hint that exits 64 for an
+    # enabled city, and list one new city once per spelling (#432 review).
+    existing = db.resolve_city(conn, db.derive_city_id(loc.city, loc.state, loc.country))
+    if existing is not None:
+        return existing, f"existing city (geocoded to {existing.city_id})"
     width, height = dims_from_boundingbox_raw(loc)
     city_id = db.register_city(
         conn,
@@ -459,8 +473,10 @@ def resolve_or_register_city(
         grid_width_m=width,
         grid_height_m=height,
         step_m=NEW_CITY_STEP_M,
+        # issue #431: an unvetted rectangle stays out of the nightly rotation
+        enabled=False,
     )
-    return db.resolve_city(conn, city_id), f"NEW city registered ({width}x{height}m)"
+    return db.resolve_city(conn, city_id), f"NEW city registered DISABLED ({width}x{height}m)"
 
 
 def find_misdated_run(conn, city_id: str, width: int, height: int, run_date: date):
@@ -592,6 +608,9 @@ def main() -> int:
     conn = db.connect(db_path)
     n_imported = n_already = n_skipped = n_redated = n_purged = 0
     report_lines = []
+    # dict, not list: insertion-ordered and de-duplicated, so the footer names
+    # each new city once however many entries resolved to it.
+    new_city_ids: dict[str, None] = {}
     stale_artifacts = []  # removed basenames, possibly still on the server
     pending_removal = set()  # csv_filenames slated for deletion this pass
 
@@ -641,6 +660,8 @@ def main() -> int:
                 report_lines.append(f"  SKIP     {label}: {note}")
                 n_skipped += 1
             continue
+        if note.startswith("NEW city registered"):
+            new_city_ids[city_row.city_id] = None
 
         csv_filename = (
             generate_run_filename(city_row.city_id, width, height, ARCHIVAL_STEP_M, entry.run_date)
@@ -732,6 +753,11 @@ def main() -> int:
     )
     for line in report_lines:
         print(line)
+    if new_city_ids:
+        noun = "city" if len(new_city_ids) == 1 else "cities"
+        print(f"\n{len(new_city_ids)} new {noun} registered DISABLED (issue #431):")
+        for cid in new_city_ids:
+            print(f"  {enable_hint(cid)}")
 
     print("\nSource datasets deliberately not imported:")
     for rel, reason in SKIPPED:

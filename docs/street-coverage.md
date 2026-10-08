@@ -162,6 +162,7 @@ The salvage rebuilds the row from the coverage artifact, which is self-describin
 `network_type` comes from the channel's config, never the artifact, since pre-#162 artifacts carry no such key.
 `api_requests` stays NULL for Mapillary: its cost is a tile census, not one request per sample.
 `scheduler reconcile-walks [--date] [--dry-run]` is the operator handle for orphans `run-due` can't catch (a manual-CLI walk, or a scheduler process that itself died).
+It checks **enabled cities only**, so since #431 an orphan on a city the collector CLI or `assess-city` registered (DISABLED) is not reconcilable until `enable-city`; enable the city, then re-run it with the walk's `--date`.
 Relatedly, `deploy_makelab1.sh` now **refuses to `git pull` while the service is active** (`--force-during-run` overrides, `--skip-pull` is always allowed): a mid-crawl fast-forward on 2026-07-28 migrated the catalog v8→v9 under a running v8 collector and cost a finished 611k-request Berlin walk its catalog row.
 
 ## Streetwalk discovery + rendering (issue #155)

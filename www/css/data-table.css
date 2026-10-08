@@ -26,15 +26,23 @@
    control strip, and once all three shared the sidebar it was a modifier every
    caller set, which is a base value wearing a class name.
 
-   The width is deliberate arithmetic: the sidebar takes 280px, and 1500 − 280
-   − 20 leaves the table the same 1200px the pages had before the sidebar, so
-   no column preset had to be re-sized. The padding is tighter than the prose
-   pages' because the point of the compact page head is to put the table and
-   its filters on the first screen. */
+   Not centred, and not capped at 1500px any more (#438): that held the table
+   to a 1160px wrap at ANY window width, so a 27" monitor scrolled the default
+   sideways beside ~1000px of empty screen. The filters are now docked to the
+   window's left edge (below), the content sits left-aligned beside them, and
+   each block is capped at 1760px. Measured live, the widest preset on any of
+   the three pages is driving.html's Plan (~1640px; the widest streets preset,
+   Kilometres, is 1489px at four providers), so that fits with headroom; the
+   cap exists because the table is `width: 100%`, so on an ultrawide extra
+   width would only stretch every leaf.
+   The padding is tighter than the prose pages' because the point of the
+   compact page head is to put the table and its filters on the first screen. */
 .streets-main {
-  max-width: 1500px;
-  margin: 0 auto;
   padding: 56px 20px 24px; /* 44px header + breathing room */
+}
+
+.streets-main > * {
+  max-width: 1760px;
 }
 
 .streets-main h1 {
@@ -175,7 +183,7 @@
      to 60+ characters ("Stara Pazova Municipality, Srem Administrative
      District, Serbia"). Left to `white-space: nowrap` alone (see the shared
      th/td rule above) a label that long single-handedly pushes the table past
-     its 1200px measure; the committed e2e fixture never catches this because
+     its container; the committed e2e fixture never catches this because
      its synthetic city names are short. Truncate with an ellipsis instead and
      carry the untruncated name in `title` (set alongside the cell markup) so
      it's still available on hover/long-press.
@@ -246,7 +254,8 @@
 /* Coverage cell: a proportional bar behind the number. The bar is
    aria-hidden — the percentage text is the accessible content. */
 /* Wide enough for the bar to read as a proportion, narrow enough that the two
-   coverage columns in a default preset still fit the 1200px measure without
+   coverage columns in a default preset still fit the 1160px wrap a 1500px page
+   used to leave (#438 widened it) without
    the table overflowing its container (issue #188). */
 .coverage-cell {
   position: relative;
@@ -594,65 +603,177 @@
   margin: 0 0 8px;
 }
 
+/* The table column. The sidebar is docked to the window edge (below) and so
+   is out of flow, which leaves this a plain block rather than the
+   sidebar-plus-table grid it was before #438. */
 .table-layout {
-  display: grid;
-  grid-template-columns: 280px minmax(0, 1fr);
-  gap: 20px;
-  /* Without this the sidebar stretches to the table's height and cannot be
-     sticky (a stretched grid item has nothing to stick within). */
-  align-items: start;
+  display: block;
 }
 
 /* The pages author this element `hidden` and table-controls.js clears the
    attribute on the first successful render, so an empty or failed load shows
    the status line alone rather than a viewport-tall empty sidebar card. This
-   rule is what makes that work: `display: grid` above is an author declaration
-   and would otherwise beat the UA stylesheet's `[hidden] { display: none }`. */
+   rule is what makes that work: `display: block` above is an author
+   declaration and would otherwise beat the UA stylesheet's
+   `[hidden] { display: none }`. */
 .table-layout[hidden] {
   display: none;
 }
 
-/* Always there, and the full height of the viewport once the head scrolls
-   away: `sticky` pins it under the 44px fixed .site-header, and the explicit
-   height (rather than max-height) is what makes it a full-extent column rather
-   than a card that ends where its controls do. It scrolls independently, so a
-   long filter list never has to be reached by scrolling the table.
-   THE SIDEBAR ITSELF carries the card chrome here, and .table-controls goes
+/* THE SIDEBAR ITSELF carries the panel chrome, and .table-controls goes
    transparent inside it — the obvious alternative, a flex chain stretching the
    controls to fill, does not survive contact with `<details>`: modern Chromium
    gives it a `::details-content` box, so .controls-region is not a flex item
    of the disclosure at all and simply does not grow. Painting the container is
    both shorter and immune to that. */
 .table-sidebar {
-  position: sticky;
-  top: 52px; /* clears the 44px fixed .site-header, plus breathing room */
-  height: calc(100vh - 64px);
-  overflow-y: auto;
-  overscroll-behavior: contain;
   background: #fff;
-  border-radius: 6px;
-  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.15);
 }
 
 .sidebar-disclosure > summary {
   display: none; /* the panel is simply present at this width */
 }
 
-@media (max-width: 900px) {
-  .table-layout {
-    grid-template-columns: minmax(0, 1fr);
+/* The collapse toggle (#438). Only meaningful while the sidebar is docked;
+   below the breakpoint the <details> summary is the toggle instead. */
+.sidebar-toggle {
+  display: none;
+}
+
+/* ── Docked sidebar (#438) ───────────────────────────────────────────────
+   Above the breakpoint the filters are a panel fixed to the window's left
+   edge, under the 44px fixed .site-header and down to the bottom, scrolling
+   independently so a long filter list never has to be reached by scrolling
+   the table. The page content moves right of it and is LEFT-aligned rather
+   than centred, so there is no gap between the filters and the table.
+
+   The offset never depends on the sidebar having mounted, which happens only
+   once the data has loaded: anything keyed on the sidebar would shove the
+   heading sideways on every page load. So the open offset is unconditional
+   (the cost is a blank gutter beside a nothing-published status line), and
+   the COLLAPSED state is keyed on `html[data-sidebar="collapsed"]`, which an
+   inline <head> script sets from localStorage before first paint, rather
+   than on a class the sidebar's own JS would add later.
+
+   Collapsed, the panel becomes a 44px rail holding only the toggle, and the
+   offset shrinks to match — at a 1600px window that is what lets every
+   streets preset fit unscrolled. `display: none` on the disclosure takes the
+   controls out of the tab order and the accessibility tree with it. The
+   collapse is scoped to this media query, so a stored preference can never
+   hide the filters on a narrow screen, where the <details> owns them.
+
+   Range syntax (`width > 900px` / `width <= 900px`) rather than a
+   min-width: 901px / max-width: 900px pair, which leaves a fractional-width
+   seam (browser zoom) where neither layout applies. */
+@media (width > 900px) {
+  .table-sidebar {
+    position: fixed;
+    top: 44px;
+    bottom: 0;
+    left: 0;
+    z-index: 10;
+    width: 280px;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    box-shadow: 1px 0 4px rgba(0, 0, 0, 0.15);
   }
 
-  /* A full-height sticky column makes no sense stacked above the table, and
-     the card chrome goes back onto the controls with it: the sidebar becomes
-     a plain block, and .table-controls the card again. */
+  .streets-main {
+    padding-left: 304px; /* 280px sidebar + 24px gap */
+  }
+
+  .sidebar-toggle {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    width: 100%;
+    padding: 10px 12px;
+    border: 0;
+    border-bottom: 1px solid #ddd;
+    background: #f5f5f5;
+    color: #1a6b1d;
+    font: inherit;
+    font-size: 13px;
+    font-weight: bold;
+    text-align: left;
+    cursor: pointer;
+    /* grid.html's filter list is taller than the panel; the toggle must not
+       scroll away with it. */
+    position: sticky;
+    top: 0;
+    z-index: 1;
+  }
+
+  .sidebar-toggle:hover {
+    background: #eaeaea;
+  }
+
+  .sidebar-toggle:focus-visible {
+    outline: 2px solid #1a73e8;
+    outline-offset: -2px;
+  }
+
+  html[data-sidebar="collapsed"] .table-sidebar {
+    width: 44px;
+    overflow: hidden;
+  }
+
+  html[data-sidebar="collapsed"] .sidebar-disclosure {
+    display: none;
+  }
+
+  /* The rail is one tall button: easy to hit, and its label reads down the
+     edge of the window rather than being clipped to "F…". */
+  html[data-sidebar="collapsed"] .sidebar-toggle {
+    flex-direction: column;
+    justify-content: flex-start;
+    gap: 8px;
+    height: 100%;
+    padding: 12px 0;
+    border-bottom: 0;
+  }
+
+  html[data-sidebar="collapsed"] .sidebar-toggle-label {
+    writing-mode: vertical-rl;
+  }
+
+  html[data-sidebar="collapsed"] .streets-main {
+    padding-left: 68px; /* 44px rail + 24px gap */
+  }
+
+  /* How many filters are hiding rows while the panel is out of sight. */
+  .sidebar-badge {
+    min-width: 20px;
+    padding: 1px 6px;
+    border-radius: 10px;
+    background: #1a6b1d;
+    color: #fff;
+    font-size: 12px;
+    text-align: center;
+  }
+}
+
+/* A printout is a page of the table, not of the controls: a fixed panel
+   would repeat on every printed page, and a landscape sheet is wide enough
+   to take the docked branch above. */
+@media print {
   .table-sidebar {
-    position: static;
-    height: auto;
-    overflow: visible;
+    display: none;
+  }
+
+  .streets-main,
+  html[data-sidebar="collapsed"] .streets-main {
+    padding-left: 20px;
+  }
+}
+
+@media (width <= 900px) {
+  /* A docked column makes no sense on a narrow screen, so the sidebar is a
+     plain block above the table, and the card chrome goes back onto the
+     controls: .table-controls is the card again. */
+  .table-sidebar {
+    margin-bottom: 20px;
     background: none;
-    border-radius: 0;
-    box-shadow: none;
   }
 
   /* Back to using the full width — but as a GRID rather than a wrapping flex
