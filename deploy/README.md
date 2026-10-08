@@ -434,14 +434,19 @@ A Project Sidewalk inquiry arrives about a city we don't track and the useful
 reply happens *today*, not after the next nightly cycle:
 
 ```bash
-# 1. Price it first: registers the city, reports boundary fit and per-channel
-#    cost, issues ZERO provider requests.
+# 1. Price it first: registers the city (DISABLED, #431), reports boundary fit
+#    and per-channel cost, issues ZERO provider requests.
 python -m streetscape_metadata_tracker.scheduler --config <prod.toml> \
   assess-city "Newport, Kentucky" --estimate
 
 # 2. Then collect + publish + print the numbers.
 python -m streetscape_metadata_tracker.scheduler --config <prod.toml> \
   assess-city "Newport, Kentucky" --yes
+
+# 3. Once the boundary is vetted, put it into the nightly rotation. Without
+#    this step no nightly batch ever collects the city.
+python -m streetscape_metadata_tracker.scheduler --config <prod.toml> \
+  enable-city "Newport, Kentucky"
 ```
 
 It runs the **GSV road walk**, the **Mapillary road walk** and the cheap
@@ -473,7 +478,8 @@ Notes:
   through the host lock and, if the batch holds it, fail fast with exit 79 —
   re-run them later. The command never marks the city failed.
 - **It does not run the GSV grid run.** That is the expensive half, and it needs
-  no help: a newly registered city is enabled with no successful run yet, so it
+  no help: a newly registered city is DISABLED (#431) until
+  `scheduler enable-city CITY`, after which, with no successful run yet, it
   leads the next night's stalest-first queue. The channels it *does* collect
   record a success, so they are not due again for a cycle — the closing report
   says so, along with the paired-snapshot cost that carries (same as

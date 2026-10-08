@@ -1291,7 +1291,9 @@ def register_city(
     already exists, the existing row wins (geometry is never overwritten).
 
     ``enabled=False`` registers the city outside the scheduler rotation (e.g.
-    sampling-frame cities awaiting boundary vetting, issue #110).
+    sampling-frame cities awaiting boundary vetting, issue #110; since #431
+    every ad-hoc registration path passes it too, so the ``True`` default is
+    reached only by the migration script and test fixtures).
 
     Returns the canonical city_id.
     """
@@ -2921,9 +2923,10 @@ def city_touched_opt_in_channels(
     ``runs`` row, or any ``street_walks`` row whose provider is one of
     ``providers`` (the imagery providers behind those channels). It is how
     ``assess-city`` decides a city is still eligible for #374's automatic
-    opt-in enrolment, and it is keyed on the OPT-IN channels on purpose: a
-    city registered by ``--estimate`` is enabled, so the nightly batch can
-    attempt it on gsv before the follow-up ``--yes`` run, and a history signal
+    opt-in enrolment, and it is keyed on the OPT-IN channels on purpose:
+    ``enable-city`` may run between ``--estimate`` and ``--yes``, and a
+    long-tracked city can be assessed, so a gsv attempt can precede the
+    ``--yes`` run, and a history signal
     that counted that attempt would silently skip the enrolment the documented
     order exists to produce. Explicit memberships are not read here: they are
     per pair, and ``enroll_opt_in_channels`` leaves them alone as ``already_set``.

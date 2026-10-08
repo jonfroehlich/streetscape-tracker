@@ -32,7 +32,7 @@ It is **local-only and never rsynced** — it lives in exactly one place, which 
 
 | Table | Key / uniqueness | Holds |
 |---|---|---|
-| `cities` | `city_id` PK | Canonical identity + **frozen grid geometry** (center, width, height, step), `enabled` flag |
+| `cities` | `city_id` PK | Canonical identity + **frozen grid geometry** (center, width, height, step), `enabled` flag (a NEW city registers `0` on every ad-hoc path since #431 — `assess-city`, the collector CLI, the archival import — as `register_frame.py` always has; `import-bundle --enable` and `migrate_to_db.py` still register enabled; `scheduler enable-city` flips it) |
 | `city_aliases` | `alias_slug` PK | Legacy slugs (e.g. `albany--ny`) → `city_id`, so the same query never re-geocodes |
 | `runs` | UNIQUE(city_id, provider, run_date) | Per-run stats incl. the #213 capture-date columns and the v14 census provenance; `unique_google_panos` is NULL for non-gsv runs; `total_points` and `status_*` are **ROW** counts and `total_grid_points` (v20) is the grid size — see "Row counts are not grid points" below |
 | `run_diffs` | UNIQUE(from_run_id, to_run_id) | Run-to-run change counters + detail filename |

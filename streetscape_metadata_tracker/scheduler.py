@@ -79,6 +79,7 @@ from .checkpointing import (
 from .city_registration import (
     MAX_GRID_DIM_M,
     CityResolutionError,
+    enable_hint,
     resolve_or_register_city,
 )
 from .download_common import (
@@ -5825,6 +5826,13 @@ def cmd_reconcile_walks(
     itself died. Checks each enabled city's expected artifact names for the date
     and salvages any whose coverage file is on disk with no catalog row —
     stat-per-candidate rather than a glob, since data/ holds thousands of files.
+
+    ENABLED cities only. Since issue #431 every ad-hoc registration (the
+    collector CLI, ``assess-city``) leaves a new city DISABLED, so an orphaned
+    walk on such a city is invisible here until ``enable-city`` runs; enable
+    it, then re-run this with the walk's ``--date``. (``assess-city`` itself
+    salvages inline through ``_run_city_channels``, so this bites only a killed
+    tail or a hand-run ``streetscape_street_analyzer.collect`` walk.)
     """
     conn = db.connect(cfg.db_path)
     today = target_date or clock.snapshot_date_today()
@@ -6325,10 +6333,12 @@ def cmd_enable_city(
 ) -> int:
     """Enable a registered-but-disabled city and enrol it on the opt-in channels (issue #374).
 
-    The handle for the ``scripts/register_frame.py`` path, which registers
-    cities DISABLED until their boundaries are vetted and until now left
-    enabling to a hand edit — which also left the four opt-in channels unset,
-    since bare ``enroll-city`` refuses a disabled city.
+    The handle for every path that registers a city DISABLED until its boundary
+    is vetted: ``scripts/register_frame.py`` since #110 and, since #431, every
+    ad-hoc registration (``assess-city``, the collector CLI, the archival
+    import). Before #374 enabling was left to a hand edit — which also left the
+    four opt-in channels unset, since bare ``enroll-city`` refuses a disabled
+    city.
 
     Enrolment runs BEFORE ``cities.enabled`` flips, for the reason
     ``cmd_enroll_city`` pre-sets exclusions first: the moment the city is
@@ -6401,8 +6411,9 @@ def cmd_enable_city(
 #
 # The GSV GRID run is deliberately absent: it is the expensive half (one request
 # per grid point) and it needs no help arriving. A newly registered city is
-# enabled with last_success_at NULL, which puts it at the head of the next
-# night's stalest-first queue -- as long as it is a gsv MEMBER. Since #301 a
+# DISABLED until `enable-city` (#431); once enabled, its last_success_at is
+# NULL, which puts it at the head of the next night's stalest-first queue -- as
+# long as it is a gsv MEMBER. Since #301 a
 # city can be excluded from gsv, and such a city is stranded behind the whole
 # gsv block instead; it arrives through the reservation _collect_due applies,
 # not at the head. That is a reason to leave the grid run out of this command,
@@ -6651,6 +6662,21 @@ def _assess_answer_report(cfg: SchedulerConfig, conn, city: db.CityRow) -> str:
         # a host with no configured public base.
         link = f"city.html?file={link_run.csv_filename}&network={DEFAULT_NETWORK_TYPE}"
         lines.append(f"  City page ({link_run.provider} run)  {cfg.site_url}{link}")
+    elif not city.enabled:
+        # Issue #431: get_due_cities filters `c.enabled = 1`, so for a disabled
+        # city "the next nightly batch" never comes. This sentence explains why
+        # there is no link YET, so an operator reads it as "wait one night" —
+        # which, unqualified, would mean waiting forever.
+        lines.append(
+            "  No grid run on any provider yet, so there is no city page to link "
+            "(generate_aggregate_v2 skips a city with no runs row). This city is "
+            "DISABLED, so no nightly batch collects its GSV grid run — the link "
+            f"arrives only after `enable-city {city.city_id}`, on the next night that "
+            "reaches it: once enabled, the grid run leads gsv's OWN stalest-first "
+            "list, which is the union's order only while the city is a gsv member; "
+            "excluded from gsv (#301) it is stranded instead and arrives through the "
+            "reservation, at [schedule].opt_in_cities_per_day per night."
+        )
     else:
         lines.append(
             "  No grid run on any provider yet, so there is no city page to link "
@@ -6701,10 +6727,16 @@ def _select_assess_channels(cfg: SchedulerConfig, requested: list[str] | None) -
             else "An opt-in channel collects the cities an operator enrolled, which is a "
             "standing decision rather than a same-day answer about one city"
         )
+        # Validated before the city is resolved, so this cannot know whether
+        # the city is enabled; say what run-due needs instead (#431). run-due
+        # collects only DUE cities, and get_due_cities filters `c.enabled = 1`,
+        # so pointing a disabled city at it alone is a silent no-op.
         raise _UsageError(
             f"--provider {', '.join(rejected)}: assess-city collects only "
             f"{', '.join(ASSESS_CHANNELS)}. {why} — use "
-            f"`run-due --provider {rejected[0]}` if you really want it now."
+            f"`run-due --provider {rejected[0]}` if you really want it now "
+            f"(run-due collects only enabled, due cities; a city registered by "
+            f"assess-city or the collector CLI is DISABLED until `enable-city`)."
         )
     return selected
 
@@ -6735,8 +6767,11 @@ def cmd_assess_city(
     :func:`enroll_opt_in_channels` (issue #374), so its next nightly run
     collects every provider on one UTC date. "Never touched" is keyed on the
     OPT-IN channels themselves (:func:`_opt_in_channels_touched`), not on the
-    city's history elsewhere: a city ``--estimate`` registered is enabled, and
-    a night can attempt it on gsv before the follow-up ``--yes`` run. So a
+    city's history elsewhere: a gsv attempt can precede the ``--yes`` run — the
+    documented order allows ``enable-city`` between ``--estimate`` and
+    ``--yes``, and a long-tracked city can be assessed — and a history signal
+    that counted that attempt would skip the enrolment (before #431
+    ``--estimate`` itself registered the city enabled). So a
     long-tracked city that was never on an opt-in channel is enrolled too,
     behind the same gates; one with any opt-in attempt, run or walk is left
     alone, and an explicit membership survives per pair as ``already_set``.
@@ -6813,6 +6848,11 @@ def cmd_assess_city(
         f"{'Registered' if newly_registered else 'Already registered'}: "
         f"{city.city_id} (geometry is frozen from here on)"
     )
+    if not city.enabled:
+        # Issue #431. On `not city.enabled`, not `newly_registered`: a frame city
+        # (register_frame.py) or an earlier --estimate also left it disabled, and
+        # the second run on an unvetted city must say so too.
+        print(f"  {enable_hint(city.city_id)}")
     # Membership is per-(city, channel) and this command had no idea (#301).
     # _run_city_channels performs no membership check, so an excluded channel
     # would be collected here -- spending its key -- and then record_attempt
@@ -6849,9 +6889,9 @@ def cmd_assess_city(
 
     # Issue #374. Decided HERE, before anything is spent, and printed as a dry
     # run; written only after the confirmation below. Keyed on the opt-in
-    # channels alone: an --estimate-registered city is enabled, so a night can
-    # attempt it on gsv before this run, and counting THAT as history would
-    # skip the enrolment the documented estimate-then-collect order is for.
+    # channels alone: `enable-city` may run between --estimate and this run, so
+    # a night can attempt the city on gsv first, and counting THAT as history
+    # would skip the enrolment the documented estimate-then-collect order is for.
     enrol_new_city = opt_in and not _opt_in_channels_touched(conn, city.city_id)
     if enrol_new_city:
         print(
@@ -6877,6 +6917,13 @@ def cmd_assess_city(
             "\n--estimate: the city is registered (a catalog-only write) and no "
             "provider request was issued. Re-run without --estimate to collect."
         )
+        if not city.enabled:
+            # Only when it is true: an already-enabled city printed no hint above,
+            # and is already in the rotation (#431 review).
+            print(
+                f"  It is registered DISABLED (see above): `enable-city {city.city_id}` "
+                f"puts it into the nightly rotation once the boundary above is vetted."
+            )
         return 0
 
     if not assume_yes:
@@ -7024,20 +7071,30 @@ def cmd_assess_city(
     # re-spending the crawl), but it has the same cost `run-due --provider`
     # carries, and #214 warns about it out loud rather than leaving it to be
     # discovered.
-    if newly_registered:
+    if not city.enabled:
+        # Issue #431: every ad-hoc registration is DISABLED, so "due on the next
+        # nightly batch" holds only after enable-city. Keyed on `enabled` rather
+        # than `newly_registered`, for the reason the hint above is.
         print(
-            "  The GSV grid run is not part of this command: it is due on the next "
-            "nightly batch and leads gsv's OWN stalest-first list. That is the union's "
-            "order only while the city is a gsv member — `enroll-city --channel gsv "
-            "--remove` (#301) makes it stranded instead, reached through the "
-            "[schedule].opt_in_cities_per_day reservation rather than at the head."
+            f"  The GSV grid run is not part of this command, and this city is DISABLED, "
+            f"so no nightly batch collects it yet. Once `enable-city {city.city_id}` "
+            f"enables it, the grid run leads gsv's OWN stalest-first list (NULLS FIRST). "
+            f"That is the union's order only while the city is a gsv member — "
+            f"`enroll-city --channel gsv --remove` (#301) makes it stranded instead, "
+            f"reached through the [schedule].opt_in_cities_per_day reservation rather "
+            f"than at the head."
         )
     if enrolled_opt_in:
         # The sentence #374 asks for: this command answers from street coverage
         # today, and every provider's grid run lands on ONE later date.
+        first_night = (
+            "this city's first nightly run"
+            if city.enabled
+            else f"this city's first nightly run after `enable-city {city.city_id}`"
+        )
         print(
             f"  The grid runs and the opt-in providers enrolled above "
-            f"({', '.join(enrolled_opt_in)}) arrive with this city's first nightly run, "
+            f"({', '.join(enrolled_opt_in)}) arrive with {first_night}, "
             f"which collects every member channel on one UTC date."
         )
     if succeeded:
@@ -13668,8 +13725,9 @@ def build_parser() -> argparse.ArgumentParser:
     _add_opt_in_flags(p_imp)
     p_enable = sub.add_parser(
         "enable-city",
-        help="Enable a registered-but-disabled city and enrol it on the opt-in "
-        "channels (issue #374)",
+        help="Enable a registered-but-disabled city — a frame city, or any ad-hoc "
+        "registration since #431 — and enrol it on the opt-in channels first "
+        "(issue #374)",
     )
     _add_global_flags(p_enable)
     p_enable.add_argument("city", help='City query or slug, e.g. "Krabi, Thailand"')
@@ -13752,7 +13810,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Register a new city, walk its streets on both providers, publish, "
         "and print the deployment numbers (issue #215). A new city is also "
         "enrolled on the opt-in channels (#374); the grid runs and the opt-in "
-        "providers arrive with its first nightly run.",
+        "providers arrive with its first nightly run. A NEW city is registered "
+        "DISABLED (issue #431); `enable-city` puts it into the nightly rotation "
+        "once its boundary is vetted.",
     )
     _add_global_flags(p_assess)
     p_assess.add_argument("city", help='City query, e.g. "Newport, Kentucky"')
@@ -13787,8 +13847,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_assess.add_argument(
         "--estimate",
         action="store_true",
-        help="Register the city and report boundary fit and per-channel cost, then "
-        "stop. No provider request is issued.",
+        help="Register the city (DISABLED, issue #431) and report boundary fit and "
+        "per-channel cost, then stop. No provider request is issued.",
     )
     p_assess.add_argument(
         "--yes", action="store_true", help="Skip the confirmation prompt (required on a non-TTY)"

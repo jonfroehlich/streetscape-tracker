@@ -2,15 +2,18 @@
 into is_baseline=1 dated runs against a fixture source tree + manifest."""
 
 import gzip
+import importlib.util
 import json
 import os
 import subprocess
 import sys
+from datetime import date
 
 import pandas as pd
 import pytest
 
 from streetscape_metadata_tracker import db
+from streetscape_metadata_tracker.city_registration import enable_hint
 from streetscape_metadata_tracker.fileutils import load_city_csv_file
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -360,20 +363,120 @@ def test_manifest_identity_registers_without_geocoding(source_root, data_dir, tm
 
     result = _run_import(source_root, data_dir, manifest)
     assert result.returncode == 0, result.stderr
-    assert "would register from manifest identity (quarter--testland)" in result.stdout
+    assert "would register from manifest identity (quarter--testland), disabled" in result.stdout
 
     result = _run_import(source_root, data_dir, manifest, "--execute")
     assert result.returncode == 0, result.stderr
     assert "1 baseline runs registered" in result.stdout
+    # Issue #431: registered DISABLED, and the report names the way in.
+    assert "registered DISABLED from manifest identity" in result.stdout
+    assert enable_hint("quarter--testland") in result.stdout
 
     conn = db.connect(os.path.join(data_dir, "streetscape_tracker.db"))
     city = db.resolve_city(conn, "quarter--testland")
     assert city is not None
+    assert city.enabled is False
     assert city.step_m == 20  # frozen at the default step, not the archival 30
     assert (city.grid_width_m, city.grid_height_m) > (0, 0)
     run = db.get_latest_run(conn, city.city_id)
     assert run.is_baseline and "_step_30_" in run.csv_filename
+    # A baseline run is a success-free registration as far as dueness goes, so
+    # an ENABLED city would be in gsv's queue here; a disabled one is not.
+    assert city.city_id not in _due_gsv(conn)
+    db.set_city_enabled(conn, city.city_id, True)
+    assert city.city_id in _due_gsv(conn), "the query must be able to see the city at all"
     conn.close()
+
+
+def _due_gsv(conn, today=date(2030, 1, 1)):
+    """gsv's nightly queue on a date far past any archival run's cycle."""
+    return [
+        c.city_id
+        for c in db.get_due_cities(
+            conn,
+            today=today,
+            cycle_days=90,
+            grace_days=10,
+            max_consecutive_failures=5,
+            default_membership=True,
+            provider="gsv",
+        )
+    ]
+
+
+def _import_script_module():
+    """The script as a module (its main() is guarded by __name__)."""
+    spec = importlib.util.spec_from_file_location("import_archival_scrapes", SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class _GeoLoc:
+    """The subset of a geocoded location the geocoded registration path reads."""
+
+    city = "Geo"
+    state = None
+    country = "Testland"
+    latitude = 44.0
+    longitude = -121.0
+    raw = {"boundingbox": ["43.99", "44.01", "-121.01", "-120.99"]}
+
+
+def test_a_geocoded_new_city_is_registered_disabled(conn, monkeypatch):
+    """
+    The geocoded site (issue #431), which the subprocess tests cannot reach:
+    they run with --no-nominatim or with a manifest identity.
+    """
+    mod = _import_script_module()
+    monkeypatch.setattr(mod, "get_city_location_data", lambda *a, **k: _GeoLoc())
+    entry = mod.ArchivalDataset(
+        rel_csv="x.csv", query="Geo, Testland", run_date=date(2023, 1, 1), fmt="v2"
+    )
+
+    row, note = mod.resolve_or_register_city(
+        conn, entry, (44.0, -121.0), (1000, 1000), use_nominatim=True, execute=True
+    )
+
+    assert row is not None
+    assert row.enabled is False
+    assert note.startswith("NEW city registered DISABLED")
+
+
+def test_a_geocode_landing_on_an_existing_city_is_not_reported_new(conn, monkeypatch):
+    """
+    The query is never aliased, so a second spelling misses resolve_city and
+    geocodes again. register_city is INSERT OR IGNORE, so it registers nothing
+    -- and reporting it "NEW ... DISABLED" would list one city per spelling
+    and, for an ENABLED city, print an enable-city hint that exits 64.
+    """
+    mod = _import_script_module()
+    monkeypatch.setattr(mod, "get_city_location_data", lambda *a, **k: _GeoLoc())
+
+    def entry(query):
+        return mod.ArchivalDataset(
+            rel_csv="x.csv", query=query, run_date=date(2023, 1, 1), fmt="v2"
+        )
+
+    first, note = mod.resolve_or_register_city(
+        conn, entry("Geo, Testland"), (44.0, -121.0), (1000, 1000), use_nominatim=True, execute=True
+    )
+    assert note.startswith("NEW city registered DISABLED")
+    db.set_city_enabled(conn, first.city_id, True)
+
+    row, note = mod.resolve_or_register_city(
+        conn,
+        entry("Geo Downtown, Testland"),
+        (44.0, -121.0),
+        (1000, 1000),
+        use_nominatim=True,
+        execute=True,
+    )
+
+    assert row.city_id == first.city_id
+    assert row.enabled is True
+    assert not note.startswith("NEW")
+    assert "DISABLED" not in note
 
 
 def test_redate_after_manifest_date_correction(source_root, data_dir, tmp_path):
