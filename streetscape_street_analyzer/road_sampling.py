@@ -23,8 +23,8 @@ WGS84 = "EPSG:4326"
 
 # Coordinate quantization for matching a sample point back to its collected
 # metadata row. Mirrors download_gsv.resume_point_key (round to 9 decimals,
-# ~0.1 mm): far finer than any spacing, far coarser than the float noise a
-# csv.gz round-trip introduces. Defined locally so the coverage/sampling code
+# ~0.1 mm): far finer than any spacing, far coarser than the one-ULP noise of a
+# reader that does not parse round-trip (the loader does since #425). Defined locally so the coverage/sampling code
 # (geopandas-only) need not import the aiohttp-heavy downloader module.
 _COORD_QUANT_DECIMALS = 9
 

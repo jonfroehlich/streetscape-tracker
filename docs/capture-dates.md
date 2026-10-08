@@ -81,6 +81,20 @@ For GSV a precision-aware comparison would be a no-op, since there is nothing fi
 For a provider with genuine day precision it could only hide real day-level re-dates.
 **What would re-open the question:** any GSV writer emitting genuine day precision (`standardize_capture_date` passes a `YYYY-MM-DD` through unchanged, so an API change would arrive silently — re-run the experiment's `sweep`), or a month-precision baseline for a census provider, whose runs carry real day precision (Mapillary's 3.00% on the 1st is what that looks like).
 
+## The same reader must also read coordinates exactly, not just dates permissively (issue #425)
+
+Written after the split (2026-10), as the coordinate twin of the #226 rule.
+`fileutils.load_city_csv_file` is the one reader for coordinates as well as dates, and the #226 rule generalizes: **a reader must hand back what is on disk**, and for a float column "on disk" is the text, whose correctly rounded value is the float the writer had.
+pandas' default C parser is not correctly rounded: on the dev catalog's six walk CSVs it returned 4.6–5.6 % of latitudes and 37.3–38.6 % of longitudes one ULP off their own text, never more than one.
+That is invisible to every statistic that aggregates (measured under both parsers over eight dated grid runs: zero stored grid stats moved, zero query-radius status flips, identical grid keys).
+It was fatal to the one consumer that keys on a rounded coordinate: `compute_streetwalk_coverage` joins samples to rows on a 9-decimal key, so a sample one ULP from a half-way point missed its own row and was scored uncovered — Seattle 5 of 247,292 samples on the dev catalog, a real +0.075 km and the published 98.4 → 98.5.
+The loader therefore reads `float_precision="round_trip"`, and the test that pins it uses a literal from a real walk CSV that the default parser is known to misplace (`tests/test_fileutils.py`).
+Two limits are stated rather than implied.
+The option reaches the `np.float64` columns only: nullable `Float64Dtype` columns (`pano_lat`, `pano_lon`) are parsed by another path and are unchanged, and nothing keys on them.
+And it costs 1.15–1.42× of load wall-clock with no memory cost (the 16.6M-row Detroit census: 29.6 → 37.1 s).
+As with #226, the CSV is never rewritten and the repair handle is a whole-series recompute: here `scripts/recompute_streetwalk_stats.py`, since no grid stat moved.
+Numbers: [`experiments/csv-float-parse.md`](experiments/csv-float-parse.md).
+
 ## Historical capture-date harvester (`download_gsv_history.py`, issue #2)
 
 **Historical capture-date harvester (`download_gsv_history.py`, issue #2).** Separate, opt-in, and out-of-band from the run pipeline.
