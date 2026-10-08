@@ -3,17 +3,23 @@
 Description=Screen Panoramax coverage across the catalog weekly
 
 [Timer]
-# Monday evening Pacific. Two things pick this slot, and both matter:
-#   - It is clear of the nightly batch, which starts by 02:15 and may start
-#     cities until 12 h later, then runs its tail (~14:45 at the latest). Both
-#     take the same machine-wide Panoramax host lock, so an overlap is not a
-#     race — it is a screen that exits 85 (host busy) and records nothing that
-#     week. It was 12:00 until 2026-09-25, which a full 12 h night overlapped;
-#     once the city cap began its staged raise, full-length nights became the
-#     norm. tests/test_prefreeze_unit.py pins the ordering.
+# Monday night Pacific. Three things pick this slot, and all matter:
+#   - It is AFTER the nightly batch's latest end: 02:15 + max_batch_hours + its
+#     tail (bounded by the collection unit's 30 min TimeoutStopSec) -- 14:45 at
+#     12 h, 18:45 at 16 h, 22:45 at 20 h. Both take the same machine-wide
+#     Panoramax host lock, so an overlap is not a race -- it is a screen that
+#     exits 85 (host busy) and records nothing that week. It was 12:00 until
+#     2026-09-25 and 18:00 until 2026-10 (issue #389), each inside the night it
+#     was meant to avoid once max_batch_hours grew.
+#   - It is DONE at least an hour before the next 02:00: 23:30 at the latest
+#     plus the service's 45 min TimeoutStartSec is 00:15. 23:00 satisfies both
+#     ends up to max_batch_hours ~20, and tests/test_prefreeze_unit.py pins both,
+#     so a raise past that fails the suite rather than losing a week.
 #   - The screen is a growth SIGNAL somebody acts on (a city crossing zero is an
 #     enrolment candidate), so it lands when there is a week ahead to act in.
-OnCalendar=Mon *-*-* 18:00:00 America/Los_Angeles
+# Still Tuesday in UTC (06:00-07:30), so the dated row and the (date, provider)
+# ledger charge do not move.
+OnCalendar=Mon *-*-* 23:00:00 America/Los_Angeles
 RandomizedDelaySec=30m
 # A missed week is a permanent hole in the series — the provider's own history
 # is not queryable backwards — so catch up on the next boot rather than skipping.

@@ -776,7 +776,7 @@ enabled = true
 # How long a road walk's street-network fetch keeps asking a refusing Overpass
 # before it gives up, exits 76 and trips the night-level breaker (issue #357).
 # Overpass is a HOST, not a [providers.*] channel: every walk channel (and the
-# daytime scripts/prefreeze_street_networks.py pass) fetches its network from
+# post-batch scripts/prefreeze_street_networks.py pass) fetches its network from
 # the same per-IP instance, so one policy covers them all and the scheduler
 # hands it to every walk child as --overpass-retry-* flags.
 #

@@ -26,7 +26,6 @@ from streetscape_metadata_tracker.scheduler import SchedulerConfig  # noqa: E402
 ROOT = Path(__file__).resolve().parent.parent
 TIMERS = [
     "streetscape-backup-check.timer",
-    "streetscape-prefreeze.timer",
     "streetscape-screen-provider.timer",
     "streetscape-tracker.timer",
 ]
@@ -95,7 +94,7 @@ class FakeSystemctl:
 
 @pytest.fixture
 def unit_files(tmp_path, monkeypatch):
-    """The four installed timer files, where the fake home keeps them."""
+    """The three installed timer files, where the fake home keeps them."""
     user = tmp_path / "user"
     user.mkdir()
     for n in TIMERS:
@@ -124,7 +123,7 @@ def _run(cfg, fake, **kw):
 # --- the timer set and the host ------------------------------------------------
 
 
-def test_shipped_timers_are_exactly_the_four_installed_units():
+def test_shipped_timers_are_exactly_the_three_installed_units():
     # A fifth timer fails here, which is the prompt to confirm the watchdog
     # (and its heartbeat) should cover it.
     assert ut.shipped_timers() == TIMERS
@@ -191,7 +190,7 @@ def test_enabled_but_inactive_timers_exit_nonzero_and_are_not_started_without_re
 
 def test_rearm_reloads_once_then_starts_only_the_inactive_timers(cfg, unit_files, sent):
     fake = FakeSystemctl()
-    a, b = TIMERS[1], TIMERS[3]
+    a, b = TIMERS[1], TIMERS[2]
     fake.set(a, ActiveState="inactive")
     fake.set(b, ActiveState="inactive")
     assert _run(cfg, fake, rearm=True) == 0
@@ -238,7 +237,7 @@ def test_a_disabled_timer_is_a_pause_not_a_failure(cfg, unit_files, sent, capsys
 def test_a_not_found_timer_is_unhealthy_and_a_reload_can_recover_it(cfg, unit_files, sent):
     """`not-found` is exactly the shape the NFS mount race leaves: the manager
     scanned an empty directory. daemon-reload re-scans; start then arms it."""
-    name = TIMERS[3]
+    name = TIMERS[2]
 
     def fake_for(reload_installs):
         f = FakeSystemctl(reload_installs=reload_installs)
@@ -287,7 +286,7 @@ def test_one_missing_timer_file_is_not_installed_and_the_rest_are_still_rearmed(
     """One shipped timer never copied into ~/.config/systemd/user/ is an install
     gap, not an unmounted home: it must not block the re-arm of the installed
     timers, nor be reported as UNIT FILES UNREACHABLE."""
-    missing, dead = TIMERS[0], TIMERS[3]
+    missing, dead = TIMERS[0], TIMERS[2]
     (unit_files / missing).unlink()
     fake = FakeSystemctl()
     fake.set(missing, LoadState="not-found", ActiveState="inactive", UnitFileState="")
@@ -357,7 +356,7 @@ def test_wait_polls_until_the_manager_and_the_unit_files_are_both_visible(cfg, u
     assert rc == 0
     assert fake.verbs().count("is-system-running") == 4
     assert fc.sleeps == [10, 10, 10]
-    assert fake.verbs()[4:] == ["show"] * 4
+    assert fake.verbs()[4:] == ["show"] * len(TIMERS)
 
 
 def test_wait_gives_up_after_the_budget_and_still_writes_the_heartbeat(cfg, unit_files, sent):
