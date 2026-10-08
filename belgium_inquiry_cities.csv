@@ -1,0 +1,4 @@
+query_string,city,admin,iso2,country,continent,size_band,population,coverage_regime,geonameid,lat,lon
+"Antwerp, Flanders, Belgium",Antwerp,Flanders,BE,Belgium,EU,,529247,,2803138,51.22047,4.40026
+"Mechelen, Flanders, Belgium",Mechelen,Flanders,BE,Belgium,EU,,77530,,2791537,51.02574,4.47762
+"Beringen, Flanders, Belgium",Beringen,Flanders,BE,Belgium,EU,,40930,,2802170,51.04954,5.22606
