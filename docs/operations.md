@@ -282,6 +282,20 @@ The `--only` dry run's summary line says no other column is read or written; if 
 Run it **per provider, in the daytime, never overlapping the 02:00 timer** — it shares the catalog with the batch, and a census provider's pass still reads millions of rows apiece.
 Nothing published reads `total_grid_points`, so the backfill republishes nothing; `scripts/undated_imagery_share_analyze.py` is its first reader; the backfill ran on production on 2026-10-04 and that regeneration is committed (see [`experiments/undated-imagery-share.md`](experiments/undated-imagery-share.md)).
 
+### Schema v21 and the quarantine alert stamp (issue #424)
+
+v21 adds `schedule_state.quarantine_alerted_at`, which makes the quarantine alert exactly-once per failure streak (see [`scheduler.md`](scheduler.md), "The failure quarantine, made visible").
+
+- **The migration is one-way, like v20's.**
+  Code older than v21 refuses a v21 catalog, so a rollback is a code revert **and** a catalog restore (`scheduler restore-backup`).
+- **Deploy only with no `run-due` in flight** (`pgrep -af '[s]cheduler .*run-due'`), for the same reason as v20.
+- **A v20 laptop bundle is refused** by `import-bundle` until the laptop checkout connects to its catalog once with the new code.
+- **The first night after the deploy emails every standing quarantined pair once**, each with its `reset-failures` command.
+  That is expected, not a regression: the migration backfills nothing, and a pair quarantined before #423 shipped was never emailed at all.
+  Every later night counts those pairs on its `Done:` line and does not email them again.
+
+There is no backfill script and nothing to run beyond the deploy itself.
+
 ## Backfilling the Mapillary quality block (issue #321)
 
 #321 adds a `quality` block to every Mapillary run's `mapillary_meta` (the `quality_score` distribution and its on-foot split; [`census.md`](census.md)), and `grid.html` builds its "Imagery quality" group from it.

@@ -4568,7 +4568,8 @@ def cmd_enroll_city(
 
     after = db.get_channel_membership(conn, city.city_id, channel)
     row = conn.execute(
-        "SELECT day_of_cycle, last_success_at FROM schedule_state WHERE city_id = ? AND provider = ?",
+        "SELECT day_of_cycle, last_success_at, consecutive_failures, quarantine_alerted_at "
+        "FROM schedule_state WHERE city_id = ? AND provider = ?",
         (city.city_id, channel),
     ).fetchone()
     print(f"{city.city_id} [{channel}]: {_describe(before)} -> {_describe(after)}")
@@ -4579,6 +4580,33 @@ def cmd_enroll_city(
     )
     for line in _enrolment_cost_note(conn, cfg, city, channel):
         print(line)
+    # A membership change never touches the quarantine alert stamp (issue #424):
+    # the stamp means "this failure streak was emailed", and enrolling does not
+    # change the streak. The operator at the keyboard is told instead.
+    failures = row["consecutive_failures"] if row else 0
+    if failures >= cfg.max_consecutive_failures:
+        stamp = row["quarantine_alerted_at"]
+        # The claim gates on exactly these three (db.claim_quarantine_alerts),
+        # so "the next run-due emails it" is true only when all three hold.
+        member = after if after is not None else CHANNEL_DEFAULT_MEMBERSHIP[channel]
+        claimable = bool(member) and city.enabled and channel in cfg.enabled_providers()
+        reset = _reset_failures_command(cfg, city.city_id, channel)
+        if claimable:
+            skip_note = f"QUARANTINED, so run-due skips this pair until `{reset}`."
+        else:
+            # Excluded, disabled or unconfigured: run-due skips it for THAT reason
+            # first, and saying "until reset-failures" would promise otherwise.
+            skip_note = (
+                "QUARANTINED: once the city is enabled, a member of this channel and the "
+                f"channel is configured, run-due still skips it until `{reset}`."
+            )
+        if stamp:
+            alert_note = f"Already alerted at {stamp}; enrolling does not re-alert."
+        elif claimable:
+            alert_note = "Not yet alerted; the next run-due emails it once."
+        else:
+            alert_note = "Not yet alerted; it is emailed once, the first night all three hold."
+        print(f"  NOTE  {failures} consecutive failure(s): {skip_note} {alert_note}")
     if not city.enabled:
         # Reached only on the --remove/--clear path, which is allowed here on
         # purpose. Say so, or "I excluded it and nothing changed" reads as the
@@ -5094,8 +5122,8 @@ def cmd_reset_failures(
         )
         return USAGE_EXIT_CODE
     row = conn.execute(
-        "SELECT consecutive_failures, last_error, last_attempt_at, member FROM schedule_state "
-        "WHERE city_id = ? AND provider = ?",
+        "SELECT consecutive_failures, last_error, last_attempt_at, member, "
+        "quarantine_alerted_at FROM schedule_state WHERE city_id = ? AND provider = ?",
         (city.city_id, channel),
     ).fetchone()
     failures = row["consecutive_failures"] if row is not None else 0
@@ -5117,6 +5145,7 @@ def cmd_reset_failures(
     print(f"{city.city_id} [{channel}]: {failures} consecutive failure(s); {state}.")
     print(f"  last attempt: {row['last_attempt_at'] or '—'}")
     print(f"  last error:   {row['last_error'] or 'none recorded'}")
+    print(f"  alerted:      {row['quarantine_alerted_at'] or 'never'}")
     if not city.enabled:
         print("  note: the city is disabled, so it is not due on any channel until enabled.")
     elif not is_member:
@@ -5130,8 +5159,9 @@ def cmd_reset_failures(
         return 0
     previous = db.reset_consecutive_failures(conn, city.city_id, channel)
     print(
-        f"Reset {city.city_id} [{channel}]: consecutive_failures {previous} -> 0. "
-        f"It is due again on its usual clock (last success and last error are unchanged)."
+        f"Reset {city.city_id} [{channel}]: consecutive_failures {previous} -> 0 and the "
+        f"alert stamp cleared, so a re-quarantine alerts again. It is due again on its "
+        f"usual clock (last success and last error are unchanged)."
     )
     return 0
 
@@ -9396,15 +9426,6 @@ def cmd_run_due(
         print(f"Would also back up the catalog to {cfg.backup_dir} (issue #145).")
         return 0
 
-    # The quarantined set as the night found it (issue #421). Diffed against the
-    # same query after the fill, so a pair that reaches max_consecutive_failures
-    # tonight is reported exactly once -- "count >= max" would re-alert it every
-    # night forever, since a quarantined pair keeps its count until cleared.
-    # After the dry-run return: a preview writes no failure, so it has no
-    # transition to find. Guarded: this runs ahead of the pre-loop backup, so a
-    # raise here would lose the whole night (see _quarantine_snapshot).
-    quarantined_before, quarantine_before_error = _quarantine_snapshot(cfg, conn, "before")
-
     # Back up the catalog BEFORE the city loop, so the night has a verified
     # copy even if the process is SIGKILLed mid-loop (issue #145; the tail
     # can't be reached in that case). Repeated in the tail to capture the
@@ -9507,20 +9528,17 @@ def cmd_run_due(
         if fill_report is not None
         else ""
     )
-    # After the fill, so its failures count too (issue #421). Guarded, because
-    # a raise here would cost the whole tail (see _quarantine_snapshot).
-    quarantined, quarantine_after_error = _quarantine_snapshot(cfg, conn, "after")
-    quarantine_error = "; ".join(e for e in (quarantine_before_error, quarantine_after_error) if e)
-    if quarantined is None:
-        quarantined = []
-    # A failed BEFORE snapshot means the transition is UNKNOWN, not that every
-    # quarantined pair is new: diffing against an empty set would report the
-    # whole standing set as tonight's, and re-alert pairs already alerted on.
-    newly_quarantined = (
-        _newly_quarantined(quarantined_before, quarantined)
-        if quarantined_before is not None
-        else []
-    )
+    # The quarantine alert (issues #421, #424): claim every quarantined pair not
+    # yet emailed, stamping it in the same UPDATE, THEN read the standing set for
+    # the Done line. Claim first, so a failed standing-set read still sends the
+    # email. After the fill, so its failures count too; after the dry-run return,
+    # so a preview stamps nothing. Both guarded: a raise here would cost the
+    # whole tail (see _quarantine_snapshot).
+    quarantine_alerts, claim_error = _claim_quarantine_alerts(cfg, conn)
+    quarantined, snapshot_error = _quarantine_snapshot(cfg, conn)
+    quarantine_error = "; ".join(e for e in (claim_error, snapshot_error) if e)
+    quarantine_alerts = quarantine_alerts or []
+    quarantined = quarantined or []
     summary = (
         f"run-due {today}{filter_note}: {succeeded}/{attempted} runs succeeded across "
         f"{processed} cities{cities_note} in {elapsed_h:.2f} h"
@@ -9590,10 +9608,10 @@ def cmd_run_due(
             else ""
         )
         + fill_note
-        # The STANDING set, on every night it is nonempty (issue #421): the
-        # transition alerts once, and this is what keeps the set from being
+        # The STANDING set, on every night it is nonempty (issue #421): each
+        # failure streak alerts once, and this is what keeps the set from being
         # forgotten after that one email.
-        + _quarantine_summary_note(quarantined, newly_quarantined)
+        + _quarantine_summary_note(quarantined, quarantine_alerts)
         + (f"; {quarantine_error}" if quarantine_error else "")
         + (f"; stopped early ({stop_reason})" if stop_reason else "")
         + (f"; {plan_error}" if plan_error else "")
@@ -9613,7 +9631,7 @@ def cmd_run_due(
         blocked_hosts=blocked_hosts,
         busy_hosts=busy_hosts,
         rejected_argv=rejected_argv,
-        newly_quarantined=newly_quarantined,
+        quarantine_alerts=quarantine_alerts,
         quarantine_error=quarantine_error or None,
     )
 
@@ -13040,9 +13058,13 @@ def _stranded_alert_note(cfg: SchedulerConfig, breaker: HostBreaker, today: date
 #
 # Two signals close it, deliberately of different weights:
 #
-# - the TRANSITION into quarantine alerts ONCE, as a part of the existing
-#   night-level email (its subject is what gets read at 03:00). It is detected
-#   by diffing the quarantined set before and after the night, never by
+# - each failure streak's quarantine alerts ONCE, as a part of the existing
+#   night-level email (its subject is what gets read at 03:00). The alert is
+#   CLAIMED from the persisted `schedule_state.quarantine_alerted_at` (#424):
+#   every quarantined pair whose stamp is NULL is emailed once and stamped in
+#   the same UPDATE, which is what makes a between-night entry (a lowered cap, a
+#   re-enabled city, an enrolment, a newly enabled provider block) emailed the
+#   next night and two overlapping `run-due`s unable to both email it -- never
 #   "count >= max", which would re-alert every night forever;
 # - the STANDING set is counted on every `Done:` line while it is nonempty, so
 #   it cannot be forgotten once the one email has scrolled away.
@@ -13068,44 +13090,75 @@ def _quarantined_pairs(cfg: SchedulerConfig, conn) -> list:
     )
 
 
-def _quarantine_snapshot(cfg: SchedulerConfig, conn, when: str) -> tuple[list | None, str | None]:
+def _quarantine_snapshot(cfg: SchedulerConfig, conn) -> tuple[list | None, str | None]:
     """``_quarantined_pairs``, guarded: ``(rows, None)``, or ``(None, error)`` on any exception.
 
-    Both of ``cmd_run_due``'s snapshots sit where a raise costs the most: the
-    BEFORE one ahead of the pre-loop backup (the whole night), the AFTER one
-    between the loop and ``_finish_batch`` (aggregate, manifests, backup,
-    publish and the alert). A reporting query must never cost either, so a
-    failure is logged and returned as a ``Done:``-line clause instead -- the
-    same posture as ``_tail_artifact``. ``when`` ("before"/"after") names the
-    snapshot in that clause.
+    It sits once in ``cmd_run_due``, between the fill and ``_finish_batch``
+    (aggregate, manifests, backup, publish and the alert), and feeds only the
+    ``Done:`` line's standing count -- the alert is ``_claim_quarantine_alerts``'
+    job. A reporting query must never cost the tail, so a failure is logged and
+    returned as a ``Done:``-line clause instead -- the same posture as
+    ``_tail_artifact``.
     """
     try:
         return _quarantined_pairs(cfg, conn), None
     except Exception as exc:
-        logger.exception(f"Quarantine check ({when} the night) failed")
+        logger.exception("Quarantine check failed")
         # The Done line is "; "-separated and parsed by splitting on ";"
         # (scripts/night_length_analyze.py), so a ";" in the exception text
         # would split this clause in two.
         reason = f"{type(exc).__name__}: {exc}".replace(";", ",")
-        return None, f"quarantine check FAILED ({when} the night: {reason})"
+        return None, f"quarantine check FAILED ({reason})"
 
 
-def _newly_quarantined(before: Sequence, after: Sequence) -> list:
-    """The rows of ``after`` whose (city, channel) was not quarantined in ``before``.
+def _claim_quarantine_alerts(cfg: SchedulerConfig, conn) -> tuple[list | None, str | None]:
+    """``db.claim_quarantine_alerts``, guarded: ``(rows, None)``, or ``(None, error)`` (#424).
 
-    A set difference, so a pair quarantined on an earlier night is in both and
-    never reported again -- the property that keeps this to ONE email. A pair
-    that left quarantine during the night (a success, or a ``reset-failures``
-    run concurrently) is simply absent from ``after`` and reports nothing.
+    Claims, and stamps, every quarantined pair on ``cfg.enabled_providers()``
+    whose failure streak has not been emailed yet -- over every enabled channel
+    like ``_quarantined_pairs``, so a ``--provider mapillary`` catch-up emails a
+    KartaView quarantine that arose between nights too (still once). It sits
+    between the fill and ``_finish_batch``, so a raise here must not cost the
+    tail: it is logged and returned as a ``Done:``-line clause. A raising claim
+    rolls its stamps back before it propagates (``db.claim_quarantine_alerts``),
+    so nothing is lost -- the next night claims them.
+
+    Every claimed pair is logged by name, at WARNING, the moment its stamp is
+    committed. From then on that streak's one email can still be lost -- a crash
+    anywhere in the tail before the send, a ``send_alert`` that fails (it
+    returns False and never raises), or ``[alerts].enabled = false`` -- and the
+    scheduler log, whose tail ``notify-failure`` emails, is then the only record
+    of which pairs were consumed.
     """
-    seen = {(r["city_id"], r["provider"]) for r in before}
-    return [r for r in after if (r["city_id"], r["provider"]) not in seen]
+    try:
+        claimed = db.claim_quarantine_alerts(
+            conn,
+            channels=cfg.enabled_providers(),
+            default_membership=CHANNEL_DEFAULT_MEMBERSHIP,
+            max_consecutive_failures=cfg.max_consecutive_failures,
+        )
+    except Exception as exc:
+        logger.exception("Quarantine alert claim failed")
+        # Same ";" escape as _quarantine_snapshot, for the same parser.
+        reason = f"{type(exc).__name__}: {exc}".replace(";", ",")
+        return None, f"quarantine alert claim FAILED ({reason})"
+    for row in claimed:
+        logger.warning(
+            "Quarantine alert claimed: %s [%s] at %d consecutive failure(s); "
+            "stamped, and tonight's email is its only alert",
+            row["city_id"],
+            row["provider"],
+            row["consecutive_failures"],
+        )
+    return claimed, None
 
 
-def _quarantine_summary_note(quarantined: Sequence, newly: Sequence) -> str:
+def _quarantine_summary_note(quarantined: Sequence, alerted: Sequence) -> str:
     """The ``Done:`` line's quarantine clause, empty when nothing is quarantined.
 
-    Example: ``; quarantined: 3 (kartaview 2, panoramax 1, 1 new tonight)``.
+    Example: ``; quarantined: 3 (kartaview 2, panoramax 1, 1 alerted tonight)``.
+    ``alerted`` is the pairs this night CLAIMED (emailed), which can include a
+    pair that crossed the cap between nights -- hence "alerted", not "new".
     The leading ``; `` is the only ``;`` in it: the ``Done:`` line is split
     on ``;`` by ``scripts/night_length_analyze.py``.
     """
@@ -13113,8 +13166,8 @@ def _quarantine_summary_note(quarantined: Sequence, newly: Sequence) -> str:
         return ""
     per_channel = Counter(r["provider"] for r in quarantined)
     detail = ", ".join(f"{ch} {n}" for ch, n in sorted(per_channel.items()))
-    if newly:
-        detail += f", {len(newly)} new tonight"
+    if alerted:
+        detail += f", {len(alerted)} alerted tonight"
     return f"; quarantined: {len(quarantined)} ({detail})"
 
 
@@ -13132,28 +13185,32 @@ def _reset_failures_command(cfg: SchedulerConfig, city_id: str, channel: str) ->
     return " ".join(shlex.quote(a) for a in argv)
 
 
-def _quarantine_alert_note(cfg: SchedulerConfig, newly: Sequence) -> str:
-    """The [alerts] paragraph naming each pair that entered quarantine tonight, or empty.
+def _quarantine_alert_note(cfg: SchedulerConfig, alerted: Sequence) -> str:
+    """The [alerts] paragraph naming each pair this night claimed an alert for, or empty.
 
     One line per pair -- city, channel, failure count, ``last_error`` and the
-    command that clears it -- because this is the only email the pair will ever
-    produce: from tomorrow it is not attempted, so it cannot fail again.
+    command that clears it -- because this is the only email the pair's failure
+    streak will ever produce (``schedule_state.quarantine_alerted_at``, #424):
+    it is not attempted again, so it cannot fail again.
     """
-    if not newly:
+    if not alerted:
         return ""
     lines = [
         f"{r['city_id']} [{r['provider']}]: {r['consecutive_failures']} consecutive "
         f"failure(s); last error: {(r['last_error'] or 'none recorded')[:200]}\n"
         f"    clear with: {_reset_failures_command(cfg, r['city_id'], r['provider'])}"
-        for r in newly
+        for r in alerted
     ]
     return (
-        f"{len(newly)} (city, channel) pair(s) reached [schedule].max_consecutive_failures "
-        f"= {cfg.max_consecutive_failures} tonight and are now QUARANTINED: run-due will not "
-        "attempt them again, so this is the last email they produce -- every later night "
-        "counts them on its `Done:` line instead (issue #421). Fix the cause first (the "
-        "per-attempt logs/collect_<city>_<channel>_<date>.log holds each failure's full "
-        "output), then clear the quarantine; without --execute the command only previews.\n  "
+        f"{len(alerted)} (city, channel) pair(s) are QUARANTINED at "
+        f"[schedule].max_consecutive_failures = {cfg.max_consecutive_failures} and had not "
+        "been alerted: run-due does not attempt them, so this is the only email they "
+        "produce -- every later night counts them on its `Done:` line instead (issues #421, "
+        "#424). A pair that crossed the cap between nights (a lowered cap, a re-enabled "
+        "city, an enrolment, a newly enabled provider block) is reported here the first "
+        "night after. Fix the cause first (the per-attempt "
+        "logs/collect_<city>_<channel>_<date>.log holds each failure's full output), then "
+        "clear the quarantine; without --execute the command only previews.\n  "
         + "\n  ".join(lines)
     )
 
@@ -13202,7 +13259,7 @@ def _finish_batch(
     busy_hosts: Counter[str] | None = None,
     rejected_argv: ArgvRejections | None = None,
     crashed: str = "LOOP",
-    newly_quarantined: Sequence | None = None,
+    quarantine_alerts: Sequence | None = None,
     quarantine_error: str | None = None,
 ) -> int:
     """Rebuild the published indexes, back up the catalog, publish, alert.
@@ -13250,19 +13307,20 @@ def _finish_batch(
     (``_run_city_channels``): ``None`` means nothing was rejected, not a dropped
     count.
 
-    ``newly_quarantined`` holds the ``schedule_state`` rows that reached
-    ``max_consecutive_failures`` TONIGHT (issue #421) -- the transition, never
-    the standing set, which the ``Done:`` line counts instead. It alerts
-    regardless of ``failure_threshold``, as an ``N QUARANTINED`` subject part
-    with a paragraph naming each pair and its ``reset-failures`` command,
-    because it is the last email that pair can ever produce: from tomorrow it
-    is not attempted, so it cannot fail again.
+    ``quarantine_alerts`` holds the ``schedule_state`` rows whose quarantine
+    alert this night CLAIMED (``db.claim_quarantine_alerts``, issues #421 and
+    #424) -- a pair is here once per failure streak, whether it crossed the cap
+    tonight or between nights; never the standing set, which the ``Done:`` line
+    counts instead. It alerts regardless of ``failure_threshold``, as an
+    ``N QUARANTINED`` subject part with a paragraph naming each pair and its
+    ``reset-failures`` command, because it is the only email that streak can
+    produce: the pair is not attempted again, so it cannot fail again.
 
-    ``quarantine_error`` is set when either quarantine snapshot raised
-    (``_quarantine_snapshot``). The ``summary`` already carries it as a clause;
-    it is passed separately because it alerts on its own, as ``QUARANTINE CHECK
-    FAILED``: a failed check is exactly the night a transition could go
-    unreported, and that transition's email is the only one the pair gets.
+    ``quarantine_error`` is set when the claim (``_claim_quarantine_alerts``) or
+    the standing-set read (``_quarantine_snapshot``) raised. The ``summary``
+    already carries it as a clause; it is passed separately because it alerts on
+    its own, as ``QUARANTINE CHECK FAILED``: a failed claim is exactly the night
+    an alert goes unsent (it is claimed the next night instead).
     """
     # Every index rebuild goes through _tail_artifact, which reports a failure
     # instead of propagating it — see there for why a lost tail is the worse
@@ -13436,8 +13494,8 @@ def _finish_batch(
     )
     rejected_argv = rejected_argv if rejected_argv is not None else ArgvRejections()
     rejected_note = _rejected_argv_alert_note(rejected_argv)
-    newly_quarantined = list(newly_quarantined or ())
-    quarantine_note = _quarantine_alert_note(cfg, newly_quarantined)
+    quarantine_alerts = list(quarantine_alerts or ())
+    quarantine_note = _quarantine_alert_note(cfg, quarantine_alerts)
 
     failures = attempted - succeeded
     unhealthy = (
@@ -13450,11 +13508,12 @@ def _finish_batch(
         busy_hosts,
         busy_recovered,
         rejected_argv,
-        # The night a pair ENTERS quarantine (issue #421). Unconditional rather
-        # than left to failure_threshold: it is that pair's last email.
-        newly_quarantined,
-        # ...and the night the check that would have SEEN that transition
-        # failed, for the same reason.
+        # The night a pair's quarantine is claimed (issues #421, #424).
+        # Unconditional rather than left to failure_threshold: it is that
+        # streak's only email.
+        quarantine_alerts,
+        # ...and the night the claim or the standing-set read failed, for the
+        # same reason.
         quarantine_error,
         # Deliberately NOT `blocked_hosts.stranded` (issue #373): a host
         # stranding already alerts through its host condition, and a DEADLINE
@@ -13505,8 +13564,8 @@ def _finish_batch(
             parts.append(f"{len(busy_recovered)} host(s) BUSY then recovered")
         if rejected_argv:
             parts.append(f"{sum(rejected_argv.values())} launch(es) REJECTED by our own CLI")
-        if newly_quarantined:
-            parts.append(f"{len(newly_quarantined)} QUARANTINED")
+        if quarantine_alerts:
+            parts.append(f"{len(quarantine_alerts)} QUARANTINED")
         if quarantine_error:
             parts.append("QUARANTINE CHECK FAILED")
         # The failure count is the subject on an ordinary bad night, and noise
