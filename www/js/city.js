@@ -1,7 +1,8 @@
-/* exported switchRun, toggleYear, setGsvMode, toggleFlatOnly, setRenderAll, toggleDiffOverlay */
+/* exported switchRun, toggleYear, setGsvMode, toggleFlatOnly, setRenderAll, toggleDiffOverlay, setStreetMode, toggleStreetGaps, streetModeKeydown */
 // (switchRun/toggleYear/setGsvMode/toggleFlatOnly/setRenderAll/toggleDiffOverlay
-// are invoked from onchange/onclick attributes in the HTML this file
-// generates, so ESLint can't see those string references.)
+// and the street section's setStreetMode/toggleStreetGaps/streetModeKeydown
+// are invoked from onchange/onclick/onkeydown attributes in the legend HTML,
+// so ESLint can't see those string references.)
 /**
  * city.js
  * Per-city detail-view logic for Streetscape City Explorer.
@@ -104,6 +105,8 @@ let onMap = new Set();          // markers currently added to the Leaflet map
 let desiredShown = new Set();   // markers that SHOULD be drawn right now
 let renderAllOverride = false;  // user opted out of the cap ("Render all")
 let panoDotsHidden = false;     // streets overlay hid the pano layer
+let streetUi = null;            // StreetUiState (street-coverage.js), or null: no street artifact
+let streetController = null;    // what renderStreetCoverage resolved to, or null
 
 // Mode-scoped caches, rebuilt by rebuildModeCaches() on load and on setGsvMode.
 // "In mode" = markerInMode(): Google-only (default) vs all-GSV; for non-GSV and
@@ -316,6 +319,100 @@ legendControl.onAdd = () => {
   return div;
 };
 legendControl.addTo(map);
+
+/** Smallest legend height worth keeping; the bottom-right stack yields first. */
+const LEGEND_MIN_HEIGHT_PX = 160;
+
+/**
+ * Smallest street-chart body worth showing expanded: one 30px row plus the
+ * chart's ~44px of axis and padding (street-coverage.js sizes the wrap at
+ * `rows × 30 + 44`), plus the body's 10px bottom padding. With less room than
+ * this the chart starts collapsed and its header says why.
+ */
+const STREET_CHART_MIN_BODY_PX = 84;
+
+/** Vertical gap kept between the legend's bottom edge and the stack. */
+const LEGEND_STACK_GAP_PX = 10;
+
+/**
+ * Keep the bottom-right panel stack from ever covering the legend (issue
+ * #104). Both are right-anchored and the stack sits above Leaflet's controls,
+ * so without this a tall street-type chart (17 rows on an `all_public` walk)
+ * slides over the legend's snapshot picker, Imagery filter, street section
+ * and year filter.
+ *
+ * The legend keeps a floor of `min(its content height, LEGEND_MIN_HEIGHT_PX)`
+ * and the STACK yields the rest. First the street chart's body is capped to
+ * the room that remains, but never below one row (STREET_CHART_MIN_BODY_PX),
+ * and scrolls inside its panel, so every row stays reachable. If that is still
+ * not enough — a body already at its one-row floor, or the capture-date panel
+ * alone too tall — the whole stack caps and scrolls (its panels are
+ * `flex-shrink: 0`, so they overflow the cap rather than shrink and clip).
+ * The legend then gets every pixel above the stack, as before. Re-run
+ * whenever the stack changes size (a panel collapses, the street chart
+ * appears), a panel is toggled, the legend rebuilds, or the window resizes.
+ *
+ * @returns {number} The room the street chart's body had before its one-row
+ *   floor (below STREET_CHART_MIN_BODY_PX, even negative, means not one row
+ *   fits), or Infinity when it was left at its natural height (or is not shown).
+ */
+function fitLegendAboveBottomPanels() {
+  const legend = document.querySelector(".legend");
+  const stack = document.getElementById("bottom-right-panels");
+  if (!legend || !stack) return Infinity;
+  const body = document.getElementById("street-chart-body");
+
+  // Measure the natural layout: clear the caps a previous pass set.
+  stack.style.maxHeight = "";
+  stack.style.overflowY = "";
+  if (body) body.style.maxHeight = "";
+
+  const legendTop = legend.getBoundingClientRect().top;
+  const legendFloor = Math.min(legend.scrollHeight, LEGEND_MIN_HEIGHT_PX);
+  const stackRoom = Math.floor(
+    stack.getBoundingClientRect().bottom - legendTop - legendFloor - LEGEND_STACK_GAP_PX
+  );
+  let excess = stack.offsetHeight - stackRoom;
+
+  let bodyRoom = Infinity;
+  const bodyHeight = body ? body.offsetHeight : 0; // 0 when hidden or collapsed
+  if (excess > 0 && bodyHeight > 0) {
+    // Never below one row: an expanded chart showing only its padding reads
+    // as broken while its button says it is open. The stack scrolls the rest.
+    bodyRoom = bodyHeight - excess;
+    const bodyCap = Math.max(Math.min(bodyHeight, STREET_CHART_MIN_BODY_PX), bodyRoom);
+    body.style.maxHeight = `${bodyCap}px`;
+    excess -= bodyHeight - bodyCap;
+  }
+  if (excess > 0) {
+    stack.style.maxHeight = `${Math.max(0, stackRoom)}px`;
+    stack.style.overflowY = "auto";
+  }
+
+  const room = stack.getBoundingClientRect().top - legendTop - LEGEND_STACK_GAP_PX;
+  legend.style.maxHeight = `${Math.max(legendFloor, Math.floor(room))}px`;
+  return bodyRoom;
+}
+{
+  const stack = document.getElementById("bottom-right-panels");
+  if (stack && typeof ResizeObserver === "function") {
+    // Deferred a frame: the fit resizes the very element observed, and doing
+    // that inside the callback is what raises "ResizeObserver loop completed
+    // with undelivered notifications". The next observation measures the
+    // capped size, recomputes the same caps, and stops.
+    let pending = false;
+    new ResizeObserver(() => {
+      if (pending) return;
+      pending = true;
+      requestAnimationFrame(() => {
+        pending = false;
+        fitLegendAboveBottomPanels();
+      });
+    }).observe(stack);
+  }
+  window.addEventListener("resize", fitLegendAboveBottomPanels);
+  fitLegendAboveBottomPanels();
+}
 
 /**
  * Rebuild the legend HTML to reflect the current marker state.
@@ -542,6 +639,12 @@ function updateLegend(years) {
       </button>`;
   }
 
+  // ── Section 3c: Street coverage (issue #104) ──────────────
+  // Present once renderStreetCoverage has drawn an overlay. Re-derived from
+  // the reported state on every rebuild, like every other section here, since
+  // the innerHTML swap below would otherwise wipe it.
+  if (streetUi) html += streetLegendSectionHtml(streetUi);
+
   // ── Section 4: Interactive year filter ────────────────────
   if (sortedYears.length > 0) {
     html += `
@@ -573,21 +676,75 @@ function updateLegend(years) {
     });
   }
 
-  // Replacing innerHTML destroys the focused element; if focus was on a
-  // year button, put it back on the same year so keyboard users don't get
-  // dropped to <body> on every toggle.
-  const focusedYear = div.contains(document.activeElement)
-    ? document.activeElement.dataset?.year
-    : null;
+  // Replacing innerHTML destroys the focused element; put focus back on the
+  // equivalent control so keyboard users don't get dropped to <body> on every
+  // toggle (the street section's checkbox and radios rebuild the legend too).
+  const focusSelector = legendFocusSelectorFor(
+    div.contains(document.activeElement) ? document.activeElement : null
+  );
   div.innerHTML = html;
-  if (focusedYear != null) {
-    div.querySelector(`.year-item[data-year="${focusedYear}"]`)?.focus();
-  }
+  if (focusSelector) div.querySelector(focusSelector)?.focus();
 
   // The innerHTML swap above destroyed any previous chart canvas — rebuild.
   rebuildRunHistoryChart();
   captureHistoryChart = rebuildCaptureHistoryChart(
     captureHistoryGlobal, providerGlobal, captureHistoryChart);
+
+  // Fit after BOTH chart rebuilds, so the legend's content height includes
+  // the capture-history section: the legend's floor is its content height
+  // when that is under the floor, so a rebuild can change how much room the
+  // bottom-right stack may take.
+  fitLegendAboveBottomPanels();
+}
+
+/**
+ * A selector that finds a legend control's replacement after an innerHTML
+ * rebuild: by id when it has one (e.g. #street-gaps-toggle), else the same
+ * year button, else the same street colour-mode radio.
+ *
+ * @param {?HTMLElement} el - The focused element inside the legend, or null.
+ * @returns {?string} A CSS selector, or null when there is nothing to restore.
+ */
+function legendFocusSelectorFor(el) {
+  if (!el) return null;
+  if (el.id) return `[id="${el.id}"]`;
+  if (el.dataset?.year != null) return `.year-item[data-year="${el.dataset.year}"]`;
+  if (el.dataset?.mode) return `.street-mode-btn[data-mode="${el.dataset.mode}"]`;
+  return null;
+}
+
+/**
+ * Legend radiogroup → street colour mode (street-coverage.js owns the
+ * restyle, and reports back through onChange, which rebuilds the legend).
+ * @param {string} mode - "age" | "coverage" | "type".
+ */
+function setStreetMode(mode) {
+  streetController?.setMode(mode);
+}
+
+/**
+ * Arrow keys inside the legend's Color-by radiogroup: check the next/previous
+ * mode and move focus to it (nextStreetMode owns the order and the wrap). The
+ * legend rebuild inside setStreetMode restores focus to the radio that was
+ * focused, so focus is moved AFTER it, onto the rebuilt target. Other keys
+ * fall through untouched, so Enter, Space and Tab behave as before.
+ *
+ * @param {KeyboardEvent} event - From the radiogroup's onkeydown attribute.
+ */
+function streetModeKeydown(event) {
+  const next = nextStreetMode(event.target?.dataset?.mode, event.key);
+  if (!next) return;
+  event.preventDefault();
+  setStreetMode(next);
+  document.querySelector(`.legend .street-mode-btn[data-mode="${next}"]`)?.focus();
+}
+
+/**
+ * Legend checkbox → "Highlight gaps".
+ * @param {boolean} on - The checkbox's new state.
+ */
+function toggleStreetGaps(on) {
+  streetController?.setGaps(on);
 }
 
 /**
@@ -1164,7 +1321,13 @@ function createTemporalPlot(canvas) {
     plugins: [verticalLinePlugin],
   });
   temporalChartGlobal = chart;
-  setupTemporalToggle(chart);
+  setupCollapsiblePanel({
+    containerId: "temporal-plot-container",
+    toggleId: "temporal-plot-toggle",
+    storageKey: "streetscape-temporal-collapsed",
+    what: "capture-date chart",
+    onExpand: () => chart.resize(),
+  });
 
   /** Apply (or toggle off) the date filter for one capture date. */
   function selectFilterDate(date) {
@@ -1241,36 +1404,63 @@ function createTemporalPlot(canvas) {
 }
 
 /**
- * Wire the temporal panel's minimize/expand button. Collapsing hides the chart
- * body so it stops covering the map; the choice persists across runs/reloads in
- * localStorage. Chart.js is resized on expand because it can't measure a
- * display:none parent.
+ * Wire a bottom-right .map-panel's minimize/expand button (the capture-date
+ * chart, and since issue #104 the street-type chart above it). Collapsing
+ * hides the panel body so it stops covering the map; the choice persists
+ * across runs/reloads in localStorage under `storageKey`. `onExpand` exists
+ * because Chart.js can't measure a display:none parent, so a chart has to be
+ * resized when its body comes back.
  *
- * @param {Chart} chart - The temporal Chart.js instance.
+ * @example
+ *   setupCollapsiblePanel({
+ *     containerId: "temporal-plot-container", toggleId: "temporal-plot-toggle",
+ *     storageKey: "streetscape-temporal-collapsed", what: "capture-date chart",
+ *     onExpand: () => chart.resize(),
+ *   });
+ *
+ * @param {Object} opts
+ * @param {string} opts.containerId - The .map-panel element's id.
+ * @param {string} opts.toggleId - The header button's id.
+ * @param {string} opts.storageKey - localStorage key ("1" = collapsed).
+ * @param {string} opts.what - Noun phrase for the button's label ("Minimize <what>").
+ * @param {function(): void} [opts.onExpand] - Called whenever the body is shown.
+ * @param {?string} [opts.autoCollapseNote] - When set, the panel starts collapsed
+ *   even without a stored choice, and this note is appended to its title until
+ *   the user toggles it. Never persisted: it describes this screen, not a
+ *   preference (used when there is no room for even one street-chart row).
  */
-function setupTemporalToggle(chart) {
-  const container = document.getElementById("temporal-plot-container");
-  const toggle = document.getElementById("temporal-plot-toggle");
+function setupCollapsiblePanel({ containerId, toggleId, storageKey, what, onExpand, autoCollapseNote }) {
+  const container = document.getElementById(containerId);
+  const toggle = document.getElementById(toggleId);
   if (!container || !toggle) return;
+  const title = container.querySelector(".map-panel-title");
+  const baseTitle = title?.textContent ?? "";
 
-  const KEY = "streetscape-temporal-collapsed";
-  const apply = (collapsed) => {
+  const apply = (collapsed, note = null) => {
     container.classList.toggle("collapsed", collapsed);
     toggle.setAttribute("aria-expanded", String(!collapsed));
-    toggle.setAttribute("aria-label",
-      collapsed ? "Expand capture-date chart" : "Minimize capture-date chart");
+    toggle.setAttribute("aria-label", `${collapsed ? "Expand" : "Minimize"} ${what}`);
     toggle.textContent = collapsed ? "+" : "–";
-    if (!collapsed) chart.resize();
+    if (title) title.textContent = note ? `${baseTitle} · ${note}` : baseTitle;
+    if (!collapsed && onExpand) onExpand();
   };
 
   let collapsed = false;
-  try { collapsed = localStorage.getItem(KEY) === "1"; } catch { /* storage may be blocked */ }
-  apply(collapsed);
+  try { collapsed = localStorage.getItem(storageKey) === "1"; } catch { /* storage may be blocked */ }
+  if (!collapsed && autoCollapseNote) {
+    collapsed = true;
+    apply(true, autoCollapseNote);
+  } else {
+    apply(collapsed);
+  }
 
   toggle.addEventListener("click", () => {
     collapsed = !collapsed;
-    try { localStorage.setItem(KEY, collapsed ? "1" : "0"); } catch { /* storage may be blocked */ }
+    try { localStorage.setItem(storageKey, collapsed ? "1" : "0"); } catch { /* storage may be blocked */ }
     apply(collapsed);
+    // Inside a capped stack a toggle changes the content but not the stack's
+    // box, so the ResizeObserver never sees it; refit explicitly.
+    fitLegendAboveBottomPanels();
   });
 }
 
@@ -1916,9 +2106,16 @@ async function loadData() {
     // this page has always shown. A broad 'all_public' walk covers a much larger
     // network — different street-km denominator, not a better number for the
     // same thing — so it is selected deliberately, never fallen back to.
-    // The setPanoDotsVisible hook lets the panel show/hide the pano markers (a
-    // coarse show-all/hide-all) so the streets can be read on their own; it goes
-    // through the reconcile model so re-showing respects the mode/year/date/cap.
+    //
+    // The overlay has no panel of its own (issue #104): it renders into the
+    // legend (a "Street coverage" section re-derived from the state reported
+    // through onChange), a top-left layer control (Panoramas + Streets) and the
+    // street-type chart stacked above the capture-date chart. "Panoramas" is a
+    // proxy layer whose add/remove goes through the reconcile model, so
+    // re-showing respects the mode/year/date/cap and hiding stays ≤ cap work.
+    //
+    // Deliberately NOT awaited: an overlay failure must not turn into "Failed
+    // to load city data" for a page that has already rendered.
     const streetwalk = cityIdGlobal
       ? lookupStreetwalk(
           await fetchStreetwalkManifest(),
@@ -1927,13 +2124,38 @@ async function loadData() {
           streetNetworkType
         )
       : null;
+    const panoLayer = panoVisibilityLayer((visible) => {
+      panoDotsHidden = !visible;
+      applyDesired();
+    }).addTo(map); // on the map from the start, so its checkbox starts checked
     renderStreetCoverage(map, targetFile, providerGlobal, {
       streetwalkFile: streetwalk?.coverage_filename,
-      setPanoDotsVisible: (visible) => {
-        panoDotsHidden = !visible;
-        applyDesired();
+      networkType: streetwalk ? streetNetworkType : null,
+      panoLayer,
+      onChange: (state) => {
+        streetUi = state;
+        updateLegend(Object.keys(markersByYear).map(Number));
       },
-    });
+    })
+      .then((controller) => {
+        streetController = controller;
+        if (controller?.chart) {
+          // The panel just appeared: fit now (not a frame later) so the room
+          // left for the chart is known before choosing its starting state.
+          // Less than one row's worth starts it collapsed, and says so.
+          const bodyRoom = fitLegendAboveBottomPanels();
+          setupCollapsiblePanel({
+            containerId: "street-chart-container",
+            toggleId: "street-chart-toggle",
+            storageKey: "streetscape-street-chart-collapsed",
+            what: "street-type chart",
+            onExpand: () => controller.chart.resize(),
+            autoCollapseNote:
+              bodyRoom < STREET_CHART_MIN_BODY_PX ? "collapsed to fit this screen" : null,
+          });
+        }
+      })
+      .catch((e) => console.warn("Street-coverage overlay failed:", e));
 
   } catch (error) {
     console.error("Error loading or parsing city data:", error);

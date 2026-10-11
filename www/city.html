@@ -40,21 +40,34 @@
 
   <div id="map" role="application" aria-label="City panorama age map"></div>
 
-  <div id="temporal-plot-container">
-    <div id="temporal-plot-head">
-      <span id="temporal-plot-title">Panoramas by capture date</span>
-      <button type="button" id="temporal-plot-toggle" aria-expanded="true"
-              aria-controls="temporal-plot-body" aria-label="Minimize capture-date chart">–</button>
+  <!-- Bottom-right panel stack: the street-type chart (issue #104) above the
+       capture-date chart. Each panel collapses on its own; the chart panel
+       stays hidden until a run has a street-coverage artifact. The rest of the
+       street overlay renders into the legend and the top-left layer control. -->
+  <div id="bottom-right-panels">
+    <div id="street-chart-container" class="map-panel" hidden
+         role="region" aria-label="Street coverage by street type">
+      <div class="map-panel-head">
+        <span id="street-chart-title" class="map-panel-title">Coverage by street type (km)</span>
+        <button type="button" id="street-clear-selection" hidden>✕ clear</button>
+        <button type="button" id="street-chart-toggle" aria-expanded="true"
+                aria-controls="street-chart-body" aria-label="Minimize street-type chart">–</button>
+      </div>
+      <div id="street-chart-body" class="map-panel-body">
+        <div id="street-chart-wrap"><canvas id="street-coverage-chart"></canvas></div>
+      </div>
     </div>
-    <div id="temporal-plot-body">
-      <canvas id="temporal-plot"></canvas>
+    <div id="temporal-plot-container" class="map-panel">
+      <div id="temporal-plot-head" class="map-panel-head">
+        <span id="temporal-plot-title" class="map-panel-title">Panoramas by capture date</span>
+        <button type="button" id="temporal-plot-toggle" aria-expanded="true"
+                aria-controls="temporal-plot-body" aria-label="Minimize capture-date chart">–</button>
+      </div>
+      <div id="temporal-plot-body" class="map-panel-body">
+        <canvas id="temporal-plot"></canvas>
+      </div>
     </div>
   </div>
-
-  <!-- OSM street-coverage panel (populated by street-coverage.js; stays
-       hidden until a run has a "_streets.json.gz" artifact) -->
-  <div id="street-coverage-container" role="region"
-       aria-label="OSM street coverage"></div>
 
   <div id="progress-container" role="status" aria-live="polite">
     <div id="progress-bar">

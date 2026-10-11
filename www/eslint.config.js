@@ -299,6 +299,9 @@ module.exports = [
     languageOptions: {
       globals: {
         renderStreetCoverage: "readonly",
+        streetLegendSectionHtml: "readonly",
+        nextStreetMode: "readonly",
+        panoVisibilityLayer: "readonly",
         renderDiffOverlay: "readonly",
         // capture-history.js (issue #109), also loaded by city.html only.
         captureHistoryLegendHtml: "readonly",
