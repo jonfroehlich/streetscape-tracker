@@ -1,0 +1,1047 @@
+{
+  "_about": {
+    "experiment": "belgium-screen",
+    "writeup": "docs/experiments/belgium-screen.md",
+    "generated_by": "python scripts/belgium_screen_analyze.py --docs-dir docs/experiments",
+    "collected_by": "python scripts/belgium_screen_collect.py --mapillary-tiles experiments/mapillary-discovery-383/tiles --panoramax-tiles experiments/belgium-screen-2026-10-08 --places experiments/mapillary-discovery-383/cities500.txt --out docs/experiments/belgium-screen_places.csv",
+    "screen_date": "2026-10-08",
+    "requests": {
+      "mapillary_z6_sequence_tiles": 2,
+      "panoramax_z6_grid_tiles": 2
+    }
+  },
+  "places": {
+    "n": 373,
+    "brussels_capital_n": 18,
+    "outside_brussels_capital_n": 355
+  },
+  "mapillary": {
+    "km_per_km2_all": {
+      "n": 373,
+      "min": 0.0,
+      "p25": 0.23,
+      "p50": 0.88,
+      "p75": 1.98,
+      "p90": 6.49,
+      "p95": 14.79,
+      "max": 51.97
+    },
+    "km_per_km2_brussels_capital": {
+      "n": 18,
+      "min": 8.36,
+      "p25": 14.67,
+      "p50": 19.05,
+      "p75": 27.63,
+      "p90": 45.85,
+      "p95": 48.02,
+      "max": 51.97
+    },
+    "km_per_km2_outside_brussels_capital": {
+      "n": 355,
+      "min": 0.0,
+      "p25": 0.2,
+      "p50": 0.79,
+      "p75": 1.77,
+      "p90": 3.04,
+      "p95": 7.01,
+      "max": 27.75
+    },
+    "places_with_zero_recent360": 65,
+    "top_creator_share_where_any": {
+      "n": 308,
+      "min": 0.37,
+      "p25": 0.72,
+      "p50": 1.0,
+      "p75": 1.0,
+      "p90": 1.0,
+      "p95": 1.0,
+      "max": 1.0
+    },
+    "brussels_capital": [
+      {
+        "place": "Brussels",
+        "pop": 1019022,
+        "mly_recent360_km": 653.1,
+        "mly_km_per_km2": 51.97,
+        "mly_top_creator_share": 0.38,
+        "pnx_pics_ub": 54344,
+        "pnx_360_ub": 45129
+      },
+      {
+        "place": "Saint-Josse-ten-Noode",
+        "pop": 27366,
+        "mly_recent360_km": 594.7,
+        "mly_km_per_km2": 47.32,
+        "mly_top_creator_share": 0.44,
+        "pnx_pics_ub": 38213,
+        "pnx_360_ub": 29979
+      },
+      {
+        "place": "Ixelles",
+        "pop": 86671,
+        "mly_recent360_km": 568.3,
+        "mly_km_per_km2": 45.22,
+        "mly_top_creator_share": 0.39,
+        "pnx_pics_ub": 55902,
+        "pnx_360_ub": 44157
+      },
+      {
+        "place": "Saint-Gilles",
+        "pop": 50221,
+        "mly_recent360_km": 474.0,
+        "mly_km_per_km2": 37.72,
+        "mly_top_creator_share": 0.45,
+        "pnx_pics_ub": 50346,
+        "pnx_360_ub": 42446
+      },
+      {
+        "place": "Etterbeek",
+        "pop": 48344,
+        "mly_recent360_km": 347.4,
+        "mly_km_per_km2": 27.65,
+        "mly_top_creator_share": 0.4,
+        "pnx_pics_ub": 47202,
+        "pnx_360_ub": 36238
+      },
+      {
+        "place": "Koekelberg",
+        "pop": 21984,
+        "mly_recent360_km": 346.6,
+        "mly_km_per_km2": 27.58,
+        "mly_top_creator_share": 0.39,
+        "pnx_pics_ub": 40600,
+        "pnx_360_ub": 33259
+      },
+      {
+        "place": "Schaerbeek",
+        "pop": 132761,
+        "mly_recent360_km": 318.7,
+        "mly_km_per_km2": 25.36,
+        "mly_top_creator_share": 0.58,
+        "pnx_pics_ub": 36959,
+        "pnx_360_ub": 29835
+      },
+      {
+        "place": "Anderlecht",
+        "pop": 160553,
+        "mly_recent360_km": 270.4,
+        "mly_km_per_km2": 21.52,
+        "mly_top_creator_share": 0.7,
+        "pnx_pics_ub": 24775,
+        "pnx_360_ub": 23576
+      },
+      {
+        "place": "Jette",
+        "pop": 52490,
+        "mly_recent360_km": 246.8,
+        "mly_km_per_km2": 19.64,
+        "mly_top_creator_share": 0.4,
+        "pnx_pics_ub": 18538,
+        "pnx_360_ub": 15912
+      },
+      {
+        "place": "Forest",
+        "pop": 56254,
+        "mly_recent360_km": 231.9,
+        "mly_km_per_km2": 18.45,
+        "mly_top_creator_share": 0.42,
+        "pnx_pics_ub": 31607,
+        "pnx_360_ub": 29888
+      },
+      {
+        "place": "Molenbeek-Saint-Jean",
+        "pop": 97037,
+        "mly_recent360_km": 216.4,
+        "mly_km_per_km2": 17.22,
+        "mly_top_creator_share": 0.67,
+        "pnx_pics_ub": 19608,
+        "pnx_360_ub": 18805
+      },
+      {
+        "place": "Woluwe-Saint-Lambert",
+        "pop": 56584,
+        "mly_recent360_km": 202.9,
+        "mly_km_per_km2": 16.15,
+        "mly_top_creator_share": 0.52,
+        "pnx_pics_ub": 12934,
+        "pnx_360_ub": 11298
+      },
+      {
+        "place": "Ganshoren",
+        "pop": 24859,
+        "mly_recent360_km": 185.2,
+        "mly_km_per_km2": 14.74,
+        "mly_top_creator_share": 0.37,
+        "pnx_pics_ub": 16006,
+        "pnx_360_ub": 13603
+      },
+      {
+        "place": "Evere",
+        "pop": 41667,
+        "mly_recent360_km": 184.0,
+        "mly_km_per_km2": 14.64,
+        "mly_top_creator_share": 0.43,
+        "pnx_pics_ub": 15744,
+        "pnx_360_ub": 14245
+      },
+      {
+        "place": "Uccle",
+        "pop": 82929,
+        "mly_recent360_km": 172.3,
+        "mly_km_per_km2": 13.71,
+        "mly_top_creator_share": 0.5,
+        "pnx_pics_ub": 24416,
+        "pnx_360_ub": 22421
+      },
+      {
+        "place": "Watermael-Boitsfort",
+        "pop": 25157,
+        "mly_recent360_km": 131.0,
+        "mly_km_per_km2": 10.42,
+        "mly_top_creator_share": 0.82,
+        "pnx_pics_ub": 14812,
+        "pnx_360_ub": 11389
+      },
+      {
+        "place": "Auderghem",
+        "pop": 33984,
+        "mly_recent360_km": 112.8,
+        "mly_km_per_km2": 8.98,
+        "mly_top_creator_share": 0.68,
+        "pnx_pics_ub": 15949,
+        "pnx_360_ub": 12066
+      },
+      {
+        "place": "Berchem-Sainte-Agathe",
+        "pop": 25162,
+        "mly_recent360_km": 105.0,
+        "mly_km_per_km2": 8.36,
+        "mly_top_creator_share": 0.44,
+        "pnx_pics_ub": 13019,
+        "pnx_360_ub": 11339
+      }
+    ],
+    "listing_floor_km_per_km2": 7.0,
+    "outside_brussels_capital_at_or_above_floor": [
+      {
+        "place": "Berchem",
+        "pop": 43511,
+        "mly_recent360_km": 348.8,
+        "mly_km_per_km2": 27.75,
+        "mly_top_creator_share": 0.94,
+        "pnx_pics_ub": 8225,
+        "pnx_360_ub": 6037,
+        "km_from_antwerp_point": 4.0
+      },
+      {
+        "place": "Borgerhout",
+        "pop": 46087,
+        "mly_recent360_km": 345.5,
+        "mly_km_per_km2": 27.49,
+        "mly_top_creator_share": 0.96,
+        "pnx_pics_ub": 6182,
+        "pnx_360_ub": 4005,
+        "km_from_antwerp_point": 2.7
+      },
+      {
+        "place": "Rixensart",
+        "pop": 21616,
+        "mly_recent360_km": 284.3,
+        "mly_km_per_km2": 22.63,
+        "mly_top_creator_share": 1.0,
+        "pnx_pics_ub": 32,
+        "pnx_360_ub": 0,
+        "km_from_antwerp_point": 56.9
+      },
+      {
+        "place": "Antwerp",
+        "pop": 529247,
+        "mly_recent360_km": 278.3,
+        "mly_km_per_km2": 22.14,
+        "mly_top_creator_share": 0.96,
+        "pnx_pics_ub": 6651,
+        "pnx_360_ub": 4832,
+        "km_from_antwerp_point": 0.0
+      },
+      {
+        "place": "Deurne",
+        "pop": 78747,
+        "mly_recent360_km": 214.9,
+        "mly_km_per_km2": 17.1,
+        "mly_top_creator_share": 0.97,
+        "pnx_pics_ub": 1953,
+        "pnx_360_ub": 1046,
+        "km_from_antwerp_point": 4.6
+      },
+      {
+        "place": "Mortsel",
+        "pop": 24525,
+        "mly_recent360_km": 198.3,
+        "mly_km_per_km2": 15.78,
+        "mly_top_creator_share": 0.95,
+        "pnx_pics_ub": 5986,
+        "pnx_360_ub": 5262,
+        "km_from_antwerp_point": 6.9
+      },
+      {
+        "place": "Wilrijk",
+        "pop": 41403,
+        "mly_recent360_km": 186.9,
+        "mly_km_per_km2": 14.87,
+        "mly_top_creator_share": 0.96,
+        "pnx_pics_ub": 2599,
+        "pnx_360_ub": 2054,
+        "km_from_antwerp_point": 5.9
+      },
+      {
+        "place": "Edegem",
+        "pop": 21839,
+        "mly_recent360_km": 177.7,
+        "mly_km_per_km2": 14.14,
+        "mly_top_creator_share": 0.94,
+        "pnx_pics_ub": 3852,
+        "pnx_360_ub": 3779,
+        "km_from_antwerp_point": 7.7
+      },
+      {
+        "place": "Kontich",
+        "pop": 20290,
+        "mly_recent360_km": 147.5,
+        "mly_km_per_km2": 11.74,
+        "mly_top_creator_share": 0.92,
+        "pnx_pics_ub": 2742,
+        "pnx_360_ub": 2705,
+        "km_from_antwerp_point": 10.3
+      },
+      {
+        "place": "Merksem",
+        "pop": 44435,
+        "mly_recent360_km": 131.6,
+        "mly_km_per_km2": 10.47,
+        "mly_top_creator_share": 0.92,
+        "pnx_pics_ub": 2369,
+        "pnx_360_ub": 1399,
+        "km_from_antwerp_point": 4.4
+      },
+      {
+        "place": "Borsbeek",
+        "pop": 10334,
+        "mly_recent360_km": 118.5,
+        "mly_km_per_km2": 9.43,
+        "mly_top_creator_share": 1.0,
+        "pnx_pics_ub": 3042,
+        "pnx_360_ub": 2551,
+        "km_from_antwerp_point": 6.5
+      },
+      {
+        "place": "Boechout",
+        "pop": 12145,
+        "mly_recent360_km": 115.2,
+        "mly_km_per_km2": 9.17,
+        "mly_top_creator_share": 1.0,
+        "pnx_pics_ub": 2202,
+        "pnx_360_ub": 2163,
+        "km_from_antwerp_point": 9.3
+      },
+      {
+        "place": "Hoboken",
+        "pop": 34443,
+        "mly_recent360_km": 110.8,
+        "mly_km_per_km2": 8.82,
+        "mly_top_creator_share": 0.87,
+        "pnx_pics_ub": 3117,
+        "pnx_360_ub": 2899,
+        "km_from_antwerp_point": 6.1
+      },
+      {
+        "place": "Boom",
+        "pop": 15810,
+        "mly_recent360_km": 109.5,
+        "mly_km_per_km2": 8.71,
+        "mly_top_creator_share": 0.62,
+        "pnx_pics_ub": 17865,
+        "pnx_360_ub": 17813,
+        "km_from_antwerp_point": 14.3
+      },
+      {
+        "place": "Gent",
+        "pop": 265086,
+        "mly_recent360_km": 104.9,
+        "mly_km_per_km2": 8.34,
+        "mly_top_creator_share": 0.98,
+        "pnx_pics_ub": 6280,
+        "pnx_360_ub": 3291,
+        "km_from_antwerp_point": 51.3
+      },
+      {
+        "place": "Sint-Amandsberg",
+        "pop": 32115,
+        "mly_recent360_km": 104.8,
+        "mly_km_per_km2": 8.34,
+        "mly_top_creator_share": 0.93,
+        "pnx_pics_ub": 7836,
+        "pnx_360_ub": 4589,
+        "km_from_antwerp_point": 48.8
+      },
+      {
+        "place": "Rumst",
+        "pop": 14521,
+        "mly_recent360_km": 103.7,
+        "mly_km_per_km2": 8.25,
+        "mly_top_creator_share": 0.76,
+        "pnx_pics_ub": 17914,
+        "pnx_360_ub": 17887,
+        "km_from_antwerp_point": 15.4
+      },
+      {
+        "place": "Basse Lasne",
+        "pop": 13861,
+        "mly_recent360_km": 96.7,
+        "mly_km_per_km2": 7.7,
+        "mly_top_creator_share": 0.97,
+        "pnx_pics_ub": 403,
+        "pnx_360_ub": 379,
+        "km_from_antwerp_point": 58.5
+      }
+    ]
+  },
+  "panoramax": {
+    "note": "upper bounds over whole H3 cells; neighbouring places share cells, never sum",
+    "pnx_360_ub_all": {
+      "n": 373,
+      "min": 0,
+      "p25": 84.0,
+      "p50": 1318.0,
+      "p75": 3355.0,
+      "p90": 7647.0,
+      "p95": 14249.0,
+      "max": 45129
+    },
+    "places_with_zero_360_ub": 82,
+    "places_with_zero_pictures_ub": 0,
+    "top_by_360_ub": [
+      {
+        "place": "Brussels",
+        "pop": 1019022,
+        "mly_recent360_km": 653.1,
+        "mly_km_per_km2": 51.97,
+        "mly_top_creator_share": 0.38,
+        "pnx_pics_ub": 54344,
+        "pnx_360_ub": 45129,
+        "flat_share_ub": 0.17
+      },
+      {
+        "place": "Ixelles",
+        "pop": 86671,
+        "mly_recent360_km": 568.3,
+        "mly_km_per_km2": 45.22,
+        "mly_top_creator_share": 0.39,
+        "pnx_pics_ub": 55902,
+        "pnx_360_ub": 44157,
+        "flat_share_ub": 0.21
+      },
+      {
+        "place": "Saint-Gilles",
+        "pop": 50221,
+        "mly_recent360_km": 474.0,
+        "mly_km_per_km2": 37.72,
+        "mly_top_creator_share": 0.45,
+        "pnx_pics_ub": 50346,
+        "pnx_360_ub": 42446,
+        "flat_share_ub": 0.157
+      },
+      {
+        "place": "Etterbeek",
+        "pop": 48344,
+        "mly_recent360_km": 347.4,
+        "mly_km_per_km2": 27.65,
+        "mly_top_creator_share": 0.4,
+        "pnx_pics_ub": 47202,
+        "pnx_360_ub": 36238,
+        "flat_share_ub": 0.232
+      },
+      {
+        "place": "Koekelberg",
+        "pop": 21984,
+        "mly_recent360_km": 346.6,
+        "mly_km_per_km2": 27.58,
+        "mly_top_creator_share": 0.39,
+        "pnx_pics_ub": 40600,
+        "pnx_360_ub": 33259,
+        "flat_share_ub": 0.181
+      },
+      {
+        "place": "Braine-l'Alleud",
+        "pop": 37512,
+        "mly_recent360_km": 0.0,
+        "mly_km_per_km2": 0.0,
+        "mly_top_creator_share": null,
+        "pnx_pics_ub": 35746,
+        "pnx_360_ub": 32360,
+        "flat_share_ub": 0.095
+      },
+      {
+        "place": "Saint-Josse-ten-Noode",
+        "pop": 27366,
+        "mly_recent360_km": 594.7,
+        "mly_km_per_km2": 47.32,
+        "mly_top_creator_share": 0.44,
+        "pnx_pics_ub": 38213,
+        "pnx_360_ub": 29979,
+        "flat_share_ub": 0.215
+      },
+      {
+        "place": "Forest",
+        "pop": 56254,
+        "mly_recent360_km": 231.9,
+        "mly_km_per_km2": 18.45,
+        "mly_top_creator_share": 0.42,
+        "pnx_pics_ub": 31607,
+        "pnx_360_ub": 29888,
+        "flat_share_ub": 0.054
+      },
+      {
+        "place": "Schaerbeek",
+        "pop": 132761,
+        "mly_recent360_km": 318.7,
+        "mly_km_per_km2": 25.36,
+        "mly_top_creator_share": 0.58,
+        "pnx_pics_ub": 36959,
+        "pnx_360_ub": 29835,
+        "flat_share_ub": 0.193
+      },
+      {
+        "place": "Waterloo",
+        "pop": 29778,
+        "mly_recent360_km": 10.0,
+        "mly_km_per_km2": 0.8,
+        "mly_top_creator_share": 0.78,
+        "pnx_pics_ub": 24080,
+        "pnx_360_ub": 23681,
+        "flat_share_ub": 0.017
+      },
+      {
+        "place": "Anderlecht",
+        "pop": 160553,
+        "mly_recent360_km": 270.4,
+        "mly_km_per_km2": 21.52,
+        "mly_top_creator_share": 0.7,
+        "pnx_pics_ub": 24775,
+        "pnx_360_ub": 23576,
+        "flat_share_ub": 0.048
+      },
+      {
+        "place": "Uccle",
+        "pop": 82929,
+        "mly_recent360_km": 172.3,
+        "mly_km_per_km2": 13.71,
+        "mly_top_creator_share": 0.5,
+        "pnx_pics_ub": 24416,
+        "pnx_360_ub": 22421,
+        "flat_share_ub": 0.082
+      },
+      {
+        "place": "Mechelen",
+        "pop": 77530,
+        "mly_recent360_km": 27.4,
+        "mly_km_per_km2": 2.18,
+        "mly_top_creator_share": 0.68,
+        "pnx_pics_ub": 21837,
+        "pnx_360_ub": 21605,
+        "flat_share_ub": 0.011
+      },
+      {
+        "place": "Molenbeek-Saint-Jean",
+        "pop": 97037,
+        "mly_recent360_km": 216.4,
+        "mly_km_per_km2": 17.22,
+        "mly_top_creator_share": 0.67,
+        "pnx_pics_ub": 19608,
+        "pnx_360_ub": 18805,
+        "flat_share_ub": 0.041
+      },
+      {
+        "place": "Rumst",
+        "pop": 14521,
+        "mly_recent360_km": 103.7,
+        "mly_km_per_km2": 8.25,
+        "mly_top_creator_share": 0.76,
+        "pnx_pics_ub": 17914,
+        "pnx_360_ub": 17887,
+        "flat_share_ub": 0.002
+      },
+      {
+        "place": "Boom",
+        "pop": 15810,
+        "mly_recent360_km": 109.5,
+        "mly_km_per_km2": 8.71,
+        "mly_top_creator_share": 0.62,
+        "pnx_pics_ub": 17865,
+        "pnx_360_ub": 17813,
+        "flat_share_ub": 0.003
+      },
+      {
+        "place": "Leuven",
+        "pop": 101032,
+        "mly_recent360_km": 23.8,
+        "mly_km_per_km2": 1.89,
+        "mly_top_creator_share": 0.61,
+        "pnx_pics_ub": 17045,
+        "pnx_360_ub": 15973,
+        "flat_share_ub": 0.063
+      },
+      {
+        "place": "Jette",
+        "pop": 52490,
+        "mly_recent360_km": 246.8,
+        "mly_km_per_km2": 19.64,
+        "mly_top_creator_share": 0.4,
+        "pnx_pics_ub": 18538,
+        "pnx_360_ub": 15912,
+        "flat_share_ub": 0.142
+      },
+      {
+        "place": "Menen",
+        "pop": 31916,
+        "mly_recent360_km": 4.2,
+        "mly_km_per_km2": 0.33,
+        "mly_top_creator_share": 1.0,
+        "pnx_pics_ub": 122812,
+        "pnx_360_ub": 14255,
+        "flat_share_ub": 0.884
+      },
+      {
+        "place": "Evere",
+        "pop": 41667,
+        "mly_recent360_km": 184.0,
+        "mly_km_per_km2": 14.64,
+        "mly_top_creator_share": 0.43,
+        "pnx_pics_ub": 15744,
+        "pnx_360_ub": 14245,
+        "flat_share_ub": 0.095
+      },
+      {
+        "place": "Ganshoren",
+        "pop": 24859,
+        "mly_recent360_km": 185.2,
+        "mly_km_per_km2": 14.74,
+        "mly_top_creator_share": 0.37,
+        "pnx_pics_ub": 16006,
+        "pnx_360_ub": 13603,
+        "flat_share_ub": 0.15
+      },
+      {
+        "place": "Wervik",
+        "pop": 17340,
+        "mly_recent360_km": 2.5,
+        "mly_km_per_km2": 0.2,
+        "mly_top_creator_share": 1.0,
+        "pnx_pics_ub": 94041,
+        "pnx_360_ub": 13309,
+        "flat_share_ub": 0.858
+      },
+      {
+        "place": "Blauwput",
+        "pop": 30215,
+        "mly_recent360_km": 14.3,
+        "mly_km_per_km2": 1.14,
+        "mly_top_creator_share": 0.86,
+        "pnx_pics_ub": 13528,
+        "pnx_360_ub": 12478,
+        "flat_share_ub": 0.078
+      },
+      {
+        "place": "Kessel-Lo",
+        "pop": 30215,
+        "mly_recent360_km": 11.4,
+        "mly_km_per_km2": 0.91,
+        "mly_top_creator_share": 1.0,
+        "pnx_pics_ub": 13528,
+        "pnx_360_ub": 12478,
+        "flat_share_ub": 0.078
+      },
+      {
+        "place": "Auderghem",
+        "pop": 33984,
+        "mly_recent360_km": 112.8,
+        "mly_km_per_km2": 8.98,
+        "mly_top_creator_share": 0.68,
+        "pnx_pics_ub": 15949,
+        "pnx_360_ub": 12066,
+        "flat_share_ub": 0.243
+      }
+    ],
+    "top_by_pictures_ub": [
+      {
+        "place": "Menen",
+        "pop": 31916,
+        "mly_recent360_km": 4.2,
+        "mly_km_per_km2": 0.33,
+        "mly_top_creator_share": 1.0,
+        "pnx_pics_ub": 122812,
+        "pnx_360_ub": 14255,
+        "flat_share_ub": 0.884
+      },
+      {
+        "place": "Mouscron",
+        "pop": 52069,
+        "mly_recent360_km": 0.0,
+        "mly_km_per_km2": 0.0,
+        "mly_top_creator_share": null,
+        "pnx_pics_ub": 115843,
+        "pnx_360_ub": 8858,
+        "flat_share_ub": 0.924
+      },
+      {
+        "place": "Wervik",
+        "pop": 17340,
+        "mly_recent360_km": 2.5,
+        "mly_km_per_km2": 0.2,
+        "mly_top_creator_share": 1.0,
+        "pnx_pics_ub": 94041,
+        "pnx_360_ub": 13309,
+        "flat_share_ub": 0.858
+      },
+      {
+        "place": "Ixelles",
+        "pop": 86671,
+        "mly_recent360_km": 568.3,
+        "mly_km_per_km2": 45.22,
+        "mly_top_creator_share": 0.39,
+        "pnx_pics_ub": 55902,
+        "pnx_360_ub": 44157,
+        "flat_share_ub": 0.21
+      },
+      {
+        "place": "Brussels",
+        "pop": 1019022,
+        "mly_recent360_km": 653.1,
+        "mly_km_per_km2": 51.97,
+        "mly_top_creator_share": 0.38,
+        "pnx_pics_ub": 54344,
+        "pnx_360_ub": 45129,
+        "flat_share_ub": 0.17
+      },
+      {
+        "place": "Saint-Gilles",
+        "pop": 50221,
+        "mly_recent360_km": 474.0,
+        "mly_km_per_km2": 37.72,
+        "mly_top_creator_share": 0.45,
+        "pnx_pics_ub": 50346,
+        "pnx_360_ub": 42446,
+        "flat_share_ub": 0.157
+      },
+      {
+        "place": "Etterbeek",
+        "pop": 48344,
+        "mly_recent360_km": 347.4,
+        "mly_km_per_km2": 27.65,
+        "mly_top_creator_share": 0.4,
+        "pnx_pics_ub": 47202,
+        "pnx_360_ub": 36238,
+        "flat_share_ub": 0.232
+      },
+      {
+        "place": "Koekelberg",
+        "pop": 21984,
+        "mly_recent360_km": 346.6,
+        "mly_km_per_km2": 27.58,
+        "mly_top_creator_share": 0.39,
+        "pnx_pics_ub": 40600,
+        "pnx_360_ub": 33259,
+        "flat_share_ub": 0.181
+      },
+      {
+        "place": "Saint-Josse-ten-Noode",
+        "pop": 27366,
+        "mly_recent360_km": 594.7,
+        "mly_km_per_km2": 47.32,
+        "mly_top_creator_share": 0.44,
+        "pnx_pics_ub": 38213,
+        "pnx_360_ub": 29979,
+        "flat_share_ub": 0.215
+      },
+      {
+        "place": "Schaerbeek",
+        "pop": 132761,
+        "mly_recent360_km": 318.7,
+        "mly_km_per_km2": 25.36,
+        "mly_top_creator_share": 0.58,
+        "pnx_pics_ub": 36959,
+        "pnx_360_ub": 29835,
+        "flat_share_ub": 0.193
+      },
+      {
+        "place": "Braine-l'Alleud",
+        "pop": 37512,
+        "mly_recent360_km": 0.0,
+        "mly_km_per_km2": 0.0,
+        "mly_top_creator_share": null,
+        "pnx_pics_ub": 35746,
+        "pnx_360_ub": 32360,
+        "flat_share_ub": 0.095
+      },
+      {
+        "place": "Forest",
+        "pop": 56254,
+        "mly_recent360_km": 231.9,
+        "mly_km_per_km2": 18.45,
+        "mly_top_creator_share": 0.42,
+        "pnx_pics_ub": 31607,
+        "pnx_360_ub": 29888,
+        "flat_share_ub": 0.054
+      },
+      {
+        "place": "Ronse",
+        "pop": 24204,
+        "mly_recent360_km": 0.0,
+        "mly_km_per_km2": 0.0,
+        "mly_top_creator_share": null,
+        "pnx_pics_ub": 31211,
+        "pnx_360_ub": 1250,
+        "flat_share_ub": 0.96
+      },
+      {
+        "place": "Anderlecht",
+        "pop": 160553,
+        "mly_recent360_km": 270.4,
+        "mly_km_per_km2": 21.52,
+        "mly_top_creator_share": 0.7,
+        "pnx_pics_ub": 24775,
+        "pnx_360_ub": 23576,
+        "flat_share_ub": 0.048
+      },
+      {
+        "place": "Wevelgem",
+        "pop": 30954,
+        "mly_recent360_km": 2.0,
+        "mly_km_per_km2": 0.16,
+        "mly_top_creator_share": 1.0,
+        "pnx_pics_ub": 24738,
+        "pnx_360_ub": 1027,
+        "flat_share_ub": 0.958
+      },
+      {
+        "place": "Uccle",
+        "pop": 82929,
+        "mly_recent360_km": 172.3,
+        "mly_km_per_km2": 13.71,
+        "mly_top_creator_share": 0.5,
+        "pnx_pics_ub": 24416,
+        "pnx_360_ub": 22421,
+        "flat_share_ub": 0.082
+      },
+      {
+        "place": "Waterloo",
+        "pop": 29778,
+        "mly_recent360_km": 10.0,
+        "mly_km_per_km2": 0.8,
+        "mly_top_creator_share": 0.78,
+        "pnx_pics_ub": 24080,
+        "pnx_360_ub": 23681,
+        "flat_share_ub": 0.017
+      },
+      {
+        "place": "Mechelen",
+        "pop": 77530,
+        "mly_recent360_km": 27.4,
+        "mly_km_per_km2": 2.18,
+        "mly_top_creator_share": 0.68,
+        "pnx_pics_ub": 21837,
+        "pnx_360_ub": 21605,
+        "flat_share_ub": 0.011
+      },
+      {
+        "place": "Molenbeek-Saint-Jean",
+        "pop": 97037,
+        "mly_recent360_km": 216.4,
+        "mly_km_per_km2": 17.22,
+        "mly_top_creator_share": 0.67,
+        "pnx_pics_ub": 19608,
+        "pnx_360_ub": 18805,
+        "flat_share_ub": 0.041
+      },
+      {
+        "place": "Jette",
+        "pop": 52490,
+        "mly_recent360_km": 246.8,
+        "mly_km_per_km2": 19.64,
+        "mly_top_creator_share": 0.4,
+        "pnx_pics_ub": 18538,
+        "pnx_360_ub": 15912,
+        "flat_share_ub": 0.142
+      },
+      {
+        "place": "Rumst",
+        "pop": 14521,
+        "mly_recent360_km": 103.7,
+        "mly_km_per_km2": 8.25,
+        "mly_top_creator_share": 0.76,
+        "pnx_pics_ub": 17914,
+        "pnx_360_ub": 17887,
+        "flat_share_ub": 0.002
+      },
+      {
+        "place": "Boom",
+        "pop": 15810,
+        "mly_recent360_km": 109.5,
+        "mly_km_per_km2": 8.71,
+        "mly_top_creator_share": 0.62,
+        "pnx_pics_ub": 17865,
+        "pnx_360_ub": 17813,
+        "flat_share_ub": 0.003
+      },
+      {
+        "place": "Leuven",
+        "pop": 101032,
+        "mly_recent360_km": 23.8,
+        "mly_km_per_km2": 1.89,
+        "mly_top_creator_share": 0.61,
+        "pnx_pics_ub": 17045,
+        "pnx_360_ub": 15973,
+        "flat_share_ub": 0.063
+      },
+      {
+        "place": "Ganshoren",
+        "pop": 24859,
+        "mly_recent360_km": 185.2,
+        "mly_km_per_km2": 14.74,
+        "mly_top_creator_share": 0.37,
+        "pnx_pics_ub": 16006,
+        "pnx_360_ub": 13603,
+        "flat_share_ub": 0.15
+      },
+      {
+        "place": "Auderghem",
+        "pop": 33984,
+        "mly_recent360_km": 112.8,
+        "mly_km_per_km2": 8.98,
+        "mly_top_creator_share": 0.68,
+        "pnx_pics_ub": 15949,
+        "pnx_360_ub": 12066,
+        "flat_share_ub": 0.243
+      }
+    ],
+    "named": {
+      "Boom": {
+        "place": "Boom",
+        "pop": 15810,
+        "mly_recent360_km": 109.5,
+        "mly_km_per_km2": 8.71,
+        "mly_top_creator_share": 0.62,
+        "pnx_pics_ub": 17865,
+        "pnx_360_ub": 17813,
+        "flat_share_ub": 0.003
+      },
+      "Braine-l'Alleud": {
+        "place": "Braine-l'Alleud",
+        "pop": 37512,
+        "mly_recent360_km": 0.0,
+        "mly_km_per_km2": 0.0,
+        "mly_top_creator_share": null,
+        "pnx_pics_ub": 35746,
+        "pnx_360_ub": 32360,
+        "flat_share_ub": 0.095
+      },
+      "Leuven": {
+        "place": "Leuven",
+        "pop": 101032,
+        "mly_recent360_km": 23.8,
+        "mly_km_per_km2": 1.89,
+        "mly_top_creator_share": 0.61,
+        "pnx_pics_ub": 17045,
+        "pnx_360_ub": 15973,
+        "flat_share_ub": 0.063
+      },
+      "Mechelen": {
+        "place": "Mechelen",
+        "pop": 77530,
+        "mly_recent360_km": 27.4,
+        "mly_km_per_km2": 2.18,
+        "mly_top_creator_share": 0.68,
+        "pnx_pics_ub": 21837,
+        "pnx_360_ub": 21605,
+        "flat_share_ub": 0.011
+      },
+      "Menen": {
+        "place": "Menen",
+        "pop": 31916,
+        "mly_recent360_km": 4.2,
+        "mly_km_per_km2": 0.33,
+        "mly_top_creator_share": 1.0,
+        "pnx_pics_ub": 122812,
+        "pnx_360_ub": 14255,
+        "flat_share_ub": 0.884
+      },
+      "Rumst": {
+        "place": "Rumst",
+        "pop": 14521,
+        "mly_recent360_km": 103.7,
+        "mly_km_per_km2": 8.25,
+        "mly_top_creator_share": 0.76,
+        "pnx_pics_ub": 17914,
+        "pnx_360_ub": 17887,
+        "flat_share_ub": 0.002
+      },
+      "Waterloo": {
+        "place": "Waterloo",
+        "pop": 29778,
+        "mly_recent360_km": 10.0,
+        "mly_km_per_km2": 0.8,
+        "mly_top_creator_share": 0.78,
+        "pnx_pics_ub": 24080,
+        "pnx_360_ub": 23681,
+        "flat_share_ub": 0.017
+      },
+      "Wervik": {
+        "place": "Wervik",
+        "pop": 17340,
+        "mly_recent360_km": 2.5,
+        "mly_km_per_km2": 0.2,
+        "mly_top_creator_share": 1.0,
+        "pnx_pics_ub": 94041,
+        "pnx_360_ub": 13309,
+        "flat_share_ub": 0.858
+      }
+    }
+  },
+  "registered": {
+    "Antwerp": {
+      "place": "Antwerp",
+      "pop": 529247,
+      "mly_recent360_km": 278.3,
+      "mly_km_per_km2": 22.14,
+      "mly_top_creator_share": 0.96,
+      "pnx_pics_ub": 6651,
+      "pnx_360_ub": 4832
+    },
+    "Mechelen": {
+      "place": "Mechelen",
+      "pop": 77530,
+      "mly_recent360_km": 27.4,
+      "mly_km_per_km2": 2.18,
+      "mly_top_creator_share": 0.68,
+      "pnx_pics_ub": 21837,
+      "pnx_360_ub": 21605
+    },
+    "Beringen": {
+      "place": "Beringen",
+      "pop": 40930,
+      "mly_recent360_km": 18.2,
+      "mly_km_per_km2": 1.45,
+      "mly_top_creator_share": 1.0,
+      "pnx_pics_ub": 4485,
+      "pnx_360_ub": 4441
+    }
+  },
+  "registered_pairwise_km": {
+    "Antwerp-Mechelen": 22.2,
+    "Antwerp-Beringen": 60.7,
+    "Mechelen-Beringen": 52.5
+  },
+  "named_pairs_km": {
+    "Mechelen-Brussels": 21.4,
+    "Boom-Rumst": 3.7
+  }
+}
