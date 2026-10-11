@@ -266,6 +266,13 @@ class ParsedHistoryFilename:
     height_meters: int
     step_meters: int
     harvest_date: date
+    # HISTORY_MARKER is gsv-specific, so a history file's provider is a
+    # constant rather than a token parsed out of the name. It is a field
+    # anyway (issue #109) so code that resolves "which provider is this
+    # artifact?" across run, walk and history files can ask every parser the
+    # same question. Last and defaulted: the dataclass is frozen and every
+    # existing constructor call stays valid.
+    provider: str = "gsv"
 
 
 def generate_history_filename(
