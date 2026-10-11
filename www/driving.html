@@ -12,6 +12,17 @@
   <link rel="stylesheet" href="css/streetscape-shared.css" />
   <link rel="stylesheet" href="css/data-table.css" />
   <link rel="stylesheet" href="css/driving.css" />
+  <!-- Apply a stored "filters collapsed" preference before first paint
+       (#438): the sidebar itself mounts only after the data loads, so a
+       preference read there would shift the page 236px sideways on every
+       load. The key mirrors SIDEBAR_COLLAPSED_KEY in table-controls.js. -->
+  <script>
+    try {
+      if (localStorage.getItem("streetscape.sidebarCollapsed") === "1") {
+        document.documentElement.dataset.sidebar = "collapsed";
+      }
+    } catch (e) { /* storage blocked: stay expanded */ }
+  </script>
 </head>
 <body class="streets-page">
   <!-- Google Analytics -->
@@ -118,8 +129,8 @@
         </div>
 
         <!-- Both trailing sections live INSIDE the table column rather than
-             below the layout, so the sticky sidebar stays beside them and the
-             filters remain reachable while the revision history is being read.
+             below the layout, so they share the table's column beside the docked
+             sidebar, whose filters stay reachable while the revision history is read.
 
              What Google actually changed between archived snapshots, rendered
              by driving.js from the artifact's `revisions`. This is the

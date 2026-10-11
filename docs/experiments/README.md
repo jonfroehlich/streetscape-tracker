@@ -40,6 +40,12 @@ That is why the detection path is differential (keyed bytes vs keyless bytes) ra
 **The domain CARTO collects at issue time is not enforced** — issued origin, foreign origin and no `Referer` return identical bytes — so the key is bearer-style, which separates unavoidable *exposure* from mitigable *abuse* and makes "same as any Mapbox client key" the wrong analogy.
 **Vector is not a way off the key** (same key, same 5M/month ceiling), so it is purely a rendering-stack decision: maplibre-gl is 6.19x Leaflet's gzipped weight, plus a WebGL flake class and no basemap at all where WebGL is unavailable. Decision: stay on raster.
 
+### `csv-float-parse.md`
+
+Issue #425 — how often pandas' default C float parser misreads a run CSV's coordinates (one ULP, ~5 % of latitudes and ~37 % of longitudes on the dev catalog), and what that cost the road-walk scorer's 9-decimal key join (Seattle: 5 of 247,292 samples scored uncovered, +0.075 km once fixed).
+Read entirely out of CSVs already on disk, no network; the fix is one `read_csv` argument and the repair is the whole-series walk recompute.
+Generalizes #226 from dates to floats: a reader must return what is on disk, and "on disk" for a float is the text.
+
 ### `grid-density.md`
 
 Issue #106 — why production stays on the 20 m grid; below ~10 m you buy redundancy, not information, since official panos sit ~10 m apart.

@@ -483,8 +483,12 @@ def compute_streetwalk_coverage(
     else:
         out["length_m"] = edges_m.length
 
-    # Match each sample to its single collected row via the quantized-coord key
-    # (a csv.gz round-trip perturbs floats below the 9-decimal round).
+    # Match each sample to its single collected row via the quantized-coord key.
+    # Since #425 the loader reads the CSV text exactly, so a loaded frame keys
+    # identically either way; the 9-decimal key tolerates a frame read by any
+    # other path (e.g. a default-parsed read, as the GSV resume file still is),
+    # whose one-ULP noise sits below the round -- except within one ULP of a
+    # half-way point, which is why the loader itself must read round-trip.
     coll = collected.copy()
     coll["_key"] = [
         quantize_coord(la, lo) for la, lo in zip(coll["query_lat"], coll["query_lon"], strict=True)

@@ -23,6 +23,11 @@ const {
   resolveVisibleColumns,
   resolveFilters,
   defaultFilterValues,
+  SIDEBAR_COLLAPSED_KEY,
+  readSidebarCollapsed,
+  writeSidebarCollapsed,
+  activeFilterCount,
+  renderSidebarToggle,
   parseTableState,
   serializeTableState,
   histogramAxisDomain,
@@ -664,6 +669,112 @@ test("wireSidebarDisclosure: a no-op without a sidebar, matchMedia, or a documen
   // DOMContentLoaded, so both must be safe.
   assert.equal(wireSidebarDisclosure({ querySelector: () => null }), null);
   assert.equal(wireSidebarDisclosure(), null);
+});
+
+// --- sidebar collapse (#438) -----------------------------------------------
+
+function memoryStorage() {
+  const data = new Map();
+  return {
+    getItem: (k) => (data.has(k) ? data.get(k) : null),
+    setItem: (k, v) => data.set(k, String(v)),
+  };
+}
+
+test("readSidebarCollapsed / writeSidebarCollapsed: round-trip through storage", () => {
+  const storage = memoryStorage();
+  assert.equal(readSidebarCollapsed(storage), false, "nothing stored means expanded");
+  writeSidebarCollapsed(storage, true);
+  assert.equal(storage.getItem(SIDEBAR_COLLAPSED_KEY), "1");
+  assert.equal(readSidebarCollapsed(storage), true);
+  writeSidebarCollapsed(storage, false);
+  assert.equal(readSidebarCollapsed(storage), false);
+});
+
+test("readSidebarCollapsed / writeSidebarCollapsed: a missing or throwing store never hides the filters", () => {
+  const throwing = {
+    getItem: () => {
+      throw new Error("SecurityError");
+    },
+    setItem: () => {
+      throw new Error("QuotaExceededError");
+    },
+  };
+  assert.equal(readSidebarCollapsed(null), false);
+  assert.equal(readSidebarCollapsed(throwing), false);
+  assert.doesNotThrow(() => writeSidebarCollapsed(null, true));
+  assert.doesNotThrow(() => writeSidebarCollapsed(throwing, true));
+});
+
+const COUNT_FILTERS = [
+  { key: "network", type: "select", defaultValue: "drive" },
+  { key: "provider", type: "select" },
+  { key: "cov", type: "histogram-range", field: "pct" },
+  { key: "multi", type: "boolean" },
+];
+
+test("activeFilterCount: the resting state counts zero, defaults included", () => {
+  // streets.html's network select rests at "drive"; counting it would put a
+  // badge on the rail for a page nobody has filtered.
+  const values = defaultFilterValues(COUNT_FILTERS);
+  assert.equal(activeFilterCount({ query: "", values }, COUNT_FILTERS), 0);
+  assert.equal(activeFilterCount({ query: "   ", values }, COUNT_FILTERS), 0);
+  assert.equal(
+    activeFilterCount({ query: "", values: { cov: { min: null, max: null }, multi: false } }, COUNT_FILTERS),
+    0
+  );
+});
+
+test("activeFilterCount: counts the search, a moved default, a set select, a range and a checkbox", () => {
+  const values = {
+    network: "all_public",
+    provider: "gsv",
+    cov: { min: 50, max: null },
+    multi: true,
+  };
+  assert.equal(activeFilterCount({ query: "seattle", values }, COUNT_FILTERS), 5);
+  assert.equal(activeFilterCount({ query: "", values: { network: "drive", cov: { min: 1 } } }, COUNT_FILTERS), 1);
+});
+
+test("renderSidebarToggle: a stable name, aria-expanded for the state, and the badge only when collapsed and active", () => {
+  const attrs = {};
+  const el = { setAttribute: (k, v) => (attrs[k] = v), innerHTML: "", title: "", dataset: {} };
+  renderSidebarToggle(el, { collapsed: false, active: 3 });
+  assert.equal(attrs["aria-expanded"], "true");
+  assert.equal(el.title, "Hide filters");
+  assert.match(el.innerHTML, /class="sidebar-toggle-label">Filters</);
+  assert.doesNotMatch(el.innerHTML, /sidebar-badge/);
+
+  renderSidebarToggle(el, { collapsed: true, active: 0 });
+  assert.equal(attrs["aria-expanded"], "false");
+  assert.equal(el.title, "Show filters");
+  assert.match(el.innerHTML, /class="sidebar-toggle-label">Filters</);
+  assert.doesNotMatch(el.innerHTML, /sidebar-badge/);
+
+  renderSidebarToggle(el, { collapsed: true, active: 2 });
+  assert.match(el.innerHTML, /class="sidebar-badge">2<span class="visually-hidden"> active<\/span>/);
+});
+
+test("renderSidebarToggle: an unchanged state does not rewrite the button", () => {
+  // It runs on every apply() — every keystroke and slider drag.
+  let writes = 0;
+  const el = {
+    setAttribute: () => {},
+    title: "",
+    dataset: {},
+    set innerHTML(_v) {
+      writes += 1;
+    },
+  };
+  renderSidebarToggle(el, { collapsed: true, active: 1 });
+  renderSidebarToggle(el, { collapsed: true, active: 1 });
+  assert.equal(writes, 1);
+  // While expanded the count is not shown, so a count change is not a change.
+  renderSidebarToggle(el, { collapsed: false, active: 1 });
+  renderSidebarToggle(el, { collapsed: false, active: 4 });
+  assert.equal(writes, 2);
+  renderSidebarToggle(el, { collapsed: true, active: 4 });
+  assert.equal(writes, 3);
 });
 
 // --- resolveFilters: the provider scope -------------------------------------

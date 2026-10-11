@@ -146,7 +146,13 @@ The Mapillary *grid* run is in the set for a different reason: it is the **same 
 The link nevertheless **falls back to the GSV run** when there is no Mapillary one, and is labelled with the provider it opens: that channel is routinely absent here (switched off after a per-IP block, narrowed away by `--provider`, over budget, or skipped by the breaker), and an already-tracked city has a GSV run, so asking only about Mapillary reported "no city page" while a working one existed
 — and sent the operator away to wait for a nightly batch that had already run.
 The **grid-coverage figure** stays Mapillary-only even then, deliberately: GSV grid coverage is precisely the number this command exists to stop anyone quoting.
-The GSV grid run needs no help arriving: a newly registered city is `enabled` with `last_success_at` NULL, which puts it at the head of the next night's stalest-first queue.
+The GSV grid run needs no help arriving once the city is enabled: with `last_success_at` NULL it sits at the head of the next night's stalest-first queue.
+**A NEW city is registered `enabled = 0` on every ad-hoc path since #431** — `assess-city` with or without `--estimate`, the collector CLI (`streetscape_tracker.py`, and so `run_cities.py` batches, which go through it) and the archival import — exactly as `register_frame.py` always has, because registration freezes the geometry and an enabled never-collected city leads the next night: the two together put an unvetted rectangle into the series in one step.
+Each path prints the same sentence (`city_registration.enable_hint`) naming the one way in, `scheduler enable-city CITY`, which enrols the opt-in pairs first (#374); `assess-city` prints it for any disabled city, a frame city included, not only one it just registered.
+The order is `assess-city --estimate`, read the boundary line, optionally `assess-city --yes` for the same-day answer, then `enable-city CITY` once the rectangle is accepted.
+`--yes` and `enable-city` commute: the pairs `assess-city` enrolled come back `already_set`, and the same-day collection never read `cities.enabled`.
+Everything nightly and every bulk or enrol command does read it, so none of them reaches a just-assessed city until `enable-city` runs — notably `run-due` on any channel (it collects only due cities), the night's fill pass, `prefreeze_street_networks.py`, `enroll-city --all`, bare `enroll-city CITY --channel <opt-in>` (exits 64, pointing at `enable-city`; `--remove`/`--clear` still work) and `reconcile-walks`.
+There is deliberately no `--enable` on `assess-city` or the CLI: a second enable path would re-open the register-and-collect race, and `import-bundle --enable` differs because a bundle's geometry was vetted on the laptop.
 **(3) A rectangle is not a city, and the pre-flight says so before anything is spent.** `boundary_audit.rect_in_boundary_frac` (the reciprocal of the existing `rect_polygon_coverage`, built on the same shapely-free shoelace math) reports what share of the sampled rectangle is actually inside the boundary;
 below 0.70 it warns and names the precedent.
 This is not hypothetical — the four NKY county rectangles scored **49–69%**, and the out-of-county remainder was largely **Cincinnati**, whose dense recent GSV would have flattered every figure quoted to the partner.
@@ -157,7 +163,7 @@ The probe is one unlocked Nominatim call wrapped in `except Exception` and is **
 Three deliberate differences, all parameters: `batch_deadline=None` (an operator run has nothing queued behind it), `stop_requested=None` (issue #206
 — a foreground command is interrupted with Ctrl-C, not by a supervisor stopping a unit, and there is no batch behind this city to wind down; required rather than defaulted for the same fail-open reason as `batch_deadline`), and `record_failures=False`
 — a success *is* recorded, because that is what stops the next nightly batch re-spending the same crawl hours later, but a failure is not, since `get_due_cities` filters on `consecutive_failures < max_consecutive_failures` and **nothing resets that counter except a success**, so letting an ad-hoc probe increment it would let a few of them quarantine a city for a whole cycle.
-**That recorded success has #214's paired-snapshot cost and the closing report names it**, because the natural thing to say there is the opposite of true: after a clean run the collected channels are the *least* stale rows in the catalog and are **not** due tonight, only `gsv` is (it never got a `schedule_state` row)
+**That recorded success has #214's paired-snapshot cost and the closing report names it**, because the natural thing to say there is the opposite of true: after a clean run the collected channels are the *least* stale rows in the catalog and are **not** due tonight, only `gsv` is, once the city is enabled (it never got a `schedule_state` row)
 — so a city assessed this way stops sharing one run date with its own channels until the cadences re-converge.
 A test asserts the wording against `get_due_cities` rather than against the sentence alone, so the two cannot drift apart again.
 **There is deliberately no `--publish` override, unlike `regenerate-aggregate`'s**
@@ -276,6 +282,53 @@ The `--only` dry run's summary line says no other column is read or written; if 
 Run it **per provider, in the daytime, never overlapping the 02:00 timer** — it shares the catalog with the batch, and a census provider's pass still reads millions of rows apiece.
 Nothing published reads `total_grid_points`, so the backfill republishes nothing; `scripts/undated_imagery_share_analyze.py` is its first reader; the backfill ran on production on 2026-10-04 and that regeneration is committed (see [`experiments/undated-imagery-share.md`](experiments/undated-imagery-share.md)).
 
+### The walk recompute after a walk-definition change (issues #257, #262, #425)
+
+`scripts/recompute_streetwalk_stats.py` is the walk twin of the stats recompute above, and like it the repair is a deploy step, not a follow-up.
+From the night the code lands every NEW walk is scored under the round-trip loader (#425) and the `NO_DATE` rule (#257), while every older row keeps the old definition, and each series' next walk diff publishes the difference as a coverage delta on `streets.html`.
+One pass applies both definitions, because the tool recomputes under whatever the current code does; if a pass already ran for #262, the same command is idempotent and only the series #425 moves will change.
+Measured on the dev catalog (not prod), #425 moves a handful of samples per large walk — Seattle +5 fully covered edges and +0.075 km (98.4 → 98.5 % by length), Corvallis gsv `all_public` +1 edge — so expect small, sparse moves; a large one is a different problem.
+
+```bash
+cd ~/streetscape-tracker && git pull          # deploy; no run-due in flight (pgrep -af '[s]cheduler .*run-due')
+# 1. Dry run: every walk that would change, and why. Read it before step 2.
+#    "note: ... matched only within 1e-08 deg" lines should be ABSENT under the round-trip
+#    loader; one means that CSV's text is not its sample's own repr -- stop and look.
+#    A "note: ... duplicate CSV rows ignored" line is a separate note and is harmless.
+.venv-makelab2/bin/python scripts/recompute_streetwalk_stats.py \
+    --data-dir /projects/makeabilitylab/streetscape-tracker/data
+# 2. Apply: rows, coverage artifacts, walk diffs and the streetwalk manifest. Daytime, never beside
+#    a run-due (refused), a manual collect or an assess-city (not detected).
+.venv-makelab2/bin/python scripts/recompute_streetwalk_stats.py \
+    --data-dir /projects/makeabilitylab/streetscape-tracker/data \
+    --execute >> logs/recompute_walks_425.log 2>&1
+# 3. Publish (the manifest was regenerated by step 2; nothing is rsynced until here).
+.venv-makelab2/bin/python -m streetscape_metadata_tracker.scheduler \
+    --config config/scheduler.makelab1.toml regenerate-aggregate --publish
+# 4. Remove from the web docroot every detail file step 2 listed after "remove these there:"
+#    (the publish never passes rsync --delete).
+```
+
+A refused series (missing GraphML, sample-frame or edge-id mismatch) is skipped whole and makes the pass exit 1; the report names it, and `--city`/`--provider` re-run the rest.
+**No grid recompute and no `recompute_run_diffs` pass are needed for #425**: measured under both parsers, no stored grid stat, grid key or query-radius status moves, and diff detail files carry pano coordinates, which the change does not touch.
+A per-run JSON generated after the deploy can differ from one generated before in the last digit of `query_bounds`; that is not a definition change and nothing re-generates the old ones for it.
+A later `recompute_run_stats.py --regenerate-json` pass rewrites the per-run JSONs it rebuilds for its own reasons, so those carry the new last digit too: rsync churn, not a moved number.
+**Re-run the walk recompute after any `import-bundle` of walks collected on a pre-#425 checkout**: a bundle's walk stats are carried, not recomputed, so they land on the old definition after this pass.
+
+### Schema v21 and the quarantine alert stamp (issue #424)
+
+v21 adds `schedule_state.quarantine_alerted_at`, which makes the quarantine alert exactly-once per failure streak (see [`scheduler.md`](scheduler.md), "The failure quarantine, made visible").
+
+- **The migration is one-way, like v20's.**
+  Code older than v21 refuses a v21 catalog, so a rollback is a code revert **and** a catalog restore (`scheduler restore-backup`).
+- **Deploy only with no `run-due` in flight** (`pgrep -af '[s]cheduler .*run-due'`), for the same reason as v20.
+- **A v20 laptop bundle is refused** by `import-bundle` until the laptop checkout connects to its catalog once with the new code.
+- **The first night after the deploy emails every standing quarantined pair once**, each with its `reset-failures` command.
+  That is expected, not a regression: the migration backfills nothing, and a pair quarantined before #423 shipped was never emailed at all.
+  Every later night counts those pairs on its `Done:` line and does not email them again.
+
+There is no backfill script and nothing to run beyond the deploy itself.
+
 ## Backfilling the Mapillary quality block (issue #321)
 
 #321 adds a `quality` block to every Mapillary run's `mapillary_meta` (the `quality_score` distribution and its on-foot split; [`census.md`](census.md)), and `grid.html` builds its "Imagery quality" group from it.
@@ -385,9 +438,9 @@ Now every enable path calls one function, `scheduler.enroll_opt_in_channels`, an
 
 | Path | Command | When enrolment runs | Preview |
 |---|---|---|---|
-| Frame / hand-registered city | `scheduler enable-city CITY` | Before `cities.enabled` flips, so the first night sees every channel | `--dry-run` |
+| Frame or ad-hoc-registered city (`register_frame.py`; since #431 also `assess-city`, the collector CLI and the archival import) | `scheduler enable-city CITY` | Before `cities.enabled` flips, so the first night sees every channel | `--dry-run` |
 | Laptop investigation | `scheduler import-bundle DIR --enable --execute` | After the bundle lands, only when `--enable` actually turns the city on | The default dry run |
-| Partner inquiry | `scheduler assess-city "City, Region"` | After the confirmation, before the walks run, only for a city never touched on an opt-in channel | The pre-flight; `--estimate` stops there |
+| Partner inquiry | `scheduler assess-city "City, Region"` | After the confirmation, before the walks run, only for a city never touched on an opt-in channel; the city itself stays DISABLED until `enable-city` | The pre-flight; `--estimate` stops there |
 
 All three take `--no-opt-in` (skip enrolment entirely; membership is untouched) and `--enroll-kartaview` (below).
 `enable-city` refuses an unknown city and an already-enabled one with exit 64: changing an enabled city's membership is `enroll-city`'s job, and re-running the gates on the ~1,200 cities already enabled is the backfill #374 keeps out of scope.
@@ -418,14 +471,14 @@ A channel not enabled in this config is still enrolled, with the same `NOTE` `en
 
 **What "new" means for `assess-city`: never touched on an OPT-IN channel.**
 `db.city_touched_opt_in_channels` is true on any `schedule_state.last_attempt_at` on an opt-in channel, or any `runs` or `street_walks` row from `kartaview` or `panoramax`; such a city is left alone entirely.
-It is keyed on the opt-in channels, never on the city's history elsewhere, because `--estimate` registers the city ENABLED: a never-collected city leads gsv's queue, so a 02:00 run between `--estimate` and `--yes` (or after a declined confirmation) stamps a gsv `last_attempt_at`, and an any-channel history gate read the follow-up run as a re-assessment — the Montréal/Ottawa failure, through the documented order.
+It is keyed on the opt-in channels, never on the city's history elsewhere, because a gsv attempt can precede the `--yes` run: the documented order allows `enable-city` between `--estimate` and `--yes`, and a long-tracked city can be assessed, so a 02:00 run in between stamps a gsv `last_attempt_at` (before #431 `--estimate` itself registered the city ENABLED, which is how the gap was first hit), and an any-channel history gate read the follow-up run as a re-assessment — the Montréal/Ottawa failure, through the documented order.
 The consequence is deliberate: re-assessing a long-tracked city that has never been on an opt-in channel enrols it behind the same gates.
 `--no-opt-in` is the opt-out, and explicit memberships are handled per pair, so an explicit `--remove` on one pair survives as `already_set` while the other pair is still decided.
 Every dry run — `--estimate`, `import-bundle` without `--execute`, `enable-city --dry-run` — writes nothing and issues no provider request, so the Panoramax pair previews as `pending_screen` with the tile count its screen will cost.
 
 **Same-date collection comes from the nightly run, not from `assess-city`.**
 `ASSESS_CHANNELS` is unchanged (the opt-in channels stay refusable there, for the reasons at its definition); enrolment is what answers both of those reasons, since the city becomes a member and Panoramax is screened first.
-The closing summary says so in one sentence: the grid runs and the opt-in providers enrolled above arrive with the city's first nightly run, which collects every member channel on one UTC date.
+The closing summary says so in one sentence: the grid runs and the opt-in providers enrolled above arrive with the city's first nightly run (for a disabled city, the first one after `enable-city`), which collects every member channel on one UTC date.
 
 ## Registering a purposive manifest on production (`panoramax_360_cities.csv`, issue #406)
 
