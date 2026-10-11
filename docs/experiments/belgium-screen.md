@@ -11,12 +11,13 @@ Instruments: the [#383](https://github.com/jonfroehlich/streetscape-tracker/issu
 
 **Outside Brussels-Capital, dense recent Mapillary 360° capture is concentrated in the Antwerp agglomeration — 14 of the 18 places at ≥ 7 km/km² — and it is almost all one creator.**
 Antwerp scores 22.14 recent-360° km per km², with 96% of that length from its largest creator; the 14 places lie within 15.4 km of Antwerp's point, and the top creator holds 62–100% in each.
-Beyond Antwerp, four places clear 7: Rixensart (22.63, one creator), which is denser than Antwerp's own point, and its neighbour Basse Lasne (7.70) in Walloon Brabant, and Gent (8.34) with its district Sint-Amandsberg (8.34).
+Beyond Antwerp, four places clear 7.
+Rixensart (22.63, one creator) is denser than Antwerp's own point; its neighbour Basse Lasne (7.70) in Walloon Brabant, Gent (8.34) and Gent's district Sint-Amandsberg (8.34) are the other three.
 **Panoramax 360° imagery is spread differently**: after Brussels-Capital, the largest bounds sit around Braine-l'Alleud and Waterloo, Mechelen, Boom and Rumst, and Leuven — places where Mapillary is thin.
 
 The decision this supported: register and enable **Antwerp, Mechelen and Beringen** on production (2026-10-08, first night 2026-10-09) for a deployment inquiry about Beringen.
 Beringen is the town the inquiry is about, so it was registered whatever it scored.
-Antwerp is the one Flemish city whose Mapillary density sits inside the Brussels communes' interquartile range (22.14 against 14.67–27.63); Mechelen holds the largest Panoramax 360° bound of any place in Flanders.
+The Antwerp agglomeration is the only part of Flanders whose Mapillary density sits inside the Brussels communes' interquartile range (Antwerp's point 22.14, its districts Borgerhout, Deurne and Wilrijk and the adjoining Mortsel 14.87–27.49, against 14.67–27.63); Mechelen holds the largest Panoramax 360° bound of any place in Flanders.
 The road walks are what will answer the inquiry; the screen only chose which cities to walk.
 
 ## The question
@@ -152,7 +153,8 @@ Each frozen grid contains the whole 2 km disc around its GeoNames point, so the 
   z6 Mapillary geometry is simplified, so lengths are approximate, and a sequence's length says nothing about which streets it covered.
   The Panoramax figures are upper bounds over whole cells.
   Only a road walk measures street coverage.
-- **A 2 km disc around a GeoNames point is not a city.** It is about 12.6 km² against frozen grids of 122 km² (Mechelen, 12,553 × 9,744 m) to 530 km² (Antwerp, 20,346 × 26,072 m) — the production geometry pinned as `FROZEN_GEOMETRY` in `tests/test_belgium_inquiry_cities_manifest.py`, not part of this record.
+- **A 2 km disc around a GeoNames point is not a city.**
+  It is about 12.6 km² against frozen grids of 122 km² (Mechelen, 12,553 × 9,744 m) to 530 km² (Antwerp, 20,346 × 26,072 m) — the production geometry pinned as `FROZEN_GEOMETRY` in `tests/test_belgium_inquiry_cities_manifest.py`, not part of this record.
 - **"Recent" is a fixed cutoff** (captured on or after 2024-10-08); an older city-wide capture scores zero.
 - **The cutoff and the density floor of 7 are choices**, not derived thresholds; the floor only decides which places this writeup lists by name.
 - The Brussels walk figures in "The question" are quoted from the production catalog and are not in this record.
