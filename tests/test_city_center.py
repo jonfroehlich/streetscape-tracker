@@ -211,6 +211,79 @@ def test_registration_logs_the_center_and_its_source(conn, geocode, caplog):
     assert CENTER_SOURCE_GEOCODER_EXPLICIT_DIMS in caplog.text
 
 
+# ── A new city is registered DISABLED (issue #431) ───────────────────────
+
+
+def _due_gsv(conn, today="2026-12-01"):
+    """gsv's nightly queue on a date well after any registration here."""
+    from datetime import date
+
+    return [
+        c.city_id
+        for c in db.get_due_cities(
+            conn,
+            today=date.fromisoformat(today),
+            cycle_days=90,
+            grace_days=10,
+            max_consecutive_failures=5,
+            default_membership=True,
+            provider="gsv",
+        )
+    ]
+
+
+def test_a_new_city_is_registered_disabled_and_is_not_due(conn, geocode):
+    """
+    Through the collector CLI's real call site: the stored row is disabled and
+    absent from gsv's queue. The second half enables it and asks the same
+    query again, so the absence above is not an artifact of a query that
+    could never see the city.
+    """
+    _, stored, newly = _run_registration(conn)
+    assert newly is True
+    assert stored.enabled is False
+    assert stored.city_id not in _due_gsv(conn)
+
+    db.set_city_enabled(conn, stored.city_id, True)
+    assert stored.city_id in _due_gsv(conn)
+
+
+def test_a_new_spelling_of_a_registered_city_keeps_its_enabled_value(conn, geocode):
+    """
+    An EXISTING row keeps its own `enabled` (issue #431 changes only what a NEW
+    row is written with): a tracked city reached under a new spelling must not
+    be dropped out of the rotation by the alias branch.
+    """
+    db.register_city(
+        conn,
+        city_name=_Loc.city,
+        state_name=_Loc.state,
+        state_code=_Loc.state_code,
+        country_name=_Loc.country,
+        country_code=_Loc.country_code,
+        center_lat=BBOX_MIDPOINT[0],
+        center_lon=BBOX_MIDPOINT[1],
+        grid_width_m=AUTO_DIMS[0],
+        grid_height_m=AUTO_DIMS[1],
+        step_m=20,
+        enabled=True,
+    )
+    assert db.resolve_city(conn, SECOND_SPELLING) is None, "no alias yet, or this tests nothing"
+
+    _, stored, newly = _run_registration(conn, SECOND_SPELLING)
+
+    assert newly is False
+    assert stored.enabled is True
+
+
+def test_registration_logs_that_the_city_is_disabled_and_how_to_enable_it(conn, geocode, caplog):
+    """The log record is the operator-facing trace on the CLI and scheduler paths."""
+    with caplog.at_level("INFO", logger=cr.__name__):
+        _, stored, _ = _register(conn)
+    assert "DISABLED" in caplog.text
+    assert cr.enable_hint(stored.city_id) in caplog.text
+
+
 # ── The preview, and its parity with the real registration ───────────────
 
 

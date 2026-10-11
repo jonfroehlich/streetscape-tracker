@@ -81,6 +81,33 @@ CENTER_SOURCE_BBOX_MIDPOINT = "OSM bbox midpoint (auto-sized grid)"
 CENTER_SOURCE_GEOCODER_NO_BBOX = "geocoder point (the geocode result carried no OSM bbox)"
 CENTER_SOURCE_FROZEN = "frozen catalog geometry"
 
+# The one command that puts a registered-but-disabled city into the nightly
+# rotation (issue #374). Every ad-hoc registration path prints this sentence
+# for a disabled city (issue #431), so the wording lives here once.
+ENABLE_CITY_COMMAND = "python -m streetscape_metadata_tracker.scheduler enable-city"
+
+
+def enable_hint(city_id: str) -> str:
+    """
+    The operator-facing sentence for a city that is registered but DISABLED.
+
+    A new city is registered with ``cities.enabled = 0`` on every ad-hoc path
+    (issue #431), exactly as ``scripts/register_frame.py`` always has, because
+    an enabled city with no success yet leads the next night's stalest-first
+    queue -- and its geometry is frozen, so a bad rectangle collected once is
+    the series' grid forever. The hint names the ONE way back in.
+
+    Example:
+        >>> enable_hint("newport--kentucky--united-states")
+        'newport--kentucky--united-states is registered DISABLED ...'
+    """
+    return (
+        f"{city_id} is registered DISABLED (cities.enabled = 0): no nightly batch "
+        f"collects it until its boundary is vetted and "
+        f"`{ENABLE_CITY_COMMAND} {city_id}` enables it (pass the host's --config; "
+        f"that command enrols the opt-in channels first, issue #374)."
+    )
+
 
 def choose_center(
     city_loc_data,
@@ -241,6 +268,11 @@ def resolve_or_register_city(
     geometry wins, overrides are ignored with the same warning, the new
     spelling is aliased, and ``newly_registered`` is False.
 
+    A NEW city is registered ``enabled=False`` (issue #431): it is collectable
+    on demand (nothing on the ad-hoc paths reads ``cities.enabled``) but joins
+    no nightly batch until ``scheduler enable-city`` flips it, after its
+    boundary is vetted. An existing row's ``enabled`` is never touched here.
+
     Note ``width``/``height`` bypass MAX_GRID_DIM_M entirely — that is the
     documented override — and, given without ``lat``/``lng``, they are applied
     around the geocoder's reported point (``choose_center``, #186), which
@@ -312,8 +344,16 @@ def resolve_or_register_city(
         grid_width_m=grid_width,
         grid_height_m=grid_height,
         step_m=step,
+        # DISABLED (issue #431): an enabled city with no success yet leads the
+        # next night's gsv queue, and the geometry frozen above has not been
+        # vetted. `scheduler enable-city` is the way in. An EXISTING row keeps
+        # its own value -- register_city is INSERT OR IGNORE, and this branch is
+        # only reached when registered_city_for_identity found no row.
+        enabled=False,
     )
     _alias_query(conn, query, city_id)
 
-    logger.info(f"Registered new city {city_id} with frozen geometry")
+    logger.info(
+        f"Registered new city {city_id} with frozen geometry, DISABLED. {enable_hint(city_id)}"
+    )
     return db.resolve_city(conn, city_id), True

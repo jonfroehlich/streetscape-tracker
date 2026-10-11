@@ -100,9 +100,9 @@ Heights measured 55.6% grid vs **92.8% of street-km**; Covington 8.2% vs
 actually inside the city boundary before anything is spent: for the four NKY
 counties that was only 49–69%, with the remainder largely Cincinnati.
 
-The expensive GSV **grid** run is deliberately not part of it — a newly
-registered city is enabled and immediately due, so it leads the next nightly
-batch's queue on its own.
+The expensive GSV **grid** run is deliberately not part of it — once
+`scheduler enable-city` enables the city (it is registered disabled, #431),
+it is immediately due and leads the next nightly batch's queue on its own.
 
 ### 4. Worldwide stratified frame (issue #110)
 
