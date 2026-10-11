@@ -282,10 +282,13 @@ Each panel collapses on its own and remembers it (`streetscape-temporal-collapse
 **The stack never covers the legend; the stack is what yields.**
 Both are right-anchored and the stack sits above Leaflet's controls, so on any viewport shorter than the two combined the stack covered the legend's lower sections — the new street section included, even at 1100px tall.
 The first fix only shortened the legend, down to a 160px floor, and below the floor the legend slid UNDER the stack: a 17-row `all_public` chart at 1440×900 left 0px of it visible, and the e2e gate passed because the fixture's chart has 2 rows.
-`fitLegendAboveBottomPanels` now reserves the legend `min(its content height, LEGEND_MIN_HEIGHT_PX)` and caps the stack to what remains below it: the street chart's body gets a `max-height` and scrolls inside its panel, so every row stays reachable, and only if the capture-date panel alone is still too tall does the whole stack cap and scroll.
+`fitLegendAboveBottomPanels` now reserves the legend `min(its content height, LEGEND_MIN_HEIGHT_PX)` and caps the stack to what remains below it.
+First the street chart's body gets a `max-height`, never below one row (`STREET_CHART_MIN_BODY_PX`, 84px), and scrolls inside its panel, so every row stays reachable.
+If that is still not enough — the body already at its one-row floor, or the capture-date panel alone too tall, which happens below about 500px of viewport (a landscape phone, a laptop at 150–200% zoom) — the whole stack caps and scrolls.
+That last step depends on `#bottom-right-panels > .map-panel { flex-shrink: 0 }`: with the flex default the panels shrank to the cap and clipped instead (at 1280×420 only 112 of the capture-date chart's 180px were reachable).
 The legend then gets every pixel above the stack, and scrolls as before.
-It runs on a ResizeObserver on the stack (deferred a frame, since the fit resizes the element it observes), on window resize, and after every legend rebuild.
-With room for less than one chart row (`STREET_CHART_MIN_BODY_PX`) the street chart starts collapsed and its title says "collapsed to fit this screen"; that is never written to `streetscape-street-chart-collapsed`, because it describes the screen rather than a preference, and the reader can still expand it.
+The fit runs on a ResizeObserver on the stack (deferred a frame, since the fit resizes the element it observes), on window resize, after every legend rebuild, and on every panel toggle — inside a capped stack a toggle changes the content but not the stack's box, so the observer never fires.
+With room for less than one chart row the street chart starts collapsed and its title says "collapsed to fit this screen"; that is never written to `streetscape-street-chart-collapsed`, because it describes the screen rather than a preference, so a stored "0" does not stop it on a later short screen either. The reader can still expand it, and then gets the one-row body inside a scrolling stack.
 Both panels carry `max-width: calc(100vw - 40px)`, or at 390px the 400px panels hang off the left edge and clip the chart's row labels.
 
 The Color-by radios also answer the arrow keys (`nextStreetMode`, wrapping), as their `role="radio"` promises; Enter, Space and Tab are untouched, and each radio stays its own Tab stop, like the Imagery radiogroup above it, which still has no arrow keys.

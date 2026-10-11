@@ -342,16 +342,19 @@ const LEGEND_STACK_GAP_PX = 10;
  * and year filter.
  *
  * The legend keeps a floor of `min(its content height, LEGEND_MIN_HEIGHT_PX)`
- * and the STACK yields the rest: the street chart's body is capped to the room
- * that remains and scrolls inside its panel (every row stays reachable), and
- * only if that is still not enough — the capture-date panel alone too tall —
- * does the whole stack cap and scroll. The legend then gets every pixel above
- * the stack, as before. Re-run whenever the stack changes size (a panel
- * collapses, the street chart appears), the legend rebuilds, or the window
- * resizes.
+ * and the STACK yields the rest. First the street chart's body is capped to
+ * the room that remains, but never below one row (STREET_CHART_MIN_BODY_PX),
+ * and scrolls inside its panel, so every row stays reachable. If that is still
+ * not enough — a body already at its one-row floor, or the capture-date panel
+ * alone too tall — the whole stack caps and scrolls (its panels are
+ * `flex-shrink: 0`, so they overflow the cap rather than shrink and clip).
+ * The legend then gets every pixel above the stack, as before. Re-run
+ * whenever the stack changes size (a panel collapses, the street chart
+ * appears), a panel is toggled, the legend rebuilds, or the window resizes.
  *
- * @returns {number} The height the street chart's body was capped to, or
- *   Infinity when it was left at its natural height (or is not shown).
+ * @returns {number} The room the street chart's body had before its one-row
+ *   floor (below STREET_CHART_MIN_BODY_PX, even negative, means not one row
+ *   fits), or Infinity when it was left at its natural height (or is not shown).
  */
 function fitLegendAboveBottomPanels() {
   const legend = document.querySelector(".legend");
@@ -371,10 +374,13 @@ function fitLegendAboveBottomPanels() {
   );
   let excess = stack.offsetHeight - stackRoom;
 
-  let bodyCap = Infinity;
+  let bodyRoom = Infinity;
   const bodyHeight = body ? body.offsetHeight : 0; // 0 when hidden or collapsed
   if (excess > 0 && bodyHeight > 0) {
-    bodyCap = Math.max(0, bodyHeight - excess);
+    // Never below one row: an expanded chart showing only its padding reads
+    // as broken while its button says it is open. The stack scrolls the rest.
+    bodyRoom = bodyHeight - excess;
+    const bodyCap = Math.max(Math.min(bodyHeight, STREET_CHART_MIN_BODY_PX), bodyRoom);
     body.style.maxHeight = `${bodyCap}px`;
     excess -= bodyHeight - bodyCap;
   }
@@ -385,7 +391,7 @@ function fitLegendAboveBottomPanels() {
 
   const room = stack.getBoundingClientRect().top - legendTop - LEGEND_STACK_GAP_PX;
   legend.style.maxHeight = `${Math.max(legendFloor, Math.floor(room))}px`;
-  return bodyCap;
+  return bodyRoom;
 }
 {
   const stack = document.getElementById("bottom-right-panels");
@@ -1452,6 +1458,9 @@ function setupCollapsiblePanel({ containerId, toggleId, storageKey, what, onExpa
     collapsed = !collapsed;
     try { localStorage.setItem(storageKey, collapsed ? "1" : "0"); } catch { /* storage may be blocked */ }
     apply(collapsed);
+    // Inside a capped stack a toggle changes the content but not the stack's
+    // box, so the ResizeObserver never sees it; refit explicitly.
+    fitLegendAboveBottomPanels();
   });
 }
 
@@ -2134,7 +2143,7 @@ async function loadData() {
           // The panel just appeared: fit now (not a frame later) so the room
           // left for the chart is known before choosing its starting state.
           // Less than one row's worth starts it collapsed, and says so.
-          const bodyCap = fitLegendAboveBottomPanels();
+          const bodyRoom = fitLegendAboveBottomPanels();
           setupCollapsiblePanel({
             containerId: "street-chart-container",
             toggleId: "street-chart-toggle",
@@ -2142,7 +2151,7 @@ async function loadData() {
             what: "street-type chart",
             onExpand: () => controller.chart.resize(),
             autoCollapseNote:
-              bodyCap < STREET_CHART_MIN_BODY_PX ? "collapsed to fit this screen" : null,
+              bodyRoom < STREET_CHART_MIN_BODY_PX ? "collapsed to fit this screen" : null,
           });
         }
       })

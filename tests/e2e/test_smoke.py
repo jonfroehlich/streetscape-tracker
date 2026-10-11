@@ -674,6 +674,9 @@ def test_city_page_street_section_names_the_broad_network(page: Page, base_url):
 # has that much content; the bottom-right stack yields instead (#104 review).
 _LEGEND_FLOOR_PX = 160
 
+# The smallest expanded street-chart body (city.js STREET_CHART_MIN_BODY_PX).
+_STREET_CHART_MIN_BODY_PX = 84
+
 # The street-chart wrap height street-coverage.js computes for N street types
 # (`types × 30 + 44`). 17 is what an `all_public` walk carries.
 _TALL_CHART_ROWS = 17
@@ -746,8 +749,9 @@ def test_the_street_chart_starts_collapsed_when_not_even_one_row_fits(page: Page
     With less room below the legend's floor than one chart row, the street
     chart starts collapsed and its header says why (#104 review) — never a
     silent collapse, and never persisted: it describes this screen, not a
-    preference. Expanding it anyway is honoured, and still never covers the
-    legend (the stack itself caps and scrolls).
+    preference. Expanding it anyway is honoured with at least one row of body
+    (never a padding-only sliver under a "–" button), and still never covers
+    the legend: the stack caps and scrolls the rest.
     """
     errors = _capture_errors(page)
     page.set_viewport_size({"width": 1280, "height": 520})
@@ -769,6 +773,64 @@ def test_the_street_chart_starts_collapsed_when_not_even_one_row_fits(page: Page
     expect(title).to_have_text("Coverage by street type (km)")
     stored = page.evaluate("localStorage.getItem('streetscape-street-chart-collapsed')")
     assert stored == "0", stored
+    page.wait_for_function(_LEGEND_CLEAR_OF_STACK_JS)
+    # One row's worth of body (city.js STREET_CHART_MIN_BODY_PX), not padding.
+    page.wait_for_function(
+        "(min) => document.getElementById('street-chart-body').clientHeight >= min",
+        arg=_STREET_CHART_MIN_BODY_PX,
+    )
+
+    assert errors == []
+
+
+def test_a_capped_stack_scrolls_rather_than_clipping_its_panels(page: Page, base_url):
+    """
+    Below about 500px of viewport even the capture-date panel does not fit
+    under the legend's floor, so the whole stack caps itself (#104 final
+    review). It must SCROLL: with the flex default the panels shrank to the
+    cap and clipped (1280×420: the stack's scrollHeight equalled its height,
+    and 112 of the capture-date chart's 180px were reachable). Scrolled to the
+    end, the capture-date canvas's bottom edge must be inside the stack.
+    """
+    errors = _capture_errors(page)
+    page.set_viewport_size({"width": 1280, "height": 420})
+    page.goto(f"{base_url}/city.html?file={ALPHA_LATEST}")
+    expect(page.locator(".legend #street-legend-section")).to_be_visible()
+    page.wait_for_function(_LEGEND_CLEAR_OF_STACK_JS)
+    page.wait_for_function(
+        "() => { const s = document.getElementById('bottom-right-panels');"
+        " return s.scrollHeight > s.clientHeight + 1; }"
+    )
+    reach = page.evaluate(
+        """() => {
+          const s = document.getElementById('bottom-right-panels');
+          s.scrollTop = s.scrollHeight;
+          const c = document.getElementById('temporal-plot').getBoundingClientRect();
+          const r = s.getBoundingClientRect();
+          return {canvasBottom: c.bottom, canvasHeight: c.height, stackBottom: r.bottom};
+        }"""
+    )
+    assert reach["canvasHeight"] >= 170, reach  # the 190px body less its padding
+    assert reach["canvasBottom"] <= reach["stackBottom"] + 1, reach
+    page.wait_for_function(_LEGEND_CLEAR_OF_STACK_JS)
+
+    # Expanding the (auto-collapsed) street chart inside an already-capped
+    # stack changes the stack's content but not its box, so the ResizeObserver
+    # never fires: the toggle itself must refit, which caps the new body at
+    # its one-row floor instead of leaving it at its natural height.
+    expect(page.locator("#street-chart-toggle")).to_have_attribute("aria-expanded", "false")
+    # A fit while collapsed first, so no cap left over from the pre-collapse
+    # fit can stand in for the one the toggle must compute.
+    page.evaluate("window.dispatchEvent(new Event('resize'))")
+    page.wait_for_function(
+        "() => document.getElementById('street-chart-body').style.maxHeight === ''"
+    )
+    page.locator("#street-chart-toggle").click()
+    page.wait_for_function(
+        "(min) => { const b = document.getElementById('street-chart-body');"
+        " return b.style.maxHeight === `${min}px` && b.clientHeight === min; }",
+        arg=_STREET_CHART_MIN_BODY_PX,
+    )
     page.wait_for_function(_LEGEND_CLEAR_OF_STACK_JS)
 
     assert errors == []

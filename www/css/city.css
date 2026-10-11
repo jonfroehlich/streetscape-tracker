@@ -343,6 +343,14 @@
   font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
 }
 
+/* When fitLegendAboveBottomPanels (city.js) caps the stack it scrolls; that
+   only works if the panels keep their height. With the default flex-shrink: 1
+   (and overflow: hidden) they would shrink to the cap and clip instead —
+   measured at 1280×420, 112 of the capture-date chart's 180px reachable. */
+#bottom-right-panels > .map-panel {
+  flex-shrink: 0;
+}
+
 /* Explicit, because a flex item's display is easy to override by accident. */
 .map-panel[hidden] {
   display: none;
