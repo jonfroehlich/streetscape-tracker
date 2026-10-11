@@ -35,6 +35,7 @@ const {
   renderStreetCoverage,
   streetLegendChipsHtml,
   streetLegendSectionHtml,
+  nextStreetMode,
   panoVisibilityLayer,
   STREET_PARTIAL_LOW_COLOR,
   STREET_PARTIAL_MID_COLOR,
@@ -823,6 +824,73 @@ test("renderStreetCoverage: setMode with an unknown or unchanged mode is a no-op
   assert.equal(env.styleFn, null); // never restyled
   assert.equal(ctl.getState().mode, "coverage");
   teardownRenderEnv();
+});
+
+/**
+ * renderStreetCoverage with the chart panel's "clear" button in the page (and
+ * no chart container, so the chart builder still returns early): enough DOM
+ * for syncClearButton to have something to show and hide.
+ */
+async function controllerWithClearButton() {
+  const env = stubRenderEnv(() => streetwalkArtifact());
+  const clearBtn = { hidden: true };
+  global.document = {
+    getElementById: (id) => (id === "street-clear-selection" ? clearBtn : null),
+  };
+  const ctl = await renderStreetCoverage(env.map, GRID_RUN, "gsv", { streetwalkFile: WALK_FILE });
+  return { env, ctl, clearBtn };
+}
+
+test("renderStreetCoverage: the clear button shows exactly while a spotlight is pinned", async () => {
+  const { ctl, clearBtn } = await controllerWithClearButton();
+  assert.equal(clearBtn.hidden, true);
+  ctl.setSelection({ type: "residential", covered: false });
+  assert.equal(clearBtn.hidden, false);
+  ctl.setSelection(null);
+  assert.equal(clearBtn.hidden, true);
+  teardownRenderEnv();
+});
+
+test("renderStreetCoverage: setGaps(true) clears a pinned spotlight and hides its clear button", async () => {
+  const { ctl, clearBtn } = await controllerWithClearButton();
+  ctl.setSelection({ type: "residential", covered: true });
+  ctl.setGaps(true);
+  // The gap highlight replaces the spotlight; a "clear" button for a selection
+  // the map no longer shows would be a control that does nothing visible.
+  assert.equal(ctl.selection, null);
+  assert.equal(clearBtn.hidden, true);
+  // Turning gaps OFF does not resurrect it.
+  ctl.setGaps(false);
+  assert.equal(ctl.selection, null);
+  teardownRenderEnv();
+});
+
+test("nextStreetMode: arrows step through the modes and wrap; other keys are null", () => {
+  assert.equal(nextStreetMode("age", "ArrowRight"), "coverage");
+  assert.equal(nextStreetMode("coverage", "ArrowDown"), "type");
+  assert.equal(nextStreetMode("type", "ArrowRight"), "age"); // wraps forward
+  assert.equal(nextStreetMode("age", "ArrowLeft"), "type"); // wraps back
+  assert.equal(nextStreetMode("type", "ArrowUp"), "coverage");
+  for (const key of ["Enter", " ", "Tab", "Home", "a"]) {
+    assert.equal(nextStreetMode("age", key), null, key);
+  }
+  assert.equal(nextStreetMode("bogus", "ArrowRight"), null);
+  assert.equal(nextStreetMode(undefined, "ArrowRight"), null);
+});
+
+test("streetLegendSectionHtml: the radiogroup routes its keydown to streetModeKeydown", () => {
+  const html = streetLegendSectionHtml({
+    mode: "age",
+    gapsOnly: false,
+    hasFractional: true,
+    provider: "gsv",
+    providerLabel: "Google Street View",
+    networkLabel: null,
+    coveredPct: 50,
+    covered: 1,
+    segments: 2,
+  });
+  assert.match(html, /role="radiogroup"[^>]*onkeydown="streetModeKeydown\(event\)"/);
 });
 
 test("city.html: the street panel is gone and the chart panel starts hidden above the temporal plot", () => {

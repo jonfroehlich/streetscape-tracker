@@ -287,6 +287,7 @@ module.exports = [
       globals: {
         renderStreetCoverage: "readonly",
         streetLegendSectionHtml: "readonly",
+        nextStreetMode: "readonly",
         panoVisibilityLayer: "readonly",
         renderDiffOverlay: "readonly",
       },

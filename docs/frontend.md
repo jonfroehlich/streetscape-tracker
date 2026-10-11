@@ -279,9 +279,16 @@ Both bottom-right panels share `.map-panel` on `#1b1f24`, the surface the street
 The one visible change to the capture-date chart is its surface, from `rgba(80,80,80,.9)` to `#1b1f24`; its `#ccc` ticks only gain contrast.
 Each panel collapses on its own and remembers it (`streetscape-temporal-collapsed`, `streetscape-street-chart-collapsed`).
 
-**The legend stops above the stack.**
+**The stack never covers the legend; the stack is what yields.**
 Both are right-anchored and the stack sits above Leaflet's controls, so on any viewport shorter than the two combined the stack covered the legend's lower sections — the new street section included, even at 1100px tall.
-`fitLegendAboveBottomPanels` sets the legend's `max-height` to end above the stack (ResizeObserver on the stack, plus window resize), with a 160px floor; the legend already scrolls.
+The first fix only shortened the legend, down to a 160px floor, and below the floor the legend slid UNDER the stack: a 17-row `all_public` chart at 1440×900 left 0px of it visible, and the e2e gate passed because the fixture's chart has 2 rows.
+`fitLegendAboveBottomPanels` now reserves the legend `min(its content height, LEGEND_MIN_HEIGHT_PX)` and caps the stack to what remains below it: the street chart's body gets a `max-height` and scrolls inside its panel, so every row stays reachable, and only if the capture-date panel alone is still too tall does the whole stack cap and scroll.
+The legend then gets every pixel above the stack, and scrolls as before.
+It runs on a ResizeObserver on the stack (deferred a frame, since the fit resizes the element it observes), on window resize, and after every legend rebuild.
+With room for less than one chart row (`STREET_CHART_MIN_BODY_PX`) the street chart starts collapsed and its title says "collapsed to fit this screen"; that is never written to `streetscape-street-chart-collapsed`, because it describes the screen rather than a preference, and the reader can still expand it.
+Both panels carry `max-width: calc(100vw - 40px)`, or at 390px the 400px panels hang off the left edge and clip the chart's row labels.
+
+The Color-by radios also answer the arrow keys (`nextStreetMode`, wrapping), as their `role="radio"` promises; Enter, Space and Tab are untouched, and each radio stays its own Tab stop, like the Imagery radiogroup above it, which still has no arrow keys.
 
 **The network is named only for a manifest walk** ("Street coverage · Roads + paths"): the derived grid artifact declares no network anywhere the page reads, so naming one would be a guess.
 

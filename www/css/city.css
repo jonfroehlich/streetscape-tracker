@@ -281,6 +281,9 @@
 
 .map-panel {
   width: 400px;
+  /* Phones: 400px + the stack's 20px right inset overflows a 390px screen and
+     clips the street chart's row labels off the left edge. */
+  max-width: calc(100vw - 40px);
   background: #1b1f24;
   border-radius: 4px;
   box-shadow: 0 0 15px rgba(0, 0, 0, 0.35);
@@ -341,6 +344,14 @@
    is sized inline by street-coverage.js, one row per street type. */
 #temporal-plot-body {
   height: 190px;
+}
+
+/* fitLegendAboveBottomPanels (city.js) caps this body's max-height when the
+   chart would otherwise reach the legend; it then scrolls, so every row stays
+   reachable. border-box so the cap includes the bottom padding. */
+#street-chart-body {
+  box-sizing: border-box;
+  overflow-y: auto;
 }
 
 #street-chart-wrap {

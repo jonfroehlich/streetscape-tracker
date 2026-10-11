@@ -501,6 +501,28 @@ function streetLegendChipsHtml(state) {
 }
 
 /**
+ * The colour mode an arrow key moves to inside the Color-by radiogroup: Right
+ * and Down step forward, Left and Up step back, wrapping at either end (the
+ * WAI-ARIA radio-group pattern). Any other key, or an unknown mode, is null —
+ * so Enter, Space and Tab keep their native button behaviour.
+ *
+ * @example
+ *   nextStreetMode("age", "ArrowRight"); // "coverage"
+ *   nextStreetMode("age", "ArrowLeft");  // "type" (wraps)
+ *   nextStreetMode("age", "Enter");      // null
+ *
+ * @param {string} mode - The mode of the focused radio.
+ * @param {string} key - A KeyboardEvent `key`.
+ * @returns {?string} The mode to check and focus, or null.
+ */
+function nextStreetMode(mode, key) {
+  const step = { ArrowRight: 1, ArrowDown: 1, ArrowLeft: -1, ArrowUp: -1 }[key];
+  const i = STREET_MODES.findIndex((m) => m.mode === mode);
+  if (!step || i < 0) return null;
+  return STREET_MODES[(i + step + STREET_MODES.length) % STREET_MODES.length].mode;
+}
+
+/**
  * The legend's "Street coverage" section (issue #104): header, headline,
  * Color-by radiogroup, Highlight-gaps checkbox and the per-mode chips. Pure,
  * so it is node-testable; city.js inserts it into the legend on every rebuild.
@@ -535,7 +557,8 @@ function streetLegendSectionHtml(state) {
         <span class="street-headline-sub">(${Number(state.covered).toLocaleString()} of
         ${Number(state.segments).toLocaleString()} segments covered)</span>
       </p>
-      <div class="street-mode" role="radiogroup" aria-label="Color streets by">${buttons}
+      <div class="street-mode" role="radiogroup" aria-label="Color streets by"
+           onkeydown="streetModeKeydown(event)">${buttons}
       </div>
       <label class="street-gaps-toggle legend-meta"
              title="Spotlight the streets with NO imagery in red; everything covered fades back">
@@ -1048,6 +1071,7 @@ if (typeof module !== "undefined" && module.exports) {
     streetsUrlForDataFile,
     streetLegendChipsHtml,
     streetLegendSectionHtml,
+    nextStreetMode,
     panoVisibilityLayer,
     styleStreetFeature,
     styleStreetByCoverage,

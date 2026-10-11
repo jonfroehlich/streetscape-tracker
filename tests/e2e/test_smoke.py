@@ -553,6 +553,219 @@ def test_city_page_street_section_names_the_broad_network(page: Page, base_url):
     assert errors == []
 
 
+# The legend never yields below this (city.js LEGEND_MIN_HEIGHT_PX) while it
+# has that much content; the bottom-right stack yields instead (#104 review).
+_LEGEND_FLOOR_PX = 160
+
+# The street-chart wrap height street-coverage.js computes for N street types
+# (`types × 30 + 44`). 17 is what an `all_public` walk carries.
+_TALL_CHART_ROWS = 17
+
+_LEGEND_CLEAR_OF_STACK_JS = (
+    "() => document.querySelector('.legend').getBoundingClientRect().bottom"
+    " <= document.getElementById('bottom-right-panels').getBoundingClientRect().top"
+)
+
+
+@pytest.mark.parametrize("viewport", [(1440, 900), (1280, 720)], ids=["1440x900", "1280x720"])
+def test_a_tall_street_chart_never_covers_the_legend(page: Page, base_url, viewport):
+    """
+    The bottom-right stack yields to the legend, never the reverse (#104
+    review, finding 1). The fixture's walk has 2 street types; a broad
+    ``all_public`` walk has 17, and at that height the old fit let the legend
+    keep its 160px floor UNDER the stack (0px of it visible at 1440×900). The
+    chart's wrap is grown to the 17-row height the JS computes, and then: the
+    legend still ends above the stack with at least its floor, the chart body
+    scrolls rather than growing (its last row reachable), and a legend control
+    is the topmost element at its own centre — which is what "not covered"
+    means to a pointer.
+    """
+    errors = _capture_errors(page)
+    page.set_viewport_size({"width": viewport[0], "height": viewport[1]})
+    page.goto(f"{base_url}/city.html?file={ALPHA_LATEST}")
+    expect(page.locator(".legend #street-legend-section")).to_be_visible()
+    expect(page.locator("#street-coverage-chart")).to_be_visible()
+
+    page.evaluate(
+        "(rows) => { document.getElementById('street-chart-wrap').style.height ="
+        " `${rows * 30 + 44}px`; }",
+        _TALL_CHART_ROWS,
+    )
+    # The stack's ResizeObserver refits on the next frame: wait for the body
+    # to have been capped (it scrolls) rather than for any fixed time.
+    page.wait_for_function(
+        "() => { const b = document.getElementById('street-chart-body');"
+        " return b.scrollHeight > b.clientHeight + 1; }"
+    )
+    page.wait_for_function(_LEGEND_CLEAR_OF_STACK_JS)
+    assert page.locator(".legend").bounding_box()["height"] >= _LEGEND_FLOOR_PX - 1
+
+    # Every row is still reachable, by scrolling inside the chart's own panel.
+    reach = page.evaluate(
+        "() => { const b = document.getElementById('street-chart-body');"
+        " b.scrollTop = b.scrollHeight;"
+        " return {top: b.scrollTop, client: b.clientHeight, full: b.scrollHeight}; }"
+    )
+    assert reach["top"] > 0 and reach["top"] + reach["client"] >= reach["full"] - 1, reach
+
+    # The legend's street controls are on top where they are drawn.
+    gaps = page.locator("#street-gaps-toggle")
+    gaps.scroll_into_view_if_needed()
+    hit = page.evaluate(
+        "() => { const e = document.getElementById('street-gaps-toggle');"
+        " const r = e.getBoundingClientRect();"
+        " return document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2) === e; }"
+    )
+    assert hit, "the Highlight-gaps checkbox is covered at its own centre"
+    gaps.click(timeout=5000)
+    expect(page.locator("#street-gaps-toggle")).to_be_checked()
+    page.wait_for_function(_LEGEND_CLEAR_OF_STACK_JS)
+
+    assert errors == []
+
+
+def test_the_street_chart_starts_collapsed_when_not_even_one_row_fits(page: Page, base_url):
+    """
+    With less room below the legend's floor than one chart row, the street
+    chart starts collapsed and its header says why (#104 review) — never a
+    silent collapse, and never persisted: it describes this screen, not a
+    preference. Expanding it anyway is honoured, and still never covers the
+    legend (the stack itself caps and scrolls).
+    """
+    errors = _capture_errors(page)
+    page.set_viewport_size({"width": 1280, "height": 520})
+    page.goto(f"{base_url}/city.html?file={ALPHA_LATEST}")
+    expect(page.locator(".legend #street-legend-section")).to_be_visible()
+
+    container = page.locator("#street-chart-container")
+    toggle = page.locator("#street-chart-toggle")
+    title = page.locator("#street-chart-title")
+    expect(container).to_have_class(re.compile(r"\bcollapsed\b"))
+    expect(toggle).to_have_attribute("aria-expanded", "false")
+    expect(title).to_contain_text("collapsed to fit this screen")
+    stored = page.evaluate("localStorage.getItem('streetscape-street-chart-collapsed')")
+    assert stored is None, stored
+    page.wait_for_function(_LEGEND_CLEAR_OF_STACK_JS)
+
+    toggle.click()
+    expect(toggle).to_have_attribute("aria-expanded", "true")
+    expect(title).to_have_text("Coverage by street type (km)")
+    stored = page.evaluate("localStorage.getItem('streetscape-street-chart-collapsed')")
+    assert stored == "0", stored
+    page.wait_for_function(_LEGEND_CLEAR_OF_STACK_JS)
+
+    assert errors == []
+
+
+def test_a_short_street_chart_does_not_start_collapsed(page: Page, base_url):
+    """The negative of the auto-collapse: at the default 1280×720 the fixture's
+    2-row chart fits, so it opens expanded with its plain title."""
+    page.goto(f"{base_url}/city.html?file={ALPHA_LATEST}")
+    expect(page.locator("#street-coverage-chart")).to_be_visible()
+    expect(page.locator("#street-chart-toggle")).to_have_attribute("aria-expanded", "true")
+    expect(page.locator("#street-chart-title")).to_have_text("Coverage by street type (km)")
+
+
+def _street_bar_center(page: Page, dataset: int, row: int) -> dict:
+    """Viewport coordinates of the middle of one street-chart bar."""
+    return page.evaluate(
+        """([ds, row]) => {
+          const c = streetController.chart;
+          const bar = c.getDatasetMeta(ds).data[row];
+          const r = c.canvas.getBoundingClientRect();
+          return {x: r.left + (bar.x + bar.base) / 2, y: r.top + bar.y};
+        }""",
+        [dataset, row],
+    )
+
+
+def test_street_chart_click_pins_a_spotlight_that_clear_and_highlight_gaps_unpin(
+    page: Page, base_url
+):
+    """
+    The street-type chart's click-to-pin, rewired into the controller by #104
+    (review finding 3): a click on a bar pins {type, covered} and shows the
+    panel's "clear" button; a second click on the same bar unpins; "Highlight
+    gaps" replaces a pinned spotlight rather than leave a clear button for a
+    selection the map no longer shows; and the clear button unpins.
+    Row 0 is residential, which the fixture walk covers in full.
+    """
+    errors = _capture_errors(page)
+    page.goto(f"{base_url}/city.html?file={ALPHA_LATEST}")
+    expect(page.locator("#street-coverage-chart")).to_be_visible()
+    clear = page.locator("#street-clear-selection")
+    expect(clear).to_be_hidden()
+    pinned = {"type": "residential", "covered": True}
+
+    bar = _street_bar_center(page, 0, 0)
+    page.mouse.click(bar["x"], bar["y"])
+    expect(clear).to_be_visible()
+    assert page.evaluate("streetController.selection") == pinned
+
+    page.mouse.click(bar["x"], bar["y"])  # the same bar again: unpin
+    expect(clear).to_be_hidden()
+    assert page.evaluate("streetController.selection") is None
+
+    page.mouse.click(bar["x"], bar["y"])
+    expect(clear).to_be_visible()
+    page.locator("#street-gaps-toggle").check()
+    expect(clear).to_be_hidden()
+    assert page.evaluate("streetController.selection") is None
+    page.locator("#street-gaps-toggle").uncheck()
+
+    page.mouse.click(bar["x"], bar["y"])
+    expect(clear).to_be_visible()
+    clear.click()
+    expect(clear).to_be_hidden()
+    assert page.evaluate("streetController.selection") is None
+
+    assert errors == []
+
+
+def test_color_by_radios_keep_focus_and_rove_with_the_arrow_keys(page: Page, base_url):
+    """
+    The Color-by radiogroup from the keyboard (#104 review, findings 3 and 4).
+    Enter on a radio rebuilds the legend, and focus must land back on the SAME
+    radio — the colour-mode branch of legendFocusSelectorFor, which nothing
+    else pins. The arrow keys check and focus the next/previous radio and wrap,
+    as the radio-group pattern its role promises; Tab still leaves the group
+    for the Highlight-gaps checkbox.
+    """
+    errors = _capture_errors(page)
+    page.goto(f"{base_url}/city.html?file={ALPHA_LATEST}")
+    expect(page.locator(".legend #street-legend-section")).to_be_visible()
+
+    def radio(mode):
+        return page.locator(f'.street-mode-btn[data-mode="{mode}"]')
+
+    def focused_mode():
+        return page.evaluate("document.activeElement?.dataset?.mode ?? null")
+
+    # The fractional walk opens on "coverage".
+    radio("age").focus()
+    page.keyboard.press("Enter")
+    expect(radio("age")).to_have_attribute("aria-checked", "true")
+    assert focused_mode() == "age"
+
+    for key, mode in [
+        ("ArrowRight", "coverage"),
+        ("ArrowDown", "type"),
+        ("ArrowRight", "age"),  # wraps forward
+        ("ArrowLeft", "type"),  # wraps back
+        ("ArrowUp", "coverage"),
+    ]:
+        page.keyboard.press(key)
+        expect(radio(mode)).to_have_attribute("aria-checked", "true")
+        assert focused_mode() == mode, (key, mode, focused_mode())
+    expect(page.locator(".street-mode-btn[aria-checked='true']")).to_have_count(1)
+
+    radio("type").focus()
+    page.keyboard.press("Tab")
+    assert page.evaluate("document.activeElement.id") == "street-gaps-toggle"
+
+    assert errors == []
+
+
 def test_city_page_renders_a_panoramax_run_as_panoramax(page: Page, base_url):
     """
     The defect issue #334 closes, asserted where it was visible rather than at

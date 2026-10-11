@@ -1,8 +1,8 @@
-/* exported switchRun, toggleYear, setGsvMode, toggleFlatOnly, setRenderAll, toggleDiffOverlay, setStreetMode, toggleStreetGaps */
+/* exported switchRun, toggleYear, setGsvMode, toggleFlatOnly, setRenderAll, toggleDiffOverlay, setStreetMode, toggleStreetGaps, streetModeKeydown */
 // (switchRun/toggleYear/setGsvMode/toggleFlatOnly/setRenderAll/toggleDiffOverlay
-// and the street section's setStreetMode/toggleStreetGaps are invoked from
-// onchange/onclick attributes in the legend HTML, so ESLint can't see those
-// string references.)
+// and the street section's setStreetMode/toggleStreetGaps/streetModeKeydown
+// are invoked from onchange/onclick/onkeydown attributes in the legend HTML,
+// so ESLint can't see those string references.)
 /**
  * city.js
  * Per-city detail-view logic for Streetscape City Explorer.
@@ -308,29 +308,89 @@ legendControl.onAdd = () => {
 };
 legendControl.addTo(map);
 
-/** Smallest legend height worth keeping; below it, overlap beats a sliver. */
+/** Smallest legend height worth keeping; the bottom-right stack yields first. */
 const LEGEND_MIN_HEIGHT_PX = 160;
 
 /**
- * Keep the legend's bottom edge above the bottom-right panel stack (issue
- * #104). Both are right-anchored, so on any viewport shorter than the two
- * combined the stack (z-index above Leaflet controls) would cover the legend's
- * lower sections — which is where the street-coverage section and the year
- * filter live. The legend already scrolls; this only shortens its box. Re-run
- * whenever the stack changes size (a panel collapses, the street chart
- * appears) or the window does.
+ * Smallest street-chart body worth showing expanded: one 30px row plus the
+ * chart's ~44px of axis and padding (street-coverage.js sizes the wrap at
+ * `rows × 30 + 44`), plus the body's 10px bottom padding. With less room than
+ * this the chart starts collapsed and its header says why.
+ */
+const STREET_CHART_MIN_BODY_PX = 84;
+
+/** Vertical gap kept between the legend's bottom edge and the stack. */
+const LEGEND_STACK_GAP_PX = 10;
+
+/**
+ * Keep the bottom-right panel stack from ever covering the legend (issue
+ * #104). Both are right-anchored and the stack sits above Leaflet's controls,
+ * so without this a tall street-type chart (17 rows on an `all_public` walk)
+ * slides over the legend's snapshot picker, Imagery filter, street section
+ * and year filter.
+ *
+ * The legend keeps a floor of `min(its content height, LEGEND_MIN_HEIGHT_PX)`
+ * and the STACK yields the rest: the street chart's body is capped to the room
+ * that remains and scrolls inside its panel (every row stays reachable), and
+ * only if that is still not enough — the capture-date panel alone too tall —
+ * does the whole stack cap and scroll. The legend then gets every pixel above
+ * the stack, as before. Re-run whenever the stack changes size (a panel
+ * collapses, the street chart appears), the legend rebuilds, or the window
+ * resizes.
+ *
+ * @returns {number} The height the street chart's body was capped to, or
+ *   Infinity when it was left at its natural height (or is not shown).
  */
 function fitLegendAboveBottomPanels() {
   const legend = document.querySelector(".legend");
   const stack = document.getElementById("bottom-right-panels");
-  if (!legend || !stack) return;
-  const room = stack.getBoundingClientRect().top - legend.getBoundingClientRect().top - 10;
-  legend.style.maxHeight = `${Math.max(LEGEND_MIN_HEIGHT_PX, Math.floor(room))}px`;
+  if (!legend || !stack) return Infinity;
+  const body = document.getElementById("street-chart-body");
+
+  // Measure the natural layout: clear the caps a previous pass set.
+  stack.style.maxHeight = "";
+  stack.style.overflowY = "";
+  if (body) body.style.maxHeight = "";
+
+  const legendTop = legend.getBoundingClientRect().top;
+  const legendFloor = Math.min(legend.scrollHeight, LEGEND_MIN_HEIGHT_PX);
+  const stackRoom = Math.floor(
+    stack.getBoundingClientRect().bottom - legendTop - legendFloor - LEGEND_STACK_GAP_PX
+  );
+  let excess = stack.offsetHeight - stackRoom;
+
+  let bodyCap = Infinity;
+  const bodyHeight = body ? body.offsetHeight : 0; // 0 when hidden or collapsed
+  if (excess > 0 && bodyHeight > 0) {
+    bodyCap = Math.max(0, bodyHeight - excess);
+    body.style.maxHeight = `${bodyCap}px`;
+    excess -= bodyHeight - bodyCap;
+  }
+  if (excess > 0) {
+    stack.style.maxHeight = `${Math.max(0, stackRoom)}px`;
+    stack.style.overflowY = "auto";
+  }
+
+  const room = stack.getBoundingClientRect().top - legendTop - LEGEND_STACK_GAP_PX;
+  legend.style.maxHeight = `${Math.max(legendFloor, Math.floor(room))}px`;
+  return bodyCap;
 }
 {
   const stack = document.getElementById("bottom-right-panels");
   if (stack && typeof ResizeObserver === "function") {
-    new ResizeObserver(fitLegendAboveBottomPanels).observe(stack);
+    // Deferred a frame: the fit resizes the very element observed, and doing
+    // that inside the callback is what raises "ResizeObserver loop completed
+    // with undelivered notifications". The next observation measures the
+    // capped size, recomputes the same caps, and stops.
+    let pending = false;
+    new ResizeObserver(() => {
+      if (pending) return;
+      pending = true;
+      requestAnimationFrame(() => {
+        pending = false;
+        fitLegendAboveBottomPanels();
+      });
+    }).observe(stack);
   }
   window.addEventListener("resize", fitLegendAboveBottomPanels);
   fitLegendAboveBottomPanels();
@@ -604,6 +664,10 @@ function updateLegend(years) {
 
   // The innerHTML swap above destroyed any previous chart canvas — rebuild.
   rebuildRunHistoryChart();
+
+  // The legend's floor is its content height when that is under the floor, so
+  // a rebuild can change how much room the bottom-right stack may take.
+  fitLegendAboveBottomPanels();
 }
 
 /**
@@ -629,6 +693,23 @@ function legendFocusSelectorFor(el) {
  */
 function setStreetMode(mode) {
   streetController?.setMode(mode);
+}
+
+/**
+ * Arrow keys inside the legend's Color-by radiogroup: check the next/previous
+ * mode and move focus to it (nextStreetMode owns the order and the wrap). The
+ * legend rebuild inside setStreetMode restores focus to the radio that was
+ * focused, so focus is moved AFTER it, onto the rebuilt target. Other keys
+ * fall through untouched, so Enter, Space and Tab behave as before.
+ *
+ * @param {KeyboardEvent} event - From the radiogroup's onkeydown attribute.
+ */
+function streetModeKeydown(event) {
+  const next = nextStreetMode(event.target?.dataset?.mode, event.key);
+  if (!next) return;
+  event.preventDefault();
+  setStreetMode(next);
+  document.querySelector(`.legend .street-mode-btn[data-mode="${next}"]`)?.focus();
 }
 
 /**
@@ -1316,23 +1397,35 @@ function createTemporalPlot(canvas) {
  * @param {string} opts.storageKey - localStorage key ("1" = collapsed).
  * @param {string} opts.what - Noun phrase for the button's label ("Minimize <what>").
  * @param {function(): void} [opts.onExpand] - Called whenever the body is shown.
+ * @param {?string} [opts.autoCollapseNote] - When set, the panel starts collapsed
+ *   even without a stored choice, and this note is appended to its title until
+ *   the user toggles it. Never persisted: it describes this screen, not a
+ *   preference (used when there is no room for even one street-chart row).
  */
-function setupCollapsiblePanel({ containerId, toggleId, storageKey, what, onExpand }) {
+function setupCollapsiblePanel({ containerId, toggleId, storageKey, what, onExpand, autoCollapseNote }) {
   const container = document.getElementById(containerId);
   const toggle = document.getElementById(toggleId);
   if (!container || !toggle) return;
+  const title = container.querySelector(".map-panel-title");
+  const baseTitle = title?.textContent ?? "";
 
-  const apply = (collapsed) => {
+  const apply = (collapsed, note = null) => {
     container.classList.toggle("collapsed", collapsed);
     toggle.setAttribute("aria-expanded", String(!collapsed));
     toggle.setAttribute("aria-label", `${collapsed ? "Expand" : "Minimize"} ${what}`);
     toggle.textContent = collapsed ? "+" : "–";
+    if (title) title.textContent = note ? `${baseTitle} · ${note}` : baseTitle;
     if (!collapsed && onExpand) onExpand();
   };
 
   let collapsed = false;
   try { collapsed = localStorage.getItem(storageKey) === "1"; } catch { /* storage may be blocked */ }
-  apply(collapsed);
+  if (!collapsed && autoCollapseNote) {
+    collapsed = true;
+    apply(true, autoCollapseNote);
+  } else {
+    apply(collapsed);
+  }
 
   toggle.addEventListener("click", () => {
     collapsed = !collapsed;
@@ -1997,12 +2090,18 @@ async function loadData() {
       .then((controller) => {
         streetController = controller;
         if (controller?.chart) {
+          // The panel just appeared: fit now (not a frame later) so the room
+          // left for the chart is known before choosing its starting state.
+          // Less than one row's worth starts it collapsed, and says so.
+          const bodyCap = fitLegendAboveBottomPanels();
           setupCollapsiblePanel({
             containerId: "street-chart-container",
             toggleId: "street-chart-toggle",
             storageKey: "streetscape-street-chart-collapsed",
             what: "street-type chart",
             onExpand: () => controller.chart.resize(),
+            autoCollapseNote:
+              bodyCap < STREET_CHART_MIN_BODY_PX ? "collapsed to fit this screen" : null,
           });
         }
       })
