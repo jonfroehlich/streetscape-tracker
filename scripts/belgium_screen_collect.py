@@ -19,7 +19,7 @@ PROVENANCE, stated so nobody mistakes this for the code that ran. The
 fetched the Mapillary tiles through the #383 screen's research fetcher (the
 uncommitted ancestor of ``mapillary_discovery_collect.TileFetcher``: cached,
 paced at a mean 40/min with CV 0.6, stop on the first refusal) and the two
-Panoramax tiles with one plain GET each, 2 s apart. Both tiles of each provider
+Panoramax tiles with one plain GET each, sleeping 2 s before each. Both tiles of each provider
 were then in a cache, so this replay reads exactly the bytes that pass read.
 It is that script with its decoding moved onto the committed helpers
 (``mapillary_discovery_common.decode_sequences`` and ``local_km``,
@@ -47,14 +47,20 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
+import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from scripts.mapillary_discovery_common import decode_sequences, local_km
-from streetscape_metadata_tracker import panoramax_screen as ps
-from streetscape_metadata_tracker.download_common import tiles_for_bbox
+# Run by path (`python scripts/belgium_screen_collect.py`), the repo root is not
+# on sys.path, so the imports below would fail without this.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from scripts.mapillary_discovery_common import decode_sequences, local_km  # noqa: E402
+from streetscape_metadata_tracker import panoramax_screen as ps  # noqa: E402
+from streetscape_metadata_tracker.download_common import tiles_for_bbox  # noqa: E402
 
 ZOOM = 6
 # (min_lon, min_lat, max_lon, max_lat): all of Belgium. Two z6 tiles.

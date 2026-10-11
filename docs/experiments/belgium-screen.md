@@ -9,14 +9,14 @@ Instruments: the [#383](https://github.com/jonfroehlich/streetscape-tracker/issu
 
 ## Verdict
 
-**Outside Brussels-Capital, the only dense recent Mapillary 360° capture in Belgium is the Antwerp agglomeration, and it is almost all one creator.**
-Antwerp scores 22.14 recent-360° km per km², with 96% of that length from its largest creator; 14 places within 15.4 km of Antwerp's point clear 7 km/km², and the top creator holds 62–100% in each.
-Beyond Antwerp, only four places clear 7: Rixensart (22.63, one creator) and its neighbour Basse Lasne (7.70) in Walloon Brabant, and Gent (8.34) with its district Sint-Amandsberg (8.34).
+**Outside Brussels-Capital, dense recent Mapillary 360° capture is concentrated in the Antwerp agglomeration — 14 of the 18 places at ≥ 7 km/km² — and it is almost all one creator.**
+Antwerp scores 22.14 recent-360° km per km², with 96% of that length from its largest creator; the 14 places lie within 15.4 km of Antwerp's point, and the top creator holds 62–100% in each.
+Beyond Antwerp, four places clear 7: Rixensart (22.63, one creator), which is denser than Antwerp's own point, and its neighbour Basse Lasne (7.70) in Walloon Brabant, and Gent (8.34) with its district Sint-Amandsberg (8.34).
 **Panoramax 360° imagery is spread differently**: after Brussels-Capital, the largest bounds sit around Braine-l'Alleud and Waterloo, Mechelen, Boom and Rumst, and Leuven — places where Mapillary is thin.
 
 The decision this supported: register and enable **Antwerp, Mechelen and Beringen** on production (2026-10-08, first night 2026-10-09) for a deployment inquiry about Beringen.
 Beringen is the town the inquiry is about, so it was registered whatever it scored.
-Antwerp is the one Flemish city with Mapillary density near the Brussels communes'; Mechelen holds the largest Panoramax 360° bound of any place in Flanders.
+Antwerp is the one Flemish city whose Mapillary density sits inside the Brussels communes' interquartile range (22.14 against 14.67–27.63); Mechelen holds the largest Panoramax 360° bound of any place in Flanders.
 The road walks are what will answer the inquiry; the screen only chose which cities to walk.
 
 ## The question
@@ -119,9 +119,10 @@ Brussels-Capital places fill most of the top of the list, as with Mapillary, but
 | Menen | 14,255 | 122,812 | 0.884 | 0.33 |
 | Wervik | 13,309 | 94,041 | 0.858 | 0.20 |
 
-Boom and Rumst, 3.7 km apart (`named_pairs_km`), share most of their cells; their two bounds are one body of imagery counted twice.
+Boom and Rumst are 3.7 km apart (`named_pairs_km`), each inside the other's 3 km cell radius, so their two bounds largely overlap and must not be added together.
+The record carries no cell ids, so how many cells they share is not something it can say.
 Menen, Wervik and neighbouring Mouscron, on the French border, hold the three largest all-picture bounds in the record (94,041–122,812, more than any Brussels commune), but **86–92% of those pictures are flat**, not 360° (`panoramax.top_by_pictures_ub`).
-Antwerp's own 360° bound is 4,832, below the national p95.
+Antwerp's own 360° bound is 4,832, below the national p90 (7,647).
 
 ### 3. The three registered cities
 
@@ -131,8 +132,12 @@ Antwerp's own 360° bound is 4,832, below the national p95.
 | Mechelen | 2.18 | 0.68 | 21,605 | 21,837 |
 | Beringen | 1.45 | 1.00 | 4,441 | 4,485 |
 
-(`registered`.) Beringen's Mapillary signal is 18.2 km of recent 360° sequence within 2 km, all from one creator — between the national p50 (0.88) and p75 (1.98), and about a fifteenth of Antwerp's.
-Antwerp–Mechelen is 22.2 km (`registered_pairwise_km`) and Mechelen–Brussels 21.4 km (`named_pairs_km`), both inside `register_frame.py`'s default 25 km reuse radius, so the batch needed an overlap radius below 21.4 km — purposive batches use `--overlap-km 5` — or Mechelen would have been aliased onto a neighbour instead of registered; the test pins every row more than 5 km from every other committed manifest row.
+(`registered`.)
+Beringen's Mapillary signal is 18.2 km of recent 360° sequence within 2 km, all from one creator — between the national p50 (0.88) and p75 (1.98), and about a fifteenth of Antwerp's.
+Mechelen's GeoNames point is 21.4 km from Brussels' (`named_pairs_km`; 21.5 km by the haversine `register_frame.py` uses, pinned in the manifest test), inside the default 25 km reuse radius, so the batch needed `--overlap-km 5`, as purposive batches use, or Mechelen would have been aliased onto Brussels instead of registered.
+That margin is quoted point to point: `register_frame.find_overlap` measures from the new row's point to an existing city's FROZEN centre, and Brussels' frozen centre exists only in the production catalog, so it is not re-measured here.
+The 22.2 km between Antwerp's and Mechelen's points (`registered_pairwise_km`) is not a reason: by the time Mechelen was checked, Antwerp's frozen centre was the one compared, and that is 27.3 km from Mechelen's point (also pinned in the manifest test), outside the default radius.
+The test pins every row more than 5 km from every other committed manifest row.
 Each frozen grid contains the whole 2 km disc around its GeoNames point, so the screen numbers above describe imagery inside the grid; `tests/test_belgium_inquiry_cities_manifest.py` pins that against the frozen geometry.
 
 ## What this justifies
@@ -143,7 +148,10 @@ Each frozen grid contains the whole 2 km disc around its GeoNames point, so the 
 
 ## Caveats
 
-- **A screen, not coverage.** z6 Mapillary geometry is simplified, so lengths are approximate, and a sequence's length says nothing about which streets it covered. The Panoramax figures are upper bounds over whole cells. Only a road walk measures street coverage.
+- **A screen, not coverage.**
+  z6 Mapillary geometry is simplified, so lengths are approximate, and a sequence's length says nothing about which streets it covered.
+  The Panoramax figures are upper bounds over whole cells.
+  Only a road walk measures street coverage.
 - **A 2 km disc around a GeoNames point is not a city.** It is about 12.6 km² against frozen grids of 122 km² (Mechelen, 12,553 × 9,744 m) to 530 km² (Antwerp, 20,346 × 26,072 m) — the production geometry pinned as `FROZEN_GEOMETRY` in `tests/test_belgium_inquiry_cities_manifest.py`, not part of this record.
 - **"Recent" is a fixed cutoff** (captured on or after 2024-10-08); an older city-wide capture scores zero.
 - **The cutoff and the density floor of 7 are choices**, not derived thresholds; the floor only decides which places this writeup lists by name.

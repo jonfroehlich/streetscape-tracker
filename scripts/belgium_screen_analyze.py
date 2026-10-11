@@ -20,9 +20,15 @@ import argparse
 import csv
 import json
 import math
+import os
+import sys
 from pathlib import Path
 
-from scripts.experiment_stats import describe
+# Run by path (`python scripts/belgium_screen_analyze.py`), the repo root is not
+# on sys.path, so the `scripts.` import below would fail without this.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from scripts.experiment_stats import describe  # noqa: E402
 
 PLACES_CSV = "belgium-screen_places.csv"
 METRICS_JSON = "belgium-screen_metrics.json"
@@ -75,7 +81,11 @@ NAMED_PAIRS = (("Mechelen", "Brussels"), ("Boom", "Rumst"))
 
 
 def _km(a: dict, b: dict) -> float:
-    """Equirectangular km between two place rows (as in the collect script)."""
+    """
+    Equirectangular km between two place rows, with the cosine taken at their
+    mean latitude (the collect script's ``_near`` takes it at the place's own
+    latitude; the difference is negligible at these distances).
+    """
     c = math.cos(math.radians((a["lat"] + b["lat"]) / 2))
     return math.hypot((a["lon"] - b["lon"]) * 111.32 * c, (a["lat"] - b["lat"]) * 110.57)
 

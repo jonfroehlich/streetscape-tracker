@@ -10,17 +10,23 @@ GeoNames data keyed by geonameid, never hand-typed. These tests are that join
 run in reverse, plus:
 
 * the city_ids, pinned as literals because registration froze them;
-* the geometry production FROZE for each (centre, width, height, all OK at the
-  boundary audit with no resize), pinned as literals, with the screen's 2 km
-  scoring disc around each GeoNames point required to lie wholly inside it —
-  so the screen numbers the writeup quotes describe imagery inside the grid;
+* the geometry production FROZE for each (centre, width, height, and the
+  boundary audit's verdict). Those literals are a RECORD of prod state read
+  from the prod catalog on 2026-10-08, not a check of it: nothing in this repo
+  can compare them with prod. What IS checked against them is that the
+  screen's 2 km scoring disc around each GeoNames point lies wholly inside
+  the grid, so the screen numbers the writeup quotes describe imagery inside
+  it;
 * each row's screen record, joined on its GeoNames point to the committed
   docs/experiments/belgium-screen_places.csv, so the writeup's per-city
   numbers and the manifest cannot drift apart;
 * no two rows, and no row and another committed manifest's row, within the
-  5 km --overlap-km a purposive batch registers with. Antwerp and Mechelen are
-  22 km apart, and Mechelen is ~21 km from the tracked Brussels point, so the
-  default 25 km radius would have aliased Mechelen away.
+  5 km --overlap-km a purposive batch registers with. Mechelen's GeoNames
+  point is 21.5 km from Brussels' (mapillary_360_cities.csv), inside the
+  default 25 km radius. register_frame.find_overlap measures from the new
+  row's point to an existing city's FROZEN centre, and Brussels' frozen
+  centre exists only in the prod catalog, so that margin is quoted
+  point-to-point rather than re-measured here.
 
 The GeoNames and query_string assertions duplicate
 tests/test_mapillary_360_cities_manifest.py rather than sharing a helper with
@@ -41,7 +47,8 @@ from scripts.build_worldwide_frame import (
     load_countries,
     query_string,
 )
-from scripts.register_frame import frame_identity
+from scripts.register_frame import DEFAULT_OVERLAP_KM, frame_identity
+from scripts.register_frame import _haversine_km as frame_km
 from streetscape_metadata_tracker import db
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -70,7 +77,8 @@ EXPECTED_CITY_IDS = {
 
 # The geometry production froze on 2026-10-08, read from the prod catalog's
 # `cities` row: (center_lat, center_lon, width_m, height_m, boundary-audit
-# verdict). All three audited OK and none was resized.
+# verdict). All three audited OK and none was resized. A RECORD of prod state,
+# not a check of it: nothing in this repo can compare these with prod.
 FROZEN_GEOMETRY = {
     "antwerp--flanders--belgium": (51.260461199999995, 4.3633156, 20346, 26072, "OK"),
     "mechelen--flanders--belgium": (51.034766700000006, 4.4595617999999995, 12553, 9744, "OK"),
@@ -169,11 +177,13 @@ def test_frame_only_columns_are_blank(manifest_rows):
         assert row["coverage_regime"] == ""
 
 
-def test_every_slug_has_frozen_geometry_that_passed_the_audit():
+def test_every_slug_has_a_frozen_geometry_record():
+    """
+    Coverage of the record only. Its values (the audit verdict included) are
+    a transcription of prod, which no assertion here can confirm, so none is
+    asserted against itself.
+    """
     assert set(FROZEN_GEOMETRY) == set(EXPECTED_CITY_IDS.values())
-    for city_id, (_, _, width_m, height_m, verdict) in FROZEN_GEOMETRY.items():
-        assert verdict == "OK", city_id
-        assert 0 < width_m <= 40_000 and 0 < height_m <= 40_000, city_id  # the #166 cap
 
 
 def test_the_scored_disc_lies_inside_the_frozen_grid(manifest_rows):
@@ -210,6 +220,27 @@ def test_every_row_is_in_the_committed_screen_record(manifest_rows):
         assert float(place["mly_km_per_km2"]) == density, row["city"]
         assert float(place["mly_top_creator_share"]) == share, row["city"]
         assert int(place["pnx_360_ub"]) == pnx_360, row["city"]
+
+
+def test_brussels_alone_is_why_the_batch_needed_a_small_overlap_radius(manifest_rows):
+    """
+    The writeup's aliasing argument, in register_frame's own distance. Against
+    the DEFAULT 25 km radius, Mechelen's point is inside Brussels' point
+    (21.5 km) and outside Antwerp's frozen centre (27.3 km) — find_overlap
+    compares against the frozen centre, which for Antwerp is recorded here and
+    for Brussels exists only in the prod catalog.
+    """
+    mechelen = next(r for r in manifest_rows if r["city"] == "Mechelen")
+    mlat, mlon = float(mechelen["lat"]), float(mechelen["lon"])
+    with open(REPO_ROOT / "mapillary_360_cities.csv", encoding="utf-8") as f:
+        brussels = next(r for r in csv.DictReader(f) if r["city"] == "Brussels")
+    alat, alon, *_ = FROZEN_GEOMETRY["antwerp--flanders--belgium"]
+
+    to_brussels = frame_km(mlat, mlon, float(brussels["lat"]), float(brussels["lon"]))
+    to_antwerp = frame_km(mlat, mlon, alat, alon)
+    assert round(to_brussels, 1) == 21.5
+    assert round(to_antwerp, 1) == 27.3
+    assert to_brussels <= DEFAULT_OVERLAP_KM < to_antwerp
 
 
 def test_no_two_rows_are_within_the_overlap_radius(manifest_rows):
