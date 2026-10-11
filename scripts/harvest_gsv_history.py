@@ -11,8 +11,10 @@ require an API key.
 
 It is intentionally OUT OF BAND from the cadenced run pipeline: it only reads a
 city's frozen geometry from the catalog and writes a separate dated
-`*_gsv_history_*.csv.gz` artifact plus a `history_harvests` catalog row. It does
-not touch runs, diffs, JSON summaries, or the aggregate — those come later.
+`*_gsv_history_*.csv.gz` artifact, a `history_harvests` catalog row, and the
+artifact's sibling capture-history summary `*_gsv_history_*.json.gz` (issue
+#109). It does not touch runs, diffs or per-run JSON; the aggregate points at
+the new summary on the next `scheduler regenerate-aggregate` or nightly tail.
 
 The city must already be registered in the catalog (run a normal collection
 first, which freezes the grid). History is near-static, so harvest a city once
@@ -38,6 +40,10 @@ from streetscape_metadata_tracker import db  # noqa: E402
 from streetscape_metadata_tracker.download_gsv_history import (  # noqa: E402
     HarvestBlockedError,
     harvest_gsv_history_async,
+)
+from streetscape_metadata_tracker.fileutils import load_history_csv_file  # noqa: E402
+from streetscape_metadata_tracker.json_summarizer import (  # noqa: E402
+    generate_history_summary_as_json,
 )
 from streetscape_metadata_tracker.naming import generate_history_filename  # noqa: E402
 from streetscape_metadata_tracker.paths import get_default_data_dir  # noqa: E402
@@ -148,6 +154,21 @@ async def _run(args) -> int:
         finished_at=result["finished_at"],
     )
 
+    # The summary is written AFTER the catalog row, from the file just written
+    # and read back through the same loader the backfill uses, so a summary
+    # written here and one backfilled later cannot disagree (issue #109).
+    json_path = generate_history_summary_as_json(
+        output_csv_gz_path,
+        load_history_csv_file(output_csv_gz_path),
+        city_id=city.city_id,
+        harvest_date=harvest_date,
+        grid_points_queried=result["grid_points"],
+        api_requests=result["api_requests"],
+        started_at=result["started_at"],
+        finished_at=result["finished_at"],
+        force_recreate_file=True,
+    )
+
     print(
         f"Done: {result['unique_panos']} unique official Google panos, "
         f"capture dates {result['oldest_capture_date']}..."
@@ -155,6 +176,7 @@ async def _run(args) -> int:
         f"searches."
     )
     print(f"Wrote {output_csv_gz_path}")
+    print(f"Wrote {json_path}")
     return 0
 
 

@@ -149,6 +149,16 @@ def test_history_and_run_filenames_do_not_cross_parse():
         parse_history_filename(run)
 
 
+def test_parse_history_filename_reports_gsv_as_its_provider():
+    # Issue #109: the history parser answers "which provider?" like the run and
+    # walk parsers do, so the e2e fixture's token sweep can place a history
+    # artifact. The marker is gsv-specific, so the answer is a constant.
+    parsed = parse_history_filename(
+        "bend--or_width_5000_height_5000_step_20_gsv_history_2026-07-08.json.gz"
+    )
+    assert parsed.provider == "gsv"
+
+
 # ── Catalog table ──────────────────────────────────────────────────────────
 
 
@@ -189,6 +199,50 @@ def test_register_and_get_history_harvest(tmp_path):
     latest = db.get_latest_history_harvest(conn, city_id)
     assert latest["unique_panos"] == 3
     assert latest["oldest_capture_date"] == "2007-10-01"
+
+
+def test_get_latest_history_harvests_all_picks_the_newest_per_city_and_provider(tmp_path):
+    conn = db.connect(str(tmp_path / "cat.db"))
+    bend = _register_city(conn)
+    other = db.register_city(
+        conn,
+        city_name="Salem",
+        state_name="Oregon",
+        state_code="OR",
+        country_name="United States",
+        country_code="US",
+        center_lat=44.94,
+        center_lon=-123.03,
+        grid_width_m=40,
+        grid_height_m=40,
+        step_m=20,
+    )
+    # Registered newest-first, so "first row" and "newest row" differ.
+    for city_id, d in [
+        (bend, date(2026, 9, 1)),
+        (bend, date(2026, 7, 8)),
+        (other, date(2026, 8, 1)),
+    ]:
+        db.register_history_harvest(
+            conn,
+            city_id=city_id,
+            harvest_date=d,
+            csv_filename=f"{city_id}_gsv_history_{d}.csv.gz",
+        )
+
+    latest = db.get_latest_history_harvests_all(conn)
+    assert set(latest) == {(bend, "gsv"), (other, "gsv")}
+    assert latest[(bend, "gsv")]["harvest_date"] == "2026-09-01"
+    assert latest[(other, "gsv")]["harvest_date"] == "2026-08-01"
+    # Agrees with the per-city lookup it replaces in the aggregate.
+    per_city = db.get_latest_history_harvest(conn, bend)
+    assert latest[(bend, "gsv")]["harvest_id"] == per_city["harvest_id"]
+    # The backfill's lister returns every row, oldest first.
+    assert [r["harvest_date"] for r in db.get_history_harvests(conn, bend)] == [
+        "2026-07-08",
+        "2026-09-01",
+    ]
+    assert len(db.get_history_harvests(conn)) == 3
 
 
 def test_register_history_harvest_is_idempotent_per_date(tmp_path):

@@ -20,6 +20,7 @@ from streetscape_metadata_tracker.config import (  # noqa: E402
     METADATA_DTYPES,
     PANORAMAX_METADATA_DTYPES,
 )
+from streetscape_metadata_tracker.download_gsv_history import HISTORY_DTYPES  # noqa: E402
 
 # The run CSV schema, from its single source of truth — a column added to
 # (or reordered in) METADATA_DTYPES flows into every synthetic fixture.
@@ -471,6 +472,26 @@ def make_panoramax_city_df(
             )
         )
     return pd.DataFrame(rows, columns=PANORAMAX_COLUMNS)
+
+
+def make_history_df(rows, *, harvested_at="2026-04-10T01:03:00+00:00"):
+    """
+    Build a synthetic `_gsv_history_` harvest DataFrame (issue #2/#109).
+
+    Args:
+        rows: list of (pano_id, capture_date_iso, lat, lon); each pano's
+            ``nearest_query_*`` is its own position.
+        harvested_at: the UTC ISO 8601 stamp every row carries.
+
+    Returns a raw (string-dated) frame with exactly HISTORY_DTYPES' columns, in
+    the harvester's order, like a freshly written history CSV. Rows are kept
+    in the order given; the harvester sorts by (capture_date, pano_id), so a
+    test that depends on which duplicate survives builds its rows that way.
+    """
+    out = [
+        (pano_id, capture, lat, lon, lat, lon, harvested_at) for pano_id, capture, lat, lon in rows
+    ]
+    return pd.DataFrame(out, columns=list(HISTORY_DTYPES))
 
 
 def write_city_csv_gz(df, path):
