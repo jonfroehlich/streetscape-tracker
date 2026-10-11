@@ -1911,7 +1911,7 @@ def test_a_v15_catalog_takes_both_rungs_backfill_and_columns(tmp_path, frozen_ut
     raw.close()
 
     conn = db.connect(db_path)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 20
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 21
     cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
     assert set(db._QUERY_RADIUS_RUN_COLUMNS) <= cols
     assert _host_rows(conn) == [("2026-09-28T06:00:00+00:00", "mapillary_tiles", "mapillary", 194)]
@@ -1974,7 +1974,7 @@ def test_migrate_v19_to_v20_adds_total_grid_points_as_null(tmp_path):
     count that overstates the grid -- and every stored stat survives. Killed by
     an ADD COLUMN with a DEFAULT, or a backfill from total_points."""
     conn = db.connect(_pre_total_grid_points_catalog(tmp_path))
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 20
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 21
     cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
     assert "total_grid_points" in cols
     run = db.get_latest_run(conn, "bend--or", provider="mapillary")
@@ -1993,6 +1993,60 @@ def test_a_catalog_stamped_v20_without_total_grid_points_gains_it(tmp_path):
     conn = db.connect(_pre_total_grid_points_catalog(tmp_path, user_version=20))
     cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
     assert "total_grid_points" in cols
+    conn.close()
+
+
+def _pre_quarantine_alerted_catalog(tmp_path, user_version=20):
+    """A current catalog minus schedule_state.quarantine_alerted_at, stamped
+    ``user_version``, with one pre-v21 quarantined schedule_state row."""
+    db_path = str(tmp_path / "v20.db")
+    raw = sqlite3.connect(db_path)
+    raw.executescript(db._SCHEMA)
+    raw.execute("ALTER TABLE schedule_state DROP COLUMN quarantine_alerted_at")
+    raw.execute(
+        """INSERT INTO cities (city_id, display_name, city_name, center_lat,
+           center_lon, grid_width_m, grid_height_m, step_m, created_at)
+           VALUES ('bend--or', 'Bend, OR', 'Bend', 44.05, -121.31,
+                   5000, 5000, 20, '2026-01-01T00:00:00+00:00')"""
+    )
+    raw.execute(
+        """INSERT INTO schedule_state (city_id, provider, day_of_cycle,
+                                      consecutive_failures, member, last_error)
+           VALUES ('bend--or', 'mapillary', 3, 5, 1, 'boom')"""
+    )
+    raw.execute(f"PRAGMA user_version = {user_version}")
+    raw.commit()
+    raw.close()
+    return db_path
+
+
+def test_migrate_v20_to_v21_adds_quarantine_alerted_at_as_null(tmp_path):
+    """v20 -> v21 (issue #424): the alert stamp arrives NULL ("not yet
+    emailed") on an existing quarantined row, and the row's other state
+    survives. Killed by an ADD COLUMN with a DEFAULT, or a backfill -- either
+    would silence the one email a pre-#423 quarantine never got."""
+    conn = db.connect(_pre_quarantine_alerted_catalog(tmp_path))
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 21
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(schedule_state)").fetchall()}
+    assert "quarantine_alerted_at" in cols
+    row = conn.execute(
+        """SELECT consecutive_failures, member, last_error, day_of_cycle,
+                  quarantine_alerted_at
+           FROM schedule_state WHERE city_id = 'bend--or' AND provider = 'mapillary'"""
+    ).fetchone()
+    assert tuple(row) == (5, 1, "boom", 3, None)
+    conn.close()
+    # Idempotent: reopening must not error or re-add the column.
+    db.connect(str(tmp_path / "v20.db")).close()
+
+
+def test_a_catalog_stamped_v21_without_quarantine_alerted_at_gains_it(tmp_path):
+    """The step also runs on every connect: a catalog another in-flight branch
+    stamped v21 for its own reason must still gain the column, or the nightly
+    claim fails. Killed by calling the step only from its rung."""
+    conn = db.connect(_pre_quarantine_alerted_catalog(tmp_path, user_version=21))
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(schedule_state)").fetchall()}
+    assert "quarantine_alerted_at" in cols
     conn.close()
 
 
@@ -2178,7 +2232,7 @@ def test_migrate_v15_to_v16_backfills_two_utc_dates_of_metered_channels(tmp_path
     raw.close()
 
     conn = db.connect(db_path)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 20
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 21
     assert _host_rows(conn) == [
         ("2026-09-27T23:59:59+00:00", "kartaview", "kartaview", 16),
         ("2026-09-27T23:59:59+00:00", "mapillary_tiles", "mapillary", 1198),
@@ -2414,22 +2468,25 @@ _COLUMN_RACE_TRIALS = 6
 def test_concurrent_first_connects_add_the_every_connect_columns_once(tmp_path):
     """PR #422 review: the every-connect column steps are race-safe.
 
-    _migrate_add_query_radius_columns (the v17 pair) and
-    _migrate_add_total_grid_points_column (v20) run on EVERY connect, so the
-    first connects after a deploy race each other -- the 02:00 run-due among
-    them. Six processes first-connect the same catalog at once, for a v19
+    _migrate_add_query_radius_columns (the v17 pair),
+    _migrate_add_total_grid_points_column (v20) and
+    _migrate_add_quarantine_alerted_at_column (v21, issue #424) run on EVERY
+    connect, so the first connects after a deploy race each other -- the 02:00
+    run-due among them. Six processes first-connect the same catalog at once,
+    for a v20 catalog lacking schedule_state.quarantine_alerted_at, a v19
     catalog lacking total_grid_points and a v16 catalog lacking the query-radius
-    pair, over several fresh catalogs of each. No connect may fail and every
-    catalog must end current with all three columns.
+    pair, over several fresh catalogs of each (18 catalogs). No connect may fail
+    and every catalog must end current with every column.
 
-    Killed by either step's check-then-ALTER outside ``BEGIN IMMEDIATE``: every
+    Killed by any step's check-then-ALTER outside ``BEGIN IMMEDIATE``: every
     racer reads the column as missing and all but one then raise ``duplicate
     column name``. Measured in the review at 162-164 of 240 connects (6
-    racers, 40 trials), so losing none of the 72 here is not a matter of luck.
+    racers, 40 trials), so losing none of the 108 here is not a matter of luck.
     """
     paths = []
     for trial in range(_COLUMN_RACE_TRIALS):
         for stamp, builder in (
+            (20, lambda d: _pre_quarantine_alerted_catalog(d)),
             (19, lambda d: _pre_total_grid_points_catalog(d)),
             (16, lambda d: _pre_query_radius_catalog(d, user_version=16)),
         ):
@@ -2445,7 +2502,9 @@ def test_concurrent_first_connects_add_the_every_connect_columns_once(tmp_path):
     for path in paths:
         raw = sqlite3.connect(path)
         cols = {r[1] for r in raw.execute("PRAGMA table_info(runs)").fetchall()}
+        state_cols = {r[1] for r in raw.execute("PRAGMA table_info(schedule_state)").fetchall()}
         version = raw.execute("PRAGMA user_version").fetchone()[0]
         raw.close()
         assert version == db.SCHEMA_VERSION, path
         assert wanted <= cols, path
+        assert "quarantine_alerted_at" in state_cols, path

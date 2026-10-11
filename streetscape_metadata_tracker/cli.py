@@ -57,6 +57,7 @@ from .city_registration import (
     CityResolutionError,
     cap_dimensions,
     choose_center,
+    enable_hint,
     new_city_identity,
     registered_city_for_identity,
     resolve_or_register_city,
@@ -767,6 +768,11 @@ async def async_main():
             f"step {city_row.step_m}m, centered at "
             f"{city_row.center_lat:.5f}, {city_row.center_lon:.5f}"
         )
+        if not city_row.enabled:
+            # Issue #431: this run still happens (the CLI never read
+            # cities.enabled), but nothing repeats it nightly until the operator
+            # enables the city.
+            print(enable_hint(city_row.city_id))
 
         # Collect each provider in turn (same run_date, so series pair up).
         # One provider failing must not prevent the other from collecting.
