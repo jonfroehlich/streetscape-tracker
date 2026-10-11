@@ -288,7 +288,8 @@ If that is still not enough — the body already at its one-row floor, or the ca
 That last step depends on `#bottom-right-panels > .map-panel { flex-shrink: 0 }`: with the flex default the panels shrank to the cap and clipped instead (at 1280×420 only 112 of the capture-date chart's 180px were reachable).
 The legend then gets every pixel above the stack, and scrolls as before.
 The fit runs on a ResizeObserver on the stack (deferred a frame, since the fit resizes the element it observes), on window resize, after every legend rebuild, and on every panel toggle — inside a capped stack a toggle changes the content but not the stack's box, so the observer never fires.
-With room for less than one chart row the street chart starts collapsed and its title says "collapsed to fit this screen"; that is never written to `streetscape-street-chart-collapsed`, because it describes the screen rather than a preference, so a stored "0" does not stop it on a later short screen either. The reader can still expand it, and then gets the one-row body inside a scrolling stack.
+With room for less than one chart row the street chart starts collapsed and its title says "collapsed to fit this screen"; that is never written to `streetscape-street-chart-collapsed`, because it describes the screen rather than a preference, so a stored "0" does not stop it on a later short screen either.
+The reader can still expand it, and then gets the one-row body inside a scrolling stack.
 Both panels carry `max-width: calc(100vw - 40px)`, or at 390px the 400px panels hang off the left edge and clip the chart's row labels.
 
 The Color-by radios also answer the arrow keys (`nextStreetMode`, wrapping), as their `role="radio"` promises; Enter, Space and Tab are untouched, and each radio stays its own Tab stop, like the Imagery radiogroup above it, which still has no arrow keys.
