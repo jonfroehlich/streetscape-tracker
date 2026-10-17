@@ -593,11 +593,18 @@ ARGV_REJECTED_EXIT_CODE = 2
 # child's log tail -- the exception never crosses the process boundary, so this
 # text is the only way a night's log can say "the clock paused it" rather than
 # "the budget paused it". Defined once so neither side can respell them.
+#
+# The third, backpressure (issue #444), is the Mapillary tile census pausing
+# itself after the CDN answered 429/503 too often in one crawl. The scheduler
+# reads it back like the other two -- `_pause_stop_phrase` iterates this dict --
+# so adding the entry is the whole of its wiring there.
 SWEEP_STOP_REQUESTS = "requests"
 SWEEP_STOP_CLOCK = "clock"
+SWEEP_STOP_BACKPRESSURE = "backpressure"
 SWEEP_STOP_PHRASES = {
     SWEEP_STOP_REQUESTS: "stopped by its request cap",
     SWEEP_STOP_CLOCK: "stopped by its wall-clock budget",
+    SWEEP_STOP_BACKPRESSURE: "stopped by provider backpressure (HTTP 429/503)",
 }
 
 
@@ -961,6 +968,32 @@ class AsyncRateLimiter:
         if self._time_func is not None:
             return self._time_func()
         return asyncio.get_running_loop().time()
+
+    def slow_down(self, factor: float) -> None:
+        """
+        Divide this limiter's rate by ``factor`` from the next acquisition on.
+
+        THIS INSTANCE ONLY, which is the scoping guarantee: nothing here is
+        module or class state, so a limiter built per crawl (as the Mapillary
+        tile census builds one) slows that crawl and no other, and a limiter in
+        another process is out of reach by construction. Applies to both modes --
+        the bucket refills slower, and the spaced pacer draws its next gap
+        around the longer mean (the gap already drawn is not redrawn, so the
+        slowdown lands one request later there). The jitter, i.e. the CV, is
+        unchanged. A no-op when pacing is disabled.
+
+        Used by the Mapillary census's backpressure rule (issue #444): halve
+        the pace for the rest of the crawl after the CDN answers 429/503.
+
+        Usage:
+            limiter = AsyncRateLimiter(40, jitter=0.6)
+            limiter.slow_down(2)   # a mean 20/min from here on
+        """
+        if not factor >= 1.0:
+            # Refused rather than clamped: a factor below 1 would SPEED the
+            # pacer up, which no caller of a method by this name means.
+            raise ValueError(f"slow_down factor must be >= 1, got {factor!r}")
+        self._rate /= factor
 
     async def acquire(self) -> None:
         """Block until a request token is available (no-op when disabled)."""

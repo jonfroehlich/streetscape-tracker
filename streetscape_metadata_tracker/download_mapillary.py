@@ -37,8 +37,9 @@ re-spent census is not merely slow -- it is charged against the same rolling
 window the block is drawn from. An interrupted city now resumes for its
 MISSING tiles only, and tiles fetched before a block survive to the next
 night. Resume is strictly next-invocation: no in-process retry is added
-anywhere, because retrying during a block is reported to extend it
-(docs/provider-access.md).
+for a refusal, because retrying during a block is reported to extend it
+(docs/provider-access.md). The one in-process retry that exists is for a
+429/503, and it waits first -- see the backpressure section (issue #444).
 
 The caller supplies the checkpoint path and discards it once its artifact is
 durable -- see checkpointing.py, and the tile-keyed reassembly contract in
@@ -46,6 +47,7 @@ the checkpoint section below.
 """
 
 import asyncio
+import email.utils
 import json
 import logging
 import math
@@ -103,6 +105,7 @@ from .download_common import _M_PER_DEG_LAT as _M_PER_DEG_LAT
 from .download_common import (
     HOST_MAPILLARY_TILES,
     MAPILLARY_TILE_CONNECTION_LIMIT,
+    SWEEP_STOP_BACKPRESSURE,
     SWEEP_STOP_CLOCK,
     SWEEP_STOP_REQUESTS,
     AsyncRateLimiter,
@@ -610,6 +613,172 @@ class TileStatusCounts:
         )
 
 
+# ── Backpressure on 429/503 (issue #444, stage 4) ──────────────────────────
+#
+# Until #444 a 429 or 503 was an ordinary ClientResponseError, which `@backoff`
+# retried up to TILE_MAX_TRIES times on a one-to-a-few-second exponential, at
+# whatever pace the crawl was running, ignoring any Retry-After -- i.e. it
+# answered "slow down" by asking again almost at once, from the host whose
+# forum reports say retrying INTO a block extends it. The rule now:
+#
+# 1. A 429 or 503 is NOT retried by `@backoff`. `_fetch_tile` raises
+#    TileBackpressureError, which is deliberately neither an aiohttp.ClientError
+#    (backoff's retry set) nor a DownloadError (#205's whole-city abort).
+# 2. The crawl's pacer is HELD -- no tile request goes out, from any socket --
+#    for `max(Retry-After, TILE_BACKPRESSURE_MIN_WAIT_S)`. A Retry-After longer
+#    than TILE_BACKPRESSURE_MAX_WAIT_S is not slept on at all: the crawl
+#    pauses instead (3), because retrying before the time the server named
+#    would disobey it, and a sleep that long belongs to the next night rather
+#    than to this one's host lock.
+# 3. The pace is halved for the REST OF THIS CRAWL (once, on the first such
+#    response). The limiter is built per crawl, so this cannot reach another
+#    crawl or another process; see AsyncRateLimiter.slow_down.
+# 4. The tile is then retried, through the same in-semaphore cap and deadline
+#    checks as a fresh tile, so `max_requests` + its reservation still bound
+#    the crawl and no attempt is counted twice.
+# 5. The TILE_BACKPRESSURE_PAUSE_AFTER-th such response in one crawl pauses it:
+#    the same checkpointed, exit-83 path the request cap takes, raised before
+#    the settle loop. It is NOT a refusal: a 302 -> /login is still the
+#    HostBlockedError (exit 75) it always was.
+#
+# Both statuses, because a CDN shedding load answers 503 and one metering a
+# client answers 429; neither has ever been observed from tiles.mapillary.com
+# (nothing counted them before the status line above), so this is built ahead
+# of the evidence, on the cheap side of an unknown.
+TILE_BACKPRESSURE_STATUSES = (429, 503)
+TILE_BACKPRESSURE_MIN_WAIT_S = 60.0
+# 15 minutes. Two reasons, one external and one ours. The only cooldown ever
+# reported for a Mapillary tile block is "the script sleeps for 15 minutes",
+# found by trial and error by a forum user (thread 5821) -- a hint, not a
+# contract. And at most PAUSE_AFTER - 1 = 2 waits happen per crawl before the
+# third response pauses it, so a crawl holds the machine-wide tile lock for at
+# most 30 minutes of sleeping: far inside the scheduler's per-city timeout
+# floor, so a waiting child is never SIGKILLed (which would count a failure).
+TILE_BACKPRESSURE_MAX_WAIT_S = 900.0
+TILE_BACKPRESSURE_PAUSE_AFTER = 3
+TILE_BACKPRESSURE_SLOWDOWN = 2.0
+
+# The hold's sleep, looked up at CALL time so a test can replace it (conftest
+# makes it instant suite-wide; tests/test_mapillary_backpressure.py records it).
+_backpressure_sleep = asyncio.sleep
+
+
+class TileBackpressureError(Exception):
+    """
+    The tile CDN answered 429 or 503: slow down, then retry (issue #444).
+
+    Raised by :func:`_fetch_tile` and handled by the crawl, never by
+    ``@backoff``: it is deliberately NOT an ``aiohttp.ClientError`` (which
+    backoff would retry at once) and NOT a ``DownloadError`` (which would trip
+    #205's whole-city abort -- this is a request to wait, not a refusal).
+    """
+
+    def __init__(self, status: int, retry_after: str | None):
+        super().__init__(f"Mapillary tile CDN answered HTTP {status} (Retry-After: {retry_after})")
+        self.status = status
+        self.retry_after = retry_after
+
+
+def retry_after_seconds(value: str | None, now: datetime | None = None) -> float | None:
+    """
+    A Retry-After header as seconds from now, or None when absent or unreadable.
+
+    Both forms RFC 9110 sec. 10.2.3 allows: delay-seconds (a non-negative
+    integer) and an HTTP-date. A date in the past is 0, not negative.
+
+    >>> retry_after_seconds("120")
+    120.0
+    >>> retry_after_seconds("Wed, 21 Oct 2015 07:28:00 GMT",
+    ...                     now=datetime(2015, 10, 21, 7, 27, tzinfo=UTC))
+    60.0
+    >>> retry_after_seconds("soon") is None
+    True
+    """
+    if value is None:
+        return None
+    text = value.strip()
+    if text.isdigit():
+        return float(int(text))
+    try:
+        when = email.utils.parsedate_to_datetime(text)
+    except (TypeError, ValueError, IndexError):
+        return None
+    if when is None:  # pragma: no cover - older Pythons returned None
+        return None
+    if when.tzinfo is None:
+        # RFC 9110: an HTTP-date is always GMT.
+        when = when.replace(tzinfo=UTC)
+    now = now or datetime.now(UTC)
+    return max((when - now).total_seconds(), 0.0)
+
+
+def backpressure_wait_seconds(retry_after_s: float | None) -> float | None:
+    """
+    How long to hold the crawl after one 429/503, or None to pause it instead.
+
+    ``max(Retry-After, TILE_BACKPRESSURE_MIN_WAIT_S)``; None when the server
+    asked for longer than TILE_BACKPRESSURE_MAX_WAIT_S (see rule 2 above).
+
+    >>> backpressure_wait_seconds(None), backpressure_wait_seconds(5.0)
+    (60.0, 60.0)
+    >>> backpressure_wait_seconds(300.0), backpressure_wait_seconds(3600.0)
+    (300.0, None)
+    """
+    if retry_after_s is not None and retry_after_s > TILE_BACKPRESSURE_MAX_WAIT_S:
+        return None
+    return max(retry_after_s or 0.0, TILE_BACKPRESSURE_MIN_WAIT_S)
+
+
+class _BackpressurePacer:
+    """
+    One crawl's pacer: the rate limiter, plus a gate a 429/503 can close.
+
+    Built per crawl around that crawl's own limiter, so a hold or a slowdown
+    lives exactly as long as the crawl does. ``acquire`` is what ``_fetch_tile``
+    awaits before every request, so a hold stops EVERY socket, not just the one
+    that was answered 429: with five connections, four other tiles would
+    otherwise keep asking while the fifth waited.
+
+    A request that was already queued on the limiter when a hold began is sent
+    back to wait the hold out (the ``_holds`` generation check), so nothing
+    slips out during a hold that was opened after it passed the gate.
+    """
+
+    def __init__(self, limiter: Any):
+        self._limiter = limiter
+        self._gate = asyncio.Lock()
+        self._holds = 0
+        self._hold_until = 0.0
+        self.slowed = False
+
+    async def acquire(self) -> None:
+        while True:
+            seen = self._holds
+            async with self._gate:
+                pass  # waits out any hold in progress
+            await self._limiter.acquire()
+            if self._holds == seen:
+                return
+
+    async def hold(self, seconds: float) -> None:
+        """Keep every request of this crawl from going out for ``seconds``."""
+        loop = asyncio.get_running_loop()
+        self._holds += 1
+        # Overlapping holds extend to the LATEST end rather than queueing, so
+        # two 429s seen together cost one wait, not two back to back.
+        self._hold_until = max(self._hold_until, loop.time() + seconds)
+        async with self._gate:
+            remaining = self._hold_until - loop.time()
+            if remaining > 0:
+                await _backpressure_sleep(remaining)
+
+    def slow_down(self) -> None:
+        """Halve this crawl's pace, once; later calls are no-ops."""
+        if not self.slowed:
+            self.slowed = True
+            self._limiter.slow_down(TILE_BACKPRESSURE_SLOWDOWN)
+
+
 @backoff.on_exception(
     backoff.expo,
     (asyncio.TimeoutError, aiohttp.ClientError),
@@ -673,8 +842,12 @@ async def _fetch_tile(
                 f"endpoint has moved and this code needs updating.",
                 host=HOST_MAPILLARY_TILES,
             )
+        if response.status in TILE_BACKPRESSURE_STATUSES:
+            # Handled by the crawl, never by @backoff (issue #444): see the
+            # backpressure section above.
+            raise TileBackpressureError(response.status, response.headers.get("Retry-After"))
         if response.status != 200:
-            # 429/5xx raise ClientResponseError, which backoff retries
+            # Other 4xx/5xx raise ClientResponseError, which backoff retries
             response.raise_for_status()
         content_type = response.headers.get("Content-Type", "")
         if any(bad in content_type.lower() for bad in _TILE_ERROR_CONTENT_TYPES):
@@ -1450,8 +1623,9 @@ async def _fetch_city_images(
             condition -- both silent fall-backs are wrong in a way nothing
             downstream could see, since ignoring the cap overspends a per-IP
             budget and honouring it burns one for nothing.
-        SweepIncompleteError: the cap or the deadline was reached with tiles
-            unfetched and the checkpoint holds them. Progress, not breakage: it
+        SweepIncompleteError: the cap or the deadline was reached, or the CDN
+            answered 429/503 TILE_BACKPRESSURE_PAUSE_AFTER times (issue #444),
+            with tiles unfetched and the checkpoint holds them. Progress, not breakage: it
             maps to exit 83, which the scheduler amnesties rather than counting
             a failure.
         DownloadError: on a rejected token or tile transport failure, carrying
@@ -1556,6 +1730,11 @@ async def _fetch_city_images(
     # caps concurrency, which on a fast link still meant ~5 tiles/s (~300/min)
     # from a single city before this (issue #198).
     rate_limiter = AsyncRateLimiter(max_requests_per_minute, jitter=jitter)
+    # What every request actually awaits: this crawl's limiter behind a gate a
+    # 429/503 can close (issue #444). Built here, per crawl, beside the limiter
+    # it wraps -- which is what keeps a hold or a halved pace from outliving
+    # this crawl.
+    pacer = _BackpressurePacer(rate_limiter)
     if max_requests_per_minute <= 0:
         logger.info("Tile pacing DISABLED (max_requests_per_minute <= 0)")
     elif jitter > 0:
@@ -1651,6 +1830,55 @@ async def _fetch_city_images(
     # in flight. That residue is the honest remaining bound, below.
     reserved = 0
 
+    # Backpressure (issue #444): 429/503 responses seen by this crawl, whether
+    # the crawl has decided to pause on them, and why, for the pause message.
+    backpressure_events = 0
+    backpressure_paused = False
+    backpressure_detail: str | None = None
+
+    def on_backpressure(e: TileBackpressureError) -> float | None:
+        """
+        Record one 429/503: halve the pace, and say how long to hold.
+
+        Returns the seconds to hold every request for, or None when the crawl
+        is to PAUSE instead -- on the TILE_BACKPRESSURE_PAUSE_AFTER-th response,
+        or on a Retry-After past TILE_BACKPRESSURE_MAX_WAIT_S.
+        """
+        nonlocal backpressure_events, backpressure_paused, backpressure_detail, stop_reason
+        backpressure_events += 1
+        pacer.slow_down()
+        if backpressure_paused:
+            # A late answer from a tile that was in flight when the pause
+            # began: counted, never waited on.
+            return None
+        wait = backpressure_wait_seconds(retry_after_seconds(e.retry_after))
+        if wait is not None and backpressure_events < TILE_BACKPRESSURE_PAUSE_AFTER:
+            logger.warning(
+                f"Mapillary tile CDN answered HTTP {e.status} (Retry-After: {e.retry_after}) "
+                f"for {city_name}: holding every tile request for {wait:.0f} s, then "
+                f"continuing at HALF the pace for the rest of this crawl (backpressure "
+                f"response {backpressure_events}/{TILE_BACKPRESSURE_PAUSE_AFTER}; issue #444)"
+            )
+            return wait
+        if wait is None:
+            backpressure_detail = (
+                f"HTTP {e.status} with a Retry-After of {e.retry_after!r}, longer than the "
+                f"{TILE_BACKPRESSURE_MAX_WAIT_S:.0f} s it will wait in-process"
+            )
+        else:
+            backpressure_detail = (
+                f"{backpressure_events} HTTP 429/503 responses in one crawl "
+                f"(the limit is {TILE_BACKPRESSURE_PAUSE_AFTER})"
+            )
+        backpressure_paused = True
+        if stop_reason is None:
+            stop_reason = SWEEP_STOP_BACKPRESSURE
+        logger.warning(
+            f"Mapillary tile CDN backpressure for {city_name}: {backpressure_detail}; "
+            f"pausing the crawl (checkpointed, exit 83), NOT a refusal"
+        )
+        return None
+
     async def fetch_one(x: int, y: int) -> pd.DataFrame:
         nonlocal fatal, capped, reserved, stop_reason
         url = f"{TILE_URL_TEMPLATE.format(z=TILE_ZOOM, x=x, y=y)}?access_token={access_token}"
@@ -1675,87 +1903,109 @@ async def _fetch_city_images(
             # drain, see the flag, and return without taking a rate-limiter
             # token or counting a request. Worst case is connection_limit
             # requests instead of the whole city.
-            if fatal is not None:
-                # Nothing was requested for this tile, so keep the progress bar
-                # honest: a city that stopped at request 1 must not read like a
-                # city that hung at tile 3. That line in
-                # logs/collect_{city}_{channel}_{date}.log is how an operator
-                # tells those two apart.
-                progress_bar.update(1)
-                return records_to_census([])
-            over_cap = max_requests is not None and api_requests + reserved >= max_requests
-            # The wall-clock budget (issue #344) is checked HERE, beside the cap,
-            # and takes exactly its path below: a clock stop is a pause for the
-            # same reason a cap is, and a tile already in flight finishes its
-            # retries under it with the same residue the cap documents.
-            if over_cap or crawl_deadline_passed(deadline_monotonic):
-                # THE CAP IS CHECKED HERE FOR THE REASON THE ABORT ABOVE IS, and
-                # it inherits that check's shape but not its bound. A tile
-                # admitted here reserves its request before releasing control,
-                # so the cap is not overshot at all in the ordinary case; what
-                # remains is RETRIES BY TILES ALREADY IN FLIGHT, at most
-                # connection_limit * (TILE_MAX_TRIES - 1). This function serves
-                # TWO callers, and since #361 both hold the same 5 sockets --
-                # download_common.MAPILLARY_TILE_CONNECTION_LIMIT, this
-                # module's default and the walk's ceiling at once -- so the
-                # residue is 20 on either:
-                #   GRID  (cli.py): cli.py forwards --connection-limit only on
-                #     its gsv arm, so this census takes this module's own
-                #     default. Not "the argparse default of 5" -- cli.py's
-                #     --connection-limit default is 50; the 5 arrives because
-                #     the argument is never forwarded.
-                #   WALK  (collect.py): the scheduler hands it
-                #     min(its per-child share, WALK_CONNECTION_LIMITS["mapillary"])
-                #     = min(50 in prod, 5). Until #361 that ceiling was 50, so a
-                #     capped walk could overshoot by 200.
-                #
-                # It is a soft ceiling on purpose: stopping requests already in
-                # flight would mean cancelling a paced, retrying fetch
-                # mid-attempt, which costs the guarantee that every request we
-                # made was counted. What is NOT deliberate is a soft ceiling
-                # that misses by a connection_limit on every capped night.
-                #
-                # Returning an empty census WITHOUT committing is what makes
-                # this resumable: an uncommitted tile is not in `done`, so the
-                # next invocation's `todo` still holds it. The empty frame never
-                # reaches the census -- the raise below happens before the
-                # settle loop, precisely so a skipped tile cannot be read as a
-                # tile observed to be empty.
-                capped = True
-                if stop_reason is None:
-                    # The cap is tested first, so a tile that finds BOTH
-                    # ceilings tripped at once reports "requests": a tie
-                    # resolves to the request cap, as in the KartaView sweep.
-                    stop_reason = SWEEP_STOP_REQUESTS if over_cap else SWEEP_STOP_CLOCK
-                progress_bar.update(1)
-                return records_to_census([])
-            # Reserved BEFORE the await, released after it: there is no
-            # suspension point between the check above and this line, so the
-            # loop cannot interleave another task into the gap.
-            reserved += 1
-            try:
-                # Pacing/counting happen inside _fetch_tile, per retried attempt.
-                tile_bytes = await _fetch_tile(
-                    session, url, timeout, rate_limiter, on_attempt, statuses.record
-                )
-            except DownloadError as e:
-                # ONLY DownloadError trips the abort. Per-tile failures
-                # (aiohttp.ClientResponseError from a 404/429/5xx, or a decode
-                # error) must still fan out to every tile — that is #168's
-                # guarantee that one bad tile cannot discard a city, and it is
-                # what the settle loop's MAX_FAILED_TILE_FRACTION tolerance is
-                # for. Assigned before leaving the semaphore block, so no
-                # waiting task can slip past the check above.
-                fatal = fatal or e
-                raise
-            finally:
-                # Every exit from the fetch, exception included: a reservation
-                # that leaked would shrink the cap for the rest of the crawl and
-                # eventually close the gate on tiles the budget still covers.
-                # The requests it stood for are in `api_requests` by now,
-                # whether the attempt succeeded, failed or exhausted its
-                # retries, so releasing it double-counts nothing.
-                reserved -= 1
+            # A LOOP only so a tile answered 429/503 can be retried (issue
+            # #444), and it re-enters at the TOP on purpose: the retry is
+            # re-checked against the abort, the cap (with its reservation) and
+            # the deadline exactly as a fresh tile is, so backpressure can
+            # never be the way a crawl spends past its cap.
+            while True:
+                if fatal is not None:
+                    # Nothing was requested for this tile, so keep the progress bar
+                    # honest: a city that stopped at request 1 must not read like a
+                    # city that hung at tile 3. That line in
+                    # logs/collect_{city}_{channel}_{date}.log is how an operator
+                    # tells those two apart.
+                    progress_bar.update(1)
+                    return records_to_census([])
+                over_cap = max_requests is not None and api_requests + reserved >= max_requests
+                # The wall-clock budget (issue #344) is checked HERE, beside the cap,
+                # and takes exactly its path below: a clock stop is a pause for the
+                # same reason a cap is, and a tile already in flight finishes its
+                # retries under it with the same residue the cap documents.
+                # A backpressure pause (issue #444) takes this path too: the
+                # crawl is not over, the CDN asked it to stop for now.
+                if backpressure_paused or over_cap or crawl_deadline_passed(deadline_monotonic):
+                    # THE CAP IS CHECKED HERE FOR THE REASON THE ABORT ABOVE IS, and
+                    # it inherits that check's shape but not its bound. A tile
+                    # admitted here reserves its request before releasing control,
+                    # so the cap is not overshot at all in the ordinary case; what
+                    # remains is RETRIES BY TILES ALREADY IN FLIGHT, at most
+                    # connection_limit * (TILE_MAX_TRIES - 1). This function serves
+                    # TWO callers, and since #361 both hold the same 5 sockets --
+                    # download_common.MAPILLARY_TILE_CONNECTION_LIMIT, this
+                    # module's default and the walk's ceiling at once -- so the
+                    # residue is 20 on either:
+                    #   GRID  (cli.py): cli.py forwards --connection-limit only on
+                    #     its gsv arm, so this census takes this module's own
+                    #     default. Not "the argparse default of 5" -- cli.py's
+                    #     --connection-limit default is 50; the 5 arrives because
+                    #     the argument is never forwarded.
+                    #   WALK  (collect.py): the scheduler hands it
+                    #     min(its per-child share, WALK_CONNECTION_LIMITS["mapillary"])
+                    #     = min(50 in prod, 5). Until #361 that ceiling was 50, so a
+                    #     capped walk could overshoot by 200.
+                    #
+                    # It is a soft ceiling on purpose: stopping requests already in
+                    # flight would mean cancelling a paced, retrying fetch
+                    # mid-attempt, which costs the guarantee that every request we
+                    # made was counted. What is NOT deliberate is a soft ceiling
+                    # that misses by a connection_limit on every capped night.
+                    #
+                    # Returning an empty census WITHOUT committing is what makes
+                    # this resumable: an uncommitted tile is not in `done`, so the
+                    # next invocation's `todo` still holds it. The empty frame never
+                    # reaches the census -- the raise below happens before the
+                    # settle loop, precisely so a skipped tile cannot be read as a
+                    # tile observed to be empty.
+                    capped = True
+                    if stop_reason is None:
+                        # The cap is tested first, so a tile that finds BOTH
+                        # ceilings tripped at once reports "requests": a tie
+                        # resolves to the request cap, as in the KartaView sweep.
+                        # (A backpressure pause set its own reason already.)
+                        stop_reason = SWEEP_STOP_REQUESTS if over_cap else SWEEP_STOP_CLOCK
+                    progress_bar.update(1)
+                    return records_to_census([])
+                # Reserved BEFORE the await, released after it: there is no
+                # suspension point between the check above and this line, so the
+                # loop cannot interleave another task into the gap.
+                reserved += 1
+                slow_down_please: TileBackpressureError | None = None
+                try:
+                    # Pacing/counting happen inside _fetch_tile, per retried attempt.
+                    tile_bytes = await _fetch_tile(
+                        session, url, timeout, pacer, on_attempt, statuses.record
+                    )
+                except TileBackpressureError as e:
+                    # Already counted (one request, one status) inside
+                    # _fetch_tile. Handled below, after the reservation is
+                    # released, so a hold never pins a reservation open.
+                    slow_down_please = e
+                except DownloadError as e:
+                    # ONLY DownloadError trips the abort. Per-tile failures
+                    # (aiohttp.ClientResponseError from a 404/5xx, or a decode
+                    # error) must still fan out to every tile — that is #168's
+                    # guarantee that one bad tile cannot discard a city, and it is
+                    # what the settle loop's MAX_FAILED_TILE_FRACTION tolerance is
+                    # for. Assigned before leaving the semaphore block, so no
+                    # waiting task can slip past the check above.
+                    fatal = fatal or e
+                    raise
+                finally:
+                    # Every exit from the fetch, exception included: a reservation
+                    # that leaked would shrink the cap for the rest of the crawl and
+                    # eventually close the gate on tiles the budget still covers.
+                    # The requests it stood for are in `api_requests` by now,
+                    # whether the attempt succeeded, failed or exhausted its
+                    # retries, so releasing it double-counts nothing.
+                    reserved -= 1
+                if slow_down_please is None:
+                    break
+                wait = on_backpressure(slow_down_please)
+                if wait is not None:
+                    await pacer.hold(wait)
+                # Back to the top: retried if the checks there still admit it,
+                # or turned away as a pause (issue #444).
         progress_bar.update(1)
         # Convert to columns HERE, not after the gather: asyncio.gather holds
         # every tile's result until the last one lands, so returning dicts kept
@@ -1847,6 +2097,8 @@ async def _fetch_city_images(
         committed = len(checkpoint.done) if checkpoint is not None else 0
         if stop_reason == SWEEP_STOP_CLOCK:
             ceiling = f"{crawl_budget_seconds(deadline_monotonic):,}-second wall-clock budget"
+        elif stop_reason == SWEEP_STOP_BACKPRESSURE:
+            ceiling = f"backpressure limit ({backpressure_detail})"
         else:
             ceiling = f"{max_requests:,}-request cap"
         detail = (

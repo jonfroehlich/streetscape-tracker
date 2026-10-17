@@ -310,3 +310,291 @@ def test_the_user_agent_names_the_project_a_contact_and_the_purpose():
     assert ua.endswith(f"aiohttp/{aiohttp.__version__}")
     # Never a credential: the token rides in the URL, and this string is logged.
     assert "MLY" not in ua and "token" not in ua.lower()
+
+
+# ── Stage 4: backpressure on 429/503 ───────────────────────────────────────
+
+
+class _RecordingLimiter:
+    """A stand-in limiter that records every one built and every slowdown."""
+
+    built: list["_RecordingLimiter"] = []
+
+    def __init__(self, max_per_minute, *args, **kwargs):
+        self.max_per_minute = max_per_minute
+        self.jitter = kwargs.get("jitter")
+        self.slowdowns: list[float] = []
+        _RecordingLimiter.built.append(self)
+
+    async def acquire(self):
+        return None
+
+    def slow_down(self, factor):
+        self.slowdowns.append(factor)
+
+
+@pytest.fixture
+def limiters(monkeypatch):
+    _RecordingLimiter.built = []
+    monkeypatch.setattr(dm, "AsyncRateLimiter", _RecordingLimiter)
+    return _RecordingLimiter.built
+
+
+@pytest.fixture
+def holds(monkeypatch):
+    """Record every backpressure hold's sleep instead of sleeping it."""
+    slept: list[float] = []
+
+    async def record(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr(dm, "_backpressure_sleep", record)
+    return slept
+
+
+@pytest.mark.parametrize("code", dm.TILE_BACKPRESSURE_STATUSES)
+def test_a_429_or_503_is_raised_once_not_retried_by_backoff(code, no_backoff_sleep):
+    """`@backoff` used to retry these at once, at pace, ignoring Retry-After."""
+    session = _ScriptedSession({(1, 2): [status(code, **{"Retry-After": "30"})] * 10})
+    counted = []
+    with pytest.raises(dm.TileBackpressureError) as excinfo:
+        asyncio.run(
+            dm._fetch_tile(
+                session,
+                "https://tiles.mapillary.com/maps/vtp/mly1_computed_public/2/14/1/2?access_token=x",
+                aiohttp.ClientTimeout(total=5),
+                None,
+                lambda: counted.append(1),
+            )
+        )
+    assert len(session.urls) == len(counted) == 1
+    assert excinfo.value.status == code
+    assert excinfo.value.retry_after == "30"
+    # Neither backoff's retry set nor the whole-city abort's type.
+    assert not isinstance(excinfo.value, aiohttp.ClientError)
+    assert not isinstance(excinfo.value, DownloadError)
+
+
+def test_retry_after_reads_both_rfc_forms():
+    from datetime import UTC, datetime
+
+    now = datetime(2026, 10, 17, 9, 0, 0, tzinfo=UTC)
+    assert dm.retry_after_seconds("120", now) == 120.0
+    assert dm.retry_after_seconds(" 0 ", now) == 0.0
+    assert dm.retry_after_seconds("Sat, 17 Oct 2026 09:05:00 GMT", now) == 300.0
+    # A date already past is "now", not a negative wait.
+    assert dm.retry_after_seconds("Sat, 17 Oct 2026 08:00:00 GMT", now) == 0.0
+    for unreadable in (None, "", "soon", "-5", "1.5"):
+        assert dm.retry_after_seconds(unreadable, now) is None, unreadable
+
+
+def test_the_wait_is_retry_after_floored_at_a_minute_and_refused_past_the_ceiling():
+    floor, ceiling = dm.TILE_BACKPRESSURE_MIN_WAIT_S, dm.TILE_BACKPRESSURE_MAX_WAIT_S
+    assert (floor, ceiling) == (60.0, 900.0)
+    assert dm.backpressure_wait_seconds(None) == floor
+    assert dm.backpressure_wait_seconds(0.0) == floor
+    assert dm.backpressure_wait_seconds(59.0) == floor
+    assert dm.backpressure_wait_seconds(300.0) == 300.0
+    assert dm.backpressure_wait_seconds(ceiling) == ceiling
+    assert dm.backpressure_wait_seconds(ceiling + 1) is None
+
+
+@pytest.mark.parametrize(
+    ("retry_after", "expected"),
+    [
+        ("120", 120.0),
+        (None, 60.0),
+        ("5", 60.0),
+    ],
+)
+def test_one_429_holds_halves_and_retries_the_tile(
+    monkeypatch, caplog, limiters, holds, retry_after, expected
+):
+    """The tile is retried after the hold, the census completes, and every
+    HTTP request is counted exactly once -- the 429 included."""
+    headers = {} if retry_after is None else {"Retry-After": retry_after}
+    script = {_TILES[0]: [status(429, **headers), ok()]}
+    caplog.set_level(logging.INFO, logger=dm.__name__)
+    result, session = _crawl(monkeypatch, script)
+
+    assert not isinstance(result, BaseException), result
+    assert result["failed_tiles"] == []
+    assert result["api_requests"] == len(session.urls) == len(_TILES) + 1
+    assert holds == [pytest.approx(expected, abs=1.0)]
+    (limiter,) = limiters
+    assert limiter.slowdowns == [dm.TILE_BACKPRESSURE_SLOWDOWN] == [2.0]
+    (line,) = _status_lines(caplog)
+    assert " 429=1 " in line and " retries=1 " in line
+
+
+def test_an_http_date_retry_after_is_honoured_in_the_crawl(monkeypatch, limiters, holds):
+    from datetime import UTC, datetime, timedelta
+
+    when = datetime.now(UTC) + timedelta(seconds=300)
+    script = {
+        _TILES[0]: [status(503, **{"Retry-After": when.strftime("%a, %d %b %Y %H:%M:%S GMT")})]
+    }
+    result, _ = _crawl(monkeypatch, script)
+    assert not isinstance(result, BaseException), result
+    assert holds == [pytest.approx(300.0, abs=3.0)]
+
+
+def test_a_hold_stops_every_socket_not_just_the_one_answered(monkeypatch, limiters):
+    """With five connections, four other tiles would keep asking while the
+    fifth waited. The hold is a GATE on the crawl's pacer, so none may."""
+    real_sleep = asyncio.sleep
+    sessions_seen = []
+    during = []
+
+    async def hold(seconds):
+        session = sessions_seen[0]
+        before = len(session.urls)
+        await real_sleep(0.05)  # let every other task run against the gate
+        during.append(len(session.urls) - before)
+
+    monkeypatch.setattr(dm, "_backpressure_sleep", hold)
+    real_build = _ScriptedSession
+
+    def build(script, **kwargs):
+        session = real_build(script, **kwargs)
+        sessions_seen.append(session)
+        return session
+
+    script = {_TILES[0]: [status(429), ok()]}
+    monkeypatch.setattr(dm.aiohttp, "ClientSession", lambda **kw: build(script, **kw))
+    result = asyncio.run(
+        dm.fetch_city_images_async("Test City", _BBOX, "MLY|test|token", connection_limit=5)
+    )
+    assert result["api_requests"] == len(_TILES) + 1
+    assert during == [0], "a tile request went out while the crawl was held"
+
+
+def _three_429s(**headers):
+    """connection_limit=1 makes the order exact: tiles 0 and 1 are each answered
+    429 then retried; tile 2's 429 is the third, and pauses the crawl."""
+    return {xy: [status(429, **headers)] for xy in _TILES[:3]}
+
+
+def test_the_third_429_pauses_the_crawl_with_exit_83_not_a_refusal(
+    monkeypatch, tmp_path, limiters, holds, caplog
+):
+    caplog.set_level(logging.INFO, logger=dm.__name__)
+    error, session = _crawl(
+        monkeypatch, _three_429s(), connection_limit=1, checkpoint_path=str(tmp_path / "cp")
+    )
+
+    assert isinstance(error, SweepIncompleteError), error
+    assert not isinstance(error, HostBlockedError)
+    from streetscape_metadata_tracker.download_common import (
+        SWEEP_STOP_BACKPRESSURE,
+        SWEEP_STOP_PHRASES,
+    )
+
+    assert error.stopped_by == SWEEP_STOP_BACKPRESSURE
+    assert error.stop_phrase == SWEEP_STOP_PHRASES[SWEEP_STOP_BACKPRESSURE]
+    assert "backpressure" in str(error)
+    # Tiles 0 and 1 were retried and committed; tile 2 was not.
+    assert error.units_done == 2
+    assert error.unit_count == len(_TILES)
+    # Two holds; the third response pauses instead of waiting.
+    assert holds == [pytest.approx(60.0, abs=1.0)] * 2
+    # 2 + 2 + 1 requests, each counted once, on both counters.
+    assert error.api_requests == len(session.urls) == 5
+    assert error.api_requests_total == 5
+    (limiter,) = limiters
+    assert limiter.slowdowns == [2.0], "halved ONCE per crawl, not per response"
+    (line,) = _status_lines(caplog)
+    assert " 429=3 " in line and " requests=5 retries=2 " in line
+
+
+def test_the_backpressure_pause_phrase_is_what_the_scheduler_reads_back(
+    monkeypatch, tmp_path, limiters, holds
+):
+    from streetscape_metadata_tracker.scheduler import _pause_stop_phrase
+
+    error, _ = _crawl(
+        monkeypatch, _three_429s(), connection_limit=1, checkpoint_path=str(tmp_path / "cp")
+    )
+    # The CLIs' pause line, as cli.py and collect.py format it.
+    line = (
+        f"mapillary crawl paused at {error.units_done}/{error.unit_count} {error.unit_name} "
+        f"({error.stop_phrase}); re-run to resume from {error.checkpoint_path}"
+    )
+    assert _pause_stop_phrase(line) == error.stop_phrase
+
+
+def test_a_retry_after_past_the_ceiling_pauses_at_once_without_waiting(
+    monkeypatch, tmp_path, limiters, holds
+):
+    """Retrying before the time the server named would disobey it, so the
+    crawl does not wait the ceiling and ask early: it pauses for tomorrow."""
+    script = {_TILES[0]: [status(429, **{"Retry-After": "3600"})]}
+    error, session = _crawl(
+        monkeypatch, script, connection_limit=1, checkpoint_path=str(tmp_path / "cp")
+    )
+    # Nothing committed, so this is the cap's no-checkpoint arm: a plain
+    # DownloadError, never "re-run to resume" over an empty directory.
+    assert type(error) is DownloadError
+    assert holds == []
+    assert len(session.urls) == error.api_requests == 1
+
+
+def test_a_retry_after_past_the_ceiling_pauses_a_crawl_with_progress(
+    monkeypatch, tmp_path, limiters, holds
+):
+    script = {_TILES[3]: [status(429, **{"Retry-After": "3600"})]}
+    error, session = _crawl(
+        monkeypatch, script, connection_limit=1, checkpoint_path=str(tmp_path / "cp")
+    )
+    assert isinstance(error, SweepIncompleteError)
+    assert error.units_done == 3
+    assert holds == []
+    assert "Retry-After" in str(error)
+
+
+@pytest.mark.parametrize("cap", [1, 2])
+def test_the_request_cap_still_bounds_a_crawl_that_is_retrying(
+    monkeypatch, tmp_path, limiters, holds, cap
+):
+    """The retry re-enters at the cap check, reservation and all.
+
+    cap=1: the 429 IS the cap, so the retry is turned away as a request-cap
+    pause and nothing is committed. cap=2: the retry is the second request.
+    """
+    script = {_TILES[0]: [status(429), ok()]}
+    error, session = _crawl(
+        monkeypatch,
+        script,
+        connection_limit=1,
+        max_requests=cap,
+        checkpoint_path=str(tmp_path / "cp"),
+    )
+    assert isinstance(error, DownloadError)
+    assert error.api_requests == len(session.urls) == cap
+    if cap == 2:
+        assert isinstance(error, SweepIncompleteError)
+        assert error.stopped_by == "requests"
+        assert error.units_done == 1
+
+
+def test_a_302_after_a_429_is_still_the_refusal(monkeypatch, limiters, holds):
+    """Backpressure must never soften the block: 302 -> /login is exit 75."""
+    login = {"Location": "https://www.mapillary.com/login/?next=x"}
+    script = {_TILES[0]: [status(429), status(302, **login)]}
+    error, session = _crawl(monkeypatch, script, connection_limit=1)
+    assert isinstance(error, HostBlockedError)
+    assert len(session.urls) == error.api_requests == 2
+
+
+def test_halving_is_scoped_to_one_crawl(monkeypatch, limiters, holds):
+    """Two crawls in one process: the second starts at the full pace."""
+    first, _ = _crawl(monkeypatch, {_TILES[0]: [status(429), ok()], _TILES[1]: [status(503), ok()]})
+    second, _ = _crawl(monkeypatch, {})
+
+    assert not isinstance(first, BaseException) and not isinstance(second, BaseException)
+    assert len(limiters) == 2, "each crawl builds its own limiter"
+    assert limiters[0].slowdowns == [2.0]
+    assert limiters[1].slowdowns == []
+    assert {(lim.max_per_minute, lim.jitter) for lim in limiters} == {
+        (dm.DEFAULT_TILE_REQUESTS_PER_MINUTE, dm.DEFAULT_TILE_JITTER)
+    }
