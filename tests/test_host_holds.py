@@ -1120,16 +1120,27 @@ _THU_UTC_WED_PACIFIC = datetime(2026, 10, 15, 3, 0, tzinfo=UTC)
 
 
 @pytest.fixture
-def pacific_tz(monkeypatch):
+def pacific_tz():
     """Run with the machine's local zone set to Pacific, as on makelab2, so a
-    probe reading a LOCAL date reads the other weekday and fails these tests."""
+    probe reading a LOCAL date reads the other weekday and fails these tests.
+
+    Restores only TZ, and re-runs tzset after restoring it. Not monkeypatch:
+    the zone must be reset with tzset AFTER the variable is restored, and
+    ``monkeypatch.undo()`` there would also undo every other patch the test
+    made, out of order with the fixtures that made them."""
     import time as _time
 
-    monkeypatch.setenv("TZ", "America/Los_Angeles")
+    saved = os.environ.get("TZ")
+    os.environ["TZ"] = "America/Los_Angeles"
     _time.tzset()
-    yield
-    monkeypatch.undo()
-    _time.tzset()
+    try:
+        yield
+    finally:
+        if saved is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = saved
+        _time.tzset()
 
 
 @pytest.fixture
