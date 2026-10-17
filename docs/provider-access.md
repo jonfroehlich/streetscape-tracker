@@ -894,6 +894,7 @@ Now:
    The scheduler amnesties 87 and skips both Mapillary channels for the rest of the night, but records no refusal and arms no cooldown (see `docs/scheduler.md`).
    The stop **closes** the crawl's pacer: no further request goes out, including ones already waiting for their turn, which are turned away uncommitted and uncounted.
    **It is not a refusal**: a 302 → `/login` is still the `HostBlockedError` (exit 75) it always was, after a 429 too, and wins if both happen in one crawl.
+   A refusal also closes the pacer and cuts short any hold in progress, so no request follows a 302 and the host lock is not held through a hold the crawl will never use.
 
 **Why 900 s.**
 The only cooldown ever reported for a Mapillary tile block is thread 5821's 15-minute sleep, a hint rather than a contract.

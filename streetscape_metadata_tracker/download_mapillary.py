@@ -789,6 +789,9 @@ class _BackpressurePacer:
     :meth:`close` is the pause's half of the same rule: once the crawl has
     decided to pause, every request still waiting here -- at the gate, or
     queued on the limiter -- raises :class:`_CrawlPaused` instead of going out.
+    It also cuts short any hold in progress: nothing will be sent after it, so
+    sleeping out the rest of a hold would only keep the host lock (a 302 seen
+    mid-hold used to sleep up to 900 s before exiting 75).
     """
 
     def __init__(self, limiter: Any, clock: Callable[[], float] | None = None):
@@ -807,6 +810,8 @@ class _BackpressurePacer:
         self._hold_until = 0.0
         self.slowed = False
         self.closed = False
+        # Set by close(); a hold in progress waits on it beside its sleep.
+        self._closed_event = asyncio.Event()
 
     def _now(self) -> float:
         if self._clock is not None:
@@ -837,6 +842,7 @@ class _BackpressurePacer:
         # A new generation, so a request mid-way through `acquire` loops back
         # and meets the closed check rather than returning.
         self._holds += 1
+        self._closed_event.set()
 
     async def hold(self, seconds: float) -> None:
         """Keep every request of this crawl from going out for ``seconds``."""
@@ -847,8 +853,16 @@ class _BackpressurePacer:
         self._hold_until = max(self._hold_until, self._now() + seconds)
         async with self._gate:
             remaining = self._hold_until - self._now()
-            if remaining > 0:
-                await _backpressure_sleep(remaining)
+            if remaining > 0 and not self.closed:
+                # The sleep races close(): whichever finishes first ends it,
+                # and the other is cancelled (so is each on our own cancel).
+                sleeper = asyncio.ensure_future(_backpressure_sleep(remaining))
+                closer = asyncio.ensure_future(self._closed_event.wait())
+                try:
+                    await asyncio.wait({sleeper, closer}, return_when=asyncio.FIRST_COMPLETED)
+                finally:
+                    sleeper.cancel()
+                    closer.cancel()
 
     def slow_down(self) -> None:
         """Halve this crawl's pace, once; later calls are no-ops."""
@@ -1937,9 +1951,11 @@ async def _fetch_city_images(
         if not same_episode:
             backpressure_events += 1
         pacer.slow_down()
-        if backpressure_paused:
+        if backpressure_paused or fatal is not None:
             # A late answer from a tile that was in flight when the pause
-            # began: counted, never waited on.
+            # began, or after a whole-city error (a 302): counted, never
+            # waited on, and no pause of its own -- `fatal` already ends the
+            # crawl, and the refusal's exit 75 must win.
             return None
         wait = backpressure_wait_seconds(retry_after_seconds(e.retry_after))
         # A hold that would outlast the crawl's wall-clock budget is not slept
@@ -2117,6 +2133,12 @@ async def _fetch_city_images(
                     # for. Assigned before leaving the semaphore block, so no
                     # waiting task can slip past the check above.
                     fatal = fatal or e
+                    # And nothing more goes out: requests already waiting on
+                    # the pacer would otherwise still be sent (3-4 after a 302,
+                    # measured), and a hold in progress would be slept out
+                    # holding the host lock. Turned away, they set `capped`,
+                    # but the `fatal` raise after the gather runs first.
+                    pacer.close()
                     raise
                 finally:
                     # Every exit from the fetch, exception included: a reservation

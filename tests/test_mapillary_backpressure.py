@@ -825,3 +825,100 @@ def test_responses_inside_one_hold_are_one_episode_not_three_strikes(
     assert not any("pausing the crawl" in m for m in messages)
     (limiter,) = limiters
     assert limiter.slowdowns == [2.0]
+
+
+# ── A refusal ends a crawl at once, backpressure or not (review of #444) ───
+
+_LOGIN = {"Location": "https://www.mapillary.com/login/?next=x"}
+
+
+def test_no_request_goes_out_after_a_302(monkeypatch, limiters):
+    """Requests already waiting on the pacer when a 302 lands used to be sent
+    anyway (3-4 measured). The refusal closes the pacer, so the count at the
+    moment the 302 is answered is the crawl's last."""
+    real_sleep = asyncio.sleep
+
+    async def slow_acquire(self):
+        await real_sleep(0.002)
+
+    monkeypatch.setattr(_RecordingLimiter, "acquire", slow_acquire)
+    refusal = status(302, **_LOGIN)
+    refusal.delay = 0.005
+    sessions = []
+
+    def build(**kwargs):
+        sessions.append(_ScriptedSession({_TILES[2]: [refusal]}, **kwargs))
+        return sessions[-1]
+
+    monkeypatch.setattr(dm.aiohttp, "ClientSession", build)
+    sent_at_refusal = []
+    real_record = dm.TileStatusCounts.record
+
+    def record(self, code, retry_after):
+        if code == 302:
+            sent_at_refusal.append(len(sessions[0].urls))
+        return real_record(self, code, retry_after)
+
+    monkeypatch.setattr(dm.TileStatusCounts, "record", record)
+    with pytest.raises(HostBlockedError) as excinfo:
+        asyncio.run(
+            dm.fetch_city_images_async("Test City", _BBOX, "MLY|test|token", connection_limit=5)
+        )
+    assert sent_at_refusal, "the 302 was never answered"
+    assert len(sessions[0].urls) == sent_at_refusal[0], "a request went out after the 302"
+    assert excinfo.value.api_requests == len(sessions[0].urls)
+
+
+def test_a_302_during_a_429_hold_ends_the_hold_and_sends_nothing_more(monkeypatch, limiters):
+    """Tile 0's 429 opens a hold; tile 1's 302, already in flight, lands
+    during it. The crawl must exit 75 now -- not sleep out the hold holding the
+    host lock, and not release the tiles waiting behind it. Turned-away tiles
+    set `capped`, so this also pins that the `fatal` raise runs first."""
+    real_sleep = asyncio.sleep
+    hold_log = {"started": 0, "finished": 0}
+
+    async def long_hold(seconds):
+        hold_log["started"] += 1
+        await real_sleep(5)  # cut short, or the test is visibly slow and fails
+        hold_log["finished"] += 1
+
+    monkeypatch.setattr(dm, "_backpressure_sleep", long_hold)
+    # Both responses take time, so both requests are in flight together.
+    throttle = status(429)
+    throttle.delay = 0.01
+    refusal = status(302, **_LOGIN)
+    refusal.delay = 0.05
+    script = {_TILES[0]: [throttle], _TILES[1]: [refusal]}
+    loop_time = []
+
+    def timed_crawl():
+        import time as _time
+
+        t0 = _time.monotonic()
+        outcome, session = _crawl(monkeypatch, script, connection_limit=2)
+        loop_time.append(_time.monotonic() - t0)
+        return outcome, session
+
+    error, session = timed_crawl()
+    assert isinstance(error, HostBlockedError), error
+    assert host_exit_code(error) == 75
+    assert hold_log == {"started": 1, "finished": 0}, "the hold was slept out"
+    assert loop_time[0] < 2.0
+    assert len(session.urls) == error.api_requests == 2
+
+
+def test_a_302_beside_a_backpressure_pause_is_still_exit_75(monkeypatch, tmp_path, limiters, holds):
+    """Both in one crawl: tile 0's Retry-After past the ceiling pauses the
+    crawl, then tile 1's 302 (in flight) lands. The refusal wins -- exit 75,
+    which records the refusal -- never the throttled 87."""
+    throttle = status(429, **{"Retry-After": "3600"})
+    throttle.delay = 0.01
+    refusal = status(302, **_LOGIN)
+    refusal.delay = 0.05
+    script = {_TILES[0]: [throttle], _TILES[1]: [refusal]}
+    error, session = _crawl(
+        monkeypatch, script, connection_limit=2, checkpoint_path=str(tmp_path / "cp")
+    )
+    assert type(error) is HostBlockedError, error
+    assert host_exit_code(error) == 75
+    assert len(session.urls) == 2
