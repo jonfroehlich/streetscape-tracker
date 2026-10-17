@@ -438,8 +438,11 @@ class HostBreaker(set):
         max_rechecks: int | None = None,
         clock: Callable[[], float] = time.monotonic,
         holds: HostHolds | None = None,
+        source: str = "run-due",
     ):
         super().__init__()
+        # The command a refusal is recorded under in host_refusals (issue #444).
+        self.source = source
         # The run's standing holds (issue #444): asked through `holding`, kept
         # OUT of the set itself so `bool(breaker)` -- the alert and the exit
         # status -- never sees one. A held host did not refuse us.
@@ -635,6 +638,21 @@ class HostBreaker(set):
                     else " for the rest of the night (re-checks exhausted)"
                 )
             )
+
+
+def _record_refusal(conn, host: str, **fields) -> None:
+    """Persist one host refusal in ``host_refusals`` (issue #444); never raise.
+
+    Called where the scheduler classifies a child exit as a host REFUSAL --
+    the blocked family, 75/76/81/84 -- right beside the breaker trip, on the
+    thread that owns the catalog. A failed write is logged and swallowed: the
+    breaker has already latched the host for the night, and losing the record
+    must not cost the rest of the night, its publish or its alert.
+    """
+    try:
+        db.record_host_verdict(conn, host, db.HOST_REFUSED, **fields)
+    except Exception:  # noqa: BLE001 - a lost record must never end the night
+        logger.exception(f"Could not record the {host} refusal in host_refusals")
 
 
 class ArgvRejections(Counter):
@@ -4131,6 +4149,8 @@ def cmd_status(cfg: SchedulerConfig) -> int:
         print(f"{window.status_line()} requests used.")
     for line in _host_hold_status_lines(cfg, conn, today):
         print(line)
+    for line in _host_refusal_status_lines(conn):
+        print(line)
 
     if cfg.driving_plan.enabled:
         latest = db.get_latest_driving_plan_snapshot(conn)
@@ -4165,6 +4185,60 @@ def _host_hold_status_lines(cfg: SchedulerConfig, conn, today: date) -> list[str
             f"{HOST_LABELS.get(host, host)} rests on {', '.join(days)} (UTC snapshot date); "
             f"today ({today}, {weekday}) is {state}."
         )
+    return lines
+
+
+def _ago(stamp: str, now: datetime) -> str:
+    """``"31.4 h ago"`` for an ISO-8601 UTC stamp."""
+    when = datetime.fromisoformat(stamp)
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=UTC)
+    return f"{(now - when).total_seconds() / 3600:.1f} h ago"
+
+
+def _host_refusal_status_lines(conn) -> list[str]:
+    """``scheduler status``'s per-host refusal lines (issue #444).
+
+    One line per host ``host_refusals`` has ever recorded: the newest
+    refusal (when, who, how) and the silence since it, the newest clearance a
+    probe recorded, and -- for a metered host -- when the ledger last
+    stamped a request on it, which is the silence that matters to a per-IP
+    block. Printed nothing for a host that has never refused us.
+    """
+    now = clock.utc_now()
+    lines = []
+    for host in db.host_verdict_hosts(conn):
+        label = HOST_LABELS.get(host, host)
+        refused = db.newest_host_verdict(conn, host, db.HOST_REFUSED)
+        cleared = db.newest_host_verdict(conn, host, db.HOST_CLEARED)
+        if refused is None:
+            refusal = "never refused us"
+        else:
+            who = refused["source"] + (
+                f", {refused['city_id']} [{refused['channel']}]" if refused["city_id"] else ""
+            )
+            code = f", exit {refused['exit_code']}" if refused["exit_code"] is not None else ""
+            before = (
+                f", {refused['requests_before']:,} requests in the 24 h before"
+                if refused["requests_before"] is not None
+                else ""
+            )
+            refusal = (
+                f"last refused {refused['recorded_at']} ({who}{code}{before}), "
+                f"{_ago(refused['recorded_at'], now)}"
+            )
+        clearance = (
+            f"last cleared {cleared['recorded_at']} ({_ago(cleared['recorded_at'], now)})"
+            if cleared is not None
+            else "no clearance recorded"
+        )
+        last_stamp = conn.execute(
+            "SELECT MAX(recorded_at) FROM host_usage WHERE host = ?", (host,)
+        ).fetchone()[0]
+        ledger = (
+            f"; last ledgered request {last_stamp} ({_ago(last_stamp, now)})" if last_stamp else ""
+        )
+        lines.append(f"{label}: {refusal}; {clearance}{ledger}.")
     return lines
 
 
@@ -7213,7 +7287,7 @@ def cmd_assess_city(
     # night or a refusal cooldown exists to keep this IP off the host, and an
     # inquiry is one more presence on it. The summary says so, and a held
     # channel makes the answer incomplete (exit 1), like a refused one.
-    blocked_hosts = HostBreaker(holds=_host_holds(cfg, today))
+    blocked_hosts = HostBreaker(holds=_host_holds(cfg, today), source="assess-city")
     blocked_hosts.note_holds({h for c in channels for h in CHANNEL_HOSTS.get(c, ())})
     busy_hosts: Counter[str] = Counter()
     # Unreachable for this command as it stands — assess-city's channel
@@ -10919,6 +10993,15 @@ def _run_city_channels(
                         # first step, so there is never a paid-for artifact to salvage
                         # here. Keep that true if either fetch ever moves later.
                         blocked_hosts.add(blocked_host)
+                        _record_refusal(
+                            conn,
+                            blocked_host,
+                            source=blocked_hosts.source,
+                            channel=provider,
+                            city_id=city.city_id,
+                            exit_code=exit_code,
+                            detail=reason,
+                        )
                         lost_to_host.append(provider)
                         logger.error(
                             f"{city.city_id} [{provider}]: {HOST_LABELS[blocked_host]} is "

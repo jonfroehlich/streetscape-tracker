@@ -1016,6 +1016,30 @@ def test_a_rest_night_holds_the_mapillary_pair_and_the_answer_is_incomplete(
     assert rc == 1
 
 
+def test_an_assess_city_refusal_is_persisted_under_its_own_name(conn, monkeypatch, tmp_path):
+    """host_refusals (issue #444) says which command was refused: one row,
+    source assess-city, for the refused child alone."""
+    blocked = _blocked_outcome(HOST_MAPILLARY_TILES)
+    _stub_collection(
+        monkeypatch,
+        conn,
+        outcome=lambda city, provider: blocked if provider.startswith("mapillary") else True,
+    )
+    _assess(tmp_path)
+    rows = conn.execute(
+        "SELECT host, source, channel, city_id, exit_code FROM host_refusals"
+    ).fetchall()
+    assert [tuple(r) for r in rows] == [
+        (
+            HOST_MAPILLARY_TILES,
+            "assess-city",
+            "mapillary",
+            CITY_ID,
+            HOST_EXIT_CODES[HOST_MAPILLARY_TILES],
+        )
+    ]
+
+
 def test_an_overpass_refusal_skips_every_channel_that_needs_it(conn, monkeypatch, tmp_path):
     """
     Overpass is the first step of both road walks, so once it refuses this host

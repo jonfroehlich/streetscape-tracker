@@ -12,6 +12,7 @@ stubbed, so ``cmd_run_due`` runs for real down to the launch gate.
 
 import logging
 import os
+import sqlite3
 from datetime import UTC, date, datetime
 
 import pytest
@@ -340,3 +341,118 @@ def test_a_hold_never_enters_the_breakers_set():
     assert not breaker
     assert breaker.latched == set()
     assert breaker.blocking({HOST_MAPILLARY_TILES}) == set()
+
+
+# ── persisted refusals (host_refusals, schema v22) ───────────────────────
+
+
+def _refusing_night(monkeypatch, conn, cfg, *, exit_code, today=THURSDAY, **kwargs):
+    """A night whose Mapillary children all exit ``exit_code``."""
+    launches = []
+
+    def fake(cfg_, city, today_, provider="gsv", **kw):
+        launches.append((city.city_id, provider))
+        if provider in MAPILLARY_PAIR:
+            return sched.CollectionOutcome(False, f"exited {exit_code} (stub)", exit_code=exit_code)
+        return True
+
+    monkeypatch.setattr(sched, "_run_one_city", fake)
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+    monkeypatch.setattr(sched.time, "sleep", lambda s: None)
+    monkeypatch.setattr(sched, "generate_aggregate_v2", lambda c, d: None)
+    monkeypatch.setattr(sched, "generate_streetwalk_manifest", lambda c, d: {})
+    monkeypatch.setattr(sched, "_publish", lambda cfg, summary, **kw: 0)
+    monkeypatch.setattr(sched, "send_alert", lambda *a, **k: None)
+    return sched.cmd_run_due(cfg, today=today, **kwargs), launches
+
+
+def _refusal_rows(conn):
+    return [
+        dict(r)
+        for r in conn.execute(
+            "SELECT host, verdict, source, channel, city_id, exit_code, detail, requests_before "
+            "FROM host_refusals ORDER BY id"
+        )
+    ]
+
+
+def test_a_refusal_the_scheduler_classifies_is_persisted(
+    conn, monkeypatch, tmp_path, frozen_utc_clock
+):
+    """Exactly one row per classified refusal -- the refused child's -- with
+    the host's prior-24 h ledger; the breaker's skips that follow add none."""
+    now = frozen_utc_clock(datetime(2026, 10, 15, 9, 30, tzinfo=UTC))
+    conn.execute(
+        "INSERT INTO host_usage VALUES (?, 'mapillary_tiles', 'mapillary', 1631)",
+        (datetime(2026, 10, 15, 2, 0, tzinfo=UTC).isoformat(),),
+    )
+    a = _register(conn, "Bend")
+    _register(conn, "Corvallis")
+    rc, launches = _refusing_night(monkeypatch, conn, _cfg(tmp_path), exit_code=75)
+
+    assert rc != 0  # a refusal is still loud: that is the breaker's, unchanged
+    assert [p for _c, p in launches].count("mapillary") == 1
+    assert _refusal_rows(conn) == [
+        {
+            "host": HOST_MAPILLARY_TILES,
+            "verdict": "refused",
+            "source": "run-due",
+            "channel": "mapillary",
+            "city_id": a,
+            "exit_code": 75,
+            "detail": "exited 75 (stub)",
+            "requests_before": 1631,
+        }
+    ]
+    row = db.newest_host_verdict(conn, HOST_MAPILLARY_TILES, db.HOST_REFUSED)
+    assert row["recorded_at"] == now.isoformat()
+
+
+def test_a_busy_host_is_not_a_refusal_and_writes_no_row(conn, monkeypatch, tmp_path):
+    """79 is another local process holding the lock -- not the third party."""
+    _register(conn, "Bend")
+    _refusing_night(monkeypatch, conn, _cfg(tmp_path), exit_code=79)
+    assert _refusal_rows(conn) == []
+
+
+def test_a_failed_refusal_write_never_ends_the_night(conn, monkeypatch, tmp_path, caplog):
+    """The breaker has the refusal already; losing the record must not cost the
+    night's later cities, its publish or its alert."""
+
+    def broken(*a, **k):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(sched.db, "record_host_verdict", broken)
+    _register(conn, "Bend")
+    _register(conn, "Corvallis")
+    with caplog.at_level(logging.INFO, logger="streetscape_scheduler"):
+        rc, launches = _refusing_night(monkeypatch, conn, _cfg(tmp_path), exit_code=75)
+    assert [p for _c, p in launches].count("gsv") == 2
+    assert "Could not record the mapillary_tiles refusal" in caplog.text
+    assert "stopped early" not in _done_line(caplog)
+    assert rc != 0
+
+
+def test_status_prints_the_last_refusal_and_clearance_per_host(
+    conn, monkeypatch, tmp_path, capsys, frozen_utc_clock
+):
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+    refused_at = datetime(2026, 10, 17, 9, 3, tzinfo=UTC)
+    db.record_host_verdict(
+        conn,
+        HOST_MAPILLARY_TILES,
+        db.HOST_REFUSED,
+        source="run-due",
+        channel="mapillary",
+        city_id="carlsbad",
+        exit_code=75,
+        at=refused_at,
+    )
+    frozen_utc_clock(datetime(2026, 10, 18, 15, 3, tzinfo=UTC))
+    sched.cmd_status(_cfg(tmp_path))
+    out = capsys.readouterr().out
+    assert (
+        "Mapillary's tile CDN (tiles.mapillary.com): last refused 2026-10-17T09:03:00+00:00 "
+        "(run-due, carlsbad [mapillary], exit 75, 0 requests in the 24 h before), 30.0 h ago; "
+        "no clearance recorded."
+    ) in out

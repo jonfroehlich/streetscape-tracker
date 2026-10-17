@@ -78,6 +78,7 @@ a geocode that lands on a city the catalog already holds (a second spelling of a
     `test_a_repeated_gsv_row_is_one_grid_point`: a gsv frame with one row repeated, the shape of a resumed legacy baseline run, stores `total_points` 4 and `total_grid_points` 3, so "gsv rows are points" is never pinned as a rule.
   - `tests/test_json_v2.py::test_published_total_search_points_is_the_deduplicated_grid_size` — for gsv and each census provider, the per-run JSON's `total_search_points` and the aggregate's `latest.total_search_points` are 5, the same as `total_grid_points`, never the row count.
   - The v20→v21 migration (`tests/test_db.py`, #424): `schedule_state.quarantine_alerted_at` arrives NULL on an existing at-cap row whose counter, membership, `last_error` and `day_of_cycle` survive (killed by a `DEFAULT` or a backfill, either of which would silence the one email a pre-#423 quarantine never got); a catalog already stamped v21 without the column gains it (killed by running the step only from its rung).
+  - The v21→v22 migration (`tests/test_db.py`, #444): the additive `host_refusals` table appears with its pinned columns on a v21 catalog, whose other rows survive; the rest of its tests are in the #444 section below.
   - The v19→v20 migration (`tests/test_db.py`): the column arrives NULL on an existing mapillary row whose row counts and coverage survive (killed by a `DEFAULT` or a copy from `total_points`); a catalog already stamped v20 without the column gains it (killed by running the step only from its rung); `register_run` round-trips it and stores NULL when omitted.
   - `test_concurrent_first_connects_add_the_every_connect_columns_once` (PR #422 review): six spawned processes, lined up on a barrier, first-connect each of six v20 catalogs lacking `schedule_state.quarantine_alerted_at` (#424), six v19 catalogs lacking `total_grid_points` and six v16 catalogs lacking the query-radius pair; no connect may fail and every catalog ends current with every column.
     All three every-connect steps go through `db._add_missing_columns` (which takes the table since #424), whose PRAGMA check and ALTERs share one `BEGIN IMMEDIATE`; the review measured the bare check-then-ALTER at 164 of 240 connects raising `duplicate column name`.
@@ -1051,7 +1052,7 @@ In `tests/test_scheduler.py`, `backup-status` gates on the heartbeat only when `
 
 ## Standing host holds, persisted refusals and `probe-host` (issue #444)
 
-`tests/test_host_holds.py`, plus one assess-city case in `tests/test_assess_city.py`.
+`tests/test_host_holds.py`, plus the assess-city cases in `tests/test_assess_city.py` and the schema cases in `tests/test_db.py`.
 A hold keeps a host's channels from launching without anything having refused us, so every test below also checks that it is not a refusal: no alert, no breaker membership, exit 0, no `record_attempt`.
 
 - Rest nights (`[hosts.<token>].rest_weekdays`):
@@ -1067,6 +1068,13 @@ A hold keeps a host's channels from launching without anything having refused us
   - `test_the_fill_declines_a_city_whose_channel_is_on_a_held_host` and `test_the_live_fill_is_handed_the_runs_holds` (the pass-through into `_fill_admission`).
   - `test_a_hold_never_enters_the_breakers_set`.
   - `test_a_rest_night_holds_the_mapillary_pair_and_the_answer_is_incomplete` (assess-city): the GSV walk still runs, the summary says HELD and not "refused", and the exit is 1.
+- Persisted refusals (`host_refusals`, schema v22):
+  - `test_a_v21_catalog_gains_host_refusals_and_keeps_its_rows` (`tests/test_db.py`) — the additive rung moves the stamp and pins the column list.
+  - `test_record_host_verdict_fills_requests_before_from_the_24h_ledger` — 23 h back counts, 25 h back and another host's do not; `test_an_unmetered_hosts_verdict_has_no_requests_before` (NULL, never 0); `test_a_verdict_outside_the_pair_is_refused` (the function and the CHECK); `test_newest_host_verdict_is_per_verdict_and_before_is_exclusive`.
+  - `test_a_refusal_the_scheduler_classifies_is_persisted` — exactly one row, the refused child's, stamped at the classification instant with its prior-24 h ledger; the breaker skips that follow add none.
+  - `test_a_busy_host_is_not_a_refusal_and_writes_no_row` (79) and `test_a_failed_refusal_write_never_ends_the_night` (a raising write is logged, and the later cities still run).
+  - `test_an_assess_city_refusal_is_persisted_under_its_own_name` (`tests/test_assess_city.py`).
+  - `test_status_prints_the_last_refusal_and_clearance_per_host`.
 
 ## The same-day partner path (issue #215)
 
