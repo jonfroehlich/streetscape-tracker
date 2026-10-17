@@ -1,0 +1,342 @@
+"""
+Standing per-IP host holds (issue #444): rest nights, and the plumbing every
+later hold shares.
+
+A HOLD keeps a host's channels from launching without anything having refused
+us tonight. Unlike the breaker (issues #208, #341) it never trips, alerts,
+records a failure or changes the exit status, and the cities stay due.
+
+Pure logic: the collection seam is ``_run_one_city`` (faked), and the tail is
+stubbed, so ``cmd_run_due`` runs for real down to the launch gate.
+"""
+
+import logging
+import os
+from datetime import UTC, date, datetime
+
+import pytest
+
+from streetscape_metadata_tracker import db
+from streetscape_metadata_tracker import scheduler as sched
+from streetscape_metadata_tracker.download_common import HOST_MAPILLARY_TILES
+from streetscape_metadata_tracker.scheduler import load_scheduler_config
+
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PROD_CONFIG = os.path.join(_PROJECT_ROOT, "config", "scheduler.makelab1.toml")
+
+WEDNESDAY = date(2026, 10, 14)
+THURSDAY = date(2026, 10, 15)
+MAPILLARY_PAIR = ("mapillary", "mapillary_streets")
+
+
+def _cfg(tmp_path, hosts_block='rest_weekdays = ["Wed"]\n', *, fill=False):
+    """gsv + the Mapillary pair, loaded THROUGH the loader, with a [hosts] block."""
+    path = tmp_path / "holds.toml"
+    path.write_text(
+        ("[schedule]\nfill_min_days = 30\n\n" if fill else "")
+        + "[providers.gsv]\nenabled = true\ndaily_request_budget = 10000000\n\n"
+        "[providers.mapillary]\nenabled = true\ndaily_request_budget = 5000\n"
+        "max_requests_per_minute = 40\njitter = 0.6\n\n"
+        "[providers.mapillary_streets]\nenabled = true\ndaily_request_budget = 5000\n"
+        "max_requests_per_minute = 40\njitter = 0.6\n\n"
+        f'[paths]\ndata_dir = "{tmp_path / "data"}"\nlog_dir = "{tmp_path / "logs"}"\n'
+        f'backup_dir = "{tmp_path / "backups"}"\n\n'
+        + (f"[hosts.mapillary_tiles]\n{hosts_block}" if hosts_block is not None else "")
+    )
+    return load_scheduler_config(str(path))
+
+
+def _register(conn, name):
+    return db.register_city(
+        conn,
+        city_name=name,
+        state_name="Oregon",
+        state_code="OR",
+        country_name="United States",
+        country_code="US",
+        center_lat=44.0,
+        center_lon=-121.0,
+        grid_width_m=5000,
+        grid_height_m=5000,
+        step_m=20,
+    )
+
+
+def _night(monkeypatch, conn, cfg, *, today=WEDNESDAY, **kwargs):
+    """``cmd_run_due`` with a fake child; returns ``(exit, launches, alerts)``."""
+    launches = []
+    alerts = []
+
+    def fake(cfg_, city, today_, provider="gsv", **kw):
+        launches.append((city.city_id, provider))
+        return True
+
+    monkeypatch.setattr(sched, "_run_one_city", fake)
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+    monkeypatch.setattr(sched.time, "sleep", lambda s: None)
+    monkeypatch.setattr(sched, "generate_aggregate_v2", lambda c, d: None)
+    monkeypatch.setattr(sched, "generate_streetwalk_manifest", lambda c, d: {})
+    monkeypatch.setattr(sched, "_publish", lambda cfg, summary, **kw: 0)
+    monkeypatch.setattr(sched, "send_alert", lambda *a, **k: alerts.append(a))
+    rc = sched.cmd_run_due(cfg, today=today, **kwargs)
+    return rc, launches, alerts
+
+
+def _done_line(caplog):
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Done: ")]
+    assert len(lines) == 1, lines
+    return lines[0]
+
+
+# ── config ───────────────────────────────────────────────────────────────
+
+
+def test_rest_weekdays_load_canonical_and_in_weekday_order(tmp_path):
+    cfg = _cfg(tmp_path, 'rest_weekdays = ["sun", "WED"]\nrolling_24h_request_budget = 900\n')
+    assert cfg.host_budget_errors == []
+    assert cfg.host_rest_weekdays == {HOST_MAPILLARY_TILES: ("Wed", "Sun")}
+    assert cfg.host_budgets == {HOST_MAPILLARY_TILES: 900}
+
+
+def test_a_rest_only_section_loads_without_a_budget(tmp_path):
+    """Since #444 a [hosts.*] section may hold rest_weekdays alone."""
+    cfg = _cfg(tmp_path, 'rest_weekdays = ["Wed"]\n')
+    assert cfg.host_budget_errors == []
+    assert cfg.host_budgets == {}
+    assert cfg.host_rest_weekdays == {HOST_MAPILLARY_TILES: ("Wed",)}
+
+
+def test_an_empty_rest_list_means_no_rest_night(tmp_path):
+    cfg = _cfg(tmp_path, "rest_weekdays = []\n")
+    assert cfg.host_budget_errors == []
+    assert cfg.host_rest_weekdays == {}
+
+
+@pytest.mark.parametrize(
+    "block",
+    [
+        'rest_weekdays = "Wed"\n',
+        'rest_weekdays = ["Wednesday"]\n',
+        'rest_weekdays = ["Wed", "wed"]\n',
+        "rest_weekdays = [3]\n",
+        'rest_weekdays = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]\n',
+        # A valid budget beside a bad rest list: the WHOLE section is refused,
+        # so the budget must not load either.
+        'rolling_24h_request_budget = 1200\nrest_weekdays = ["Wedn"]\n',
+    ],
+    ids=["string", "full-name", "duplicate", "integer", "every-day", "beside-a-budget"],
+)
+def test_an_invalid_rest_list_fails_closed(conn, monkeypatch, tmp_path, caplog, block):
+    """Dropping a bad rest list would run the host on the night it was meant to
+    rest (fail-OPEN), so it is recorded and the channel-running commands refuse
+    -- the same posture as an invalid [hosts.*] budget (#385)."""
+    with caplog.at_level(logging.ERROR, logger="streetscape_scheduler"):
+        cfg = _cfg(tmp_path, block)
+    assert cfg.host_rest_weekdays == {}
+    assert cfg.host_budgets == {}
+    assert len(cfg.host_budget_errors) == 1
+    assert "rest_weekdays" in cfg.host_budget_errors[0]
+    assert [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR] == (
+        cfg.host_budget_errors
+    )
+    connected = []
+    monkeypatch.setattr(sched.db, "connect", lambda path: connected.append(path) or conn)
+    assert sched.cmd_run_due(cfg, today=WEDNESDAY) == sched.USAGE_EXIT_CODE
+    assert sched.cmd_assess_city(cfg, "Bend, OR") == sched.USAGE_EXIT_CODE
+    assert connected == []
+
+
+def test_makelab1_rests_the_tile_cdn_on_wednesday_and_sunday():
+    """Pinned exactly, with the pass-through: the PROD config's rest list is the
+    one `_host_holds` reads, so a Wednesday and a Sunday hold the tile CDN and
+    a Thursday does not."""
+    cfg = load_scheduler_config(PROD_CONFIG)
+    assert cfg.host_budget_errors == []
+    assert cfg.host_rest_weekdays == {HOST_MAPILLARY_TILES: ("Wed", "Sun")}
+    assert sched._host_holds(cfg, WEDNESDAY).active(HOST_MAPILLARY_TILES).detail == "Wed"
+    assert sched._host_holds(cfg, date(2026, 10, 18)).active(HOST_MAPILLARY_TILES) is not None
+    assert sched._host_holds(cfg, THURSDAY).active(HOST_MAPILLARY_TILES) is None
+    # Nothing else rests: GSV, KartaView and Panoramax run every night.
+    assert sched._host_holds(cfg, WEDNESDAY).hosts() == {HOST_MAPILLARY_TILES}
+
+
+# ── the night ────────────────────────────────────────────────────────────
+
+
+def test_a_rest_night_holds_only_the_hosts_channels_and_is_not_a_failure(
+    conn, monkeypatch, tmp_path, caplog
+):
+    """The core contract: gsv runs, the Mapillary pair launches nothing, and
+    nothing about the night reads as a refusal or a failure."""
+    a = _register(conn, "Bend")
+    b = _register(conn, "Corvallis")
+    cfg = _cfg(tmp_path)
+    with caplog.at_level(logging.INFO, logger="streetscape_scheduler"):
+        rc, launches, alerts = _night(monkeypatch, conn, cfg)
+
+    assert rc == 0
+    assert alerts == []
+    assert sorted(launches) == [(a, "gsv"), (b, "gsv")]
+    # The held pairs recorded no attempt, so the cities stay due and no
+    # failure counter moved.
+    for cid in (a, b):
+        for channel in MAPILLARY_PAIR:
+            row = conn.execute(
+                "SELECT last_attempt_at, consecutive_failures FROM schedule_state "
+                "WHERE city_id = ? AND provider = ?",
+                (cid, channel),
+            ).fetchone()
+            assert row["last_attempt_at"] is None
+            assert row["consecutive_failures"] == 0
+    done = _done_line(caplog)
+    assert "HELD Mapillary's tile CDN (tiles.mapillary.com): rest night (Wed)" in done
+    assert "4 launch(es) held, cities stay due" in done
+    assert "unavailable" not in done and "refused" not in done
+    assert "holding mapillary, mapillary_streets for this run" in caplog.text
+
+
+def test_a_non_rest_night_launches_the_pair(conn, monkeypatch, tmp_path, caplog):
+    cid = _register(conn, "Bend")
+    with caplog.at_level(logging.INFO, logger="streetscape_scheduler"):
+        rc, launches, _ = _night(monkeypatch, conn, _cfg(tmp_path), today=THURSDAY)
+    assert rc == 0
+    assert sorted(launches) == [(cid, "gsv"), (cid, "mapillary"), (cid, "mapillary_streets")]
+    assert "HELD" not in _done_line(caplog)
+
+
+def test_a_rest_night_with_nothing_due_on_the_host_still_reaches_the_done_line(
+    conn, monkeypatch, tmp_path, caplog
+):
+    """A rest is never invisible: named even when it held no launch."""
+    with caplog.at_level(logging.INFO, logger="streetscape_scheduler"):
+        rc, launches, _ = _night(monkeypatch, conn, _cfg(tmp_path))
+    assert rc == 0 and launches == []
+    assert "rest night (Wed), 0 launch(es) held" in _done_line(caplog)
+
+
+def test_the_limit_catch_up_honours_the_rest_night(conn, monkeypatch, tmp_path, caplog):
+    """`run-due --provider mapillary --limit N`, the supported catch-up path."""
+    _register(conn, "Bend")
+    with caplog.at_level(logging.INFO, logger="streetscape_scheduler"):
+        rc, launches, alerts = _night(
+            monkeypatch, conn, _cfg(tmp_path), requested_providers=["mapillary"], limit=5
+        )
+    assert rc == 0 and alerts == []
+    assert launches == []
+    assert "rest night (Wed), 1 launch(es) held" in _done_line(caplog)
+
+
+def test_ignore_host_holds_launches_and_says_so(conn, monkeypatch, tmp_path, caplog):
+    cid = _register(conn, "Bend")
+    with caplog.at_level(logging.INFO, logger="streetscape_scheduler"):
+        rc, launches, _ = _night(
+            monkeypatch,
+            conn,
+            _cfg(tmp_path),
+            requested_providers=["mapillary"],
+            limit=5,
+            ignore_host_holds=True,
+        )
+    assert rc == 0
+    assert launches == [(cid, "mapillary")]
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(m.startswith("--ignore-host-holds") and "rest night (Wed)" in m for m in warnings), (
+        warnings
+    )
+
+
+def test_the_override_flag_reaches_cmd_run_due(monkeypatch, tmp_path):
+    monkeypatch.setattr(sched.sys, "argv", ["scheduler", "run-due", "--ignore-host-holds"])
+    monkeypatch.setattr(sched, "load_scheduler_config", lambda path: _cfg(tmp_path))
+    monkeypatch.setattr(sched, "setup_logging", lambda cfg, verbose=False: None)
+    seen = {}
+    monkeypatch.setattr(sched, "cmd_run_due", lambda cfg, **kw: seen.update(kw) or 0)
+    assert sched.main() == 0
+    assert seen["ignore_host_holds"] is True
+
+
+def test_the_rest_night_is_read_on_the_utc_snapshot_date(
+    conn, monkeypatch, tmp_path, frozen_utc_clock
+):
+    """00:30 UTC Wednesday is still Tuesday evening in Pacific time. The run is
+    dated Wednesday (#347), so it is a Wednesday rest night -- whatever the
+    host's local calendar says."""
+    frozen_utc_clock(datetime(2026, 10, 14, 0, 30, tzinfo=UTC))
+    _register(conn, "Bend")
+    rc, launches, _ = _night(monkeypatch, conn, _cfg(tmp_path), today=None)
+    assert rc == 0
+    assert [p for _c, p in launches] == ["gsv"]
+
+
+def test_the_dry_run_shows_the_hold(conn, monkeypatch, tmp_path, capsys):
+    cid = _register(conn, "Bend")
+    rc, launches, _ = _night(monkeypatch, conn, _cfg(tmp_path), dry_run=True)
+    out = capsys.readouterr().out
+    assert rc == 0 and launches == []
+    assert "HELD tonight — Mapillary's tile CDN (tiles.mapillary.com): rest night (Wed)" in out
+    held_lines = [ln for ln in out.splitlines() if cid in ln and "HELD (rest night)" in ln]
+    assert len(held_lines) == 2, out
+
+
+def test_status_names_the_rest_weekdays_and_whether_today_is_one(
+    conn, monkeypatch, tmp_path, capsys, frozen_utc_clock
+):
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+    cfg = _cfg(tmp_path, 'rest_weekdays = ["Wed", "Sun"]\n')
+    frozen_utc_clock(datetime(2026, 10, 14, 12, 0, tzinfo=UTC))
+    sched.cmd_status(cfg)
+    assert (
+        "Mapillary's tile CDN (tiles.mapillary.com) rests on Wed, Sun (UTC snapshot date); "
+        "today (2026-10-14, Wed) is a REST night."
+    ) in capsys.readouterr().out
+    frozen_utc_clock(datetime(2026, 10, 15, 12, 0, tzinfo=UTC))
+    sched.cmd_status(cfg)
+    assert "today (2026-10-15, Thu) is not a rest night." in capsys.readouterr().out
+
+
+# ── the fill ─────────────────────────────────────────────────────────────
+
+
+def test_the_fill_declines_a_city_whose_channel_is_on_a_held_host(conn, tmp_path):
+    """Admitted whole or not at all: the launch gate would hold the Mapillary
+    pair, so a fill city that runs them would land without them."""
+    cfg = _cfg(tmp_path, fill=True)
+    city = db.resolve_city(conn, _register(conn, "Bend"))
+    verdict = sched._fill_prebudget_refusal(
+        cfg, city, ["gsv", "mapillary"], latched=set(), held_hosts={HOST_MAPILLARY_TILES}
+    )
+    assert verdict is not None and not verdict.admit
+    assert verdict.blocker == sched._FILL_BLOCKER_HOST_HELD
+    assert sched._fill_prebudget_refusal(cfg, city, ["gsv"], set(), {HOST_MAPILLARY_TILES}) is None
+
+
+def test_the_live_fill_is_handed_the_runs_holds(conn, monkeypatch, tmp_path):
+    """The pass-through: `_fill_admission` asks the breaker's holds, not an empty set."""
+    cfg = _cfg(tmp_path, fill=True)
+    city = db.resolve_city(conn, _register(conn, "Bend"))
+    seen = {}
+    real = sched._fill_judge
+
+    def spy(*a, **kw):
+        seen["held_hosts"] = kw.get("held_hosts")
+        return real(*a, **kw)
+
+    monkeypatch.setattr(sched, "_fill_judge", spy)
+    breaker = sched.HostBreaker(holds=sched._host_holds(cfg, WEDNESDAY))
+    verdict = sched._fill_admission(cfg, conn, WEDNESDAY, city, ["gsv", "mapillary"], None, breaker)
+    assert seen["held_hosts"] == {HOST_MAPILLARY_TILES}
+    assert verdict.blocker == sched._FILL_BLOCKER_HOST_HELD
+
+
+# ── the breaker is untouched ─────────────────────────────────────────────
+
+
+def test_a_hold_never_enters_the_breakers_set():
+    """`bool(breaker)` is the alert and the exit status; a hold must not reach it."""
+    breaker = sched.HostBreaker(holds=sched.HostHolds(rest={HOST_MAPILLARY_TILES: "Wed"}))
+    assert breaker.holding({HOST_MAPILLARY_TILES}) == {
+        HOST_MAPILLARY_TILES: sched.HostHold(HOST_MAPILLARY_TILES, sched.HOLD_REST, "Wed")
+    }
+    assert not breaker
+    assert breaker.latched == set()
+    assert breaker.blocking({HOST_MAPILLARY_TILES}) == set()

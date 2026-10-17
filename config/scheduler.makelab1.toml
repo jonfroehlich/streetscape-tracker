@@ -777,8 +777,24 @@ network_type = "drive"
 # still above the ~800/day a steady catalog refresh needs. The figure is about
 # hours of presence on the host per night (#444's H1), not a threshold we
 # believe Mapillary enforces.
+#
+# rest_weekdays (#444): on a run dated one of these weekdays, NO channel that
+# touches the tile CDN launches -- mapillary and mapillary_streets both, nightly
+# and `run-due --provider mapillary --limit N` catch-ups alike -- while every
+# other channel runs as usual. The date is the run's SNAPSHOT date, the UTC
+# calendar (#347): the 02:00 Pacific nightly is the same calendar day in both
+# zones, but a hand-run catch-up after 17:00 Pacific is already the next UTC
+# day. Two nights a week of zero presence, because #444's best-fitting reading
+# (H1) is a per-IP reputation fed by SUSTAINED daily presence, and the blocks
+# began on the sixth consecutive ~2k-request night. A Mapillary-only rest
+# rather than resting every channel, by the Maintainer's choice: a rested
+# city's Mapillary snapshot lands on a later night than its GSV one, so those
+# snapshots un-pair. Not a failure: no alert, no breaker trip, no change to the
+# exit status, and the cities stay due. `run-due --ignore-host-holds` is the
+# logged operator override.
 [hosts.mapillary_tiles]
 rolling_24h_request_budget = 1200
+rest_weekdays = ["Wed", "Sun"]
 
 [download]
 batch_size = 100

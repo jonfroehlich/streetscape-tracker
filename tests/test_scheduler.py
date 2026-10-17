@@ -7799,7 +7799,13 @@ def _run_main_run_due_raising(monkeypatch, exc, argv):
     monkeypatch.setattr(sched, "setup_logging", lambda cfg, verbose=False: None)
 
     def boom(
-        cfg, dry_run=False, limit=None, requested_providers=None, requested_cities=None, force=False
+        cfg,
+        dry_run=False,
+        limit=None,
+        requested_providers=None,
+        requested_cities=None,
+        force=False,
+        ignore_host_holds=False,
     ):
         raise exc
 

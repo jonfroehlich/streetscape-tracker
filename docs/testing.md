@@ -1049,6 +1049,25 @@ In `tests/test_scheduler.py`, `backup-status` gates on the heartbeat only when `
   the scheduler parses `[providers.*].jitter` as None-when-absent — never 0, which means "restore the exact cadence" — **warns and falls back to None on an out-of-range or non-numeric field** rather than letting it reach a child as an exit-2 argparse error on every city every night, and hands a valid one to both Mapillary children, a 0 included, while an unset one and a GSV child get no flag;
   and the prod config pin asserts both Mapillary channels resumed at the same jittered rate)
 
+## Standing host holds, persisted refusals and `probe-host` (issue #444)
+
+`tests/test_host_holds.py`, plus one assess-city case in `tests/test_assess_city.py`.
+A hold keeps a host's channels from launching without anything having refused us, so every test below also checks that it is not a refusal: no alert, no breaker membership, exit 0, no `record_attempt`.
+
+- Rest nights (`[hosts.<token>].rest_weekdays`):
+  - `test_rest_weekdays_load_canonical_and_in_weekday_order`, `test_a_rest_only_section_loads_without_a_budget`, `test_an_empty_rest_list_means_no_rest_night`.
+  - `test_an_invalid_rest_list_fails_closed` — six bad spellings, one of them beside a valid budget, are each recorded, logged, load NEITHER key, and refuse `run-due` and `assess-city` before the catalog opens.
+  - `test_makelab1_rests_the_tile_cdn_on_wednesday_and_sunday` — prod's list pinned exactly and read through `_host_holds` (the pass-through), with nothing else resting.
+  - `test_a_rest_night_holds_only_the_hosts_channels_and_is_not_a_failure` — gsv runs, the Mapillary pair launches nothing, `last_attempt_at` and `consecutive_failures` stay untouched, and the `Done:` line says HELD and never "refused".
+  - `test_a_non_rest_night_launches_the_pair` and `test_a_rest_night_with_nothing_due_on_the_host_still_reaches_the_done_line`.
+  - `test_the_limit_catch_up_honours_the_rest_night` — `run-due --provider mapillary --limit 5`.
+  - `test_ignore_host_holds_launches_and_says_so` and `test_the_override_flag_reaches_cmd_run_due`.
+  - `test_the_rest_night_is_read_on_the_utc_snapshot_date` — 00:30 UTC Wednesday (Tuesday evening in Pacific) is a Wednesday rest night.
+  - `test_the_dry_run_shows_the_hold` and `test_status_names_the_rest_weekdays_and_whether_today_is_one`.
+  - `test_the_fill_declines_a_city_whose_channel_is_on_a_held_host` and `test_the_live_fill_is_handed_the_runs_holds` (the pass-through into `_fill_admission`).
+  - `test_a_hold_never_enters_the_breakers_set`.
+  - `test_a_rest_night_holds_the_mapillary_pair_and_the_answer_is_incomplete` (assess-city): the GSV walk still runs, the summary says HELD and not "refused", and the exit is 1.
+
 ## The same-day partner path (issue #215)
 
 `tests/test_assess_city.py`: the channel set collected in `enabled_providers()` order and **never** including the GSV grid run;
