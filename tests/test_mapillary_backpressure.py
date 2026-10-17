@@ -385,8 +385,16 @@ def test_retry_after_reads_both_rfc_forms():
     assert dm.retry_after_seconds("Sat, 17 Oct 2026 09:05:00 GMT", now) == 300.0
     # A date already past is "now", not a negative wait.
     assert dm.retry_after_seconds("Sat, 17 Oct 2026 08:00:00 GMT", now) == 0.0
-    for unreadable in (None, "", "soon", "-5", "1.5"):
+    for unreadable in (None, "", "soon", "-5", "1.5", "\u00b2", "\u0663"):
         assert dm.retry_after_seconds(unreadable, now) is None, unreadable
+    # Huge but well-formed: clamped, finite, and past the ceiling -- never an
+    # OverflowError (400 digits) or int()'s 4,300-digit ValueError (5,000).
+    for huge in ("9" * 400, "9" * 5000, "1" + "0" * 10):
+        seconds = dm.retry_after_seconds(huge, now)
+        assert seconds == float(dm._RETRY_AFTER_CAP_S), huge[:12]
+        assert dm.backpressure_wait_seconds(seconds) is None
+    # A date too far out for datetime is unreadable, not a crash.
+    assert dm.retry_after_seconds("Sat, 17 Oct 99999 09:05:00 GMT", now) is None
 
 
 def test_the_wait_is_retry_after_floored_at_a_minute_and_refused_past_the_ceiling():

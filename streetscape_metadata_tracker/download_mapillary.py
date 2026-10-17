@@ -674,6 +674,12 @@ class TileBackpressureError(Exception):
         self.retry_after = retry_after
 
 
+# A Retry-After is clamped to this before any arithmetic. Far past
+# TILE_BACKPRESSURE_MAX_WAIT_S, so a clamped value still reads as "longer than
+# we will wait" and pauses the crawl; it only keeps the number finite.
+_RETRY_AFTER_CAP_S = 10**9
+
+
 def retry_after_seconds(value: str | None, now: datetime | None = None) -> float | None:
     """
     A Retry-After header as seconds from now, or None when absent or unreadable.
@@ -692,11 +698,19 @@ def retry_after_seconds(value: str | None, now: datetime | None = None) -> float
     if value is None:
         return None
     text = value.strip()
-    if text.isdigit():
-        return float(int(text))
+    # ASCII digits only: str.isdigit() also accepts "²" and other Unicode
+    # digits that int() refuses. A value this function cannot read is None,
+    # never an exception -- the caller then waits the 60 s floor.
+    if text.isascii() and text.isdigit():
+        # Compared as a STRING length first: int() refuses more than 4,300
+        # digits (ValueError) and float() overflows past ~308. Anything longer
+        # than the cap's own digits is past the ceiling anyway.
+        if len(text) > len(str(_RETRY_AFTER_CAP_S)):
+            return float(_RETRY_AFTER_CAP_S)
+        return float(min(int(text), _RETRY_AFTER_CAP_S))
     try:
         when = email.utils.parsedate_to_datetime(text)
-    except (TypeError, ValueError, IndexError):
+    except (TypeError, ValueError, IndexError, OverflowError):
         return None
     if when is None:  # pragma: no cover - older Pythons returned None
         return None
