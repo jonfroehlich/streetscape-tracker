@@ -930,7 +930,9 @@ def test_a_429_after_a_302_neither_holds_nor_pauses(monkeypatch, limiters, holds
     caplog.set_level(logging.INFO, logger=dm.__name__)
     refusal = status(302, **_LOGIN)
     refusal.delay = 0.01
-    throttle = status(429)
+    # Past the ceiling: without the guard this is the one 429 that would
+    # still announce a stop, since the closed pacer already skips a hold.
+    throttle = status(429, **{"Retry-After": "3600"})
     throttle.delay = 0.05
     script = {_TILES[0]: [refusal], _TILES[1]: [throttle]}
     error, session = _crawl(monkeypatch, script, connection_limit=2)
