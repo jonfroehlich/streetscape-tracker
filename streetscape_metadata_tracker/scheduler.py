@@ -4469,10 +4469,12 @@ def cmd_probe_host(
     since August: full silence, then one request). Exactly one request -- for
     Mapillary's tile CDN, one z14 tile (``host_probe.MAPILLARY_PROBE_TILE``)
     with ``MAPILLARY_ACCESS_TOKEN``, redirects NOT followed, so a 302 to the
-    login page reads as REFUSED -- and the verdict goes to ``host_refusals``:
+    login page reads as REFUSED, while a 429/503 reads as THROTTLED
+    (inconclusive: the collector's backpressure reading) -- and the verdict
+    goes to ``host_refusals``:
     a refusal (which the cross-night cooldown then counts from) or a clearance
-    (which it never does). An inconclusive answer (a rejected token, a 5xx, no
-    response) records nothing. A request that got an HTTP answer is charged to
+    (which it never does). An inconclusive answer (throttled, a rejected token,
+    another 5xx, no response) records nothing. A request that got an HTTP answer is charged to
     the ``mapillary`` ledger like any other, so the host's rolling window
     sees it.
 
@@ -14568,9 +14570,9 @@ def build_parser() -> argparse.ArgumentParser:
         "probe-host",
         help="Send ONE request to a per-IP host and record the verdict in host_refusals "
         "(issue #444): for mapillary_tiles, one z14 tile, redirects not followed, so a "
-        "302 to the login page is REFUSED. Refuses while a run-due is in flight, and "
-        "inside the host's refusal cooldown unless --force. Exit 0 cleared, 75 refused, "
-        "1 inconclusive.",
+        "302 to the login page is REFUSED and a 429/503 is THROTTLED (inconclusive). "
+        "Refuses while a run-due is in flight, and inside the host's refusal cooldown "
+        "unless --force. Exit 0 cleared, 75 refused, 1 inconclusive.",
     )
     _add_global_flags(p_probe)
     p_probe.add_argument("host", help="The per-IP host token; today only mapillary_tiles")

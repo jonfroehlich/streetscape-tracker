@@ -716,13 +716,14 @@ def test_a_probe_refusal_starts_the_cooldown_a_night_then_honours(
 @pytest.mark.parametrize(
     "status,headers,verdict,rc",
     [
-        (429, {"Retry-After": "3600"}, "refused", 75),
+        (429, {"Retry-After": "3600"}, None, 1),
+        (503, {}, None, 1),
         (200, {"Content-Type": "text/html; charset=utf-8"}, "refused", 75),
         (301, {}, "refused", 75),
         (404, {}, "cleared", 0),
         (403, {}, None, 1),
         (401, {}, None, 1),
-        (503, {}, None, 1),
+        (500, {}, None, 1),
     ],
 )
 def test_probe_host_classifies_each_answer(conn, probe_env, status, headers, verdict, rc):
@@ -730,6 +731,34 @@ def test_probe_host_classifies_each_answer(conn, probe_env, status, headers, ver
     assert sched.cmd_probe_host(probe_env, HOST_MAPILLARY_TILES, fetch=fetch) == rc
     assert len(fetch.urls) == 1
     assert [v for v, _s, _d in _verdicts(conn)] == ([verdict] if verdict else [])
+
+
+@pytest.mark.parametrize(
+    "status,headers,said",
+    [
+        (
+            429,
+            {"Retry-After": "3600"},
+            "HTTP 429: throttled (backpressure, not a refusal); Retry-After: 3600",
+        ),
+        (503, {}, "HTTP 503: throttled (backpressure, not a refusal); no Retry-After"),
+    ],
+)
+def test_a_throttled_probe_records_nothing_and_says_so(
+    conn, monkeypatch, probe_env, capsys, frozen_utc_clock, status, headers, said
+):
+    """The collector reads a 429/503 as backpressure -- it waits and slows,
+    records no refusal and trips no breaker -- so the probe must not arm the
+    36 h cooldown on one: exit 1, no row, and the next night is not held."""
+    assert sched.cmd_probe_host(probe_env, HOST_MAPILLARY_TILES, fetch=_Fetch(status, headers)) == 1
+    assert _verdicts(conn) == []
+    out = capsys.readouterr().out
+    assert f"INCONCLUSIVE — {said} (not recorded)." in out
+    frozen_utc_clock(_NIGHT_START + timedelta(hours=20))
+    a = _register(conn, "Bend")
+    rc, launches, _ = _night(monkeypatch, conn, probe_env, today=THURSDAY)
+    assert rc == 0
+    assert sorted(launches) == [(a, "gsv"), (a, "mapillary"), (a, "mapillary_streets")]
 
 
 def test_no_response_is_inconclusive_and_not_ledgered(conn, probe_env):

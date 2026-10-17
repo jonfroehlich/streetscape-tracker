@@ -94,8 +94,12 @@ def classify_mapillary(status: int, headers: dict[str, str]) -> ProbeResult:
 
     * any redirect -- the block is a 302 to ``www.mapillary.com/login`` -- or
       a 200 carrying an HTML/JSON error page: REFUSED;
-    * a 429: REFUSED. An explicit rate refusal is the CDN telling this IP to
-      stay away, which is the fact the cooldown keys on (fail-closed);
+    * a 429 or a 503: THROTTLED, which is INCONCLUSIVE and recorded nowhere.
+      The collector reads both as BACKPRESSURE -- it waits, slows down and
+      pauses, records no refusal and trips no breaker -- so the probe must
+      not read them as a refusal either: a refused row would arm the 36 h
+      cooldown on an answer the collector itself would have waited out. The
+      ``Retry-After`` is printed when the CDN sends one;
     * a 200 tile, or a 404 (the CDN answered, with no tile): CLEARED;
     * a 401/403 (the TOKEN was rejected, a per-credential fault, not a
       per-IP one), any 5xx, anything else: INCONCLUSIVE, recorded nowhere.
@@ -107,12 +111,13 @@ def classify_mapillary(status: int, headers: dict[str, str]) -> ProbeResult:
     if 300 <= status < 400:
         location = redact_credentials(lowered.get("location", "(none)"))
         return ProbeResult(db.HOST_REFUSED, status, f"HTTP {status} -> {location}")
-    if status == 429:
+    if status in (429, 503):
         retry = lowered.get("retry-after")
         return ProbeResult(
-            db.HOST_REFUSED,
+            None,
             status,
-            "HTTP 429" + (f" (Retry-After: {retry})" if retry else ""),
+            f"HTTP {status}: throttled (backpressure, not a refusal)"
+            + (f"; Retry-After: {retry}" if retry else "; no Retry-After"),
         )
     if status == 200:
         content_type = lowered.get("content-type", "")

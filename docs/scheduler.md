@@ -584,7 +584,8 @@ A busy exit writes nothing; a failed write is logged and swallowed, since the br
 
 **`probe-host HOST` sends exactly one request and records the verdict.**
 For `mapillary_tiles` it is the z14 tile 2581/5921 (downtown Corvallis, Oregon; 269 distinct images in the 2026-07-06 census) with `MAPILLARY_ACCESS_TOKEN`, redirects not followed.
-A redirect, a 200 error page or a 429 is REFUSED (exit 75); a tile or a 404 is CLEARED (exit 0); a rejected token, a 5xx or no response is inconclusive (exit 1) and records nothing.
+A redirect or a 200 error page is REFUSED (exit 75); a tile or a 404 is CLEARED (exit 0); a 429 or a 503 is THROTTLED, and that, a rejected token, another 5xx or no response is inconclusive (exit 1) and records nothing.
+A 429/503 is not a refusal because the collector reads both as backpressure (it waits, slows and pauses with exit 83, recording no refusal and tripping no breaker), and a probe that recorded one would arm the cooldown on an answer the collector itself would have waited out; the probe prints the `Retry-After` when there is one.
 A request that got an answer is charged to the `mapillary` ledger.
 It refuses (64, nothing sent) while any `run-due` is in flight (`_run_due_in_flight`) and inside the host's cooldown unless `--force`, and exits 79 when another process holds the host lock.
 The lock is taken in `host_probe.py`, never in `scheduler.py`, whose source must not name the lock module (#208): the parent-must-not-hold rule is about children it spawns, and `probe-host` spawns none.
