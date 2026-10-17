@@ -206,6 +206,38 @@ OVERPASS_URL_ENV = "OVERPASS_URL"
 OVERPASS_USER_AGENT = "streetscape_metadata_tracker (jonf@cs.uw.edu)"
 OVERPASS_REFERER = "https://github.com/jonfroehlich/streetscape-tracker"
 
+# The project's identifying User-Agent for the tile hosts that read none of the
+# Nominatim/Overpass conventions above (Panoramax since #405, Mapillary since
+# #444). The contact address is Jon's choice, made for Panoramax in #405
+# (commit 8bc6f35): a shared lab address, not a personal one.
+#
+# Shape, per RFC 9110 sec. 10.1.5 (`product *( RWS ( product / comment ) )`,
+# where a product is `token ["/" version]` and a token has NO spaces -- hence
+# `StreetscapeTracker`, not "Streetscape Tracker") and per the Wikimedia
+# User-Agent policy's `<client name>/<version> (<contact information>)
+# <library>/<version>`, which is the convention OSM's own services (Nominatim:
+# "identifying the application ... stock User-Agents ... will not do") read.
+#
+# A BUILDER, not a finished string, so this module need not import aiohttp
+# (the scheduler imports it, and is a long-lived parent under a memory cap):
+# each caller passes its real HTTP library token, which therefore cannot drift.
+STREETSCAPE_USER_AGENT_CONTACT = "sidewalk@cs.uw.edu"
+
+
+def streetscape_user_agent(library: str) -> str:
+    """
+    The project User-Agent, ending in the caller's HTTP library token.
+
+    >>> streetscape_user_agent("aiohttp/3.9.5")
+    'StreetscapeTracker/1.0 (+https://github.com/jonfroehlich/streetscape-tracker; sidewalk@cs.uw.edu) aiohttp/3.9.5'
+    """
+    return (
+        "StreetscapeTracker/1.0 "
+        f"(+https://github.com/jonfroehlich/streetscape-tracker; {STREETSCAPE_USER_AGENT_CONTACT}) "
+        f"{library}"
+    )
+
+
 # osmnx's own `settings.http_accept_language` default, restated here so the
 # re-check can build osmnx's exact header set without importing osmnx.
 # download_street_network.py assigns it to osmnx explicitly, as it does the
@@ -593,11 +625,18 @@ ARGV_REJECTED_EXIT_CODE = 2
 # child's log tail -- the exception never crosses the process boundary, so this
 # text is the only way a night's log can say "the clock paused it" rather than
 # "the budget paused it". Defined once so neither side can respell them.
+#
+# The third, backpressure (issue #444), is the Mapillary tile census pausing
+# itself after the CDN answered 429/503 too often in one crawl. The scheduler
+# reads it back like the other two -- `_pause_stop_phrase` iterates this dict --
+# so adding the entry is the whole of its wiring there.
 SWEEP_STOP_REQUESTS = "requests"
 SWEEP_STOP_CLOCK = "clock"
+SWEEP_STOP_BACKPRESSURE = "backpressure"
 SWEEP_STOP_PHRASES = {
     SWEEP_STOP_REQUESTS: "stopped by its request cap",
     SWEEP_STOP_CLOCK: "stopped by its wall-clock budget",
+    SWEEP_STOP_BACKPRESSURE: "stopped by provider backpressure (HTTP 429/503)",
 }
 
 
@@ -961,6 +1000,32 @@ class AsyncRateLimiter:
         if self._time_func is not None:
             return self._time_func()
         return asyncio.get_running_loop().time()
+
+    def slow_down(self, factor: float) -> None:
+        """
+        Divide this limiter's rate by ``factor`` from the next acquisition on.
+
+        THIS INSTANCE ONLY, which is the scoping guarantee: nothing here is
+        module or class state, so a limiter built per crawl (as the Mapillary
+        tile census builds one) slows that crawl and no other, and a limiter in
+        another process is out of reach by construction. Applies to both modes --
+        the bucket refills slower, and the spaced pacer draws its next gap
+        around the longer mean (the gap already drawn is not redrawn, so the
+        slowdown lands one request later there). The jitter, i.e. the CV, is
+        unchanged. A no-op when pacing is disabled.
+
+        Used by the Mapillary census's backpressure rule (issue #444): halve
+        the pace for the rest of the crawl after the CDN answers 429/503.
+
+        Usage:
+            limiter = AsyncRateLimiter(40, jitter=0.6)
+            limiter.slow_down(2)   # a mean 20/min from here on
+        """
+        if not factor >= 1.0:
+            # Refused rather than clamped: a factor below 1 would SPEED the
+            # pacer up, which no caller of a method by this name means.
+            raise ValueError(f"slow_down factor must be >= 1, got {factor!r}")
+        self._rate /= factor
 
     async def acquire(self) -> None:
         """Block until a request token is available (no-op when disabled)."""

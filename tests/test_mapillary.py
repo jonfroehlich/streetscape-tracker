@@ -476,7 +476,9 @@ def _stub_fetch_tile(monkeypatch, fetch):
     ``_fetch_tile`` for that.
     """
 
-    async def paced(session, url, timeout, rate_limiter=None, on_request=None):
+    async def paced(session, url, timeout, rate_limiter=None, on_request=None, on_response=None):
+        # on_response (issue #444's status counter) is accepted and unused: a
+        # stub has no HTTP status to report, so its requests count as `noresp`.
         if rate_limiter is not None:
             await rate_limiter.acquire()
         if on_request is not None:
@@ -1491,12 +1493,15 @@ def test_an_html_error_page_is_not_fed_to_the_protobuf_decoder():
 
 
 def test_a_5xx_tile_is_left_to_the_retry_layer():
-    """The new checks must not swallow the transient path. A 429/5xx is still
+    """The new checks must not swallow the transient path. A 5xx is still
     a ClientResponseError for backoff to retry and, past that, one tolerable
     bad tile under MAX_FAILED_TILE_FRACTION (issue #168) — NOT a DownloadError,
     which would fail the whole city. Called through __wrapped__ to skip the
-    retry sleeps."""
-    session = _FakeTileSession(_FakeTileResponse(503))
+    retry sleeps.
+
+    500, not 503: since #444 a 429 or 503 is backpressure, handled by the crawl
+    rather than by backoff -- tests/test_mapillary_backpressure.py."""
+    session = _FakeTileSession(_FakeTileResponse(500))
     with pytest.raises(aiohttp.ClientResponseError):
         asyncio.run(dm._fetch_tile.__wrapped__(session, _TILE_URL, aiohttp.ClientTimeout(total=5)))
 

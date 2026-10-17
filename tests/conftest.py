@@ -553,7 +553,17 @@ def _no_tile_census_pacing(monkeypatch):
         async def acquire(self):
             return None
 
+        def slow_down(self, factor):
+            # The Mapillary census halves its pace on a 429/503 (issue #444).
+            return None
+
+    async def _no_backpressure_wait(seconds):
+        # ...and holds every request for >= 60 s first. Instant here, like the
+        # pacing; tests/test_mapillary_backpressure.py records it instead.
+        return None
+
     monkeypatch.setattr(dm, "AsyncRateLimiter", _NoPacing)
+    monkeypatch.setattr(dm, "_backpressure_sleep", _no_backpressure_wait)
     monkeypatch.setattr(dp, "AsyncRateLimiter", _NoPacing)
     monkeypatch.setattr(ps, "AsyncRateLimiter", _NoPacing)
 
