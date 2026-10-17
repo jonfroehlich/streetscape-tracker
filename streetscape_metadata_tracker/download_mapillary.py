@@ -544,7 +544,8 @@ _TILE_ERROR_CONTENT_TYPES = ("text/html", "application/json")
 # tile CDN ever answers 429 or 5xx BEFORE it starts redirecting to /login --
 # the hypothesis that our retries walk us into the block -- was unobservable.
 # Every HTTP response a crawl receives is now tallied by class and logged as
-# ONE line per crawl, in a fixed key order so a log grep can read it:
+# ONE line per crawl, in a fixed key order so a log grep can read it
+# (illustrative numbers):
 #
 #     mapillary tile statuses: 200=81 204=0 404=1 429=0 4xx=0 5xx=0 3xx=5
 #     other=0 noresp=0 requests=87 retries=1 retry_after=[] city='Carlsbad, CA'
