@@ -629,3 +629,27 @@ def test_a_backpressure_pause_resumes_for_the_missing_tiles_only(
     assert resumed["api_requests"] == len(session.urls) == len(_TILES) - 2
     assert resumed["api_requests_total"] == 5 + len(_TILES) - 2
     assert resumed["failed_tiles"] == []
+
+
+def test_a_hold_that_would_outlast_the_deadline_pauses_instead(
+    monkeypatch, tmp_path, limiters, holds
+):
+    """The scheduler's SIGKILL lands 600 s after the forwarded budget, and a
+    hold can be 900 s: one begun near the deadline must pause (exit 83), not
+    sleep into the kill (a counted failure)."""
+    import time as _time
+
+    script = {_TILES[3]: [status(429, **{"Retry-After": "300"})]}
+    error, session = _crawl(
+        monkeypatch,
+        script,
+        connection_limit=1,
+        checkpoint_path=str(tmp_path / "cp"),
+        deadline_monotonic=_time.monotonic() + 200,
+    )
+    assert isinstance(error, SweepIncompleteError), error
+    assert error.stopped_by == "backpressure"
+    assert "wall-clock budget" in str(error)
+    assert holds == []
+    assert error.units_done == 3
+    assert len(session.urls) == 4

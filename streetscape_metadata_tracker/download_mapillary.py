@@ -52,6 +52,7 @@ import json
 import logging
 import math
 import os
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
@@ -629,7 +630,9 @@ class TileStatusCounts:
 #    than TILE_BACKPRESSURE_MAX_WAIT_S is not slept on at all: the crawl
 #    pauses instead (3), because retrying before the time the server named
 #    would disobey it, and a sleep that long belongs to the next night rather
-#    than to this one's host lock.
+#    than to this one's host lock. Nor is a hold that would end past the
+#    crawl's wall-clock budget (`deadline_monotonic`), which the scheduler sets
+#    600 s before its SIGKILL: sleeping into the kill would count a failure.
 # 3. The pace is halved for the REST OF THIS CRAWL (once, on the first such
 #    response). The limiter is built per crawl, so this cannot reach another
 #    crawl or another process; see AsyncRateLimiter.slow_down.
@@ -1852,7 +1855,20 @@ async def _fetch_city_images(
             # began: counted, never waited on.
             return None
         wait = backpressure_wait_seconds(retry_after_seconds(e.retry_after))
-        if wait is not None and backpressure_events < TILE_BACKPRESSURE_PAUSE_AFTER:
+        # A hold that would outlast the crawl's wall-clock budget is not slept
+        # either: the scheduler forwards that budget as its SIGKILL timeout
+        # less a 600 s margin, and a 900 s hold begun inside the margin would be
+        # killed mid-sleep -- counted a failure, where pausing now is exit 83.
+        outlasts_deadline = (
+            wait is not None
+            and deadline_monotonic is not None
+            and time.monotonic() + wait >= deadline_monotonic
+        )
+        if (
+            wait is not None
+            and not outlasts_deadline
+            and backpressure_events < TILE_BACKPRESSURE_PAUSE_AFTER
+        ):
             logger.warning(
                 f"Mapillary tile CDN answered HTTP {e.status} (Retry-After: {e.retry_after}) "
                 f"for {city_name}: holding every tile request for {wait:.0f} s, then "
@@ -1860,7 +1876,12 @@ async def _fetch_city_images(
                 f"response {backpressure_events}/{TILE_BACKPRESSURE_PAUSE_AFTER}; issue #444)"
             )
             return wait
-        if wait is None:
+        if outlasts_deadline:
+            backpressure_detail = (
+                f"HTTP {e.status} asking for a {wait:.0f} s wait that would outlast this "
+                f"crawl's wall-clock budget"
+            )
+        elif wait is None:
             backpressure_detail = (
                 f"HTTP {e.status} with a Retry-After of {e.retry_after!r}, longer than the "
                 f"{TILE_BACKPRESSURE_MAX_WAIT_S:.0f} s it will wait in-process"
