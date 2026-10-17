@@ -453,6 +453,10 @@ def test_a_failed_refusal_write_never_ends_the_night(conn, monkeypatch, tmp_path
     assert len(alerts) == 1
     _cfg_arg, _subject, body = alerts[0]
     assert "Refusal(s) NOT RECORDED in host_refusals (1 of Mapillary's tile CDN" in body
+    # The alert's own paragraph carries the advice too, not only the summary
+    # line quoted above it (the capital R is the paragraph's sentence).
+    paragraph = body.split("Refusal(s) NOT RECORDED", 1)[1]
+    assert "by hand" in paragraph and "does arm the cooldown" in paragraph
     assert rc != 0
 
 
