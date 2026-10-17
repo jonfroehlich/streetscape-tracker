@@ -753,12 +753,26 @@ class _BackpressurePacer:
     slips out during a hold that was opened after it passed the gate.
     """
 
-    def __init__(self, limiter: Any):
+    def __init__(self, limiter: Any, clock: Callable[[], float] | None = None):
+        """
+        Args:
+            limiter: this crawl's rate limiter; anything with ``acquire()``
+                and ``slow_down(factor)``.
+            clock: monotonic seconds, for the hold arithmetic. Defaults to the
+                running loop's clock; injectable so a test can advance time
+                with the hold's own sleep.
+        """
         self._limiter = limiter
+        self._clock = clock
         self._gate = asyncio.Lock()
         self._holds = 0
         self._hold_until = 0.0
         self.slowed = False
+
+    def _now(self) -> float:
+        if self._clock is not None:
+            return self._clock()
+        return asyncio.get_running_loop().time()
 
     async def acquire(self) -> None:
         while True:
@@ -771,13 +785,13 @@ class _BackpressurePacer:
 
     async def hold(self, seconds: float) -> None:
         """Keep every request of this crawl from going out for ``seconds``."""
-        loop = asyncio.get_running_loop()
         self._holds += 1
         # Overlapping holds extend to the LATEST end rather than queueing, so
-        # two 429s seen together cost one wait, not two back to back.
-        self._hold_until = max(self._hold_until, loop.time() + seconds)
+        # two 429s seen together cost one wait, not two back to back -- and a
+        # later, SHORTER hold can never cut short a longer one still queued.
+        self._hold_until = max(self._hold_until, self._now() + seconds)
         async with self._gate:
-            remaining = self._hold_until - loop.time()
+            remaining = self._hold_until - self._now()
             if remaining > 0:
                 await _backpressure_sleep(remaining)
 

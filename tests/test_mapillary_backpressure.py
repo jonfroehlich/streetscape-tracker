@@ -662,3 +662,32 @@ def test_a_hold_that_would_outlast_the_deadline_pauses_instead(
     assert holds == []
     assert error.units_done == 3
     assert len(session.urls) == 4
+
+
+def test_a_shorter_hold_never_cuts_short_a_longer_one(monkeypatch):
+    """Overlapping holds end at the LATEST requested end.
+
+    Three 429s land together: A asks 10 s, B 100 s, C 5 s. A takes the gate
+    and sleeps 10; B, queued behind it, must then sleep the 90 s still owed to
+    its own 100 s. If C's 5 s could overwrite the end B registered, B would
+    find nothing left and the crawl would resume 90 s early.
+    """
+    clock = {"t": 0.0}
+    slept = []
+
+    real_sleep = asyncio.sleep
+
+    async def sleep(seconds):
+        slept.append(seconds)
+        await real_sleep(0)  # yield, so the other holds queue behind this one
+        clock["t"] += seconds
+
+    monkeypatch.setattr(dm, "_backpressure_sleep", sleep)
+    pacer = dm._BackpressurePacer(_RecordingLimiter(40), clock=lambda: clock["t"])
+
+    async def scenario():
+        await asyncio.gather(pacer.hold(10), pacer.hold(100), pacer.hold(5))
+
+    asyncio.run(scenario())
+    assert slept == [pytest.approx(10.0), pytest.approx(90.0)]
+    assert clock["t"] == pytest.approx(100.0)
