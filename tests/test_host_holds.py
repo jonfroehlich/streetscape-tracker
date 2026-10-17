@@ -533,6 +533,34 @@ def test_a_throttled_night_quarantines_nothing_however_often_it_repeats(
     assert _failures(conn).get((a, "mapillary"), 0) == (nights if counted else 0)
 
 
+@pytest.mark.parametrize("exit_code", [THROTTLED, 75], ids=["throttled-87", "refused-75"])
+def test_a_throttled_or_refused_pair_stays_due(conn, monkeypatch, tmp_path, exit_code):
+    """Round-2 review of #444: the amnesty is only half the contract -- the
+    pair must also stay DUE, so it leads the next night's queue and resumes
+    its checkpoint. Nothing pinned that: recording a success before the
+    branch's `continue` survived the whole suite. 75 is pinned beside 87,
+    since its branch had the same gap."""
+    a = _register(conn, "Bend")
+    cfg = _cfg(tmp_path, None)
+    _refusing_night(monkeypatch, conn, cfg, exit_code=exit_code)
+
+    row = conn.execute(
+        "SELECT last_success_at FROM schedule_state WHERE city_id = ? AND provider = 'mapillary'",
+        (a,),
+    ).fetchone()
+    assert row is None or row["last_success_at"] is None
+    due = db.get_due_cities(
+        conn,
+        today=THURSDAY + timedelta(days=1),
+        cycle_days=cfg.cycle_days,
+        grace_days=cfg.grace_days,
+        max_consecutive_failures=cfg.max_consecutive_failures,
+        default_membership=sched.CHANNEL_DEFAULT_MEMBERSHIP["mapillary"],
+        provider="mapillary",
+    )
+    assert a in [c.city_id for c in due]
+
+
 def test_a_throttle_arms_no_refusal_cooldown(conn, monkeypatch, tmp_path, frozen_utc_clock):
     """The next night is not held: a 429 is inconclusive, so only a real
     refusal (a host_refusals `refused` row) may start the 36 h cooldown."""
