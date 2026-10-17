@@ -100,7 +100,8 @@ Numbers: [`experiments/csv-float-parse.md`](experiments/csv-float-parse.md).
 **Historical capture-date harvester (`download_gsv_history.py`, issues #2 and #442).** Separate, opt-in, and out-of-band from the run pipeline.
 A normal run records only the *current* capture date per point;
 this harvests the FULL official-Google capture history — every past drive-through and its month — which no documented Google API (free or paid) exposes.
-It comes instead from an **unpublished endpoint** (`GeoPhotoService.SingleImageSearch`, the backend behind the Maps-JS `getPanorama().time[]` array), queried directly with no API key.
+It comes instead from an **unpublished endpoint** (the `MapsJsInternalService/SingleImageSearch` RPC behind the Maps-JS `getPanorama().time[]` array), queried directly with no API key.
+Its older JSONP shim (`maps/api/js/GeoPhotoService.SingleImageSearch`) was **turned down by 2026-10-17**: the pilot's first 100 requests all got HTTP 200 and the body `GeoPhotoService.SingleImageSearch is decommissioned and turned down.`, which is exactly the shape change the raw store exists for; `download_gsv_history.RPC_URL` records the route that answers (request body and response offsets after sk-zk/streetlevel, MIT).
 Because it is undocumented **there is no guarantee it keeps working**, and it is IP-identified rather than key-metered, which fixes three things about how it runs (#442):
 
 - **Where.** Only from a dedicated address that no lab service shares — never makelab1 or makelab2, whose addresses carry Project Sidewalk and the nightly collection.
@@ -114,7 +115,7 @@ The unit of work is a **road-walk sample point**, not a grid point (the grid-poi
 Pass 1 is each edge's midpoint sample (8.9 M rows catalog-wide), pass 2 the remaining samples, so the two passes query disjoint points ([`experiments/gsv-history-sizing.md`](experiments/gsv-history-sizing.md)).
 Per work list and pass the crawler streams three gzip files, each flush its own gzip member so a crash leaves every earlier member readable, and a cut final member is dropped before the next append:
 the **raw** bodies, verbatim, first — the only copy that survives a parser the endpoint has outgrown;
-the per-sample **history** (one row per sample and dated pano, `SAMPLE_HISTORY_COLUMNS`), keeping only panos that carry a date (a present date is the endpoint-native signal of official Google imagery — the analogue of the `© Google` filter);
+the per-sample **history** (one row per sample and dated pano, `SAMPLE_HISTORY_COLUMNS`): the pano served there now (`is_current`) plus every dated pano the service relates to it, each flagged `third_party` from the node's type code — a date no longer marks official imagery, since user photospheres come dated too, so the `© Google` analogue is that flag, never the presence of a date;
 and the **queries** ledger last, one row per request with `anchor_in_history` (does the walk's own pano appear in its history?) as the pilot's parser-health signal.
 The ledger IS the checkpoint: a key is done only once everything it stands for is on disk.
 The per-city, per-pano artifact below (`{city_id}_..._gsv_history_YYYY-MM-DD.csv.gz`, its own `HISTORY_DTYPES` schema, NOT a run/`METADATA_DTYPES` file; `naming.parse_filename` rejects it, `parse_history_filename` parses it) and its `history_harvests` row (schema v3) are **derived** from those per-sample results by the import step that lands them, which #442 leaves to a follow-up.

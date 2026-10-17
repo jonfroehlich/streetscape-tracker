@@ -8,7 +8,6 @@ import asyncio
 import gzip
 import json
 import os
-import re
 import sys
 from datetime import UTC, date, datetime, timedelta
 
@@ -29,75 +28,132 @@ from streetscape_metadata_tracker.naming import (  # noqa: E402
 
 # ── Response-fixture builder ───────────────────────────────────────────────
 #
-# Reproduces the (undocumented) endpoint's deeply-nested shape: a callbackfunc
-# wrapper around data where data[1][5][0] is the "subset", subset[3][0] is the
-# pano list and subset[8] is the date list. Per the endpoint's quirk, the date
-# list covers only the LAST n panos, so undated (user) panos must lead and
-# dated (official Google) panos must trail.
+# Reproduces the live RPC response shape (measured 2026-10-17, offsets after
+# sk-zk/streetlevel): data[0][0] is the response code; msg = data[1];
+# msg[1][1] the current pano's id, msg[6][7] its [year, month],
+# msg[5][0][1][0][2:4] its position; msg[5][0][3][0] every related pano node
+# [[type, id], _, [[_, _, lat, lon]]] (the current pano first), and
+# msg[5][0][8] the history as [index, [year, month], ...] keyed into that list.
 
 
-def _pano_node(pano_id, lat, lon):
-    return [[None, pano_id], None, [[None, None, lat, lon]]]
+def _node(pano_id, lat, lon, kind=2):
+    return [[kind, pano_id], None, [[None, None, lat, lon]]]
 
 
-def _date_node(year, month):
-    return [None, [year, month]]
-
-
-def make_response(undated, dated):
+def make_response(main, historical=(), neighbors=(), code=0):
     """
-    undated: list of (pano_id, lat, lon) with no capture date (user panos)
-    dated:   list of (pano_id, lat, lon, (year, month)) official Google panos
-    Returns the raw callbackfunc(...) response body as a string.
+    main:       (pano_id, lat, lon, (year, month)) -- the pano served at the location now
+    historical: (pano_id, lat, lon, (year, month)[, type]) -- dated panos keyed by index
+    neighbors:  (pano_id, lat, lon) -- undated nodes (links), never history
+    Returns the raw JSON response body as a string.
     """
-    raw_panos = [_pano_node(p, la, lo) for (p, la, lo) in undated]
-    raw_panos += [_pano_node(p, la, lo) for (p, la, lo, _) in dated]
-    raw_dates = [_date_node(y, m) for (_, _, _, (y, m)) in dated]
-    subset = [None, None, None, [raw_panos], None, None, None, None, raw_dates]
-    data = [None, [None, None, None, None, None, [subset]]]
-    return f"callbackfunc( {json.dumps(data)} )"
+    if code != 0:
+        return json.dumps([[code, "generic", "Search returned no images."]])
+    mid, mlat, mlon, (my, mm) = main
+    nodes = [_node(mid, mlat, mlon)]
+    dates = []
+    for h in historical:
+        pid, la, lo, (y, m) = h[:4]
+        kind = h[4] if len(h) > 4 else 2
+        dates.append([len(nodes), [y, m], None, None, None, kind])
+        nodes.append(_node(pid, la, lo, kind))
+    for pid, la, lo in neighbors:
+        nodes.append(_node(pid, la, lo))
+    subset = [None, [[None, None, mlat, mlon]], None, [nodes], None, None, None, None, dates]
+    msg = [
+        None,
+        [None, mid],
+        None,
+        None,
+        [[[["© 2026 Google"]]]],
+        [subset],
+        [None] * 7 + [[my, mm]],
+    ]
+    return json.dumps([[0], msg])
 
 
 # ── Parsing ────────────────────────────────────────────────────────────────
 
+TP_ID = "CIHM0ogKEICAgIDO44iHaw"  # a user photosphere id, as the live endpoint returns them
 
-def test_parse_keeps_only_dated_official_panos():
+
+def test_parse_returns_the_current_pano_and_its_history_with_third_party_flagged():
     text = make_response(
-        undated=[("userA", 45.0, -122.0), ("userB", 45.0, -122.0)],
-        dated=[
+        main=("g2023", 45.31, -122.94, (2023, 6)),
+        historical=[
             ("g2007", 45.31, -122.94, (2007, 10)),
             ("g2012", 45.31, -122.94, (2012, 6)),
-            ("g2023", 45.31, -122.94, (2023, 6)),
+            (TP_ID, 45.31, -122.94, (2019, 11), 10),
+        ],
+        neighbors=[("userA", 45.0, -122.0), ("userB", 45.0, -122.0)],
+    )
+    result = dgh.parse_search(text)
+    assert result.response_code == 0 and result.panos_total == 6
+    panos = result.panos
+    assert [p.pano_id for p in panos] == ["g2023", "g2007", "g2012", TP_ID]
+    assert panos[0].is_current and not any(p.is_current for p in panos[1:])
+    by_id = {p.pano_id: p for p in panos}
+    # month-precision dates standardized to ISO with day defaulting to 01
+    assert by_id["g2023"].capture_date == "2023-06-01"
+    assert by_id["g2007"].capture_date == "2007-10-01"
+    assert by_id["g2012"].capture_date == "2012-06-01"
+    assert by_id["g2007"].lat == pytest.approx(45.31)
+    # A date no longer marks official imagery: the user photosphere is dated
+    # and KEPT, flagged, never silently folded into the official history.
+    assert by_id[TP_ID].third_party and not by_id["g2007"].third_party
+    assert dgh.parse_search_response(text) == list(panos)
+
+
+def test_parse_third_party_falls_back_to_the_id_shape_when_the_type_is_missing():
+    text = make_response(
+        main=("g2023", 45.0, -122.0, (2023, 6)),
+        historical=[
+            (TP_ID, 45.0, -122.0, (2019, 11), None),
+            ("x" * 23, 45.0, -122.0, (2018, 1), None),
         ],
     )
     panos = dgh.parse_search_response(text)
-
-    assert {p.pano_id for p in panos} == {"g2007", "g2012", "g2023"}
-    by_id = {p.pano_id: p for p in panos}
-    # month-precision dates standardized to ISO with day defaulting to 01
-    assert by_id["g2007"].capture_date == "2007-10-01"
-    assert by_id["g2012"].capture_date == "2012-06-01"
-    assert by_id["g2023"].capture_date == "2023-06-01"
-    assert by_id["g2007"].lat == pytest.approx(45.31)
+    assert [p.third_party for p in panos] == [False, True, True]
+    assert dgh.is_third_party_pano_id("TC9HEmnUNHFZac4hT1lccQ") is False
 
 
-def test_parse_no_images_sentinel_returns_empty():
-    text = f"callbackfunc( {json.dumps(dgh._NO_IMAGES_SENTINEL)} )"
-    assert dgh.parse_search_response(text) == []
+def test_parse_no_images_response_code_returns_empty():
+    result = dgh.parse_search(make_response(None, code=5))
+    assert result.response_code == 5 and result.panos == () and result.panos_total == 0
+
+
+def test_parse_decommissioned_shim_body_is_not_a_result():
+    # What the retired JSONP route answered on 2026-10-17 (100 of 100 pilot
+    # requests): HTTP 200 and this body. It must parse as nothing, never as
+    # "no imagery here".
+    text = (
+        '/**/callbackfunc && callbackfunc( [[5,"generic","GeoPhotoService.SingleImageSearch '
+        'is decommissioned and turned down."]] )'
+    )
+    result = dgh.parse_search(text)
+    assert result.response_code is None and result.panos == () and result.panos_total is None
 
 
 @pytest.mark.parametrize(
     "text",
     [
         "",
-        "not javascript at all",
-        "callbackfunc( {not json} )",
-        "callbackfunc( [1,2,3] )",  # right wrapper, wrong shape
+        "not json at all",
+        "[1,2,3]",  # right type, wrong shape
+        json.dumps([[0], None]),
+        json.dumps([[0], [None, None]]),
     ],
 )
 def test_parse_malformed_is_swallowed(text):
-    # A shape change in the undocumented endpoint must not raise mid-sweep.
+    # A shape change in the undocumented endpoint must not raise mid-crawl.
     assert dgh.parse_search_response(text) == []
+
+
+def test_build_search_body_asks_for_official_imagery_history_at_the_walk_radius():
+    body = json.loads(dgh.build_search_body(47.6, -122.3))
+    assert body[1] == [[None, None, 47.6, -122.3], 50.0]
+    assert body[2][10] == [[[dgh.PANO_TYPE_OFFICIAL, True, 2]]]
+    assert 6 in body[3][0]  # neighbours + historical toggle
 
 
 # ── Circuit breaker ────────────────────────────────────────────────────────
@@ -302,15 +358,16 @@ def test_v2_catalog_gains_history_table_on_connect(tmp_path):
 
 def test_parse_skips_malformed_date_node_keeps_good_sibling():
     # A single corrupt date entry must not sink the whole response, nor its
-    # well-formed siblings — one odd row can't abort a sweep.
-    good = _pano_node("gGOOD", 45.0, -122.0)
-    bad = _pano_node("gBAD", 45.0, -122.0)
-    raw_dates = [_date_node(2015, 6), [None, ["oops"]]]  # 2nd node malformed
-    subset = [None, None, None, [[good, bad]], None, None, None, None, raw_dates]
-    data = [None, [None, None, None, None, None, [subset]]]
-    panos = dgh.parse_search_response(f"callbackfunc( {json.dumps(data)} )")
-    assert [p.pano_id for p in panos] == ["gGOOD"]
-    assert panos[0].capture_date == "2015-06-01"
+    # well-formed siblings — one odd row can't abort a crawl.
+    text = make_response(
+        main=("gMAIN", 45.0, -122.0, (2024, 1)),
+        historical=[("gGOOD", 45.0, -122.0, (2015, 6)), ("gBAD", 45.0, -122.0, (2015, 6))],
+    )
+    data = json.loads(text)
+    data[1][5][0][8][1][1] = ["oops"]  # the second history entry's date node
+    panos = dgh.parse_search_response(json.dumps(data))
+    assert [p.pano_id for p in panos] == ["gMAIN", "gGOOD"]
+    assert panos[1].capture_date == "2015-06-01"
 
 
 # ── Work-list crawl (endpoint mocked) ───────────────────────────────────────
@@ -363,12 +420,18 @@ def _worklist(n=3, *, anchors=None, pass_no=1):
     return pd.DataFrame(rows, columns=dgh.WORKLIST_COLUMNS)
 
 
-def _lat_of(url):
-    return float(re.search(r"!3d([-0-9.]+)", url).group(1))
+def _lat_of(body):
+    """The query latitude a request body carries (the fake fetch receives the body)."""
+    return float(json.loads(body)[1][0][2])
 
 
-THREE = [("g2007", 44.0, -121.0, (2007, 10)), ("g2023", 44.0, -121.0, (2023, 6))]
-BODY = make_response(undated=[("user1", 44.0, -121.0)], dated=THREE)
+# The current pano (dated) plus one historical capture, and an undated
+# neighbour the search relates to it: 3 nodes, 2 dated.
+BODY = make_response(
+    main=("g2023", 44.0, -121.0, (2023, 6)),
+    historical=[("g2007", 44.0, -121.0, (2007, 10))],
+    neighbors=[("user1", 44.0, -121.0)],
+)
 
 
 def _run(wl, out_dir, **kw):
@@ -411,7 +474,7 @@ def test_raw_store_holds_every_body_verbatim_and_reparses_to_the_history(monkeyp
     bodies = {}
 
     def responder(url):
-        body = make_response(undated=[], dated=[(f"p{_lat_of(url)}", 44.0, -121.0, (2019, 3))])
+        body = make_response(main=(f"p{_lat_of(url)}", 44.0, -121.0, (2019, 3)))
         bodies[url] = body
         return 200, body
 
@@ -420,7 +483,7 @@ def test_raw_store_holds_every_body_verbatim_and_reparses_to_the_history(monkeyp
     raw = [json.loads(line) for line in gzip.open(result["paths"]["raw"], "rt")]
     assert len(raw) == 3
     assert {r["body"] for r in raw} == set(bodies.values())
-    assert all(r["http_status"] == 200 and r["url"] in bodies for r in raw)
+    assert all(r["http_status"] == 200 and r["request"] in bodies for r in raw)
     # Re-parsing the raw copy reproduces the parsed file: the raw store is the
     # irreplaceable one, so it must be sufficient on its own.
     reparsed = sorted(
@@ -673,10 +736,27 @@ def test_load_worklist_refuses_missing_columns_and_duplicate_keys(tmp_path):
         dgh.load_worklist(str(dup))
 
 
-def test_count_panos_counts_dated_and_undated_nodes():
-    assert dgh._count_panos(BODY) == 3
-    assert dgh._count_panos("garbage") is None
-    assert dgh._count_panos(f"callbackfunc( {json.dumps(dgh._NO_IMAGES_SENTINEL)} )") is None
+def test_queries_ledger_carries_the_response_code_and_third_party_count(monkeypatch, tmp_path):
+    body = make_response(
+        main=("g2023", 44.0, -121.0, (2023, 6)),
+        historical=[(TP_ID, 44.0, -121.0, (2019, 11), 10)],
+    )
+    _patch_fetch(monkeypatch, lambda url: (200, body))
+    result = _run(_worklist(1), tmp_path)
+    q = _read(result["paths"]["queries"])
+    assert q.loc[0, "response_code"] == 0 and q.loc[0, "panos_total"] == 2
+    assert q.loc[0, "panos_dated"] == 2 and q.loc[0, "panos_third_party"] == 1
+    hist = _read(result["paths"]["history"]).set_index("pano_id")
+    assert bool(hist.loc[TP_ID, "third_party"]) and not bool(hist.loc["g2023", "third_party"])
+    assert bool(hist.loc["g2023", "is_current"]) and not bool(hist.loc[TP_ID, "is_current"])
+
+
+def test_raw_lines_carry_the_request_body_beside_the_response(monkeypatch, tmp_path):
+    _patch_fetch(monkeypatch, lambda url: (200, BODY))
+    result = _run(_worklist(1), tmp_path)
+    raw = [json.loads(line) for line in gzip.open(result["paths"]["raw"], "rt")]
+    assert raw[0]["url"] == dgh.RPC_URL
+    assert json.loads(raw[0]["request"])[1][0][2:4] == [44.0, -121.0]
 
 
 # ── The CLI ──────────────────────────────────────────────────────────────────

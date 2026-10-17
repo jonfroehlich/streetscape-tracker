@@ -6,9 +6,10 @@ it taken?" — one *current* date per point. Google's own time-travel feature,
 though, exposes the FULL capture history at a location: every official
 Street View drive-through and its date. That history is not in any documented
 Google API (free or paid). It is returned by an **unpublished endpoint**
-(`GeoPhotoService.SingleImageSearch`, the backend the Maps JS
+(the `MapsJsInternalService/SingleImageSearch` RPC, the backend the Maps JS
 `StreetViewService.getPanorama().time[]` array reads from), which we query
-directly here — no API key, no browser.
+directly here — no API key, no browser. Its older JSONP shim was turned down
+by 2026-10-17; `RPC_URL` below records the route that answers.
 
 Because the endpoint is undocumented there is **no guarantee it keeps working**,
 and it is identified by our IP rather than a metered key, so this harvester is
@@ -31,10 +32,12 @@ Collection model (#442):
     current ("anchor") pano. The crawler runs on a dedicated host that holds
     no catalog and needs nothing but the file.
   * Pass 1 queries each edge's midpoint sample; pass 2 the remaining samples.
-  * Each search returns a neighbourhood of panoramas; only those carrying a
-    capture DATE are kept — in this endpoint a present date is the signal of
-    official Google imagery (user photospheres come back undated). This is the
-    endpoint-native analogue of the `© Google` filter used elsewhere.
+  * Each search returns the pano served at the location now, plus every pano
+    the service relates to it: neighbours (undated) and the capture HISTORY
+    (dated, keyed by index). Every dated pano is kept, the current one first.
+    A date no longer marks official imagery — user photospheres come dated
+    too — so each row carries `third_party`, from the node's type code (2
+    official, 10 user) with the id-shape rule as fallback.
   * Results stay keyed to the sample that found them (one row per sample and
     dated pano), so "how often is THIS street re-captured?" is answerable.
     Whether the anchor pano appears in its own history (`anchor_in_history`)
@@ -60,7 +63,6 @@ import io
 import json
 import logging
 import os
-import re
 import zlib
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -93,15 +95,21 @@ HISTORY_DTYPES = {
     "harvested_at": str,  # UTC ISO 8601
 }
 
-_SEARCH_URL = (
-    "https://maps.googleapis.com/maps/api/js/GeoPhotoService.SingleImageSearch"
-    "?pb=!1m5!1sapiv3!5sUS!11m2!1m1!1b0!2m4!1m2!3d{lat}!4d{lon}!2d50!3m10"
-    "!2m2!1sen!2sUS!9m1!1e2!11m4!1m3!1e2!2b1!3e2!4m10!1e1!1e2!1e3!1e4"
-    "!1e8!1e6!5m1!1e2!6m1!1e2"
-    "&callback=callbackfunc"
+# The live route (measured 2026-10-17 from the pilot host): the RPC that the
+# Maps JavaScript API itself calls. The older JSONP shim this module shipped
+# with (`maps/api/js/GeoPhotoService.SingleImageSearch?pb=...&callback=`) now
+# answers every query with HTTP 200 and the body
+# `[[5,"generic","GeoPhotoService.SingleImageSearch is decommissioned and turned down."]]`
+# -- 100 of 100 pilot requests, before the parser noticed anything. The request
+# body and the response offsets follow sk-zk/streetlevel (MIT), the maintained
+# client of this RPC; the toggles ask for resolution, street name and date,
+# copyright, neighbours + history, and the exact-timestamp field.
+RPC_URL = (
+    "https://maps.googleapis.com/$rpc/google.internal.maps.mapsjs.v1.MapsJsInternalService"
+    "/SingleImageSearch"
 )
-_CALLBACK_RE = re.compile(r"callbackfunc\( (.*) \)$", re.DOTALL)
-_NO_IMAGES_SENTINEL = [[5, "generic", "Search returned no images."]]
+RPC_CONTENT_TYPE = "application/json+protobuf"
+DEFAULT_SEARCH_RADIUS_M = 50.0  # the walk's own match radius
 
 # A realistic browser UA; the endpoint is meant to be called from Maps JS.
 _USER_AGENT = (
@@ -110,15 +118,31 @@ _USER_AGENT = (
     "Chrome/126.0 Safari/537.36"
 )
 
+# Pano type codes the response carries in each node's first field (and the
+# request asks for): 2 = official Google imagery, 10 = third-party/user.
+PANO_TYPE_OFFICIAL = 2
+PANO_TYPE_THIRD_PARTY = 10
+
 
 @dataclass(frozen=True)
 class HistoricalPano:
-    """One official Google panorama and its capture month."""
+    """One panorama the search knows about at this location, with its capture month."""
 
     pano_id: str
-    capture_date: str  # standardized ISO 'YYYY-MM-DD'
+    capture_date: str  # standardized ISO 'YYYY-MM-DD' (month precision, pinned to the 1st)
     lat: float
     lon: float
+    third_party: bool = False  # user photosphere rather than official Google imagery
+    is_current: bool = False  # the pano the search returned as the one served here now
+
+
+@dataclass(frozen=True)
+class SearchResult:
+    """A parsed search response."""
+
+    response_code: int | None  # 0 ok, 5 "Search returned no images.", None unparseable
+    panos: tuple[HistoricalPano, ...]  # every DATED pano: the current one plus its history
+    panos_total: int | None  # every pano node the response carries, dated or not
 
 
 class HarvestBlockedError(DownloadError):
@@ -129,66 +153,144 @@ class HarvestBlockedError(DownloadError):
     """
 
 
-def build_search_url(lat: float, lon: float) -> str:
-    """URL of the unpublished single-image-search endpoint for a coordinate."""
-    return _SEARCH_URL.format(lat=lat, lon=lon)
+def is_third_party_pano_id(pano_id: str) -> bool:
+    """The id-shape rule for user photospheres (sk-zk/streetlevel): 'CIHM0og...' or longer than 22."""
+    return pano_id.startswith("CIHM0og") or len(pano_id) > 22
+
+
+def build_search_body(lat: float, lon: float, radius_m: float = DEFAULT_SEARCH_RADIUS_M) -> str:
+    """The JSON+protobuf request body for a location search (official imagery, en-US)."""
+    message = [
+        ["apiv3", None, None, None, "US"],
+        [[None, None, float(lat), float(lon)], float(radius_m)],
+        [
+            None,
+            ["en", "US"],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            [2],
+            None,
+            [[[PANO_TYPE_OFFICIAL, True, 2]]],
+        ],
+        [[1, 2, 3, 4, 6, 8, 12], None, None, None, [], []],
+    ]
+    return json.dumps(message)
+
+
+def _month_iso(node: Any) -> str:
+    """``[year, month]`` or ``[year, month, day]`` -> 'YYYY-MM-01', '' when malformed."""
+    try:
+        return standardize_capture_date(f"{int(node[0])}-{int(node[1]):02d}")
+    except (IndexError, KeyError, TypeError, ValueError):
+        return ""
+
+
+def parse_search(text: str) -> SearchResult:
+    """
+    Parse one RPC response into the dated panos at a location.
+
+    Shape (offsets after sk-zk/streetlevel): ``data[0][0]`` is the response
+    code; ``msg = data[1]``; ``msg[1][1]`` the current pano's id, ``msg[6][7]``
+    its ``[year, month]``, ``msg[5][0][1][0][2:4]`` its position; ``msg[5][0][3][0]``
+    the list of every pano node the search relates to it (neighbours AND
+    history, the current pano included), each ``[[type, id], _, [[_, _, lat, lon], ...]]``;
+    and ``msg[5][0][8]`` the history list, ``[index, [year, month], ...]`` keyed
+    by index into that node list. Any structural surprise yields an empty
+    result rather than raising, so one odd response cannot abort a crawl --
+    the raw body is kept verbatim for a later re-parse.
+
+    A date no longer marks official imagery (third-party photospheres come
+    dated here), so each pano carries ``third_party`` from the node's type
+    code, with the id-shape rule as fallback.
+    """
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        return SearchResult(None, (), None)
+    try:
+        code = int(data[0][0])
+    except (IndexError, KeyError, TypeError, ValueError):
+        return SearchResult(None, (), None)
+    if code != 0:
+        return SearchResult(code, (), 0)
+    try:
+        msg = data[1]
+        main_id = str(msg[1][1])
+        nodes = msg[5][0][3][0] or []
+    except (IndexError, KeyError, TypeError):
+        return SearchResult(code, (), None)
+    try:
+        main_latlon = (float(msg[5][0][1][0][2]), float(msg[5][0][1][0][3]))
+    except (IndexError, KeyError, TypeError, ValueError):
+        main_latlon = None
+    try:
+        main_date = _month_iso(msg[6][7])
+    except (IndexError, KeyError, TypeError):
+        main_date = ""
+    try:
+        raw_dates = msg[5][0][8] or []
+    except (IndexError, KeyError, TypeError):
+        raw_dates = []
+    dates: dict[int, str] = {}
+    for entry in raw_dates:
+        try:
+            dates[int(entry[0])] = _month_iso(entry[1])
+        except (IndexError, KeyError, TypeError, ValueError):
+            continue
+
+    def _node(node) -> tuple[str, bool, float | None, float | None] | None:
+        try:
+            pano_id = str(node[0][1])
+        except (IndexError, KeyError, TypeError):
+            return None
+        try:
+            kind = int(node[0][0])
+            third = kind == PANO_TYPE_THIRD_PARTY
+        except (IndexError, KeyError, TypeError, ValueError):
+            third = is_third_party_pano_id(pano_id)
+        try:
+            lat, lon = float(node[2][0][2]), float(node[2][0][3])
+        except (IndexError, KeyError, TypeError, ValueError):
+            lat = lon = None
+        return pano_id, third or is_third_party_pano_id(pano_id), lat, lon
+
+    out: list[HistoricalPano] = []
+    seen: set[str] = set()
+    if main_date and main_latlon is not None:
+        out.append(
+            HistoricalPano(
+                pano_id=main_id,
+                capture_date=main_date,
+                lat=main_latlon[0],
+                lon=main_latlon[1],
+                third_party=is_third_party_pano_id(main_id),
+                is_current=True,
+            )
+        )
+        seen.add(main_id)
+    for idx, iso in sorted(dates.items()):
+        if idx >= len(nodes) or not iso:
+            continue
+        parsed = _node(nodes[idx])
+        if parsed is None:
+            continue
+        pano_id, third, lat, lon = parsed
+        if pano_id in seen or lat is None:
+            continue
+        seen.add(pano_id)
+        out.append(
+            HistoricalPano(pano_id=pano_id, capture_date=iso, lat=lat, lon=lon, third_party=third)
+        )
+    return SearchResult(code, tuple(out), len(nodes))
 
 
 def parse_search_response(text: str) -> list[HistoricalPano]:
-    """
-    Extract dated official-Google panoramas from one endpoint response.
-
-    The response body is a JS callback wrapping a deeply-nested array. Only
-    panoramas that carry a capture date are returned (undated entries are user
-    contributions, not the official history). Any structural surprise — a shape
-    change from this undocumented endpoint — is swallowed and yields an empty
-    list rather than raising, so one odd response can't abort a sweep.
-
-    Adapted from robolyst/streetview (MIT).
-    """
-    m = _CALLBACK_RE.search(text.strip())
-    if not m:
-        return []
-    try:
-        data = json.loads(m.group(1))
-    except (ValueError, json.JSONDecodeError):
-        return []
-    if not data or data == _NO_IMAGES_SENTINEL:
-        return []
-
-    try:
-        subset = data[1][5][0]
-        raw_panos = subset[3][0]
-        # Dates cover only the last n panos; reverse both so indices align.
-        raw_dates = subset[8] if (len(subset) > 8 and subset[8]) else []
-        raw_panos = raw_panos[::-1]
-        raw_dates = raw_dates[::-1]
-    except (IndexError, KeyError, TypeError):
-        return []
-
-    dates: list[str] = []
-    for d in raw_dates:
-        try:
-            dates.append(f"{d[1][0]}-{int(d[1][1]):02d}")
-        except (IndexError, KeyError, TypeError, ValueError):
-            dates.append("")
-
-    out: list[HistoricalPano] = []
-    for i, pano in enumerate(raw_panos):
-        raw_date = dates[i] if i < len(dates) else ""
-        iso = standardize_capture_date(raw_date)
-        if not iso:
-            continue  # no date -> not official Google history; skip
-        try:
-            pano_id = pano[0][1]
-            lat = pano[2][0][2]
-            lon = pano[2][0][3]
-        except (IndexError, KeyError, TypeError):
-            continue
-        out.append(
-            HistoricalPano(pano_id=str(pano_id), capture_date=iso, lat=float(lat), lon=float(lon))
-        )
-    return out
+    """Every dated pano in one response (the current one first); see ``parse_search``."""
+    return list(parse_search(text).panos)
 
 
 class _CircuitBreaker:
@@ -216,7 +318,7 @@ class _CircuitBreaker:
 
 
 async def _fetch_search(
-    session: aiohttp.ClientSession, url: str, timeout: aiohttp.ClientTimeout
+    session: aiohttp.ClientSession, body: str, timeout: aiohttp.ClientTimeout
 ) -> tuple[int, str]:
     """
     One search request, UNRETRIED. Returns ``(http_status, body)``.
@@ -228,7 +330,9 @@ async def _fetch_search(
     retry attempt takes its own pacer slot there, which is why the retry is
     not a decorator on this function.
     """
-    async with session.get(url, timeout=timeout) as resp:
+    async with session.post(
+        RPC_URL, data=body, headers={"content-type": RPC_CONTENT_TYPE}, timeout=timeout
+    ) as resp:
         if resp.status in (429, 403):
             return resp.status, await resp.text()
         if resp.status == 503:
@@ -273,8 +377,10 @@ QUERY_COLUMNS = [
     "edge_id",
     "sample_idx",
     "http_status",
+    "response_code",
     "panos_total",
     "panos_dated",
+    "panos_third_party",
     "anchor_in_history",
     "fetched_at",
 ]
@@ -294,6 +400,8 @@ SAMPLE_HISTORY_COLUMNS = [
     "capture_date",
     "pano_lat",
     "pano_lon",
+    "third_party",
+    "is_current",
     "harvested_at",
 ]
 
@@ -570,13 +678,13 @@ async def harvest_worklist_async(
         max_time=90,
         factor=fetch_backoff_factor,
     )
-    async def paced_fetch(session, url):
+    async def paced_fetch(session, request_body):
         # Every attempt, retries included, waits for its own pacer slot and is
         # counted: a retry is a request the endpoint sees (issue #198).
         nonlocal api_requests
         await limiter.acquire()
         api_requests += 1
-        return await _fetch_search(session, url, timeout)
+        return await _fetch_search(session, request_body, timeout)
 
     blocked: tuple[str, int | None] | None = None
     capped = False
@@ -617,10 +725,10 @@ async def harvest_worklist_async(
                         capped = True
                         break
                     key = (r.edge_id, int(r.sample_idx))
-                    url = build_search_url(float(r.query_lat), float(r.query_lon))
+                    request_body = build_search_body(float(r.query_lat), float(r.query_lon))
                     fetched_at = now_func().isoformat()
                     try:
-                        status, body = await paced_fetch(session, url)
+                        status, body = await paced_fetch(session, request_body)
                     except (TimeoutError, aiohttp.ClientError) as e:
                         logger.debug("transport failure at %s: %s", key, e)
                         breaker.record(ok=False)
@@ -638,7 +746,8 @@ async def harvest_worklist_async(
                                 "sample_idx": key[1],
                                 "query_lat": float(r.query_lat),
                                 "query_lon": float(r.query_lon),
-                                "url": url,
+                                "url": RPC_URL,
+                                "request": request_body,
                                 "http_status": status,
                                 "fetched_at": fetched_at,
                                 "body": body,
@@ -650,7 +759,8 @@ async def harvest_worklist_async(
                         blocked = (f"HTTP {status} from the endpoint", status)
                         break
                     breaker.record(ok=True)
-                    found = parse_search_response(body)
+                    result = parse_search(body)
+                    found = result.panos
                     anchor = (
                         r.anchor_pano_id
                         if isinstance(r.anchor_pano_id, str) and r.anchor_pano_id
@@ -664,8 +774,10 @@ async def harvest_worklist_async(
                             "edge_id": key[0],
                             "sample_idx": key[1],
                             "http_status": status,
-                            "panos_total": _count_panos(body),
+                            "response_code": result.response_code,
+                            "panos_total": result.panos_total,
                             "panos_dated": len(found),
+                            "panos_third_party": sum(1 for p in found if p.third_party),
                             "anchor_in_history": anchor_in_history,
                             "fetched_at": fetched_at,
                         }
@@ -688,6 +800,8 @@ async def harvest_worklist_async(
                                 "capture_date": p.capture_date,
                                 "pano_lat": p.lat,
                                 "pano_lon": p.lon,
+                                "third_party": p.third_party,
+                                "is_current": p.is_current,
                                 "harvested_at": fetched_at,
                             }
                         )
@@ -754,15 +868,3 @@ def _csv_text(records: list[dict], columns: list[str], *, header: bool) -> str:
     for rec in records:
         w.writerow({c: ("" if rec.get(c) is None else rec.get(c)) for c in columns})
     return buf.getvalue()
-
-
-def _count_panos(body: str) -> int | None:
-    """Every pano node the response carries, dated or not (None if unparseable)."""
-    m = _CALLBACK_RE.search(body.strip())
-    if not m:
-        return None
-    try:
-        data = json.loads(m.group(1))
-        return len(data[1][5][0][3][0])
-    except (ValueError, IndexError, KeyError, TypeError):
-        return None
