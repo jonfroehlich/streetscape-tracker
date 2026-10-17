@@ -1,0 +1,103 @@
+{
+  "generated_by": [
+    "python scripts/size_gsv_history_walks.py <repo_dir> out/summary.json",
+    "python scripts/gsv_history_walk_pair_changes.py <repo_dir> out/pair_changes.json",
+    "python scripts/size_gsv_history_walks.py <repo_dir> out/walk_totals.json --catalog-totals-only"
+  ],
+  "measured_on": "makelab2, production catalog and walk files: backfill and change_rate on 2026-10-09, walk_totals on 2026-10-17 (no network requests)",
+  "scripts_as_run_md5": {
+    "size_walk_history.py": "1e8df8e1c2fef43830c140610468a299",
+    "walk_pair_changes.py": "6e55677392ae341ef87ebaad8931f6ab"
+  },
+  "backfill": {
+    "generated_by": "size_walk_history.py",
+    "generated_at": "2026-10-09T17:47:10-0700",
+    "cities": 1274,
+    "missing_files": 0,
+    "samples": 78141072,
+    "present_samples": 65960216,
+    "google_samples": 64143008,
+    "distinct_all_sum_per_city": 61973742,
+    "distinct_google_sum_per_city": 60569862,
+    "distinct_all_global": 60257773,
+    "distinct_google_global": 58872073,
+    "distinct_google_per_city_pctiles": {
+      "10": 504.3,
+      "25": 1241.0,
+      "50": 5190.5,
+      "75": 29256.75,
+      "90": 120711.70000000004,
+      "99": 644457.95,
+      "100": 1104848.0
+    },
+    "pairs_total": 121,
+    "pairs_aligned": 71,
+    "pairs_days_pctiles": {
+      "10": 35.0,
+      "50": 61.0,
+      "90": 67.0
+    },
+    "pairs_samples": 1191810,
+    "pairs_changed": 45031,
+    "pairs_gained": 13349,
+    "pairs_lost": 227,
+    "pairs_changed_distinct_new_panos": 55792,
+    "pairs_changed_frac_pctiles": {
+      "10": 0.0,
+      "25": 0.0,
+      "50": 0.004769921436588103,
+      "75": 0.042031028107837584,
+      "90": 0.3332766247022797,
+      "99": 0.7954815031019637
+    },
+    "pairs_new_panos_per_day_sum": 1068.0097727816872
+  },
+  "change_rate": {
+    "generated_by": "walk_pair_changes.py",
+    "pairs": 121,
+    "pairs_match_ge_95pct": 121,
+    "match_frac_pctiles": {
+      "0": 1.0,
+      "10": 1.0,
+      "50": 1.0
+    },
+    "days_pctiles": {
+      "10": 49.0,
+      "50": 62.0,
+      "90": 67.0
+    },
+    "google_both": 4513196,
+    "changed": 458571,
+    "changed_newer_date": 301502,
+    "changed_same_date": 134701,
+    "changed_older_date": 22365,
+    "gained": 21719,
+    "lost": 4920,
+    "new_capture_distinct_panos": 311970,
+    "new_frac_pctiles": {
+      "25": 0.0,
+      "50": 0.0007039774727208729,
+      "75": 0.0212495206219712,
+      "90": 0.3033856754786987,
+      "99": 1.0329431547746284
+    },
+    "new_capture_panos_per_day_per_1M_google_samples": 1220.4760937303731
+  },
+  "walk_totals": {
+    "cities": 1274,
+    "edges_total": 8945469,
+    "walks_missing_edges_total": 0,
+    "length_km": 1169629.955,
+    "walks_missing_length_km": 0,
+    "length_km_covered": 940863.091,
+    "walks_missing_length_km_covered": 0,
+    "edges_per_city_pctiles": {
+      "10": 48.0,
+      "50": 493.5,
+      "90": 16276.000000000005,
+      "99": 106049.52999999997,
+      "100": 357773.0
+    },
+    "generated_at": "2026-10-17T08:31:12-0700"
+  }
+}
