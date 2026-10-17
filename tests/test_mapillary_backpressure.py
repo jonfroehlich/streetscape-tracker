@@ -296,18 +296,19 @@ def test_the_tile_session_is_built_with_the_identifying_user_agent(monkeypatch):
     assert session.kwargs.get("headers") == {"User-Agent": dm.MAPILLARY_USER_AGENT}
 
 
-def test_the_user_agent_names_the_project_a_contact_and_the_purpose():
-    ua = dm.MAPILLARY_USER_AGENT
-    # RFC 9110 product token first: no spaces inside it.
-    assert ua.split(" ", 1)[0] == "StreetscapeTracker"
-    assert "https://github.com/jonfroehlich/streetscape-tracker" in ua
-    # The same address the Overpass and Nominatim agents name.
-    from streetscape_metadata_tracker.download_common import OVERPASS_USER_AGENT
+def test_the_user_agent_is_the_projects_one_identity_with_the_lab_contact():
+    """The same string Panoramax sends, from the one builder, so the two cannot
+    drift; its RFC 9110 shape is pinned in tests/test_panoramax.py."""
+    from streetscape_metadata_tracker import download_panoramax as dp
+    from streetscape_metadata_tracker.download_common import STREETSCAPE_USER_AGENT_CONTACT
 
-    assert dm.MAPILLARY_USER_AGENT_CONTACT in OVERPASS_USER_AGENT
-    assert dm.MAPILLARY_USER_AGENT_CONTACT in ua
-    assert "research" in ua
-    assert ua.endswith(f"aiohttp/{aiohttp.__version__}")
+    ua = dm.MAPILLARY_USER_AGENT
+    assert ua == dp.USER_AGENT
+    assert STREETSCAPE_USER_AGENT_CONTACT == "sidewalk@cs.uw.edu"
+    assert ua == (
+        "StreetscapeTracker/1.0 (+https://github.com/jonfroehlich/streetscape-tracker; "
+        f"sidewalk@cs.uw.edu) aiohttp/{aiohttp.__version__}"
+    )
     # Never a credential: the token rides in the URL, and this string is logged.
     assert "MLY" not in ua and "token" not in ua.lower()
 

@@ -117,6 +117,7 @@ from .download_common import (
     crawl_ceiling_needs_checkpoint,
     crawl_deadline_passed,
     redact_credentials,
+    streetscape_user_agent,
 )
 from .download_common import assign_to_grid as assign_to_grid
 from .download_common import grid_bbox as grid_bbox
@@ -148,20 +149,10 @@ IMAGE_LAYER = "image"
 # one is read, so this is a courtesy whose effect is UNKNOWN, not a fix: what it
 # buys is that anyone at Mapillary reading their logs can write to a person.
 #
-# Shape follows `download_common.OVERPASS_USER_AGENT` (project, contact) and
-# download_panoramax's RFC 9110 layout -- a product token with no spaces, a
-# comment, then the library -- with "research" saying what the traffic is for.
-# No project version: the repo has none short of shelling out to git, and the
-# "1.0" Panoramax sends is not one. The aiohttp token is the real version, so it
-# cannot drift. Mapillary ONLY: the other providers' agents are their own
-# constants and are deliberately not changed here.
-MAPILLARY_USER_AGENT_CONTACT = "jonf@cs.uw.edu"
-MAPILLARY_USER_AGENT = (
-    "StreetscapeTracker "
-    "(+https://github.com/jonfroehlich/streetscape-tracker; "
-    f"{MAPILLARY_USER_AGENT_CONTACT}; academic research) "
-    f"aiohttp/{aiohttp.__version__}"
-)
+# The SAME string the Panoramax collector sends, from the one builder
+# (download_common.streetscape_user_agent): one project, one identity, and the
+# contact address Jon chose in #405 rather than a second hand-written copy.
+MAPILLARY_USER_AGENT = streetscape_user_agent(f"aiohttp/{aiohttp.__version__}")
 
 
 # ── Slippy-map tile math (stdlib only) ─────────────────────────────────────

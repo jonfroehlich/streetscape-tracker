@@ -859,13 +859,15 @@ Rolling it into the scheduler's `Done:` line is #444's scheduler half.
 The one session the census opens is built with
 
 ```
-StreetscapeTracker (+https://github.com/jonfroehlich/streetscape-tracker; jonf@cs.uw.edu; academic research) aiohttp/<version>
+StreetscapeTracker/1.0 (+https://github.com/jonfroehlich/streetscape-tracker; sidewalk@cs.uw.edu) aiohttp/<version>
 ```
 
 (`download_mapillary.MAPILLARY_USER_AGENT`) in place of aiohttp's stock agent, the one every scraper sends.
-The contact is `OVERPASS_USER_AGENT`'s, the layout is the RFC 9110 product-plus-comment that Panoramax's agent uses, and there is no project version because the repo has none short of shelling out to git.
+It is the **same string the Panoramax collector sends**, built by one function, `download_common.streetscape_user_agent`, so the two providers cannot drift apart.
+The contact address was chosen by Jon for the Panoramax agent in #405 (commit `8bc6f35`): a shared lab address rather than a personal one.
+The layout is RFC 9110's product token plus a comment, as the Panoramax section above describes.
 Since no Mapillary page says a `User-Agent` is read, **its effect on blocking is unknown**: what it buys is that someone reading Mapillary's logs can write to a person instead of refusing an IP.
-It also makes our traffic trivially identifiable, which is the point, and is the trade the Panoramax agent already made (#405).
+It also makes our traffic trivially identifiable, which is the point.
 
 ### Backpressure on 429 and 503
 

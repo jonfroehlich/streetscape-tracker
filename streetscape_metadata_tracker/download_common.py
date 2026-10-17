@@ -206,6 +206,38 @@ OVERPASS_URL_ENV = "OVERPASS_URL"
 OVERPASS_USER_AGENT = "streetscape_metadata_tracker (jonf@cs.uw.edu)"
 OVERPASS_REFERER = "https://github.com/jonfroehlich/streetscape-tracker"
 
+# The project's identifying User-Agent for the tile hosts that read none of the
+# Nominatim/Overpass conventions above (Panoramax since #405, Mapillary since
+# #444). The contact address is Jon's choice, made for Panoramax in #405
+# (commit 8bc6f35): a shared lab address, not a personal one.
+#
+# Shape, per RFC 9110 sec. 10.1.5 (`product *( RWS ( product / comment ) )`,
+# where a product is `token ["/" version]` and a token has NO spaces -- hence
+# `StreetscapeTracker`, not "Streetscape Tracker") and per the Wikimedia
+# User-Agent policy's `<client name>/<version> (<contact information>)
+# <library>/<version>`, which is the convention OSM's own services (Nominatim:
+# "identifying the application ... stock User-Agents ... will not do") read.
+#
+# A BUILDER, not a finished string, so this module need not import aiohttp
+# (the scheduler imports it, and is a long-lived parent under a memory cap):
+# each caller passes its real HTTP library token, which therefore cannot drift.
+STREETSCAPE_USER_AGENT_CONTACT = "sidewalk@cs.uw.edu"
+
+
+def streetscape_user_agent(library: str) -> str:
+    """
+    The project User-Agent, ending in the caller's HTTP library token.
+
+    >>> streetscape_user_agent("aiohttp/3.9.5")
+    'StreetscapeTracker/1.0 (+https://github.com/jonfroehlich/streetscape-tracker; sidewalk@cs.uw.edu) aiohttp/3.9.5'
+    """
+    return (
+        "StreetscapeTracker/1.0 "
+        f"(+https://github.com/jonfroehlich/streetscape-tracker; {STREETSCAPE_USER_AGENT_CONTACT}) "
+        f"{library}"
+    )
+
+
 # osmnx's own `settings.http_accept_language` default, restated here so the
 # re-check can build osmnx's exact header set without importing osmnx.
 # download_street_network.py assigns it to osmnx explicitly, as it does the
