@@ -529,6 +529,11 @@ def test_the_third_429_pauses_the_crawl_with_exit_83_not_a_refusal(
     assert limiter.slowdowns == [2.0], "halved ONCE per crawl, not per response"
     (line,) = _status_lines(caplog)
     assert " 429=3 " in line and " requests=5 retries=2 " in line
+    # The pause warning cannot know yet which way the crawl ends, so it must
+    # not claim "checkpointed" outright (review of #444): it names both.
+    (warning,) = [r.getMessage() for r in caplog.records if "pausing the crawl" in r.getMessage()]
+    assert "exit 83" in warning and "plain failure" in warning
+    assert "NOT a refusal" in warning
 
 
 def test_the_backpressure_pause_phrase_is_what_the_scheduler_reads_back(
@@ -691,3 +696,58 @@ def test_a_shorter_hold_never_cuts_short_a_longer_one(monkeypatch):
     asyncio.run(scenario())
     assert slept == [pytest.approx(10.0), pytest.approx(90.0)]
     assert clock["t"] == pytest.approx(100.0)
+
+
+def test_no_request_goes_out_after_the_pause_decision(monkeypatch, tmp_path, limiters):
+    """Review of #444: with five sockets and a limiter that takes real time,
+    requests already waiting on the pacer used to be released AFTER the third
+    429 decided to pause -- four of seven in the reproduction. A closed pacer
+    turns them away uncommitted instead."""
+    real_sleep = asyncio.sleep
+
+    async def slow_acquire(self):
+        await real_sleep(0.002)
+
+    async def hold(seconds):
+        await real_sleep(0.01)
+
+    monkeypatch.setattr(_RecordingLimiter, "acquire", slow_acquire)
+    monkeypatch.setattr(dm, "_backpressure_sleep", hold)
+
+    sessions = []
+    script = {xy: [status(429)] for xy in _TILES[:3]}
+
+    def build(**kwargs):
+        sessions.append(_ScriptedSession(script, **kwargs))
+        return sessions[-1]
+
+    sent_at_pause = []
+
+    class _AtPause(logging.Handler):
+        def emit(self, record):
+            if "pausing the crawl" in record.getMessage():
+                sent_at_pause.append(len(sessions[0].urls))
+
+    handler = _AtPause()
+    logging.getLogger(dm.__name__).addHandler(handler)
+    monkeypatch.setattr(dm.aiohttp, "ClientSession", build)
+    try:
+        # A pause either way: exit 83 if a tile committed first, else the
+        # plain no-checkpoint failure. Which one depends on scheduling.
+        with pytest.raises(DownloadError) as excinfo:
+            asyncio.run(
+                dm.fetch_city_images_async(
+                    "Test City",
+                    _BBOX,
+                    "MLY|test|token",
+                    connection_limit=5,
+                    checkpoint_path=str(tmp_path / "cp"),
+                )
+            )
+    finally:
+        logging.getLogger(dm.__name__).removeHandler(handler)
+
+    assert len(sent_at_pause) == 1, "the crawl must decide to pause exactly once"
+    assert len(sessions[0].urls) == sent_at_pause[0], "a request went out after the pause"
+    assert excinfo.value.api_requests == len(sessions[0].urls)
+    assert "backpressure limit" in str(excinfo.value)

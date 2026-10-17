@@ -738,6 +738,18 @@ def backpressure_wait_seconds(retry_after_s: float | None) -> float | None:
     return max(retry_after_s or 0.0, TILE_BACKPRESSURE_MIN_WAIT_S)
 
 
+class _CrawlPaused(Exception):
+    """
+    Raised by a closed :class:`_BackpressurePacer` instead of releasing a request.
+
+    The crawl decided to pause while this request was waiting for its turn, so
+    it must not go out (issue #444 review): the tile is turned away uncommitted,
+    exactly as one the pause check refuses. Not an aiohttp.ClientError, so
+    ``@backoff`` does not retry it, and raised BEFORE ``on_request``, so no
+    request is counted for it -- none was sent.
+    """
+
+
 class _BackpressurePacer:
     """
     One crawl's pacer: the rate limiter, plus a gate a 429/503 can close.
@@ -751,6 +763,10 @@ class _BackpressurePacer:
     A request that was already queued on the limiter when a hold began is sent
     back to wait the hold out (the ``_holds`` generation check), so nothing
     slips out during a hold that was opened after it passed the gate.
+
+    :meth:`close` is the pause's half of the same rule: once the crawl has
+    decided to pause, every request still waiting here -- at the gate, or
+    queued on the limiter -- raises :class:`_CrawlPaused` instead of going out.
     """
 
     def __init__(self, limiter: Any, clock: Callable[[], float] | None = None):
@@ -768,6 +784,7 @@ class _BackpressurePacer:
         self._holds = 0
         self._hold_until = 0.0
         self.slowed = False
+        self.closed = False
 
     def _now(self) -> float:
         if self._clock is not None:
@@ -776,12 +793,21 @@ class _BackpressurePacer:
 
     async def acquire(self) -> None:
         while True:
+            if self.closed:
+                raise _CrawlPaused()
             seen = self._holds
             async with self._gate:
                 pass  # waits out any hold in progress
             await self._limiter.acquire()
-            if self._holds == seen:
+            if self._holds == seen and not self.closed:
                 return
+
+    def close(self) -> None:
+        """Release no further request from this crawl: it is pausing."""
+        self.closed = True
+        # A new generation, so a request mid-way through `acquire` loops back
+        # and meets the closed check rather than returning.
+        self._holds += 1
 
     async def hold(self, seconds: float) -> None:
         """Keep every request of this crawl from going out for ``seconds``."""
@@ -1914,9 +1940,16 @@ async def _fetch_city_images(
         backpressure_paused = True
         if stop_reason is None:
             stop_reason = SWEEP_STOP_BACKPRESSURE
+        # Nothing more goes out from this crawl, including requests already
+        # waiting on the pacer (review of #444: they used to be released).
+        pacer.close()
+        # Which way the crawl ends is decided after the gather, by whether any
+        # tile is committed by then, so the warning names both outcomes rather
+        # than guessing.
         logger.warning(
             f"Mapillary tile CDN backpressure for {city_name}: {backpressure_detail}; "
-            f"pausing the crawl (checkpointed, exit 83), NOT a refusal"
+            f"pausing the crawl, NOT a refusal: it ends as a checkpointed pause (exit 83) "
+            f"if any tile is committed to resume from, otherwise as a plain failure"
         )
         return None
 
@@ -2012,6 +2045,7 @@ async def _fetch_city_images(
                 # loop cannot interleave another task into the gap.
                 reserved += 1
                 slow_down_please: TileBackpressureError | None = None
+                turned_away = False
                 try:
                     # Pacing/counting happen inside _fetch_tile, per retried attempt.
                     tile_bytes = await _fetch_tile(
@@ -2022,6 +2056,10 @@ async def _fetch_city_images(
                     # _fetch_tile. Handled below, after the reservation is
                     # released, so a hold never pins a reservation open.
                     slow_down_please = e
+                except _CrawlPaused:
+                    # Waited on the pacer and the crawl paused meanwhile: no
+                    # request was sent or counted for this attempt.
+                    turned_away = True
                 except DownloadError as e:
                     # ONLY DownloadError trips the abort. Per-tile failures
                     # (aiohttp.ClientResponseError from a 404/5xx, or a decode
@@ -2040,6 +2078,12 @@ async def _fetch_city_images(
                     # whether the attempt succeeded, failed or exhausted its
                     # retries, so releasing it double-counts nothing.
                     reserved -= 1
+                if turned_away:
+                    # The pause check's own outcome: uncommitted, owed to the
+                    # resume, and never past the raise before the settle loop.
+                    capped = True
+                    progress_bar.update(1)
+                    return records_to_census([])
                 if slow_down_please is None:
                     break
                 wait = on_backpressure(slow_down_please)
