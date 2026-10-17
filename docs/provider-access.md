@@ -363,6 +363,7 @@ The budgets were left at 1,750 for the restart because a fourth cut has no mecha
 
 **This is a pre-registered test, not a fix**, and the prediction is recorded in #286 before the restart.
 Blocks 2 and 3 each landed **on the 6th active collection night**: 08-13…08-20 and 08-23…08-28 are each a run of six collecting nights ending in the block.
+**Caveat (2026-10-17, #444):** 08-13 and 08-14 fell inside block 1 (see the correction above), so their traffic was mostly refused requests; counting only nights that were served, block 2 came after four nights, not six, and the regularity holds for block 3 alone.
 Two observations, not three — block 1 (08-12) came from a bulk catch-up sustaining ~370 req/min rather than from a six-night restart — so this is an n=2 regularity and the read-out below is only as strong as that.
 Those two runs were also 8 calendar days apart, but only because each happened to contain exactly two paused days — so the calendar reading and the active-night reading coincided by accident.
 This restart has no paused days, so the two PREDICTIONS diverge — six active nights lands on 09-04, where carrying the priors' 8-calendar-day block-to-block spacing forward from 08-28 lands on 09-05 — and the active-night rule is the one stated here.
@@ -383,7 +384,7 @@ All eleven ran clean, and the evidence that carries this is the collect logs: **
 `schedule_state.consecutive_failures` is deliberately NOT quoted as evidence here, and should not be: `db.record_attempt` zeroes it on every success and the column is current state keyed by (city, channel) rather than a per-night record, so an all-zero read today is equally consistent with a blocked night followed by a success.
 Night 6 (09-04) is the night both prior blocks landed on and the night #286 named in advance; it passed, and so did the five after it.
 Eleven active nights is **1.8× the six-active-night interval that preceded blocks 2 and 3**, so the interval that generated the prediction has been cleared with room to spare.
-Be honest about that interval's strength: it is an **n=2** regularity, not n=3 — block 1 (2026-08-12) came from a bulk catch-up sustaining ~370 req/min, not from a six-night restart — and the read-out is only as strong as the rule it cleared.
+Be honest about that interval's strength: it is an **n=2** regularity at best, not n=3 (n=1 if only served nights count — see the caveat above) — block 1 (2026-08-12) came from a bulk catch-up sustaining ~370 req/min, not from a six-night restart — and the read-out is only as strong as the rule it cleared.
 **Grid-channel** spend across the window, per night: 755 / 950 / 1,241 / 1,037 / 1,736 / 1,723 / 862 / 1,343 / 1,593 / 543 / 1,162 requests.
 Those are the `mapillary` column alone, and the quantity the block is keyed on is the **combined** per-IP one: the ledger above pairs 09-03's 1,736 with a 524-request walk for **2,260**, the highest combined night the ledger RECORDS.
 The walk's per-night spend for 09-05…09-09 is not in that ledger, so read the last five figures as a **floor** on the combined load rather than as the load itself — and therefore as a reason not to call 2,260 the window's maximum.
