@@ -537,6 +537,67 @@ Pre-#385 code refuses a v16 catalog ("newer than this code supports") on every s
 Rolling back past #367 (v17) as well needs more than the stamp: old code builds `RunRow(**dict(row))` from `SELECT * FROM runs`, so the two query-radius columns must be dropped (`ALTER TABLE runs DROP COLUMN status_out_of_radius`, then `query_radius_m`) before it can read a run.
 Re-deploying after such a rollback does **not** re-backfill (the table is no longer empty), so spend made while rolled back is missing from the window until it would have aged out anyway.
 
+## Standing host holds, persisted refusals and `probe-host` (issue #444, added 2026-10-17)
+
+**A HOLD keeps a per-IP host's channels from launching without anything having refused us.**
+There are two kinds, both configured per host token beside the rolling budget:
+
+- `rest_weekdays = ["Wed", "Sun"]` — on a run dated one of these weekdays, no channel that touches the host launches.
+- `refusal_cooldown_h = 36` — for this many hours after the newest `refused` row in `host_refusals`, no channel that touches the host launches.
+
+Prod sets both on `[hosts.mapillary_tiles]`, so they hold `mapillary` and `mapillary_streets` and nothing else; GSV, KartaView and Panoramax run every night.
+Unset means no hold, and the night reads exactly as it did before #444.
+
+**A hold is not a refusal.**
+It lives on the breaker (`HostBreaker.holds`, `held`, `held_launches`) but outside its set, so `bool(breaker)`, which drives the alert and the exit status, never sees it.
+A held launch records no attempt, trips nothing, alerts nobody and touches no `consecutive_failures`, so the city stays due and leads a later night.
+It is not a stranding either: a hold covers every channel on the host, so a walk's grid sibling on the same host is held too.
+It is the same posture as the fill's "holding <channel>" backlog, and it is reported the same way: once at WARNING when the run starts, at INFO per skipped launch, and as `HELD <host>: rest night (Wed), N launch(es) held, cities stay due` (or `cooling down until <T> (...)`) on the `Done:` line, in `run-due --dry-run` and in `assess-city`'s summary.
+`scheduler status` prints each host's rest weekdays (and whether today is one) and whether it is cooling down.
+
+**One gate, every path.**
+The hold is asked at the submit gate in `_run_city_channels`, before the breaker (so a held host never spends a re-check), which means the due loop, the stranded-walk retry, the fill and `assess-city` all honour it — and so does the supported catch-up, `run-due --provider mapillary --limit N`.
+The fill declines a city whose channel is on a held host (`_FILL_BLOCKER_HOST_HELD`), because a fill city is admitted whole or not at all; on a rest night the due slate's unattempted Mapillary pairs also hold the fill's Mapillary channels as a backlog, so in practice the fill does not touch the host at all.
+`assess-city` treats a held channel as an incomplete answer (exit 1), like a refused one, without claiming anything refused us.
+`run-due --ignore-host-holds` lifts both kinds for one invocation, logged at WARNING; the nightly unit never passes it.
+
+**The rest night is read on the run's snapshot date: the UTC calendar date** (`clock.snapshot_date_today()`, #347), the same date that dates every run it collects and keys its `api_usage` rows.
+The nightly fires at 02:00 Pacific, i.e. 09:00 or 10:00 UTC, the same calendar day in both zones, so a Wednesday night is a Wednesday wherever you read it.
+A hand-run catch-up after 17:00 Pacific is already the next UTC day, and is held or not by that day.
+A night is held for its whole run by its date, even past UTC midnight, exactly as all its runs carry one date.
+**A rested city's Mapillary snapshot un-pairs from its GSV one**: the Maintainer chose a Mapillary-only rest over resting every channel (which would have kept pairing), and #444 records that trade.
+
+**The cooldown is read once, when the run builds its holds, and against the wall clock at each launch.**
+It holds until the newest refusal plus the cooldown, so it can END mid-night (a night that starts 30 h after a refusal under 36 h resumes Mapillary 6 h in), and it never STARTS mid-night: a refusal tonight is the breaker's.
+**Only the newest REFUSAL counts**; a clearance from `probe-host` never shortens it, because one positive probe says the wall is down, not that full volume is safe again.
+It exists for the 02:00 nightly: on 2026-10-17 that launch re-probed the IP about 20 h into a block and was refused on its first request.
+
+**A bad hold key fails CLOSED**, the same way an invalid budget does: a rest list that is not a list of distinct three-letter weekday names (all seven is refused too; that is `enabled = false`), or a cooldown that is not a number of hours in (0, 168], is recorded in `host_budget_errors`, and `run-due`, `assess-city` and `probe-host` refuse with 64.
+Dropping the entry instead would run the host on the very night it was meant to rest, or let the nightly re-probe the IP the cooldown leaves alone — fail-open on keys whose only effect is less traffic.
+The cost is the whole night rather than one host, accepted because it is loud (the unit fails and `notify-failure` emails it) and reachable only through an edit to a config a test pins.
+A section must hold at least one known key and nothing else, and one bad key refuses the whole section, budget included.
+
+**`host_refusals` (schema v22) is the persisted record.**
+A `refused` row is written wherever the scheduler classifies a child exit as a host refusal (the blocked family, 75/76/81/84), beside the breaker trip, with the command (`run-due` or `assess-city`), channel, city, exit code, reason and `requests_before` — the host's `host_usage` total over the prior 24 h, NULL for an unmetered host such as Overpass.
+A busy exit writes nothing; a failed write is logged and swallowed, since the breaker already has the refusal.
+`scheduler status` prints, per host with a row, the last refusal and how long ago, the last clearance, and the last ledgered request on the host.
+
+**`probe-host HOST` sends exactly one request and records the verdict.**
+For `mapillary_tiles` it is the z14 tile 2581/5921 (downtown Corvallis, Oregon; 269 distinct images in the 2026-07-06 census) with `MAPILLARY_ACCESS_TOKEN`, redirects not followed.
+A redirect, a 200 error page or a 429 is REFUSED (exit 75); a tile or a 404 is CLEARED (exit 0); a rejected token, a 5xx or no response is inconclusive (exit 1) and records nothing.
+A request that got an answer is charged to the `mapillary` ledger.
+It refuses (64, nothing sent) while any `run-due` is in flight (`_run_due_in_flight`) and inside the host's cooldown unless `--force`, and exits 79 when another process holds the host lock.
+The lock is taken in `host_probe.py`, never in `scheduler.py`, whose source must not name the lock module (#208): the parent-must-not-hold rule is about children it spawns, and `probe-host` spawns none.
+It retires the untracked two-request `probe_mapillary_block.sh` on makelab2.
+
+**The `Done:` line also names each metered host's presence** — `on <host> 09:06-15:44 UTC (6.7 h), 17.6 h after its previous ledgered request` — the first launch to the last finish of any channel touching it, and the gap back to the newest `host_usage` stamp from before the run (each child stamps once, at its end, so that is the previous run's last finish).
+It is there because #444's best-fitting reading of the blocks is hours of presence per day, which no other record held.
+
+**Deploying v22.**
+`import-bundle` requires the bundle's catalog at exactly this host's `SCHEMA_VERSION`, so import any waiting v21 bundle first.
+Pre-#444 code refuses a v22 catalog, so a rollback needs `PRAGMA user_version = 21` set by hand; the extra table is harmless to old code.
+The migration backfills nothing: refusals before the deploy are in the logs only, so the first cooldown a v22 night can see counts from a refusal recorded after it — record one with `probe-host` if the host is mid-block at deploy time.
+
 ## What a capped night spends its slots on (issue #308, added 2026-09-02)
 
 **Breadth-first was never a decision; it was the shape of a tiebreak, and this section is that tiebreak given a name and a lever.**
@@ -843,6 +904,8 @@ scheduler run-due --provider panoramax,panoramax_streets --limit 5
 
 The same recipe is how a KartaView tranche is exercised, and it is the only supported bulk path either way — never a detached script.
 The filtered run advances only those channels' clocks, which for a first collection costs nothing (there is no paired snapshot to un-pair yet).
+
+**`probe-host HOST [--force]`** (#444) sends exactly one request to a per-IP host, prints the verdict and records it in `host_refusals`; it refuses while a `run-due` is in flight and inside the host's refusal cooldown unless `--force`. See the standing-holds section above.
 
 **`notify-failure`** emails the recent scheduler-log tail and is wired as the unit's `OnFailure=` hook (`deploy/systemd/streetscape-tracker-notify@.service`), so a crash that never reaches the in-run alerting still produces an email.
 It exits 0 when it alerted (or alerting is intentionally off) and 1 only when a send was attempted and failed, so the notify unit's own status is meaningful.

@@ -320,6 +320,7 @@ Both figures are upper bounds, and the measured/reported/guessed tiers below mus
   That claim remains untested in both directions: both times we chose silence over the retry experiment, deliberately.
 - **The protocol, proven twice:** disable both Mapillary channels **immediately**, sweep for detached processes, keep true silence, then a **single-request** probe per application daily starting ~24 h after the last refused request.
   An automated version (`probe_mapillary_block.sh` plus a self-disarming systemd user timer, untracked, emails the verdict either way) lives on makelab2 from the second incident.
+  Since #444 the single request is `scheduler probe-host mapillary_tiles`, which sends one request (the script sends two) and records the verdict in `host_refusals`.
   Re-enabling the channels stays a human decision — make it **promptly** on a clean probe, since both incidents' channels sat dark longer than their bans.
   And n=2 with upper bounds only: do not infer a shorter wait works, and do not probe more than once a day.
 
@@ -429,6 +430,37 @@ Like every budget here it is a **soft ceiling**: in-flight retries can overshoot
 Mechanism, ledger and reporting: `docs/scheduler.md`, the rolling-24h section.
 
 Mapillary's own documentation and forum were re-read before this landed (2026-09-29): the API docs still give only the per-app `tiles.mapillary.com` limit of 50,000 per day, and [thread 10644](https://forum.mapillary.com/t/50-000-requests-day-rate-limit-scope/10644) still ends at this project's own 2026-08-28 question, unanswered, so nothing published speaks to the per-IP layer beyond the staff reply above.
+
+## Every-second-night blocks, and the staged response (issue #444, 2026-10-17)
+
+**From 2026-10-10 the tile CDN refused makelab2 every second night, and on 10-17 the block carried over**: the night's first tile was refused about 20 h after the 10-16 onset.
+The diagnosis, the measured tables and the ranked hypotheses are in [#444](https://github.com/jonfroehlich/streetscape-tracker/issues/444); what follows is what changed in code and config, and why.
+The short version of the diagnosis: no volume window from 12 h to 7 d, and no leaky bucket, separates blocked onsets (rolling 24 h at 1,631–2,287) from clean night ends (up to 3,481); what changed on 10-05 is that the fill (#404) made every night a ~2k-request Mapillary night with 6–9 h of presence, back to back, and the blocks began on the sixth such night.
+The best fit, **inferred and not measured**, is a per-IP reputation with slow decay that sustained daily presence feeds (H1); the cheap discriminators are whether the CDN sends 429s before the wall (H2, needs the per-status counts) and whether a request made while blocked extends the block (H3).
+
+**Stage 1 (config, prod):** `[hosts.mapillary_tiles].rolling_24h_request_budget` 3,000 → **1,200**, `[schedule].fill_host_ceilings.mapillary_tiles` 2,260 → **600**, `[providers.mapillary].daily_request_budget` 3,500 → **1,500**.
+The pace stays at 40/min with CV 0.6: slowing it would lengthen presence, the axis that moved most.
+Steady-state need is ~800/day (#385), so the 90-day cycle still fits, and fill refreshes mostly stop on this host.
+**Falsifier:** blocks continue at ≤ 1,200/night with two rest nights a week → volume and daily presence are not the inputs. Clean for three weeks → step up at most 25% a week, one knob at a time.
+
+**Rest nights (`rest_weekdays = ["Wed", "Sun"]`):** two nights a week with zero Mapillary presence, on the run's UTC snapshot date, while every other channel runs.
+A Mapillary-only rest, by the Maintainer's choice, so a rested city's Mapillary snapshot lands on a later night than its GSV one; the alternative (rest every channel through the timer) keeps pairing and costs GSV two nights a week.
+A rest night is a standing hold, not a refusal: no alert, no breaker trip, no failure, and the cities stay due.
+
+**The cross-night refusal cooldown (`refusal_cooldown_h = 36`):** for 36 h after the newest recorded refusal, no channel on the tile CDN launches.
+It exists because the 02:00 nightly re-probed the IP ~20 h into the 10-16 block, and if H3 holds, that request is the most expensive one we make.
+36 h is past every block measured so far (≤ 16.6 h on 10-14/15, > 19.8 h on 10-16/17), and the hold ends mid-night rather than costing the whole night.
+**Falsifier for H3:** if blocks clear in the same time whether or not we probed at ~20 h, probing does not extend them, and the cooldown can shrink.
+
+**Refusals are now persisted** (`host_refusals`, schema v22), with each one's `requests_before` (the host's 24 h ledger total at the refusal), and the `Done:` line names each metered host's hours of presence and the gap since its previous ledgered request — the two quantities #444 had to rebuild by hand for every onset.
+
+**`scheduler probe-host mapillary_tiles` replaces the untracked probe script** in the recovery protocol below: exactly one request, one z14 tile, one token, redirects not followed, the verdict recorded, and refused while a `run-due` is in flight or inside the cooldown unless `--force`.
+A clearance it records does not end the cooldown; only the newest refusal is counted.
+Mechanism, posture and tests: `docs/scheduler.md`, the standing-holds section, and `docs/testing.md`.
+
+Not done here, and why: the per-status response counts, the identifying User-Agent and the 429/`Retry-After` backoff (Stages 2 and 4) live in `download_mapillary.py` and `download_common.py`, on a separate branch.
+The forum post and the support email (Stage 5) each need the Maintainer's OK.
+Per this file's opening rule, Mapillary's API docs and forum must be re-read before this is DEPLOYED: it changes how often and how much we ask (every change in the direction of less), and they were not re-read in the session that wrote it.
 
 ## Per-IP hosts and the cross-process host lock (issue #208)
 
