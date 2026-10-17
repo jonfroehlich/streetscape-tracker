@@ -277,3 +277,36 @@ def test_retry_after_values_are_capped_in_the_line_but_counted():
     shown = ",".join(str(i) for i in range(dm.TILE_RETRY_AFTER_LOG_CAP))
     assert f"retry_after=[{shown},+5 more]" in line
     assert f"429={dm.TILE_RETRY_AFTER_LOG_CAP + 5} " in line
+
+
+# ── Stage 4: an identifying User-Agent ─────────────────────────────────────
+
+
+def test_the_tile_session_is_built_with_the_identifying_user_agent(monkeypatch):
+    """Pinned at the CONSTRUCTION SITE: the session the census actually opens.
+
+    A constant-only test would stay green if the session were built without it
+    -- the shape #292's jitter default once shipped in. The session stand-in
+    records the kwargs it was built with, and the real ``_fetch_tile`` then
+    issues every request through that same object.
+    """
+    result, session = _crawl(monkeypatch, {})
+
+    assert result["api_requests"] == len(_TILES) == len(session.urls)
+    assert session.kwargs.get("headers") == {"User-Agent": dm.MAPILLARY_USER_AGENT}
+
+
+def test_the_user_agent_names_the_project_a_contact_and_the_purpose():
+    ua = dm.MAPILLARY_USER_AGENT
+    # RFC 9110 product token first: no spaces inside it.
+    assert ua.split(" ", 1)[0] == "StreetscapeTracker"
+    assert "https://github.com/jonfroehlich/streetscape-tracker" in ua
+    # The same address the Overpass and Nominatim agents name.
+    from streetscape_metadata_tracker.download_common import OVERPASS_USER_AGENT
+
+    assert dm.MAPILLARY_USER_AGENT_CONTACT in OVERPASS_USER_AGENT
+    assert dm.MAPILLARY_USER_AGENT_CONTACT in ua
+    assert "research" in ua
+    assert ua.endswith(f"aiohttp/{aiohttp.__version__}")
+    # Never a credential: the token rides in the URL, and this string is logged.
+    assert "MLY" not in ua and "token" not in ua.lower()
