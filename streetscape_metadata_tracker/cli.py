@@ -66,7 +66,6 @@ from .city_registration import (
 from .diff import compute_run_diff, generate_diff_filename, sync_diff_detail
 from .download_common import (
     SWEEP_INCOMPLETE_EXIT_CODE,
-    HostBlockedError,
     HostBusyError,
     HostUnavailableError,
     SweepIncompleteError,
@@ -857,15 +856,12 @@ async def async_main():
                 # If one channel found the host blocked and another merely found
                 # it busy, report BLOCKED: over-reacting costs the night's
                 # remaining channels on that host, under-reacting keeps firing
-                # into a CDN that is already refusing us. THROTTLED (#444) sits
-                # between them: it latches the host too, but records no
-                # refusal, so a real refusal beside it must win.
+                # into a CDN that is already refusing us. THROTTLED (#444) needs
+                # no rank of its own: only the Mapillary tile host raises it, and
+                # a grid run has one Mapillary provider, so it never meets a
+                # BLOCKED error from the same host here.
                 worst = next(
-                    (e for e in unavailable if isinstance(e, HostBlockedError)),
-                    next(
-                        (e for e in unavailable if not isinstance(e, HostBusyError)),
-                        unavailable[0],
-                    ),
+                    (e for e in unavailable if not isinstance(e, HostBusyError)), unavailable[0]
                 )
                 return host_exit_code(worst)
             return 1
