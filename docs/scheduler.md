@@ -677,8 +677,9 @@ A declined city is skipped and the next one asked, as the due loop does for a bu
 The motivating case is in the issue: today a due city whose Mapillary run does not fit still gets its GSV run, which un-pairs its snapshots and strands it behind the hoist (#301, #341); a fill city never does.
 
 **The fill ceiling is lower than the budget on purpose, and it is fixed.**
-Prod sets `fill_host_ceilings = { mapillary_tiles = 2260 }` under the 3,000 `[hosts.mapillary_tiles]` budget, every night with no ramp (Jon, 2026-10-02): 2,260 is the highest combined night the #292 window measured clean (`docs/provider-access.md`).
-The due slate keeps the whole 3,000, and the fill takes only what is left under 2,260 — so the fill fills unused capacity and never raises any ceiling.
+Prod set `fill_host_ceilings = { mapillary_tiles = 2260 }` under the 3,000 `[hosts.mapillary_tiles]` budget, every night with no ramp (Jon, 2026-10-02): 2,260 is the highest combined night the #292 window measured clean (`docs/provider-access.md`).
+The due slate keeps the whole budget, and the fill takes only what is left under its ceiling — so the fill fills unused capacity and never raises any ceiling.
+**Since 2026-10-17 (#444, Stage 1) the pair is 600 under 1,200**: 2,260 did not protect, because the fill made every night a ~2,255-request Mapillary night back to back, and the tile CDN began refusing this IP every second night on the sixth such night.
 GSV metadata has no per-IP host and no charge, so on gsv only the daily budget and the deadline bound it.
 
 **The fill never borrows tomorrow's due room** (Jon, 2026-10-02).

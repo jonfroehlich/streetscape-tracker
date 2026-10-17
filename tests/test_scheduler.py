@@ -1099,12 +1099,15 @@ def test_makelab1_production_config_is_wired():
     # 2026-09-05, once the pre-registered jitter window closed — a 20-city budget
     # meeting the 40-city night #304 created, not a relaxation of the block posture.
     # The walk channel is unchanged: since #290 it spends 0 on a paired night.
-    assert cfg.providers["mapillary"].daily_request_budget == 3_500
+    # #444 Stage 1 (2026-10-17) cut the grid channel 3,500 -> 1,500 after the
+    # CDN began refusing this IP every second night; pacing stayed put.
+    assert cfg.providers["mapillary"].daily_request_budget == 1_500
     assert cfg.providers["mapillary_streets"].daily_request_budget == 1_750
     # And the pool both of them draw from over a rolling 24 h (#385), added after
-    # block 4. Pinned exactly, with no load error, so a prod change to the one
-    # guard that bounds the pair's combined volume is a red test.
-    assert cfg.host_budgets == {"mapillary_tiles": 3_000}
+    # block 4 and cut 3,000 -> 1,200 by #444 Stage 1. Pinned exactly, with no
+    # load error, so a prod change to the one guard that bounds the pair's
+    # combined volume is a red test.
+    assert cfg.host_budgets == {"mapillary_tiles": 1_200}
     assert cfg.host_budget_errors == []
     # kartaview was turned on in production on 2026-08-28, the separate deploy
     # decision this assertion previously withheld (#248). Enabling the CHANNEL
@@ -1308,7 +1311,8 @@ def test_makelab1_production_config_is_wired():
     # decision someone made on purpose.
     mly = cfg.providers["mapillary"].daily_request_budget
     mly_streets = cfg.providers["mapillary_streets"].daily_request_budget
-    assert mly == 3_500
+    # 3,500 -> 1,500 on 2026-10-17 (#444 Stage 1), with the host pool below.
+    assert mly == 1_500
     assert mly_streets == 1_750
     # The sum is still the figure that matters, because the block is per IP and
     # these are two tokens at one address. What changed on 2026-09-05 is the
@@ -1320,17 +1324,23 @@ def test_makelab1_production_config_is_wired():
     # assertion: the un-paired sum is the only one of the two that this line
     # can actually constrain, because the paired figure IS the grid channel's
     # own budget (mly_streets prices at 0 under #290's census reuse) and is
-    # already pinned at mly == 3_500 above. A second `assert mly == 3_500`
+    # already pinned at mly == 1_500 above. A second `assert mly == 1_500`
     # here would restate that line while touching nothing about mly_streets,
     # so it is deliberately not written.
-    assert mly + mly_streets == 5_250, (
-        "an UN-PAIRED night is the worst case and it is 1.5x the ceiling #241 "
-        "sanctioned — the honest cost of the 2026-09-05 raise, accepted only "
-        "because block 3 falsified daily volume and every 1-8 day window "
-        "(#286), never because volume is known safe. The PAIRED night is "
-        "3,500 + 0, the ceiling #241 already sanctioned; moving EITHER "
-        "channel's budget has to argue with both numbers (issue #286, "
-        "docs/provider-access.md)"
+    #
+    # Since #385 neither sum is what binds: both channels also draw on the
+    # rolling-24h [hosts.mapillary_tiles] pool, 1,200 since #444 Stage 1,
+    # which is below even the grid channel's own figure. Pinned as an
+    # inequality beside the exact values so a later raise of either channel
+    # cannot quietly lift the pool out of the binding position.
+    assert mly + mly_streets == 3_250, (
+        "an UN-PAIRED night is the worst case of the two daily budgets; moving "
+        "EITHER channel's budget has to argue with both numbers (issues #286, "
+        "#444, docs/provider-access.md)"
+    )
+    assert cfg.host_budgets["mapillary_tiles"] <= min(mly, mly_streets), (
+        "the rolling-24h host pool is the guard that binds (#385, #444); a "
+        "channel budget under it would bind first and the pool would stop being the guard"
     )
     # The per-minute pace is still pinned — an unpaced burst (~370/min) is
     # confirmed harmful — but per #241 it is NOT sufficient on its own, and per

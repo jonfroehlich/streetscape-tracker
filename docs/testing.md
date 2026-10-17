@@ -504,7 +504,7 @@ Incidental coverage of a deprecated spelling trains readers to ignore the notice
   - `test_an_invalid_host_budget_refuses_the_channel_running_commands` — eight invalid spellings, `[hosts.overpass]` among them, are each recorded and logged at load and refuse `run-due` and `assess-city` before the catalog opens; killed by validating against `HOST_LABELS` instead of the metered hosts, and by not logging the errors.
   - `test_block_4s_catch_up_then_night_is_gated_across_the_utc_boundary` — 1,444 spent 9 h earlier on the PREVIOUS UTC date caps the next city at 3,000 − 1,444 and the one after at that minus the first's spend; killed by keying the window on the UTC date.
   - `test_dry_run_and_status_print_the_host_window`; killed by dropping the status line.
-  - `test_makelab1_production_config_is_wired` pins prod's 3,000 exactly.
+  - `test_makelab1_production_config_is_wired` pins prod's budget exactly (1,200 since #444 Stage 1, with `[providers.mapillary]` at 1,500).
   - `test_no_host_budget_configured_is_todays_launch_exactly` — argv captured at `_run_collection_subprocess` from the REAL `_run_one_city`, grid and walk, is byte-identical with `[hosts]` absent, empty, or 10,000,000 against 10,000 in the window, and differs under the prod budget; killed by letting any host window govern.
   - `test_the_age_wall_projects_against_what_tonights_batch_can_grant` — a 6.5-day checkpoint with ~360 requests to go and 40,000 left on the channel: last night's 2,947 (stamped 20 h ago, gone before a 12 h batch ends) lets it launch capped at 53; the same 2,947 spent tonight (1 h ago) refuses it, as does a 300 budget, and both refusals name `[hosts.mapillary_tiles].rolling_24h_request_budget`; with no batch deadline the ceiling is the momentary remainder and it is refused; killed by the host's full budget as the ceiling, by the momentary remainder as the ceiling, and by not handing the live gate its batch end.
   - `test_the_budget_is_shared_by_both_channels_on_the_host` — the grid's 2,500 leaves the walk 500 whatever the walk's own row says; killed by stamping rows per channel rather than per host.
@@ -559,7 +559,7 @@ Every "killed by" below was run against the committed code, one mutation at a ti
 - `test_budget_drawn_down_by_earlier_fill_cities_declines_a_later_one` — `ended by budget (mapillary)`; killed by dropping the per-channel check.
 - `test_fill_candidates_need_every_member_channel_past_the_floor_and_not_due` — floor, not-due wall, never-collected, quarantine, ONE failure, exclusion, disabled, and the oldest-channel order; killed by ignoring the floor, ordering freshest-first, ignoring failures, and ignoring membership.
 - `test_fill_host_room_is_the_smaller_of_budget_and_ceiling` and `test_the_fill_ceiling_binds_below_the_host_budget`; killed by ignoring the ceiling.
-- `test_makelab1_fills_at_30_days_under_the_measured_mapillary_ceiling`.
+- `test_makelab1_fills_at_30_days_under_its_mapillary_ceiling`.
 - `test_sigterm_mid_city_in_the_fill_stops_the_night` — a SIGTERM during a fill city's gsv stops its mapillary, the fill and the night; killed by not making a fill SIGTERM the night's stop.
 - `test_the_deadline_check_sums_the_channels_needs` and `test_the_fill_ends_at_the_deadline_and_says_so`; killed by dropping the deadline check.
 - `test_the_dry_run_draws_its_ledgers_down_across_fill_cities` and `test_the_dry_run_draws_the_fill_ceiling_down_across_fill_cities`; killed by not subtracting an admitted city's price, and by leaving the preview's own spend out of the host room.

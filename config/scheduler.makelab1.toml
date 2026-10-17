@@ -105,10 +105,17 @@ refresh_slots = 10
 # all. cycle_days stays the guarantee. Counted against max_cities_per_day.
 # Delete these two lines to switch it off; nothing else depends on them.
 fill_min_days = 30
-# The fill's own rolling-24h ceiling on the tile CDN, BELOW the 3,000 budget the
-# due slate keeps: 2,260 is the highest combined (grid + walk) night the #292
-# window measured clean, which #404 says to start the fill at.
-fill_host_ceilings = { mapillary_tiles = 2260 }
+# The fill's own rolling-24h ceiling on the tile CDN, BELOW the host budget the
+# due slate keeps. It started at 2,260 (the highest combined grid + walk night
+# the #292 window measured clean, which #404 said to start the fill at), and
+# it did not protect: the fill made every night a ~2,255-request Mapillary
+# night back to back from 10-05, and the CDN began refusing this IP every
+# second night on the sixth (#444). 2,260 -> 600 on 2026-10-17 (#444, Stage 1)
+# with the host budget 3,000 -> 1,200: the fill now tops up only what a light
+# due night leaves, and mostly stops on this host. The other channels' fill is
+# unchanged; a fill city is admitted whole or not at all, so a Mapillary-member
+# city that does not fit this room is declined, not run without Mapillary.
+fill_host_ceilings = { mapillary_tiles = 600 }
 # The cron timer-watchdog (issue #369) writes logs/timer_watchdog_status.json on
 # every run; backup-status goes unhealthy (and its noon timer alerts) when that
 # heartbeat is missing or older than this. The two watchdogs cover each other:
@@ -152,7 +159,8 @@ timer_watchdog_max_age_h = 48
 #      cheapest real headroom win and has nothing to do with this knob.
 #   2. Issue #256 landed — resume for the Mapillary tile census — so a stop that
 #      kills N children no longer re-spends a whole census into the per-IP
-#      ceiling (3,500/day paired, 5,250 un-paired since 2026-09-05).
+#      ceiling (3,500/day paired, 5,250 un-paired from 2026-09-05; since
+#      2026-10-17 the 1,200 rolling-24h host pool binds first, #444).
 #
 # 2 AND NOT 3 -- a STAGING decision, not a claim that 3 is unusable.
 #
@@ -271,8 +279,10 @@ daily_request_budget = 35000000
 # PAUSED 2026-08-28 after the THIRD per-IP block (see the new-issue link in
 # docs/provider-access.md). Not a volume decision: the ledger rules out a fixed
 # threshold over every window from 1 to 8 days — 08-28 was refused at 1,938/day
-# while 08-14 spent 26,363 clean — so cutting the budget a third time has no
-# mechanism to work through. The budgets below are LEFT AS-IS deliberately: they
+# while 08-23 (3,190) and 08-24 (3,292) ran clean — so cutting the budget a
+# third time has no mechanism to work through. (This line used to cite "08-14
+# spent 26,363 clean". That was wrong (#444): 08-14 fell INSIDE block 1, and
+# its 25,297 + 1,066 were mostly the detached loop's REFUSED requests.) The budgets below are LEFT AS-IS deliberately: they
 # are the sizing #241/#267 argued for, and re-enabling should be a decision about
 # the mechanism, not a re-derivation of numbers that were never the binding
 # constraint.
@@ -399,8 +409,9 @@ enabled = true
 # An un-paired night can reach 5,250: 1.5x that ceiling, the most this host
 # has been configured for since the 2026-08-22 cut (for ~2 days after block 2
 # it still sat at 15,000 + 5,000), and the honest cost of this change.
-# Accepted because block 3 (1,938/day, against 26,363 clean on 08-14)
-# falsified daily volume and every accumulation window from 1 to 8 days
+# Accepted because block 3 (1,938/day, against 3,190 and 3,292 clean on
+# 08-23/08-24 -- NOT 26,363 on 08-14, a day inside block 1 whose requests were
+# mostly refused, #444) falsified daily volume and every accumulation window from 1 to 8 days
 # (#286) -- NOT because volume is known safe here. Nothing about this host is.
 # The structurally right fix is one per-IP pool both channels draw from, which
 # is a scheduler change and is not attempted here.
@@ -410,14 +421,32 @@ enabled = true
 # Volume is an axis that test holds still, so raising it inside
 # the window would have handed a fourth block two candidate causes where the
 # design went to real trouble to leave one. Cost of waiting: the two skips.
-daily_request_budget = 3500
+#
+# 3,500 -> 1,500 on 2026-10-17 (#444, Stage 1), with the host budget below
+# 3,000 -> 1,200 and the fill ceiling 2,260 -> 600. NOT a volume model: #444
+# falsified every volume window from 12 h to 7 d and every leaky bucket, and
+# from 10-10 the CDN refused this IP every second night, with the rolling 24 h
+# at 1,631-2,287 served requests at each onset. The bet is H1 there (a per-IP reputation with slow decay that
+# sustained daily PRESENCE feeds), so this cuts hours of Mapillary per night
+# rather than the rate, which stays at 40/min (slowing it would lengthen
+# presence, the axis that moved most). Steady-state need is ~800/day (#385), so
+# the 90-day cycle still fits; fill refreshes mostly stop on this host. The
+# host budget, not this line, is what binds; this one keeps the grid channel
+# from claiming the whole pool when the walk is un-paired. Falsifier: blocks
+# continue at <= 1,200/night with the two rest nights a week -> volume and
+# daily presence are not the inputs. Clean for 3 weeks -> step up <= 25%/week,
+# one knob at a time.
+daily_request_budget = 1500
 # Client-side tile pacing (issue #198). Shared per-IP with mapillary_streets
 # below and with any manual run on this host — the host lock (#208) is what
 # makes this figure the real one rather than a per-process wish.
 #
 # 40 and JITTERED, not a metronomic 60 (issue #292, the fourth hypothesis):
 # block 2 came with this limiter pinned at 60 and block 3 at 1,938/day while
-# 26,363 had run clean in a day, so rate and volume are both falsified. The
+# 08-23/08-24 had run 3,190 and 3,292 clean, so rate and volume are both
+# falsified. (Not "26,363 clean on 08-14": that day was inside block 1 and its
+# requests were mostly refused, #444. The October record agrees: 09-29/09-30
+# ran 3,500 then 3,006 back to back, clean, against blocks at ~1,630-2,290.) The
 # one thing every restart left unchanged was the exact 1.000 s cadence of a
 # saturated token bucket.
 #
@@ -531,7 +560,10 @@ spacing_m = 15
 # splits, as of the 2026-09-05 re-size (#286): [providers.mapillary] is 3,500
 # and this channel is 1,750. It was 1,750 + 1,750 = 3,500, split evenly, from
 # 2026-08-22 until then; see the issue #241 and #286 notes in
-# [providers.mapillary]. The even split bought lockstep depletion, which #290
+# [providers.mapillary]. Since 2026-10-17 (#444) [providers.mapillary] is 1,500
+# and BOTH are bounded by the 1,200 rolling-24h [hosts.mapillary_tiles] pool,
+# which is now the number that binds; this line is left at 1,750 because the
+# pool, not the split, is the guard. The even split bought lockstep depletion, which #290
 # had already ended: a road walk reads the identical tile census as the grid
 # run, but now reuses it rather than re-reading it. Since #290 it REUSES that census
 # rather than re-reading it, so on a paired night this channel spends nothing
@@ -734,12 +766,19 @@ network_type = "drive"
 #
 # This is a STAGING GUARD on how fast our traffic can change, NOT a model of
 # Mapillary's per-IP threshold: #286 found no accumulation window from 1 to 8
-# days that separates blocked days from clean ones. 3,000 is above the ~800/day
-# a steady catalog refresh needs and forbids bursts. A SOFT ceiling like every
-# budget here: in-flight retries can overshoot it by
-# connection_limit x (TILE_MAX_TRIES - 1).
+# days that separates blocked days from clean ones, and #444 extended that to
+# every window from 12 h to 7 d. A SOFT ceiling like every budget here:
+# in-flight retries can overshoot it by connection_limit x (TILE_MAX_TRIES - 1)
+# = 20 for these channels.
+#
+# 3,000 -> 1,200 on 2026-10-17 (#444, Stage 1). 3,000 did not protect: from
+# 10-10 the CDN refused this IP every second night with the rolling 24 h at
+# 1,631-2,287, and on 10-15 this cap was what ENDED the night (1,271). 1,200 is
+# still above the ~800/day a steady catalog refresh needs. The figure is about
+# hours of presence on the host per night (#444's H1), not a threshold we
+# believe Mapillary enforces.
 [hosts.mapillary_tiles]
-rolling_24h_request_budget = 3000
+rolling_24h_request_budget = 1200
 
 [download]
 batch_size = 100
