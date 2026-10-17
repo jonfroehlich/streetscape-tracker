@@ -650,7 +650,19 @@ TILE_BACKPRESSURE_MIN_WAIT_S = 60.0
 # most 30 minutes of sleeping: far inside the scheduler's per-city timeout
 # floor, so a waiting child is never SIGKILLed (which would count a failure).
 TILE_BACKPRESSURE_MAX_WAIT_S = 900.0
+# Counted in EPISODES, not responses (review of #444): a 429/503 answering a
+# request that was sent before the latest hold began belongs to that hold's
+# episode -- one throttle window can answer several in-flight requests at once
+# -- so it adds no strike. It may still EXTEND the hold, to its own wait.
 TILE_BACKPRESSURE_PAUSE_AFTER = 3
+# Backpressure responses ONE TILE may draw before it is given up as an ordinary
+# failed tile -- REQUEST_FAILED under MAX_FAILED_TILE_FRACTION (#168), exactly
+# what `@backoff` exhausting it meant before #444. Strictly below
+# PAUSE_AFTER, so a single tile that always answers 503 can never pause its
+# crawl on its own: without this it spent all three strikes, the crawl paused
+# (exit 83, amnestied without bound), and the next night hit the same tile
+# first, so the city never completed.
+TILE_BACKPRESSURE_TILE_TRIES = 2
 TILE_BACKPRESSURE_SLOWDOWN = 2.0
 
 # The hold's sleep, looked up at CALL time so a test can replace it (conftest
@@ -790,6 +802,13 @@ class _BackpressurePacer:
         if self._clock is not None:
             return self._clock()
         return asyncio.get_running_loop().time()
+
+    @property
+    def generation(self) -> int:
+        """Holds begun so far (plus one for a close). A request records it
+        when it is sent; a 429 to a request from an older generation belongs
+        to a hold that has already been opened."""
+        return self._holds
 
     async def acquire(self) -> None:
         while True:
@@ -1885,16 +1904,23 @@ async def _fetch_city_images(
     backpressure_paused = False
     backpressure_detail: str | None = None
 
-    def on_backpressure(e: TileBackpressureError) -> float | None:
+    def on_backpressure(e: TileBackpressureError, sent_generation: int) -> float | None:
         """
         Record one 429/503: halve the pace, and say how long to hold.
 
         Returns the seconds to hold every request for, or None when the crawl
-        is to PAUSE instead -- on the TILE_BACKPRESSURE_PAUSE_AFTER-th response,
-        or on a Retry-After past TILE_BACKPRESSURE_MAX_WAIT_S.
+        is to PAUSE instead -- on the TILE_BACKPRESSURE_PAUSE_AFTER-th EPISODE,
+        on a Retry-After past TILE_BACKPRESSURE_MAX_WAIT_S, or on a wait that
+        would outlast the deadline.
+
+        ``sent_generation`` is the pacer's generation when the answered request
+        was sent. Older than the current one means a hold began after it went
+        out: the same episode, so no strike (see TILE_BACKPRESSURE_PAUSE_AFTER).
         """
         nonlocal backpressure_events, backpressure_paused, backpressure_detail, stop_reason
-        backpressure_events += 1
+        same_episode = sent_generation != pacer.generation
+        if not same_episode:
+            backpressure_events += 1
         pacer.slow_down()
         if backpressure_paused:
             # A late answer from a tile that was in flight when the pause
@@ -1910,6 +1936,11 @@ async def _fetch_city_images(
             and deadline_monotonic is not None
             and time.monotonic() + wait >= deadline_monotonic
         )
+        if wait is not None and not outlasts_deadline and same_episode:
+            # No strike: the hold already open covers it. Returning the wait
+            # lets it EXTEND that hold if it asked for longer (holds end at the
+            # latest requested end), and costs nothing if it did not.
+            return wait
         if (
             wait is not None
             and not outlasts_deadline
@@ -1919,7 +1950,7 @@ async def _fetch_city_images(
                 f"Mapillary tile CDN answered HTTP {e.status} (Retry-After: {e.retry_after}) "
                 f"for {city_name}: holding every tile request for {wait:.0f} s, then "
                 f"continuing at HALF the pace for the rest of this crawl (backpressure "
-                f"response {backpressure_events}/{TILE_BACKPRESSURE_PAUSE_AFTER}; issue #444)"
+                f"episode {backpressure_events}/{TILE_BACKPRESSURE_PAUSE_AFTER}; issue #444)"
             )
             return wait
         if outlasts_deadline:
@@ -1934,7 +1965,7 @@ async def _fetch_city_images(
             )
         else:
             backpressure_detail = (
-                f"{backpressure_events} HTTP 429/503 responses in one crawl "
+                f"{backpressure_events} HTTP 429/503 episodes in one crawl "
                 f"(the limit is {TILE_BACKPRESSURE_PAUSE_AFTER})"
             )
         backpressure_paused = True
@@ -1957,13 +1988,18 @@ async def _fetch_city_images(
         nonlocal fatal, capped, reserved, stop_reason
         url = f"{TILE_URL_TEMPLATE.format(z=TILE_ZOOM, x=x, y=y)}?access_token={access_token}"
         attempts = 0
+        # This tile's backpressure responses (TILE_BACKPRESSURE_TILE_TRIES), and
+        # the pacer generation its latest attempt was sent under.
+        tile_backpressure = 0
+        sent_generation = pacer.generation
 
         def on_attempt() -> None:
             # One call per HTTP request, from inside _fetch_tile: the ledger's
             # count, plus the status line's retries (any attempt past a tile's
             # first, whichever layer retried it).
-            nonlocal attempts
+            nonlocal attempts, sent_generation
             count_request()
+            sent_generation = pacer.generation
             attempts += 1
             if attempts > 1:
                 statuses.retries += 1
@@ -2086,9 +2122,20 @@ async def _fetch_city_images(
                     return records_to_census([])
                 if slow_down_please is None:
                     break
-                wait = on_backpressure(slow_down_please)
+                wait = on_backpressure(slow_down_please, sent_generation)
                 if wait is not None:
                     await pacer.hold(wait)
+                tile_backpressure += 1
+                if wait is not None and tile_backpressure >= TILE_BACKPRESSURE_TILE_TRIES:
+                    # Given up as an ordinary failed tile, AFTER the hold (the
+                    # hold protects the other tiles, not this one): it settles
+                    # as an exception, so #168's tolerance judges it.
+                    logger.warning(
+                        f"Mapillary tile ({x}, {y}) of {city_name} answered HTTP "
+                        f"{slow_down_please.status} {tile_backpressure} times; giving it up "
+                        f"as a failed tile (issue #444)"
+                    )
+                    raise slow_down_please
                 # Back to the top: retried if the checks there still admit it,
                 # or turned away as a pause (issue #444).
         progress_bar.update(1)

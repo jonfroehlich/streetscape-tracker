@@ -94,6 +94,11 @@ class _ScriptedSession:
 
         class _Ctx:
             async def __aenter__(self):
+                # A response may take time to arrive, so requests can be in
+                # flight together (the episode test needs that).
+                delay = getattr(response, "delay", 0)
+                if delay:
+                    await asyncio.sleep(delay)
                 return response
 
             async def __aexit__(self, *exc):
@@ -751,3 +756,64 @@ def test_no_request_goes_out_after_the_pause_decision(monkeypatch, tmp_path, lim
     assert len(sessions[0].urls) == sent_at_pause[0], "a request went out after the pause"
     assert excinfo.value.api_requests == len(sessions[0].urls)
     assert "backpressure limit" in str(excinfo.value)
+
+
+def test_a_tile_that_always_answers_503_cannot_stall_its_city(
+    monkeypatch, tmp_path, limiters, holds
+):
+    """Review of #444: one tile answering 503 to everything spent all three
+    strikes, the crawl paused (exit 83, amnestied without bound), and the next
+    night hit the same tile first -- forever. A tile is now given up as an
+    ordinary failed tile after TILE_BACKPRESSURE_TILE_TRIES responses, below
+    the pause, so the city completes and #168's tolerance judges the hole.
+
+    Same checkpoint across nights, as the scheduler would run it: the city
+    must complete within a bounded number of nights (one, in fact).
+    """
+    assert dm.TILE_BACKPRESSURE_TILE_TRIES < dm.TILE_BACKPRESSURE_PAUSE_AFTER
+    cp = str(tmp_path / "cp")
+    bad = _TILES[100]
+    outcomes = []
+    for _night in range(3):
+        outcome, session = _crawl(
+            monkeypatch, {bad: [status(503)] * 50}, connection_limit=1, checkpoint_path=cp
+        )
+        outcomes.append(outcome)
+        if not isinstance(outcome, BaseException):
+            break
+    assert len(outcomes) == 1, [type(o).__name__ for o in outcomes]
+    result = outcomes[0]
+    assert result["failed_tiles"] == [bad]
+    # The bad tile drew exactly its allowance, each request counted once.
+    bad_urls = [u for u in session.urls if f"/{bad[0]}/{bad[1]}?" in u]
+    assert len(bad_urls) == dm.TILE_BACKPRESSURE_TILE_TRIES
+    assert result["api_requests"] == len(session.urls) == len(_TILES) - 1 + len(bad_urls)
+
+
+def test_responses_inside_one_hold_are_one_episode_not_three_strikes(
+    monkeypatch, tmp_path, limiters, holds, caplog
+):
+    """Review of #444: one throttle window can answer several in-flight
+    requests at once. Three tiles sent together and all answered 429 are ONE
+    episode -- one strike, one halving -- so the crawl retries and completes
+    instead of pausing on what was a single "slow down"."""
+    slow_429 = []
+    for _ in range(3):
+        r = status(429)
+        r.delay = 0.01
+        slow_429.append(r)
+    script = {xy: [slow, ok()] for xy, slow in zip(_TILES[:3], slow_429, strict=True)}
+    caplog.set_level(logging.INFO, logger=dm.__name__)
+    result, session = _crawl(
+        monkeypatch, script, connection_limit=5, checkpoint_path=str(tmp_path / "cp")
+    )
+
+    assert not isinstance(result, BaseException), result
+    assert result["failed_tiles"] == []
+    assert result["api_requests"] == len(session.urls) == len(_TILES) + 3
+    messages = [r.getMessage() for r in caplog.records]
+    assert sum("episode 1/3" in m for m in messages) == 1
+    assert not any("episode 2/3" in m for m in messages)
+    assert not any("pausing the crawl" in m for m in messages)
+    (limiter,) = limiters
+    assert limiter.slowdowns == [2.0]
