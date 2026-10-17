@@ -440,7 +440,9 @@ The best fit, **inferred and not measured**, is a per-IP reputation with slow de
 
 **Stage 1 (config, prod):** `[hosts.mapillary_tiles].rolling_24h_request_budget` 3,000 → **1,200**, `[schedule].fill_host_ceilings.mapillary_tiles` 2,260 → **600**, `[providers.mapillary].daily_request_budget` 3,500 → **1,500**.
 The pace stays at 40/min with CV 0.6: slowing it would lengthen presence, the axis that moved most.
-Steady-state need is ~800/day (#385), so the 90-day cycle still fits, and fill refreshes mostly stop on this host.
+Steady-state need is ~800/day (#385), averaged over the week; **with two rest nights it has to land on five**, so a Mapillary night needs ~800 × 7/5 ≈ **1,120, 93% of the 1,200 pool**, before any cooldown night takes another night away.
+The 90-day cycle therefore fits on paper with almost no headroom: the backlog can grow on any week with a cooldown, and the fill effectively stops on this host.
+**Falsifier for the sizing:** watch the Mapillary due backlog over the three-week Stage 1 window; if it grows week over week, the pool is too small for the rest schedule, independent of whether the blocks stop.
 **Falsifier:** blocks continue at ≤ 1,200/night with two rest nights a week → volume and daily presence are not the inputs. Clean for three weeks → step up at most 25% a week, one knob at a time.
 
 **Rest nights (`rest_weekdays = ["Wed", "Sun"]`):** two nights a week with zero Mapillary presence, on the run's UTC snapshot date, while every other channel runs.
