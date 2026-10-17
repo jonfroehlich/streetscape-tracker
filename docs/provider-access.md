@@ -898,7 +898,7 @@ Now:
 7. The **third episode** in one crawl stops it on the request cap's own path — turned-away tiles uncommitted, the checkpoint kept, raised before the settle loop — as **`HostThrottledError`, exit 87**, the THROTTLED family (`download_common.HOST_THROTTLED_EXIT_CODES`).
    Every backpressure stop raises it, committed tiles or not; its message carries the phrase "stopped by provider backpressure (HTTP 429/503)", and says "the next run resumes it" only when a tile is committed, "starts from the first tile" otherwise.
    It replaced exit 83 plus a plain-`DownloadError` arm for the nothing-committed case: that arm counted a `consecutive_failure`, so a few nights of a 429 storm would have quarantined every Mapillary pair (#421), and nothing latched the host, so the next city walked into the same 429s at full pace.
-   The scheduler amnesties 87 and skips both Mapillary channels for the rest of the night, but records no refusal and arms no cooldown (see `docs/scheduler.md`).
+   The scheduler half of #444 (PR #449, meant to merge with this one) amnesties 87 and skips both Mapillary channels for the rest of the night, but records no refusal and arms no cooldown, and documents that in `docs/scheduler.md`; until it lands the scheduler counts 87 as an ordinary failure.
    The stop **closes** the crawl's pacer: no further request goes out, including ones already waiting for their turn, which are turned away uncommitted and uncounted.
    **It is not a refusal**: a 302 → `/login` is still the `HostBlockedError` (exit 75) it always was, after a 429 too, and wins if both happen in one crawl.
    A refusal also closes the pacer and cuts short any hold in progress, so no request follows a 302 and the host lock is not held through a hold the crawl will never use.
@@ -908,7 +908,7 @@ The only cooldown ever reported for a Mapillary tile block is thread 5821's 15-m
 And with the pause at the third episode, a crawl holds in at most two episodes, each lasting the longest wait asked for inside it (at most 900 s), so it holds the machine-wide tile lock for about 30 minutes of sleeping — not exactly, since a same-episode response can extend a hold by up to one request timeout (30 s).
 That is well inside prod's 180-minute per-city timeout floor (`city_timeout_minutes`).
 **A hold that would end past the crawl's wall-clock budget is not slept at all**: the crawl stops at once instead.
-The scheduler forwards that budget as the child's SIGKILL timeout less a 600 s margin (`_crawl_max_seconds`), so a 900 s hold begun inside the margin would be killed mid-sleep and counted a failure, where stopping is the amnestied exit 87.
+The scheduler forwards that budget as the child's SIGKILL timeout less a 600 s margin (`_crawl_max_seconds`), so a 900 s hold begun inside the margin would be killed mid-sleep and counted a failure, where stopping is exit 87, which the scheduler half (PR #449) amnesties.
 A halved pace also doubles the remaining wall clock of the crawl it applies to, so a large city answered 429 early can reach its budget; the clock then pauses it as exit 83, which is the intended outcome.
 
 **One known interaction, left as it is.**

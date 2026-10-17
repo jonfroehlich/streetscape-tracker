@@ -638,7 +638,8 @@ class TileStatusCounts:
 #    checkpoint kept, raised before the settle loop -- and the crawl's pacer is
 #    closed so no request still waiting for its turn goes out. It raises
 #    HostThrottledError (exit 87), committed tiles or not, so the scheduler
-#    skips this host for the rest of the night without counting a failure. It
+#    (#444's scheduler change, PR #449) can skip this host for the rest of the
+#    night without counting a failure. It
 #    is NOT a refusal: a 302 -> /login is still the HostBlockedError (exit 75)
 #    it always was, and wins if both happen in one crawl.
 # 6. One tile is given up as an ordinary failed tile after
@@ -1732,8 +1733,8 @@ async def _fetch_city_images(
             #444) -- its TILE_BACKPRESSURE_PAUSE_AFTER-th 429/503 episode, a
             Retry-After past the ceiling, or a hold past the deadline --
             whether or not any tile is committed. The checkpoint is kept; it
-            maps to the throttled exit (87), which the scheduler amnesties and
-            uses to skip this host for the rest of the night.
+            maps to the throttled exit (87), which the scheduler (PR #449)
+            amnesties and uses to skip this host for the rest of the night.
         DownloadError: on a rejected token or tile transport failure, carrying
             ``api_requests`` so the caller can still record what it spent.
     """
