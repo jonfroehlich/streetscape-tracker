@@ -439,10 +439,25 @@ def test_an_http_date_retry_after_is_honoured_in_the_crawl(monkeypatch, limiters
     assert holds == [pytest.approx(300.0, abs=3.0)]
 
 
-def test_a_hold_stops_every_socket_not_just_the_one_answered(monkeypatch, limiters):
+@pytest.mark.parametrize("limiter_suspends", [False, True])
+def test_a_hold_stops_every_socket_not_just_the_one_answered(
+    monkeypatch, limiters, limiter_suspends
+):
     """With five connections, four other tiles would keep asking while the
-    fifth waited. The hold is a GATE on the crawl's pacer, so none may."""
+    fifth waited. The hold is a GATE on the crawl's pacer, so none may.
+
+    ``limiter_suspends`` makes the limiter's acquire take real time, as the
+    production pacer's does, so other tiles are QUEUED ON IT -- past the gate --
+    when the hold begins. Those must be sent back to wait the hold out too
+    (the pacer's generation check), not released into it.
+    """
     real_sleep = asyncio.sleep
+    if limiter_suspends:
+
+        async def slow_acquire(self):
+            await real_sleep(0.002)
+
+        monkeypatch.setattr(_RecordingLimiter, "acquire", slow_acquire)
     sessions_seen = []
     during = []
 
@@ -598,3 +613,19 @@ def test_halving_is_scoped_to_one_crawl(monkeypatch, limiters, holds):
     assert {(lim.max_per_minute, lim.jitter) for lim in limiters} == {
         (dm.DEFAULT_TILE_REQUESTS_PER_MINUTE, dm.DEFAULT_TILE_JITTER)
     }
+
+
+def test_a_backpressure_pause_resumes_for_the_missing_tiles_only(
+    monkeypatch, tmp_path, limiters, holds
+):
+    """The point of pausing rather than failing: tomorrow pays only for what is
+    left, and a full census lands. Nothing was published from the paused night."""
+    cp = str(tmp_path / "cp")
+    paused, _ = _crawl(monkeypatch, _three_429s(), connection_limit=1, checkpoint_path=cp)
+    assert isinstance(paused, SweepIncompleteError)
+
+    resumed, session = _crawl(monkeypatch, {}, checkpoint_path=cp)
+    assert not isinstance(resumed, BaseException), resumed
+    assert resumed["api_requests"] == len(session.urls) == len(_TILES) - 2
+    assert resumed["api_requests_total"] == 5 + len(_TILES) - 2
+    assert resumed["failed_tiles"] == []
