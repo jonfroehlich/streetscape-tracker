@@ -897,6 +897,12 @@ def test_the_production_fetch_never_follows_a_redirect(monkeypatch):
     assert host_probe.requests_fetch("https://t/x") == (302, _Response.headers)
     assert seen["allow_redirects"] is False
     assert seen["timeout"] == host_probe.PROBE_TIMEOUT_S
+    # The probe must look like the collector it predicts (#444), not like
+    # requests' default python-requests/<ver>.
+    from streetscape_metadata_tracker.download_mapillary import MAPILLARY_USER_AGENT
+
+    assert seen["headers"] == {"User-Agent": MAPILLARY_USER_AGENT}
+    assert "sidewalk@cs.uw.edu" in seen["headers"]["User-Agent"]
 
 
 def test_the_token_comes_from_the_existing_loader(monkeypatch):

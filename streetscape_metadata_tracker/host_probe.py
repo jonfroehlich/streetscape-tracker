@@ -73,11 +73,33 @@ class ProbeResult:
     detail: str
 
 
+def probe_headers() -> dict[str, str]:
+    """
+    The probe's request headers: the collector's exact User-Agent (issue #444).
+
+    The probe exists to predict what tonight's collector will be told, so it
+    must look like the collector. It sends ``MAPILLARY_USER_AGENT`` verbatim --
+    aiohttp library token included, although this request goes out through
+    ``requests`` -- because a CDN that scores the User-Agent would otherwise
+    be asked about a client it never sees at night (``requests``' default is
+    ``python-requests/<ver>``).
+    """
+    from .download_mapillary import MAPILLARY_USER_AGENT
+
+    return {"User-Agent": MAPILLARY_USER_AGENT}
+
+
 def requests_fetch(url: str) -> tuple[int, dict[str, str]]:
     """The production fetch: one GET, redirects NOT followed, body not read."""
     import requests
 
-    with requests.get(url, allow_redirects=False, timeout=PROBE_TIMEOUT_S, stream=True) as r:
+    with requests.get(
+        url,
+        headers=probe_headers(),
+        allow_redirects=False,
+        timeout=PROBE_TIMEOUT_S,
+        stream=True,
+    ) as r:
         return r.status_code, dict(r.headers)
 
 
