@@ -803,8 +803,13 @@ network_type = "drive"
 # rather than resting every channel, by the Maintainer's choice: a rested
 # city's Mapillary snapshot lands on a later night than its GSV one, so those
 # snapshots un-pair. Not a failure: no alert, no breaker trip, no change to the
-# exit status, and the cities stay due. `run-due --ignore-host-holds` is the
-# logged operator override.
+# exit status, and the cities stay due -- but NOT at the head of the queue: a
+# city due on gsv + Mapillary still collects gsv on a rest night, so its held
+# Mapillary channels re-enter through the stranded (Mapillary-only-due) tier,
+# i.e. the bounded opt_in_cities_per_day reservation, or rejoin the head when
+# the city is next gsv-due (~83 days). Watch that population on a Thursday
+# `run-due --dry-run` (docs/provider-access.md, #444 Stage 1).
+# `run-due --ignore-host-holds` is the logged operator override.
 #
 # refusal_cooldown_h (#444): for this many hours after the newest refusal in
 # the catalog's host_refusals table, no channel touching the tile CDN launches

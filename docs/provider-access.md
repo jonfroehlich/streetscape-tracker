@@ -443,11 +443,15 @@ The pace stays at 40/min with CV 0.6: slowing it would lengthen presence, the ax
 Steady-state need is ~800/day (#385), averaged over the week; **with two rest nights it has to land on five**, so a Mapillary night needs ~800 × 7/5 ≈ **1,120, 93% of the 1,200 pool**, before any cooldown night takes another night away.
 The 90-day cycle therefore fits on paper with almost no headroom: the backlog can grow on any week with a cooldown, and the fill effectively stops on this host.
 **Falsifier for the sizing:** watch the Mapillary due backlog over the three-week Stage 1 window; if it grows week over week, the pool is too small for the rest schedule, independent of whether the blocks stop.
+Watch beside it **the size of the Mapillary-only-due population**: cities due on `mapillary` or `mapillary_streets` but not on `gsv`.
+A rest night still collects the gsv half of a city due on gsv and Mapillary, which leaves its Mapillary half in exactly that population — the STRANDED tier, reached only through the bounded `[schedule].opt_in_cities_per_day` reservation or when the city is next gsv-due, about one cycle (~83 days) later.
+Read it on a Thursday, after the Wednesday rest: `run-due --dry-run` builds the night's slate and logs `N of M cities not due on gsv are inside tonight's ...-city cap`, where M is that population; if M grows week over week, rest nights are deferring Mapillary by a cycle rather than by a night.
 **Falsifier:** blocks continue at ≤ 1,200/night with two rest nights a week → volume and daily presence are not the inputs. Clean for three weeks → step up at most 25% a week, one knob at a time.
 
 **Rest nights (`rest_weekdays = ["Wed", "Sun"]`):** two nights a week with zero Mapillary presence, on the run's UTC snapshot date, while every other channel runs.
 A Mapillary-only rest, by the Maintainer's choice, so a rested city's Mapillary snapshot lands on a later night than its GSV one; the alternative (rest every channel through the timer) keeps pairing and costs GSV two nights a week.
 A rest night is a standing hold, not a refusal: no alert, no breaker trip, no failure, and the cities stay due.
+**Staying due is not leading the queue**: a city due on gsv and Mapillary still collects gsv on a rest night, so its held Mapillary channels re-enter through the stranded (Mapillary-only-due) tier — the bounded opt-in reservation — not at the head of the next night's queue (see the sizing falsifier above).
 Holds bind scheduler commands only (`run-due`, its `--limit` catch-ups, `assess-city`); a collector run directly (`streetscape_tracker.py` or `streetscape_street_analyzer.collect` with `--provider mapillary`) ignores them, so check `scheduler status` before one.
 A held walk that would have been a 0-request census-cache hit is still held — conservative, and accepted.
 
