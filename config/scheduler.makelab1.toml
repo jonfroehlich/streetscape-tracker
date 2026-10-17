@@ -808,7 +808,9 @@ network_type = "drive"
 # Mapillary channels re-enter through the stranded (Mapillary-only-due) tier,
 # i.e. the bounded opt_in_cities_per_day reservation, or rejoin the head when
 # the city is next gsv-due (~83 days). Watch that population on a Thursday
-# `run-due --dry-run` (docs/provider-access.md, #444 Stage 1).
+# `run-due --dry-run` (docs/provider-access.md, #444 Stage 1) -- through a
+# noisy proxy: its "N of M cities not due on gsv" counts EVERY city not due on
+# gsv, #301 exclusions and KartaView/Panoramax opt-in-only cities included.
 # `run-due --ignore-host-holds` is the logged operator override.
 #
 # refusal_cooldown_h (#444): for this many hours after the newest refusal in

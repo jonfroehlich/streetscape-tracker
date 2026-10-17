@@ -445,7 +445,10 @@ The 90-day cycle therefore fits on paper with almost no headroom: the backlog ca
 **Falsifier for the sizing:** watch the Mapillary due backlog over the three-week Stage 1 window; if it grows week over week, the pool is too small for the rest schedule, independent of whether the blocks stop.
 Watch beside it **the size of the Mapillary-only-due population**: cities due on `mapillary` or `mapillary_streets` but not on `gsv`.
 A rest night still collects the gsv half of a city due on gsv and Mapillary, which leaves its Mapillary half in exactly that population — the STRANDED tier, reached only through the bounded `[schedule].opt_in_cities_per_day` reservation or when the city is next gsv-due, about one cycle (~83 days) later.
-Read it on a Thursday, after the Wednesday rest: `run-due --dry-run` builds the night's slate and logs `N of M cities not due on gsv are inside tonight's ...-city cap`, where M is that population; if M grows week over week, rest nights are deferring Mapillary by a cycle rather than by a night.
+Read it on a Thursday, after the Wednesday rest: `run-due --dry-run` builds the night's slate and logs `N of M cities not due on gsv are inside tonight's ...-city cap`.
+**M is a noisy proxy, not that population**: in code it is every city not due on gsv, so it also counts the gsv-excluded cities (#301) and the cities due only on the KartaView or Panoramax opt-in channels.
+Read its week-over-week trend, not its level; if it grows while those enrolments and exclusions stand still, rest nights are deferring Mapillary by a cycle rather than by a night.
+The dry run does not split M by channel: its per-city rows list each previewed city's due channels, so the Mapillary-only cities inside tonight's cap are the rows naming only `mapillary`/`mapillary_streets`, and the ones past the cap are not shown.
 **Falsifier:** blocks continue at ≤ 1,200/night with two rest nights a week → volume and daily presence are not the inputs. Clean for three weeks → step up at most 25% a week, one knob at a time.
 
 **Rest nights (`rest_weekdays = ["Wed", "Sun"]`):** two nights a week with zero Mapillary presence, on the run's UTC snapshot date, while every other channel runs.
