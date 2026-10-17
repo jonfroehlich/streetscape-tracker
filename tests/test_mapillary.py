@@ -476,7 +476,9 @@ def _stub_fetch_tile(monkeypatch, fetch):
     ``_fetch_tile`` for that.
     """
 
-    async def paced(session, url, timeout, rate_limiter=None, on_request=None):
+    async def paced(session, url, timeout, rate_limiter=None, on_request=None, on_response=None):
+        # on_response (issue #444's status counter) is accepted and unused: a
+        # stub has no HTTP status to report, so its requests count as `noresp`.
         if rate_limiter is not None:
             await rate_limiter.acquire()
         if on_request is not None:

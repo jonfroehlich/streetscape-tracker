@@ -511,6 +511,82 @@ DEFAULT_TILE_JITTER = 0.6
 _TILE_ERROR_CONTENT_TYPES = ("text/html", "application/json")
 
 
+# ── Per-status response counts (issue #444, stage 2) ───────────────────────
+#
+# Until #444 `_fetch_tile` counted requests and nothing else, so whether the
+# tile CDN ever answers 429 or 5xx BEFORE it starts redirecting to /login --
+# the hypothesis that our retries walk us into the block -- was unobservable.
+# Every HTTP response a crawl receives is now tallied by class and logged as
+# ONE line per crawl, in a fixed key order so a log grep can read it:
+#
+#     mapillary tile statuses: 200=81 204=0 404=1 429=0 4xx=0 5xx=0 3xx=5
+#     other=0 noresp=0 requests=87 retries=1 retry_after=[] city='Carlsbad, CA'
+#
+# (one line in the log; wrapped here). `3xx` is every redirect -- in practice
+# the 302 -> /login refusal; `4xx` is every 4xx EXCEPT 404 and 429, which have
+# their own keys; `noresp` is requests that got no HTTP status at all (a
+# timeout or a reset connection), derived as `requests` minus the statuses so
+# the two can never disagree; `retries` is attempts beyond a tile's first,
+# whichever layer retried it. `retry_after` lists every Retry-After header
+# value seen, verbatim, capped at TILE_RETRY_AFTER_LOG_CAP entries.
+
+# The key order of the status line, and the classes `tile_status_class` returns.
+TILE_STATUS_CLASSES = ("200", "204", "404", "429", "4xx", "5xx", "3xx", "other")
+TILE_STATUS_LINE_PREFIX = "mapillary tile statuses:"
+# Retry-After values kept for the status line. A storm that sent one per request
+# would otherwise make the line as long as the crawl; the count is still exact.
+TILE_RETRY_AFTER_LOG_CAP = 20
+
+
+def tile_status_class(status: int) -> str:
+    """
+    The status-line key one HTTP status is counted under.
+
+    >>> [tile_status_class(s) for s in (200, 302, 403, 404, 429, 503, 101)]
+    ['200', '3xx', '4xx', '404', '429', '5xx', 'other']
+    """
+    if status in (200, 204, 404, 429):
+        return str(status)
+    if 300 <= status < 400:
+        return "3xx"
+    if 400 <= status < 500:
+        return "4xx"
+    if 500 <= status < 600:
+        return "5xx"
+    return "other"
+
+
+@dataclass
+class TileStatusCounts:
+    """One crawl's response tally; see the section comment above for the line."""
+
+    counts: dict[str, int] = field(default_factory=lambda: dict.fromkeys(TILE_STATUS_CLASSES, 0))
+    retries: int = 0
+    retry_after: list[str] = field(default_factory=list)
+    retry_after_seen: int = 0
+
+    def record(self, status: int, retry_after: str | None) -> None:
+        """Count one HTTP response, and keep its Retry-After if it sent one."""
+        self.counts[tile_status_class(status)] += 1
+        if retry_after is not None:
+            self.retry_after_seen += 1
+            if len(self.retry_after) < TILE_RETRY_AFTER_LOG_CAP:
+                # Bounded per value too: this is provider text going into a log.
+                self.retry_after.append(redact_credentials(retry_after)[:64])
+
+    def summary_line(self, city_name: str, requests: int) -> str:
+        """The greppable per-crawl line. ``requests`` is THIS process's spend."""
+        statuses = " ".join(f"{key}={self.counts[key]}" for key in TILE_STATUS_CLASSES)
+        noresp = max(requests - sum(self.counts.values()), 0)
+        retry_after = ",".join(self.retry_after)
+        if self.retry_after_seen > len(self.retry_after):
+            retry_after += f",+{self.retry_after_seen - len(self.retry_after)} more"
+        return (
+            f"{TILE_STATUS_LINE_PREFIX} {statuses} noresp={noresp} requests={requests} "
+            f"retries={self.retries} retry_after=[{retry_after}] city={city_name!r}"
+        )
+
+
 @backoff.on_exception(
     backoff.expo,
     (asyncio.TimeoutError, aiohttp.ClientError),
@@ -523,6 +599,7 @@ async def _fetch_tile(
     timeout: aiohttp.ClientTimeout,
     rate_limiter: AsyncRateLimiter | None = None,
     on_request: Callable[[], None] | None = None,
+    on_response: Callable[[int, str | None], None] | None = None,
 ) -> bytes:
     # Pacing and counting sit INSIDE the retried body on purpose (issue #198).
     # This function may issue up to TILE_MAX_TRIES requests; taking one token
@@ -541,6 +618,10 @@ async def _fetch_tile(
     # protobuf decoder. A host-wide block then read as `DecodeError: Error
     # parsing message with type 'vector_tile.tile'`, i.e. as corrupt data.
     async with session.get(url, timeout=timeout, allow_redirects=False) as response:
+        # FIRST, before any branch below can raise: a refusal and a 429 are
+        # exactly the responses the status line exists to count (issue #444).
+        if on_response is not None:
+            on_response(response.status, response.headers.get("Retry-After"))
         if response.status in (401, 403):
             # Deliberately NOT a HostBlockedError: a rejected token is scoped to
             # the CREDENTIAL, and our two Mapillary channels hold different
@@ -1407,6 +1488,9 @@ async def _fetch_city_images(
             channel=checkpoint_channel,
             variant=checkpoint_variant,
         ):
+            # Still one status line per crawl, so a grep over a night's logs
+            # finds every census -- this one issued nothing.
+            logger.info(TileStatusCounts().summary_line(city_name, 0))
             return _reuse_cached_census(
                 cached,
                 city_name=city_name,
@@ -1478,6 +1562,10 @@ async def _fetch_city_images(
         nonlocal api_requests
         api_requests += 1
 
+    # Every HTTP response this crawl receives, by class (issue #444). Logged
+    # once, after the gather, on every way out of it -- success, refusal, pause.
+    statuses = TileStatusCounts()
+
     def interrupted(err: DownloadError) -> DownloadError:
         """
         Stamp an interrupted census's two counters and persist what it spent.
@@ -1543,6 +1631,18 @@ async def _fetch_city_images(
     async def fetch_one(x: int, y: int) -> pd.DataFrame:
         nonlocal fatal, capped, reserved, stop_reason
         url = f"{TILE_URL_TEMPLATE.format(z=TILE_ZOOM, x=x, y=y)}?access_token={access_token}"
+        attempts = 0
+
+        def on_attempt() -> None:
+            # One call per HTTP request, from inside _fetch_tile: the ledger's
+            # count, plus the status line's retries (any attempt past a tile's
+            # first, whichever layer retried it).
+            nonlocal attempts
+            count_request()
+            attempts += 1
+            if attempts > 1:
+                statuses.retries += 1
+
         async with semaphore:
             # The abort check belongs HERE, inside the semaphore, not at the top
             # of the coroutine: gather starts every task at once and each runs to
@@ -1612,7 +1712,9 @@ async def _fetch_city_images(
             reserved += 1
             try:
                 # Pacing/counting happen inside _fetch_tile, per retried attempt.
-                tile_bytes = await _fetch_tile(session, url, timeout, rate_limiter, count_request)
+                tile_bytes = await _fetch_tile(
+                    session, url, timeout, rate_limiter, on_attempt, statuses.record
+                )
             except DownloadError as e:
                 # ONLY DownloadError trips the abort. Per-tile failures
                 # (aiohttp.ClientResponseError from a 404/429/5xx, or a decode
@@ -1680,6 +1782,9 @@ async def _fetch_city_images(
         raise interrupted(error) from e
     finally:
         progress_bar.close()
+        # HERE, so a refused, failed or paused crawl logs its statuses too:
+        # every request is settled by now, and every raise below is after it.
+        logger.info(statuses.summary_line(city_name, api_requests))
 
     # THIS BLOCK WINS, AND THE LOOP'S DownloadError ARM BELOW IS THE ONE THAT IS
     # DEAD TODAY — the reverse of what this comment used to claim. `fetch_one`
