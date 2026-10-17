@@ -598,6 +598,7 @@ The night still alerts and exits nonzero; the subject says `host(s) THROTTLED` a
 For `mapillary_tiles` it is the z14 tile 2581/5921 (downtown Corvallis, Oregon; 269 distinct images in the 2026-07-06 census) with `MAPILLARY_ACCESS_TOKEN`, redirects not followed.
 A redirect or a 200 error page is REFUSED (exit 75); a tile or a 404 is CLEARED (exit 0); a 429 or a 503 is THROTTLED, and that, a rejected token, another 5xx or no response is inconclusive (exit 1) and records nothing.
 A 429/503 is not a refusal because the collector reads both as backpressure (it waits, slows and at worst stops THROTTLED, exit 87, which latches the host for the night but records no refusal), and a probe that recorded one would arm the cooldown on an answer the collector itself would have waited out; the probe prints the `Retry-After` when there is one.
+The two read the statuses from one place: `host_probe.classify_mapillary` imports the collector's `TILE_BACKPRESSURE_STATUSES` and `TILE_REDIRECT_STATUSES`, so a status the collector does not treat as a redirect (a 304) is never a REFUSED probe.
 A request that got an answer is charged to the `mapillary` ledger.
 It refuses (64, nothing sent) while any `run-due` is in flight (`_run_due_in_flight`) and inside the host's cooldown unless `--force`, and exits 79 when another process holds the host lock.
 The lock is taken in `host_probe.py`, never in `scheduler.py`, whose source must not name the lock module (#208): the parent-must-not-hold rule is about children it spawns, and `probe-host` spawns none.

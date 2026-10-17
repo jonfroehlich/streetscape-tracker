@@ -888,6 +888,64 @@ def test_a_probe_refusal_starts_the_cooldown_a_night_then_honours(
     assert launches == [(a, "gsv")]
 
 
+@pytest.mark.parametrize("status", [*range(300, 309), 429, 503, 304])
+def test_the_probe_reads_redirects_and_backpressure_as_the_collector_does(status):
+    """S4 of the #444 review: the probe imports the collector's two status
+    sets rather than restating them, and agrees with `_fetch_tile` itself on
+    every 3xx and on 429/503 -- so a 304, which the collector does not treat
+    as the block, is never a REFUSED probe."""
+    import asyncio
+
+    from streetscape_metadata_tracker import download_mapillary as dm
+    from streetscape_metadata_tracker import host_probe
+    from streetscape_metadata_tracker.download_common import HostBlockedError
+
+    result = host_probe.classify_mapillary(status, {"Location": "https://x/login"})
+
+    class _Resp:
+        def __init__(self):
+            self.status = status
+            self.headers = {"Location": "https://x/login"}
+
+        async def read(self):
+            return b""
+
+        def raise_for_status(self):
+            raise RuntimeError(f"HTTP {status}")
+
+    class _Session:
+        def get(self, url, **kwargs):
+            class _Ctx:
+                async def __aenter__(self_inner):
+                    return _Resp()
+
+                async def __aexit__(self_inner, *exc):
+                    return False
+
+            return _Ctx()
+
+    async def fetch():
+        return await dm._fetch_tile.__wrapped__(_Session(), "https://t/1", None)
+
+    try:
+        asyncio.run(fetch())
+        collector = "served"
+    except HostBlockedError:
+        collector = "refused"
+    except dm.TileBackpressureError:
+        collector = "backpressure"
+    except Exception:  # noqa: BLE001 - any other per-tile failure
+        collector = "other"
+
+    assert (result.verdict == db.HOST_REFUSED) == (collector == "refused"), (status, collector)
+    assert (status in dm.TILE_REDIRECT_STATUSES) == (collector == "refused")
+    assert (status in dm.TILE_BACKPRESSURE_STATUSES) == (collector == "backpressure")
+    if collector == "backpressure":
+        assert result.verdict is None and "throttled" in result.detail
+    if status == 304:
+        assert result.verdict != db.HOST_REFUSED
+
+
 @pytest.mark.parametrize(
     "status,headers,verdict,rc",
     [

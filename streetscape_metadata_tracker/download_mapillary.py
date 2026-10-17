@@ -650,6 +650,10 @@ class TileStatusCounts:
 # (nothing counted them before the status line above), so this is built ahead
 # of the evidence, on the cheap side of an unknown.
 TILE_BACKPRESSURE_STATUSES = (429, 503)
+# The redirects `_fetch_tile` reads as the per-IP block (302 -> /login), named so
+# `host_probe.classify_mapillary` reads the same set: 304 Not Modified is not
+# one, so a probe must never call it REFUSED.
+TILE_REDIRECT_STATUSES = (301, 302, 303, 307, 308)
 TILE_BACKPRESSURE_MIN_WAIT_S = 60.0
 # 15 minutes. Two reasons, one external and one ours. The only cooldown ever
 # reported for a Mapillary tile block is "the script sleeps for 15 minutes",
@@ -916,7 +920,7 @@ async def _fetch_tile(
                 f"Mapillary rejected the access token (HTTP {response.status}). "
                 "Check MAPILLARY_ACCESS_TOKEN."
             )
-        if response.status in (301, 302, 303, 307, 308):
+        if response.status in TILE_REDIRECT_STATUSES:
             # Whole-city (indeed whole-host) condition, so DownloadError: the
             # caller re-raises those immediately instead of counting them
             # against MAX_FAILED_TILE_FRACTION, since every remaining tile

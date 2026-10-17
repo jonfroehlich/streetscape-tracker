@@ -114,12 +114,14 @@ def mapillary_probe_url(token: str) -> str:
 def classify_mapillary(status: int, headers: dict[str, str]) -> ProbeResult:
     """Read one tile response as the collector reads it (``_fetch_tile``).
 
-    * any redirect -- the block is a 302 to ``www.mapillary.com/login`` -- or
-      a 200 carrying an HTML/JSON error page: REFUSED;
-    * a 429 or a 503: THROTTLED, which is INCONCLUSIVE and recorded nowhere.
-      The collector reads both as BACKPRESSURE -- it waits, slows down and
-      pauses, records no refusal and trips no breaker -- so the probe must
-      not read them as a refusal either: a refused row would arm the 36 h
+    * a redirect the collector treats as the block (``TILE_REDIRECT_STATUSES``;
+      the block is a 302 to ``www.mapillary.com/login``) or a 200 carrying an
+      HTML/JSON error page: REFUSED. A 304 is not one;
+    * a status in the collector's ``TILE_BACKPRESSURE_STATUSES`` (429, 503):
+      THROTTLED, which is INCONCLUSIVE and recorded nowhere. The collector
+      reads both as BACKPRESSURE -- it waits, slows down and at worst stops
+      THROTTLED (exit 87), recording no refusal -- so the probe must not read
+      them as a refusal either: a refused row would arm the 36 h
       cooldown on an answer the collector itself would have waited out. The
       ``Retry-After`` is printed when the CDN sends one;
     * a 200 tile, or a 404 (the CDN answered, with no tile): CLEARED;
@@ -127,13 +129,17 @@ def classify_mapillary(status: int, headers: dict[str, str]) -> ProbeResult:
       per-IP one), any 5xx, anything else: INCONCLUSIVE, recorded nowhere.
     """
     from . import db
-    from .download_mapillary import _TILE_ERROR_CONTENT_TYPES
+    from .download_mapillary import (
+        _TILE_ERROR_CONTENT_TYPES,
+        TILE_BACKPRESSURE_STATUSES,
+        TILE_REDIRECT_STATUSES,
+    )
 
     lowered = {k.lower(): v for k, v in headers.items()}
-    if 300 <= status < 400:
+    if status in TILE_REDIRECT_STATUSES:
         location = redact_credentials(lowered.get("location", "(none)"))
         return ProbeResult(db.HOST_REFUSED, status, f"HTTP {status} -> {location}")
-    if status in (429, 503):
+    if status in TILE_BACKPRESSURE_STATUSES:
         retry = lowered.get("retry-after")
         return ProbeResult(
             None,
