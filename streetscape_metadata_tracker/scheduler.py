@@ -512,6 +512,9 @@ class HostBreaker(set):
         super().__init__()
         # The command a refusal is recorded under in host_refusals (issue #444).
         self.source = source
+        # host -> refusals whose host_refusals write FAILED tonight (#444
+        # review). Each one is a cooldown the next night cannot see.
+        self.unrecorded_refusals: Counter[str] = Counter()
         # The run's standing holds (issue #444): asked through `holding`, kept
         # OUT of the set itself so `bool(breaker)` -- the alert and the exit
         # status -- never sees one. A held host did not refuse us.
@@ -723,19 +726,23 @@ class HostBreaker(set):
             )
 
 
-def _record_refusal(conn, host: str, **fields) -> None:
+def _record_refusal(conn, breaker: "HostBreaker", host: str, **fields) -> None:
     """Persist one host refusal in ``host_refusals`` (issue #444); never raise.
 
     Called where the scheduler classifies a child exit as a host REFUSAL --
     the blocked family, 75/76/81/84 -- right beside the breaker trip, on the
-    thread that owns the catalog. A failed write is logged and swallowed: the
-    breaker has already latched the host for the night, and losing the record
-    must not cost the rest of the night, its publish or its alert.
+    thread that owns the catalog. A failed write must not cost the rest of the
+    night, its publish or its alert, so it is caught -- but it is NOT silent:
+    that row is the only thing that arms the next night's refusal cooldown,
+    so the host is added to ``breaker.unrecorded_refusals``, which the
+    ``Done:`` line and the alert both name (the night alerts anyway, since a
+    refusal tripped the breaker).
     """
     try:
         db.record_host_verdict(conn, host, db.HOST_REFUSED, **fields)
     except Exception:  # noqa: BLE001 - a lost record must never end the night
         logger.exception(f"Could not record the {host} refusal in host_refusals")
+        breaker.unrecorded_refusals[host] += 1
 
 
 class ArgvRejections(Counter):
@@ -10166,6 +10173,7 @@ def cmd_run_due(
             else ""
         )
         + (f"; {blocked_note}" if blocked_note else "")
+        + _unrecorded_refusal_note(blocked_hosts)
         # Apart from the refusal clause above (issue #444): nothing refused us
         # and nothing failed; a rest night or a cooldown held the host.
         + _held_summary_note(blocked_hosts)
@@ -11242,6 +11250,7 @@ def _run_city_channels(
                         blocked_hosts.add(blocked_host)
                         _record_refusal(
                             conn,
+                            blocked_hosts,
                             blocked_host,
                             source=blocked_hosts.source,
                             channel=provider,
@@ -13600,6 +13609,25 @@ def _blocked_summary_note(breaker: HostBreaker) -> str:
     return ", ".join(parts)
 
 
+def _unrecorded_refusal_note(breaker: HostBreaker, sep: str = "; ") -> str:
+    """``; 1 refusal of <host> NOT RECORDED in host_refusals (...)``, or ``""`` (#444 review).
+
+    A refusal whose catalog write failed is a cooldown the next night cannot
+    see: its 02:00 launch would ask the blocked host again. Shared by the
+    ``Done:`` line and the alert.
+    """
+    if not breaker.unrecorded_refusals:
+        return ""
+    lost = ", ".join(
+        f"{n} of {HOST_LABELS.get(h, h)}" for h, n in sorted(breaker.unrecorded_refusals.items())
+    )
+    return (
+        f"{sep}refusal(s) NOT RECORDED in host_refusals ({lost}): the next night's refusal "
+        f"cooldown cannot see them -- record one with `probe-host` once the catalog is "
+        f"writable, or hold the channels by hand"
+    )
+
+
 def _blocked_alert_note(breaker: HostBreaker) -> str:
     """The [alerts] paragraph about the hosts that refused us, or empty."""
     if not breaker:
@@ -13626,6 +13654,9 @@ def _blocked_alert_note(breaker: HostBreaker) -> str:
         f"about an hour is the shape seen on 2026-09-13 and 09-15, while the one confirmed ban "
         f"lasted ~20 h and presented as connection refused (issue #341)."
     )
+    lost = _unrecorded_refusal_note(breaker, sep="")
+    if lost:
+        note += " " + lost[0].upper() + lost[1:] + "."
     return note
 
 

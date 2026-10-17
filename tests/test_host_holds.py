@@ -362,7 +362,10 @@ def _refusing_night(monkeypatch, conn, cfg, *, exit_code, today=THURSDAY, **kwar
     monkeypatch.setattr(sched, "generate_aggregate_v2", lambda c, d: None)
     monkeypatch.setattr(sched, "generate_streetwalk_manifest", lambda c, d: {})
     monkeypatch.setattr(sched, "_publish", lambda cfg, summary, **kw: 0)
-    monkeypatch.setattr(sched, "send_alert", lambda *a, **k: None)
+    alerts = kwargs.pop("alerts", None)
+    monkeypatch.setattr(
+        sched, "send_alert", lambda *a, **k: alerts.append(a) if alerts is not None else None
+    )
     return sched.cmd_run_due(cfg, today=today, **kwargs), launches
 
 
@@ -425,12 +428,37 @@ def test_a_failed_refusal_write_never_ends_the_night(conn, monkeypatch, tmp_path
     monkeypatch.setattr(sched.db, "record_host_verdict", broken)
     _register(conn, "Bend")
     _register(conn, "Corvallis")
+    alerts = []
+    cfg = _cfg(tmp_path)
+    cfg.alerts.enabled = True
     with caplog.at_level(logging.INFO, logger="streetscape_scheduler"):
-        rc, launches = _refusing_night(monkeypatch, conn, _cfg(tmp_path), exit_code=75)
+        rc, launches = _refusing_night(monkeypatch, conn, cfg, exit_code=75, alerts=alerts)
     assert [p for _c, p in launches].count("gsv") == 2
     assert "Could not record the mapillary_tiles refusal" in caplog.text
-    assert "stopped early" not in _done_line(caplog)
+    done = _done_line(caplog)
+    assert "stopped early" not in done
+    lost = (
+        "refusal(s) NOT RECORDED in host_refusals (1 of Mapillary's tile CDN "
+        "(tiles.mapillary.com)): the next night's refusal cooldown cannot see them"
+    )
+    assert f"; {lost}" in done
+    # Surfaced in the alert too: the night alerts anyway, because of the refusal.
+    assert len(alerts) == 1
+    _cfg_arg, _subject, body = alerts[0]
+    assert "Refusal(s) NOT RECORDED in host_refusals (1 of Mapillary's tile CDN" in body
     assert rc != 0
+
+
+def test_a_recorded_refusal_says_nothing_about_lost_records(conn, monkeypatch, tmp_path, caplog):
+    """The clause appears only when a write failed."""
+    _register(conn, "Bend")
+    alerts = []
+    cfg = _cfg(tmp_path)
+    cfg.alerts.enabled = True
+    with caplog.at_level(logging.INFO, logger="streetscape_scheduler"):
+        _refusing_night(monkeypatch, conn, cfg, exit_code=75, alerts=alerts)
+    assert "NOT RECORDED" not in _done_line(caplog)
+    assert len(alerts) == 1 and "NOT RECORDED" not in alerts[0][2]
 
 
 def test_status_prints_the_last_refusal_and_clearance_per_host(

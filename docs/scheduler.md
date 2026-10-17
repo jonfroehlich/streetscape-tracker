@@ -579,7 +579,8 @@ A section must hold at least one known key and nothing else, and one bad key ref
 
 **`host_refusals` (schema v22) is the persisted record.**
 A `refused` row is written wherever the scheduler classifies a child exit as a host refusal (the blocked family, 75/76/81/84), beside the breaker trip, with the command (`run-due` or `assess-city`), channel, city, exit code, reason and `requests_before` — the host's `host_usage` total over the prior 24 h, NULL for an unmetered host such as Overpass.
-A busy exit writes nothing; a failed write is logged and swallowed, since the breaker already has the refusal.
+A busy exit writes nothing.
+A failed write is caught so it cannot end the night, but it is **not silent**: that row is the only thing that arms the next night's cooldown, so the `Done:` line and the alert (which the night sends anyway, because of the refusal) both say `refusal(s) NOT RECORDED in host_refusals`, with the fix — record one with `probe-host` once the catalog is writable, or hold the channels by hand.
 `scheduler status` prints, per host with a row, the last refusal and how long ago, the last clearance, and the last ledgered request on the host.
 
 **`probe-host HOST` sends exactly one request and records the verdict.**
