@@ -10636,8 +10636,8 @@ def _run_city_channels(
     # ...and those lost to an argv our own CLI rejected (issue #359), which the
     # end-of-night retry must never re-launch (issue #380).
     lost_to_argv: set[str] = set()
-    # ...and those lost to a THROTTLED host (exit 87, or a breaker skip on a
-    # host latched only by a throttle; issue #444), named so in the alert.
+    # ...and those lost to a THROTTLED host (exit 87; issue #444), named so in
+    # the alert.
     lost_to_throttle: set[str] = set()
     # ...and the walks the batch deadline deferred (issue #373), stranded
     # below when their grid sibling landed in this same call.
@@ -10852,6 +10852,10 @@ def _run_city_channels(
                             lost_to_host.append(provider)
                             throttled_skip = blocked_hosts.throttled_only(unavailable)
                             if throttled_skip:
+                                # Defensive: a breaker-skipped walk never strands,
+                                # since its grid sibling is on the same latched host
+                                # and was skipped too. Kept so the stranded wording
+                                # agrees with this line's if a sibling ever lands.
                                 lost_to_throttle.add(provider)
                             logger.info(
                                 f"{city.city_id} [{provider}]: skipping — "

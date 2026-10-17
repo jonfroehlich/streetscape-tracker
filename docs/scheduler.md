@@ -593,7 +593,7 @@ A failed write is caught so it cannot end the night, but it is **not silent**: t
 The Mapillary tile census exits 87 on every backpressure stop (`HostThrottledError`).
 The scheduler latches the tile CDN for the rest of the run — both Mapillary channels, the fill included; the host has no `HOST_RECHECKS` entry, so nothing asks it again — and amnesties the child: no `record_attempt`, so no `consecutive_failures` and never a quarantine, and the checkpoint is kept for the next due night.
 It writes no `host_refusals` row and so arms no cooldown, because a 429 is inconclusive, exactly as `probe-host` reads it.
-A walk lost to it (its own 87, or a breaker skip on a host latched only by a throttle) strands like one lost to a refusal, and the alert names it `a throttled host (HTTP 429/503)`.
+A walk lost to its own 87 strands like one lost to a refusal, and the alert names it `a throttled host (HTTP 429/503)`.
 The night still alerts and exits nonzero; the subject says `host(s) THROTTLED` and the `Done:` line `THROTTLED (HTTP 429/503, no refusal recorded)`, never "unavailable".
 `scheduler status` prints, per host with a row, the last refusal and how long ago, the last clearance, and the last ledgered request on the host.
 
