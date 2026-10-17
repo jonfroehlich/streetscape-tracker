@@ -147,6 +147,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--include-third-party", action="store_true")
     p.add_argument("--rate-per-minute", type=float, default=300.0)
     p.add_argument("--db-path", default=None, help="record the spend in this catalog's ledger")
+    p.add_argument(
+        "--env-file",
+        default=None,
+        help="the .env holding GMAPS_STREETS_API_KEY (default: the nearest .env up from the cwd)",
+    )
     p.add_argument("--dry-run", action="store_true", help="sample and report, no requests")
     return p
 
@@ -163,6 +168,11 @@ def main(argv=None, fetch: Fetch | None = None) -> int:
     if args.dry_run:
         return 0
     if fetch is None:
+        from dotenv import find_dotenv, load_dotenv
+
+        # The same loader the CLI uses, from the cwd rather than this file's
+        # directory, so a worktree checkout can read the production .env.
+        load_dotenv(args.env_file or find_dotenv(usecwd=True))
         fetch = _requests_fetch(config.load_config(PROVIDER)["api_key"])
     metrics = spot_check(sample, fetch, rate_per_minute=args.rate_per_minute)
     metrics["history_file"] = os.path.basename(args.history)
