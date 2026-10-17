@@ -4441,6 +4441,105 @@ def _print_membership_footer(conn, providers) -> None:
         print(_exclusion_line(conn, provider, n_member, n_enabled, n_excluded, listing=True))
 
 
+def cmd_probe_host(
+    cfg: SchedulerConfig,
+    host: str,
+    *,
+    force: bool = False,
+    fetch=None,
+    today: date | None = None,
+) -> int:
+    """``probe-host HOST``: send ONE request to a per-IP host, print and record the verdict (#444).
+
+    The operator's single-request probe after a block (the recovery recipe
+    since August: full silence, then one request). Exactly one request -- for
+    Mapillary's tile CDN, one z14 tile (``host_probe.MAPILLARY_PROBE_TILE``)
+    with ``MAPILLARY_ACCESS_TOKEN``, redirects NOT followed, so a 302 to the
+    login page reads as REFUSED -- and the verdict goes to ``host_refusals``:
+    a refusal (which the cross-night cooldown then counts from) or a clearance
+    (which it never does). An inconclusive answer (a rejected token, a 5xx, no
+    response) records nothing. A request that got an HTTP answer is charged to
+    the ``mapillary`` ledger like any other, so the host's rolling window
+    sees it.
+
+    Refuses, with ``USAGE_EXIT_CODE`` and nothing sent:
+
+    * while any ``run-due`` is in flight on this machine (``_run_due_in_flight``,
+      the check ``import-bundle`` and the pre-freeze pass use) -- a probe in the
+      middle of a night is one more talker at the worst moment, and its verdict
+      would race the night's own;
+    * inside the host's refusal cooldown, unless ``force`` -- the cooldown is the
+      silence the probe exists to end, and probing inside it is the re-probe it
+      exists to prevent;
+    * on a config the channel-running commands would refuse, an unknown host,
+      or a missing token.
+
+    Another local process holding the host lock (a hand-run collector) exits
+    with the host's BUSY code, also with nothing sent. ``fetch`` (url ->
+    (status, headers)) is the test seam; production uses ``requests`` with
+    ``allow_redirects=False``.
+
+    Exit status: 0 cleared, the host's blocked code (75 for the tile CDN)
+    refused, 1 inconclusive.
+    """
+    from . import host_probe
+
+    if host not in host_probe.PROBES:
+        logger.error(
+            f"probe-host: no probe for {host!r} (known: {', '.join(sorted(host_probe.PROBES))})"
+        )
+        return USAGE_EXIT_CODE
+    if _config_refusals(cfg):
+        for message in _config_refusals(cfg):
+            logger.error(message)
+        return USAGE_EXIT_CODE
+    in_flight = _run_due_in_flight()
+    if in_flight:
+        logger.error(
+            f"probe-host: a run-due is in flight on this machine ({in_flight}); not probing "
+            f"{HOST_LABELS[host]} beside it. Wait for it to finish."
+        )
+        return USAGE_EXIT_CODE
+    # Not closed on return, like `status`: a one-shot command's process exit
+    # closes it, and tests hand every command the same shared handle.
+    conn = db.connect(cfg.db_path)
+    if today is None:
+        today = clock.snapshot_date_today()
+    cooling = _host_holds(cfg, today, conn).cooldown(host)
+    if cooling is not None:
+        if not force:
+            logger.error(
+                f"probe-host: {cooling.describe()} -- refusing to probe inside the "
+                f"cooldown. Pass --force to probe anyway (issue #444)."
+            )
+            return USAGE_EXIT_CODE
+        logger.warning(f"probe-host --force: probing inside the cooldown ({cooling.describe()})")
+    token_loader, _url, _classify = host_probe.PROBES[host]
+    try:
+        token = token_loader()
+    except ValueError as exc:
+        logger.error(f"probe-host: {exc}")
+        return USAGE_EXIT_CODE
+    try:
+        result, sent = host_probe.probe(host, token, fetch or host_probe.requests_fetch)
+    except HostBusyError as exc:
+        logger.error(f"probe-host: {exc}")
+        return host_probe.busy_exit_code(host)
+    if sent:
+        # The one request is a real tile request on the grid channel's token,
+        # so the ledger -- and through it the host's rolling-24h window --
+        # counts it like any other.
+        db.add_api_usage(conn, today, 1, "mapillary")
+    if result.verdict is not None:
+        db.record_host_verdict(
+            conn, host, result.verdict, source="probe-host", detail=result.detail
+        )
+    verdict = (result.verdict or "inconclusive").upper()
+    recorded = "recorded" if result.verdict is not None else "not recorded"
+    print(f"{HOST_LABELS[host]}: {verdict} — {result.detail} ({recorded}).")
+    return host_probe.exit_code_for(host, result)
+
+
 def cmd_assign(cfg: SchedulerConfig) -> int:
     """(Re)compute the day-of-cycle stagger assignment for all cities.
 
@@ -14411,6 +14510,21 @@ def build_parser() -> argparse.ArgumentParser:
         "rest night or a refusal_cooldown_h cooldown (issue #444). Logged at WARNING; "
         "an operator override the nightly unit never passes.",
     )
+    p_probe = sub.add_parser(
+        "probe-host",
+        help="Send ONE request to a per-IP host and record the verdict in host_refusals "
+        "(issue #444): for mapillary_tiles, one z14 tile, redirects not followed, so a "
+        "302 to the login page is REFUSED. Refuses while a run-due is in flight, and "
+        "inside the host's refusal cooldown unless --force. Exit 0 cleared, 75 refused, "
+        "1 inconclusive.",
+    )
+    _add_global_flags(p_probe)
+    p_probe.add_argument("host", help="The per-IP host token; today only mapillary_tiles")
+    p_probe.add_argument(
+        "--force",
+        action="store_true",
+        help="Probe even inside the host's [hosts.*].refusal_cooldown_h cooldown",
+    )
     p_assess = sub.add_parser(
         "assess-city",
         help="Register a new city, walk its streets on both providers, publish, "
@@ -14655,6 +14769,8 @@ def main() -> int:
         return cmd_fetch_driving_plan(
             cfg, force=args.force, from_file=args.from_file, target_date=target
         )
+    if args.command == "probe-host":
+        return cmd_probe_host(cfg, args.host, force=args.force)
     if args.command == "assess-city":
         return cmd_assess_city(
             cfg,

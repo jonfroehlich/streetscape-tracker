@@ -627,3 +627,230 @@ def test_status_says_whether_the_host_is_cooling_down(
     frozen_utc_clock(_NIGHT_START + timedelta(hours=17))
     sched.cmd_status(cfg)
     assert "refusal cooldown 36 h: not cooling down." in capsys.readouterr().out
+
+
+# ── scheduler probe-host ─────────────────────────────────────────────────
+
+_TOKEN = "MLY|probe-token-SECRET"
+
+
+class _Fetch:
+    """An injected fetch primitive: records every URL, answers one canned response."""
+
+    def __init__(self, status=200, headers=None, error=None):
+        self.urls = []
+        self.status = status
+        self.headers = (
+            headers if headers is not None else {"Content-Type": "application/x-protobuf"}
+        )
+        self.error = error
+
+    def __call__(self, url):
+        self.urls.append(url)
+        if self.error is not None:
+            raise self.error
+        return self.status, self.headers
+
+
+@pytest.fixture
+def probe_env(conn, monkeypatch, tmp_path, frozen_utc_clock):
+    """The catalog, a frozen clock and a stubbed token for probe-host."""
+    from streetscape_metadata_tracker import host_probe
+
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+    loader, url_for, classify = host_probe.PROBES[HOST_MAPILLARY_TILES]
+    monkeypatch.setitem(
+        host_probe.PROBES, HOST_MAPILLARY_TILES, (lambda: _TOKEN, url_for, classify)
+    )
+    frozen_utc_clock(_NIGHT_START)
+    return _cfg(tmp_path, "refusal_cooldown_h = 36\n")
+
+
+def _verdicts(conn):
+    return [
+        (r["verdict"], r["source"], r["detail"])
+        for r in conn.execute("SELECT * FROM host_refusals ORDER BY id")
+    ]
+
+
+def test_probe_host_sends_exactly_one_tile_request_and_records_a_clearance(conn, probe_env, capsys):
+    fetch = _Fetch()
+    rc = sched.cmd_probe_host(probe_env, HOST_MAPILLARY_TILES, fetch=fetch)
+    assert rc == 0
+    assert len(fetch.urls) == 1
+    assert fetch.urls[0] == (
+        "https://tiles.mapillary.com/maps/vtp/mly1_computed_public/2/14/2581/5921"
+        f"?access_token={_TOKEN}"
+    )
+    assert _verdicts(conn) == [("cleared", "probe-host", "HTTP 200 tile (application/x-protobuf)")]
+    # The one request is ledgered like any other, so the host window sees it.
+    assert db.get_api_usage(conn, _NIGHT_START.date(), "mapillary") == 1
+    assert "CLEARED" in capsys.readouterr().out
+
+
+def test_a_redirect_is_a_refusal_and_the_token_never_reaches_the_record(conn, probe_env):
+    fetch = _Fetch(
+        302,
+        {"Location": f"https://www.mapillary.com/login/?next=x%3Faccess_token%3D{_TOKEN}"},
+    )
+    rc = sched.cmd_probe_host(probe_env, HOST_MAPILLARY_TILES, fetch=fetch)
+    assert rc == 75
+    ((verdict, source, detail),) = _verdicts(conn)
+    assert (verdict, source) == ("refused", "probe-host")
+    assert detail.startswith("HTTP 302 -> https://www.mapillary.com/login/")
+    assert "SECRET" not in detail
+
+
+def test_a_probe_refusal_starts_the_cooldown_a_night_then_honours(
+    conn, monkeypatch, probe_env, frozen_utc_clock
+):
+    """The pass-through from probe-host's row to the next night's gate."""
+    assert sched.cmd_probe_host(probe_env, HOST_MAPILLARY_TILES, fetch=_Fetch(302, {})) == 75
+    frozen_utc_clock(_NIGHT_START + timedelta(hours=20))
+    a = _register(conn, "Bend")
+    rc, launches, _ = _night(monkeypatch, conn, probe_env, today=THURSDAY)
+    assert rc == 0
+    assert launches == [(a, "gsv")]
+
+
+@pytest.mark.parametrize(
+    "status,headers,verdict,rc",
+    [
+        (429, {"Retry-After": "3600"}, "refused", 75),
+        (200, {"Content-Type": "text/html; charset=utf-8"}, "refused", 75),
+        (301, {}, "refused", 75),
+        (404, {}, "cleared", 0),
+        (403, {}, None, 1),
+        (401, {}, None, 1),
+        (503, {}, None, 1),
+    ],
+)
+def test_probe_host_classifies_each_answer(conn, probe_env, status, headers, verdict, rc):
+    fetch = _Fetch(status, headers)
+    assert sched.cmd_probe_host(probe_env, HOST_MAPILLARY_TILES, fetch=fetch) == rc
+    assert len(fetch.urls) == 1
+    assert [v for v, _s, _d in _verdicts(conn)] == ([verdict] if verdict else [])
+
+
+def test_no_response_is_inconclusive_and_not_ledgered(conn, probe_env):
+    fetch = _Fetch(error=ConnectionError("connection refused"))
+    assert sched.cmd_probe_host(probe_env, HOST_MAPILLARY_TILES, fetch=fetch) == 1
+    assert _verdicts(conn) == []
+    assert db.get_api_usage(conn, _NIGHT_START.date(), "mapillary") == 0
+
+
+def test_probe_host_refuses_while_a_run_due_is_in_flight(conn, monkeypatch, probe_env):
+    monkeypatch.setattr(sched, "_run_due_in_flight", lambda: "pid 4242: python -m ... run-due")
+    fetch = _Fetch()
+    assert sched.cmd_probe_host(probe_env, HOST_MAPILLARY_TILES, fetch=fetch) == (
+        sched.USAGE_EXIT_CODE
+    )
+    assert fetch.urls == [] and _verdicts(conn) == []
+
+
+def test_probe_host_refuses_inside_the_cooldown_unless_forced(conn, probe_env, caplog):
+    _refused(conn, 20)
+    fetch = _Fetch()
+    with caplog.at_level(logging.ERROR, logger="streetscape_scheduler"):
+        rc = sched.cmd_probe_host(probe_env, HOST_MAPILLARY_TILES, fetch=fetch)
+    assert rc == sched.USAGE_EXIT_CODE
+    assert fetch.urls == []
+    assert "cooling down until 2026-10-16 01:00 UTC" in caplog.text
+    assert sched.cmd_probe_host(probe_env, HOST_MAPILLARY_TILES, fetch=fetch, force=True) == 0
+    assert len(fetch.urls) == 1
+
+
+def test_probe_host_refuses_while_another_process_holds_the_host_lock(conn, probe_env):
+    """The lock every collection child takes: the busy code, and nothing sent.
+    Held the way tests/test_host_lock.py holds it -- a second FileLock on the
+    same path, which is another holder as far as flock is concerned."""
+    from filelock import FileLock
+
+    from streetscape_metadata_tracker import host_lock as hl
+
+    fetch = _Fetch()
+    other = FileLock(hl.lock_path(HOST_MAPILLARY_TILES))
+    other.acquire()
+    try:
+        assert sched.cmd_probe_host(probe_env, HOST_MAPILLARY_TILES, fetch=fetch) == 79
+    finally:
+        other.release()
+    assert fetch.urls == [] and _verdicts(conn) == []
+    # Free again: the probe takes the lock itself, and gives it back.
+    assert sched.cmd_probe_host(probe_env, HOST_MAPILLARY_TILES, fetch=fetch) == 0
+    other.acquire(timeout=0)
+    other.release()
+
+
+def test_probe_host_refuses_an_unknown_host_and_a_missing_token(conn, monkeypatch, probe_env):
+    from streetscape_metadata_tracker import host_probe
+
+    fetch = _Fetch()
+    assert sched.cmd_probe_host(probe_env, "overpass", fetch=fetch) == sched.USAGE_EXIT_CODE
+
+    def no_token():
+        raise ValueError("MAPILLARY_ACCESS_TOKEN not found")
+
+    _loader, url_for, classify = host_probe.PROBES[HOST_MAPILLARY_TILES]
+    monkeypatch.setitem(host_probe.PROBES, HOST_MAPILLARY_TILES, (no_token, url_for, classify))
+    assert sched.cmd_probe_host(probe_env, HOST_MAPILLARY_TILES, fetch=fetch) == (
+        sched.USAGE_EXIT_CODE
+    )
+    assert fetch.urls == []
+
+
+def test_probe_host_is_wired_into_the_cli(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        sched.sys, "argv", ["scheduler", "probe-host", "mapillary_tiles", "--force"]
+    )
+    monkeypatch.setattr(sched, "load_scheduler_config", lambda path: _cfg(tmp_path))
+    monkeypatch.setattr(sched, "setup_logging", lambda cfg, verbose=False: None)
+    seen = {}
+    monkeypatch.setattr(
+        sched, "cmd_probe_host", lambda cfg, host, **kw: seen.update(kw, host=host) or 0
+    )
+    assert sched.main() == 0
+    assert seen == {"host": "mapillary_tiles", "force": True}
+
+
+def test_the_production_fetch_never_follows_a_redirect(monkeypatch):
+    """allow_redirects=False is the whole verdict: following the 302 lands on
+    the login page's own 200 (the collector's #199 bug)."""
+    import requests
+
+    from streetscape_metadata_tracker import host_probe
+
+    seen = {}
+
+    class _Response:
+        status_code = 302
+        headers = {"Location": "https://www.mapillary.com/login/"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def fake_get(url, **kwargs):
+        seen.update(kwargs, url=url)
+        return _Response()
+
+    monkeypatch.setattr(requests, "get", fake_get)
+    assert host_probe.requests_fetch("https://t/x") == (302, _Response.headers)
+    assert seen["allow_redirects"] is False
+    assert seen["timeout"] == host_probe.PROBE_TIMEOUT_S
+
+
+def test_the_token_comes_from_the_existing_loader(monkeypatch):
+    import dotenv
+
+    from streetscape_metadata_tracker import config, host_probe
+
+    monkeypatch.setattr(dotenv, "load_dotenv", lambda *a, **k: False)
+    monkeypatch.setattr(config, "warn_if_credentials_world_readable", lambda path: False)
+    monkeypatch.setenv("MAPILLARY_ACCESS_TOKEN", "MLY|from-env")
+    assert host_probe.load_mapillary_token() == "MLY|from-env"
+    monkeypatch.delenv("MAPILLARY_ACCESS_TOKEN")
+    with pytest.raises(ValueError):
+        host_probe.load_mapillary_token()

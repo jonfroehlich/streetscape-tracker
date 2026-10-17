@@ -1084,6 +1084,15 @@ A hold keeps a host's channels from launching without anything having refused us
   - `test_the_cooldown_ends_mid_night_and_the_host_resumes` — 35.5 h at the start: the first city's pair is held, the second's runs once a gsv run has carried the clock past 36 h.
   - `test_status_says_whether_the_host_is_cooling_down`.
   - `test_a_refusal_cooldown_holds_an_inquiry_off_the_tile_cdn` (`tests/test_assess_city.py`).
+- `scheduler probe-host` (an injected fetch primitive, `_Fetch`, records every URL; the network guard in conftest backs it up):
+  - `test_probe_host_sends_exactly_one_tile_request_and_records_a_clearance` — ONE request, to exactly the documented z14 tile with the token, a `cleared` row, and one request on the `mapillary` ledger.
+  - `test_a_redirect_is_a_refusal_and_the_token_never_reaches_the_record` (exit 75, the Location redacted).
+  - `test_a_probe_refusal_starts_the_cooldown_a_night_then_honours` — the pass-through from probe-host's row to the next night's gate.
+  - `test_probe_host_classifies_each_answer` — 429, a 200 HTML page and a 301 are refused; a 404 is cleared; 401, 403 and 503 are inconclusive and record nothing; each with exactly one request.
+  - `test_no_response_is_inconclusive_and_not_ledgered`.
+  - `test_probe_host_refuses_while_a_run_due_is_in_flight`, `test_probe_host_refuses_inside_the_cooldown_unless_forced` and `test_probe_host_refuses_while_another_process_holds_the_host_lock` (busy code 79, nothing sent; the lock is released after a probe) — each with no request sent.
+  - `test_probe_host_refuses_an_unknown_host_and_a_missing_token`, `test_probe_host_is_wired_into_the_cli`.
+  - `test_the_production_fetch_never_follows_a_redirect` (`allow_redirects=False` reaches `requests.get`) and `test_the_token_comes_from_the_existing_loader`.
 
 ## The same-day partner path (issue #215)
 
