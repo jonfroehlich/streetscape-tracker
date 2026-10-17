@@ -1075,6 +1075,15 @@ A hold keeps a host's channels from launching without anything having refused us
   - `test_a_busy_host_is_not_a_refusal_and_writes_no_row` (79) and `test_a_failed_refusal_write_never_ends_the_night` (a raising write is logged, and the later cities still run).
   - `test_an_assess_city_refusal_is_persisted_under_its_own_name` (`tests/test_assess_city.py`).
   - `test_status_prints_the_last_refusal_and_clearance_per_host`.
+- The cross-night refusal cooldown (`[hosts.<token>].refusal_cooldown_h`):
+  - `test_a_refusal_cooldown_loads` (36, 0.5, 168) and `test_an_invalid_refusal_cooldown_fails_closed` (0, −1, 169, a bool, a string, a list).
+  - `test_makelab1_cools_the_tile_cdn_for_36_hours_and_it_reaches_the_gate` — prod's 36 h read through `_host_holds` against a refusal 20 h back, held at the night's start and released one second past 36 h.
+  - `test_a_night_inside_the_cooldown_holds_the_host_and_is_not_a_refusal` — the 10-17 shape: gsv runs, the pair sends nothing, no alert, exit 0, no new `host_refusals` row, no `last_attempt_at`, and "cooling down until" on the `Done:` line and in the log.
+  - `test_a_night_past_the_cooldown_launches` and `test_no_cooldown_configured_is_todays_behaviour` (a refusal an hour old, no key: asked again).
+  - `test_a_clearance_does_not_shorten_the_cooldown` — only the newest REFUSAL counts.
+  - `test_the_cooldown_ends_mid_night_and_the_host_resumes` — 35.5 h at the start: the first city's pair is held, the second's runs once a gsv run has carried the clock past 36 h.
+  - `test_status_says_whether_the_host_is_cooling_down`.
+  - `test_a_refusal_cooldown_holds_an_inquiry_off_the_tile_cdn` (`tests/test_assess_city.py`).
 
 ## The same-day partner path (issue #215)
 

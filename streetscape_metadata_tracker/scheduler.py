@@ -304,6 +304,7 @@ HOST_RECHECKS: dict[str, Callable[[], bool]] = {
 # before the night from config and the catalog, and it never trips, alerts,
 # records a failure or changes the exit status. The cities stay due.
 HOLD_REST = "rest night"
+HOLD_COOLDOWN = "cooling down"
 
 
 @dataclass(frozen=True)
@@ -312,12 +313,21 @@ class HostHold:
 
     host: str
     reason: str
-    # Human-readable specifics: "Wed" for a rest night.
+    # Human-readable specifics: "Wed" for a rest night; for a cooldown, its end
+    # and the refusal it counts from.
     detail: str
 
     def describe(self) -> str:
-        """``Mapillary's tile CDN (...): rest night (Wed)``."""
-        return f"{HOST_LABELS.get(self.host, self.host)}: {self.reason} ({self.detail})"
+        """``...: rest night (Wed)`` or ``...: cooling down until 2026-10-18 21:03 UTC (...)``."""
+        label = HOST_LABELS.get(self.host, self.host)
+        if self.reason == HOLD_COOLDOWN:
+            return f"{label}: {self.reason} {self.detail}"
+        return f"{label}: {self.reason} ({self.detail})"
+
+
+def _utc_minute(when: datetime) -> str:
+    """``2026-10-18 21:03 UTC``: how a hold names an instant."""
+    return when.astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC")
 
 
 class HostHolds:
@@ -329,31 +339,72 @@ class HostHolds:
     run's DATE: a night that starts on a Tuesday (UTC) and runs past midnight is
     still a Tuesday night, the same way all its runs are dated Tuesday.
 
+    A refusal COOLDOWN is the other kind: it holds until a fixed instant, the
+    newest refusal before the run plus the host's ``refusal_cooldown_h``, so
+    it is read against the wall clock at each ask and can end mid-run -- a
+    night that starts 30 h after a refusal under a 36 h cooldown launches its
+    Mapillary channels from hour 6 on. It never STARTS mid-run: the refusals
+    it counts from were all recorded before the run began, and a refusal
+    tonight is the breaker's to handle.
+
     The empty instance (no arguments) holds nothing, which is what every caller
     that predates #444 gets.
     """
 
-    def __init__(self, rest: dict[str, str] | None = None):
+    def __init__(
+        self,
+        rest: dict[str, str] | None = None,
+        cooldowns: dict[str, tuple[datetime, datetime]] | None = None,
+        now: Callable[[], datetime] | None = None,
+    ):
         # host -> the weekday name it rests on tonight. Only hosts resting
         # TONIGHT are here; the config's full weekday list is not needed.
         self._rest = dict(rest or {})
+        # host -> (the refusal the cooldown counts from, the instant it ends).
+        self._cooldowns = dict(cooldowns or {})
+        # Read at call time, never bound at import, so a frozen test clock
+        # (`clock._utc_clock`) reaches it.
+        self._now = now or (lambda: clock.utc_now())
 
     def active(self, host: str) -> HostHold | None:
-        """The hold on ``host`` right now, or None."""
+        """The hold on ``host`` right now, or None. A rest night outranks a cooldown."""
         day = self._rest.get(host)
         if day is not None:
             return HostHold(host, HOLD_REST, day)
+        return self.cooldown(host)
+
+    def cooldown(self, host: str) -> HostHold | None:
+        """The refusal cooldown on ``host`` right now, rest night or not, or None."""
+        cooldown = self._cooldowns.get(host)
+        if cooldown is not None:
+            refused_at, until = cooldown
+            if self._now() < until:
+                hours = (until - refused_at).total_seconds() / 3600
+                return HostHold(
+                    host,
+                    HOLD_COOLDOWN,
+                    f"until {_utc_minute(until)} ({hours:g} h after the refusal recorded "
+                    f"{_utc_minute(refused_at)})",
+                )
         return None
 
     def hosts(self) -> set[str]:
-        """Every host this instance could hold."""
-        return set(self._rest)
+        """Every host this instance could hold (an expired cooldown included)."""
+        return set(self._rest) | set(self._cooldowns)
 
-    def __bool__(self) -> bool:
-        return bool(self._rest)
+    def current(self) -> dict[str, HostHold]:
+        """Every hold in force right now, by host."""
+        found = {host: self.active(host) for host in sorted(self.hosts())}
+        return {host: hold for host, hold in found.items() if hold is not None}
 
 
-def _host_holds(cfg: "SchedulerConfig", today: date, *, ignore: bool = False) -> HostHolds:
+def _host_holds(
+    cfg: "SchedulerConfig",
+    today: date,
+    conn=None,
+    *,
+    ignore: bool = False,
+) -> HostHolds:
     """The holds for a run dated ``today`` (issue #444).
 
     ``today`` is the run's snapshot date -- the UTC calendar date
@@ -363,6 +414,14 @@ def _host_holds(cfg: "SchedulerConfig", today: date, *, ignore: bool = False) ->
     UTC, the same calendar day in both zones; a hand-run catch-up after 17:00
     Pacific is already the NEXT UTC day, and is held or not by that day.
 
+    A refusal cooldown (``[hosts.<token>].refusal_cooldown_h``) needs
+    ``conn``: it reads the newest ``refused`` row in ``host_refusals`` for the
+    host and holds until that instant plus the cooldown. Read ONCE, when the
+    run builds its holds, so a refusal recorded later in the run never becomes
+    a hold mid-run -- that one is the breaker's. A CLEARANCE row never shortens
+    it: one positive probe is evidence the wall is down, not that full volume
+    is safe again. No ``conn``, or no refusal on record, means no cooldown.
+
     ``ignore`` (``run-due --ignore-host-holds``) returns the empty instance;
     the caller logs that it did so.
     """
@@ -370,7 +429,17 @@ def _host_holds(cfg: "SchedulerConfig", today: date, *, ignore: bool = False) ->
         return HostHolds()
     weekday = WEEKDAY_NAMES[today.weekday()]
     rest = {host: weekday for host, days in cfg.host_rest_weekdays.items() if weekday in days}
-    return HostHolds(rest=rest)
+    cooldowns: dict[str, tuple[datetime, datetime]] = {}
+    if conn is not None:
+        for host, hours in cfg.host_refusal_cooldown_h.items():
+            row = db.newest_host_verdict(conn, host, db.HOST_REFUSED)
+            if row is None:
+                continue
+            refused_at = datetime.fromisoformat(row["recorded_at"])
+            if refused_at.tzinfo is None:
+                refused_at = refused_at.replace(tzinfo=UTC)
+            cooldowns[host] = (refused_at, refused_at + timedelta(hours=hours))
+    return HostHolds(rest=rest, cooldowns=cooldowns)
 
 
 class HostBreaker(set):
@@ -1207,6 +1276,11 @@ class SchedulerConfig:
     # Read against the run's snapshot date (UTC, #347). Empty (the default, and
     # every host without the key) means no rest night.
     host_rest_weekdays: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    # [hosts.<token>].refusal_cooldown_h (issue #444): host -> hours after its
+    # newest host_refusals `refused` row during which no channel touching it
+    # launches. Empty (the default) means no cooldown: a host refused last night
+    # is asked again tonight, exactly as before #444.
+    host_refusal_cooldown_h: dict[str, float] = field(default_factory=dict)
     # [alerts] — operator email on unhealthy runs (off by default)
     alerts: AlertConfig = field(default_factory=AlertConfig)
     # [resource_guard] — load/RAM-aware concurrency backoff on shared hosts
@@ -1535,7 +1609,12 @@ _HOST_BUDGET_KEY = "rolling_24h_request_budget"
 # (`clock.snapshot_date_today()`, the UTC calendar, #347), the same date the
 # night's runs are dated and its ledger rows are keyed by.
 _HOST_REST_KEY = "rest_weekdays"
-_HOST_KEYS = (_HOST_BUDGET_KEY, _HOST_REST_KEY)
+# Hours after the newest recorded refusal during which the host's channels do
+# not launch (issue #444): the 02:00 nightly must not re-probe a blocked IP ~20 h
+# into a block. Bounded at a week, so a units typo (minutes, seconds) is caught.
+_HOST_COOLDOWN_KEY = "refusal_cooldown_h"
+_HOST_COOLDOWN_MAX_H = 7 * 24
+_HOST_KEYS = (_HOST_BUDGET_KEY, _HOST_REST_KEY, _HOST_COOLDOWN_KEY)
 # Indexed by `date.weekday()`: Monday is 0.
 WEEKDAY_NAMES = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 
@@ -1545,6 +1624,7 @@ class _HostSettings(NamedTuple):
 
     budgets: dict[str, int]
     rest_weekdays: dict[str, tuple[str, ...]]
+    cooldown_h: dict[str, float]
     errors: list[str]
 
 
@@ -1611,6 +1691,10 @@ def _host_settings(table: Any, config_path) -> _HostSettings:
     its own in-night re-check (#341) and no ledger, and nothing has asked to
     rest it.
 
+    ``refusal_cooldown_h`` (issue #444) likewise: a positive number of hours,
+    at most a week, refused rather than dropped, since dropping it would let the
+    nightly re-probe a blocked IP the cooldown exists to leave alone.
+
     A section must hold at least one known key and nothing else, and every key
     in a section must be valid for ANY of it to load: a half-applied section is
     harder to reason about than a refused one.
@@ -1618,12 +1702,13 @@ def _host_settings(table: Any, config_path) -> _HostSettings:
     metered = sorted(set(CHANNEL_METERED_HOST.values()))
     budgets: dict[str, int] = {}
     rest: dict[str, tuple[str, ...]] = {}
+    cooldown: dict[str, float] = {}
     errors: list[str] = []
     if table is None:
-        return _HostSettings(budgets, rest, errors)
+        return _HostSettings(budgets, rest, cooldown, errors)
     if not isinstance(table, dict):
         errors.append(f"[hosts] in {config_path} is not a table of [hosts.<token>] sections.")
-        return _HostSettings(budgets, rest, errors)
+        return _HostSettings(budgets, rest, cooldown, errors)
     for token, section in table.items():
         where = f"[hosts.{token}] in {config_path}"
         if token not in metered:
@@ -1650,6 +1735,16 @@ def _host_settings(table: Any, config_path) -> _HostSettings:
             days, error = _rest_weekdays(section[_HOST_REST_KEY], where)
             if error is not None:
                 section_errors.append(error)
+        hours = section.get(_HOST_COOLDOWN_KEY)
+        if _HOST_COOLDOWN_KEY in section and (
+            isinstance(hours, bool)
+            or not isinstance(hours, int | float)
+            or not 0 < hours <= _HOST_COOLDOWN_MAX_H
+        ):
+            section_errors.append(
+                f"{where}: {_HOST_COOLDOWN_KEY}={hours!r} is not a number of hours in "
+                f"(0, {_HOST_COOLDOWN_MAX_H}]."
+            )
         if section_errors:
             errors.extend(section_errors)
             continue
@@ -1657,7 +1752,9 @@ def _host_settings(table: Any, config_path) -> _HostSettings:
             budgets[token] = budget
         if days:
             rest[token] = days
-    return _HostSettings(budgets, rest, errors)
+        if _HOST_COOLDOWN_KEY in section:
+            cooldown[token] = float(hours)
+    return _HostSettings(budgets, rest, cooldown, errors)
 
 
 def _config_refusals(cfg: SchedulerConfig) -> list[str]:
@@ -1784,6 +1881,7 @@ def load_scheduler_config(path: str | None = None) -> SchedulerConfig:
         fill_min_days=fill_min_days,
         fill_host_ceilings=fill_host_ceilings,
         host_rest_weekdays=host_settings.rest_weekdays,
+        host_refusal_cooldown_h=host_settings.cooldown_h,
         timer_watchdog_max_age_h=float(sched.get("timer_watchdog_max_age_h", 0.0)),
         batch_size=dl.get("batch_size", 100),
         connection_limit=dl.get("connection_limit", 50),
@@ -4179,6 +4277,11 @@ def _host_hold_status_lines(cfg: SchedulerConfig, conn, today: date) -> list[str
     """
     lines = []
     weekday = WEEKDAY_NAMES[today.weekday()]
+    holds = _host_holds(cfg, today, conn)
+    for host, hours in sorted(cfg.host_refusal_cooldown_h.items()):
+        cooling = holds.cooldown(host)
+        state = cooling.describe().split(": ", 1)[1] if cooling is not None else "not cooling down"
+        lines.append(f"{HOST_LABELS.get(host, host)} refusal cooldown {hours:g} h: {state}.")
     for host, days in sorted(cfg.host_rest_weekdays.items()):
         state = "a REST night" if weekday in days else "not a rest night"
         lines.append(
@@ -7287,7 +7390,7 @@ def cmd_assess_city(
     # night or a refusal cooldown exists to keep this IP off the host, and an
     # inquiry is one more presence on it. The summary says so, and a held
     # channel makes the answer incomplete (exit 1), like a refused one.
-    blocked_hosts = HostBreaker(holds=_host_holds(cfg, today), source="assess-city")
+    blocked_hosts = HostBreaker(holds=_host_holds(cfg, today, conn), source="assess-city")
     blocked_hosts.note_holds({h for c in channels for h in CHANNEL_HOSTS.get(c, ())})
     busy_hosts: Counter[str] = Counter()
     # Unreachable for this command as it stands — assess-city's channel
@@ -9418,15 +9521,15 @@ def cmd_run_due(
         today = clock.snapshot_date_today()
     # The run's standing host holds (issue #444), decided ONCE from the run's
     # snapshot date, before the dry-run branch so a preview shows them too.
-    holds = _host_holds(cfg, today, ignore=ignore_host_holds)
+    # Built once, here: a refusal recorded later tonight is the breaker's and
+    # never turns into a hold mid-night.
+    holds = _host_holds(cfg, today, conn, ignore=ignore_host_holds)
     if ignore_host_holds:
-        would_hold = _host_holds(cfg, today)
+        would_hold = _host_holds(cfg, today, conn).current()
         logger.warning(
             "--ignore-host-holds: launching on hosts this run would otherwise hold"
             + (
-                " ("
-                + "; ".join(would_hold.active(h).describe() for h in sorted(would_hold.hosts()))
-                + ")"
+                " (" + "; ".join(hold.describe() for hold in would_hold.values()) + ")"
                 if would_hold
                 else " (none would have been held)"
             )
@@ -9633,14 +9736,15 @@ def cmd_run_due(
             left_str += "; " + ", ".join(w.status_line() for w in windows)
         print(f"DRY RUN — would process (budget remaining {left_str}):")
         run_hosts = {h for p in providers for h in CHANNEL_HOSTS.get(p, ())}
-        for host in sorted(holds.hosts() & run_hosts):
-            print(f"  HELD tonight — {holds.active(host).describe()} (issue #444)")
+        for host, hold in holds.current().items():
+            if host in run_hosts:
+                print(f"  HELD tonight — {hold.describe()} (issue #444)")
         for city in due[:day_cap]:
             for provider in providers_for_city[city.city_id]:
                 held_by = [
-                    holds.active(h)
-                    for h in sorted(CHANNEL_HOSTS.get(provider, ()))
-                    if holds.active(h)
+                    hold
+                    for host, hold in holds.current().items()
+                    if host in CHANNEL_HOSTS.get(provider, ())
                 ]
                 if held_by:
                     # The live gate's answer, asked of the same instance: a held
@@ -9769,7 +9873,7 @@ def cmd_run_due(
                 host_spent=host_spent,
                 unfinished=preview_unfinished,
                 window_start=preview_now - HOST_BUDGET_WINDOW,
-                held_hosts={h for h in holds.hosts() if holds.active(h)},
+                held_hosts=set(holds.current()),
             )
         if cfg.driving_plan.enabled:
             print("Would also snapshot the GSV driving-plan feed (issue #176).")
@@ -12617,7 +12721,7 @@ def _fill_admission(
         city,
         channels,
         latched=set(blocked_hosts.latched),
-        held_hosts={h for h in blocked_hosts.holds.hosts() if blocked_hosts.holds.active(h)},
+        held_hosts=set(blocked_hosts.holds.current()),
         channel_room=channel_room,
         used_by_host=used,
         remaining_s=remaining_s,

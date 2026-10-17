@@ -13,7 +13,7 @@ stubbed, so ``cmd_run_due`` runs for real down to the launch gate.
 import logging
 import os
 import sqlite3
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
@@ -456,3 +456,174 @@ def test_status_prints_the_last_refusal_and_clearance_per_host(
         "(run-due, carlsbad [mapillary], exit 75, 0 requests in the 24 h before), 30.0 h ago; "
         "no clearance recorded."
     ) in out
+
+
+# ── the cross-night refusal cooldown ─────────────────────────────────────
+
+_NIGHT_START = datetime(2026, 10, 15, 9, 0, tzinfo=UTC)  # a Thursday, 02:00 PDT
+
+
+def _refused(conn, hours_before, at=_NIGHT_START):
+    db.record_host_verdict(
+        conn,
+        HOST_MAPILLARY_TILES,
+        db.HOST_REFUSED,
+        source="run-due",
+        channel="mapillary",
+        exit_code=75,
+        at=at - timedelta(hours=hours_before),
+    )
+
+
+@pytest.mark.parametrize("value,hours", [("36", 36.0), ("0.5", 0.5), ("168", 168.0)])
+def test_a_refusal_cooldown_loads(tmp_path, value, hours):
+    cfg = _cfg(tmp_path, f"refusal_cooldown_h = {value}\n")
+    assert cfg.host_budget_errors == []
+    assert cfg.host_refusal_cooldown_h == {HOST_MAPILLARY_TILES: hours}
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "169", "true", '"36"', "[36]"])
+def test_an_invalid_refusal_cooldown_fails_closed(conn, monkeypatch, tmp_path, value):
+    """Dropping it would let the nightly re-probe the blocked IP it exists to
+    leave alone, so it refuses the channel-running commands like a bad budget."""
+    cfg = _cfg(tmp_path, f"refusal_cooldown_h = {value}\n")
+    assert cfg.host_refusal_cooldown_h == {}
+    assert len(cfg.host_budget_errors) == 1
+    assert "refusal_cooldown_h" in cfg.host_budget_errors[0]
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+    assert sched.cmd_run_due(cfg, today=THURSDAY) == sched.USAGE_EXIT_CODE
+
+
+def test_makelab1_cools_the_tile_cdn_for_36_hours_and_it_reaches_the_gate(conn, frozen_utc_clock):
+    """The pass-through: prod's 36 h is the figure the holds are built from."""
+    cfg = load_scheduler_config(PROD_CONFIG)
+    assert cfg.host_refusal_cooldown_h == {HOST_MAPILLARY_TILES: 36.0}
+    _refused(conn, 20)
+    frozen_utc_clock(_NIGHT_START)
+    hold = sched._host_holds(cfg, THURSDAY, conn).active(HOST_MAPILLARY_TILES)
+    assert hold is not None and hold.reason == sched.HOLD_COOLDOWN
+    assert "until 2026-10-16 01:00 UTC (36 h after the refusal recorded 2026-10-14 13:00 UTC)" in (
+        hold.describe()
+    )
+    frozen_utc_clock(_NIGHT_START + timedelta(hours=16, seconds=1))
+    assert sched._host_holds(cfg, THURSDAY, conn).active(HOST_MAPILLARY_TILES) is None
+
+
+def test_a_night_inside_the_cooldown_holds_the_host_and_is_not_a_refusal(
+    conn, monkeypatch, tmp_path, caplog, frozen_utc_clock
+):
+    """The 10-17 shape: refused ~20 h before the 02:00 fire. Nothing is sent to
+    the host, nothing alerts, the exit is clean, no new refusal row is written,
+    and the cities stay due."""
+    _refused(conn, 20)
+    frozen_utc_clock(_NIGHT_START)
+    a = _register(conn, "Bend")
+    with caplog.at_level(logging.INFO, logger="streetscape_scheduler"):
+        rc, launches, alerts = _night(
+            monkeypatch, conn, _cfg(tmp_path, "refusal_cooldown_h = 36\n"), today=THURSDAY
+        )
+    assert rc == 0 and alerts == []
+    assert launches == [(a, "gsv")]
+    assert conn.execute("SELECT COUNT(*) FROM host_refusals").fetchone()[0] == 1
+    for channel in MAPILLARY_PAIR:
+        row = conn.execute(
+            "SELECT last_attempt_at FROM schedule_state WHERE city_id = ? AND provider = ?",
+            (a, channel),
+        ).fetchone()
+        assert row["last_attempt_at"] is None
+    done = _done_line(caplog)
+    assert (
+        "HELD Mapillary's tile CDN (tiles.mapillary.com): cooling down until 2026-10-16 01:00 UTC"
+        in done
+    )
+    assert "2 launch(es) held" in done
+    assert "cooling down until 2026-10-16 01:00 UTC" in caplog.text
+
+
+def test_a_night_past_the_cooldown_launches(conn, monkeypatch, tmp_path, frozen_utc_clock):
+    _refused(conn, 37)
+    frozen_utc_clock(_NIGHT_START)
+    a = _register(conn, "Bend")
+    rc, launches, _ = _night(
+        monkeypatch, conn, _cfg(tmp_path, "refusal_cooldown_h = 36\n"), today=THURSDAY
+    )
+    assert rc == 0
+    assert sorted(launches) == [(a, "gsv"), (a, "mapillary"), (a, "mapillary_streets")]
+
+
+def test_no_cooldown_configured_is_todays_behaviour(conn, monkeypatch, tmp_path, frozen_utc_clock):
+    """Unset means no cooldown: a host refused an hour ago is asked again."""
+    _refused(conn, 1)
+    frozen_utc_clock(_NIGHT_START)
+    a = _register(conn, "Bend")
+    rc, launches, _ = _night(monkeypatch, conn, _cfg(tmp_path, None), today=THURSDAY)
+    assert sorted(launches) == [(a, "gsv"), (a, "mapillary"), (a, "mapillary_streets")]
+
+
+def test_a_clearance_does_not_shorten_the_cooldown(conn, tmp_path, frozen_utc_clock):
+    """Only the newest REFUSAL counts; one positive probe is not licence for volume."""
+    _refused(conn, 20)
+    db.record_host_verdict(
+        conn,
+        HOST_MAPILLARY_TILES,
+        db.HOST_CLEARED,
+        source="probe-host",
+        at=_NIGHT_START - timedelta(hours=2),
+    )
+    frozen_utc_clock(_NIGHT_START)
+    cfg = _cfg(tmp_path, "refusal_cooldown_h = 36\n")
+    assert sched._host_holds(cfg, THURSDAY, conn).active(HOST_MAPILLARY_TILES) is not None
+
+
+def test_the_cooldown_ends_mid_night_and_the_host_resumes(
+    conn, monkeypatch, tmp_path, frozen_utc_clock
+):
+    """Read against the wall clock at each launch: a night that starts 35.5 h
+    after the refusal holds the first city's pair and runs the second's once
+    the 36 h have passed."""
+    _refused(conn, 35.5)
+    frozen_utc_clock(_NIGHT_START)
+    first = _register(conn, "Bend")
+    second = _register(conn, "Corvallis")
+    launches = []
+    elapsed = {"h": 0.0}
+
+    def fake(cfg_, city, today_, provider="gsv", **kw):
+        launches.append((city.city_id, provider))
+        if provider == "gsv":  # each gsv run takes 20 min of wall clock
+            elapsed["h"] += 1 / 3
+            frozen_utc_clock(_NIGHT_START + timedelta(hours=elapsed["h"]))
+        return True
+
+    monkeypatch.setattr(sched, "_run_one_city", fake)
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+    monkeypatch.setattr(sched.time, "sleep", lambda s: None)
+    monkeypatch.setattr(sched, "generate_aggregate_v2", lambda c, d: None)
+    monkeypatch.setattr(sched, "generate_streetwalk_manifest", lambda c, d: {})
+    monkeypatch.setattr(sched, "_publish", lambda cfg, summary, **kw: 0)
+    monkeypatch.setattr(sched, "send_alert", lambda *a, **k: None)
+    cfg = _cfg(tmp_path, "refusal_cooldown_h = 36\n")
+    assert sched.cmd_run_due(cfg, today=THURSDAY) == 0
+
+    by_city = {cid: [p for c, p in launches if c == cid] for cid in (first, second)}
+    ran_first = launches[0][0]
+    ran_second = second if ran_first == first else first
+    assert by_city[ran_first] == ["gsv"]
+    assert by_city[ran_second] == ["gsv", "mapillary", "mapillary_streets"]
+
+
+def test_status_says_whether_the_host_is_cooling_down(
+    conn, monkeypatch, tmp_path, capsys, frozen_utc_clock
+):
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+    cfg = _cfg(tmp_path, "refusal_cooldown_h = 36\n")
+    _refused(conn, 20)
+    frozen_utc_clock(_NIGHT_START)
+    sched.cmd_status(cfg)
+    assert (
+        "Mapillary's tile CDN (tiles.mapillary.com) refusal cooldown 36 h: cooling down until "
+        "2026-10-16 01:00 UTC"
+    ) in capsys.readouterr().out
+    frozen_utc_clock(_NIGHT_START + timedelta(hours=17))
+    sched.cmd_status(cfg)
+    assert "refusal cooldown 36 h: not cooling down." in capsys.readouterr().out

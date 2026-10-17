@@ -1016,6 +1016,26 @@ def test_a_rest_night_holds_the_mapillary_pair_and_the_answer_is_incomplete(
     assert rc == 1
 
 
+def test_a_refusal_cooldown_holds_an_inquiry_off_the_tile_cdn(
+    conn, monkeypatch, tmp_path, capsys, frozen_utc_clock
+):
+    """The cooldown (issue #444) is read from the catalog for assess-city too:
+    an inquiry 10 h after a recorded refusal sends the CDN nothing."""
+    refused_at = datetime(2026, 8, 17, 0, 0, tzinfo=UTC)
+    db.record_host_verdict(
+        conn, HOST_MAPILLARY_TILES, db.HOST_REFUSED, source="run-due", at=refused_at
+    )
+    frozen_utc_clock(datetime(2026, 8, 17, 10, 0, tzinfo=UTC))
+    ran = _stub_collection(monkeypatch, conn)
+    cfg = _cfg(tmp_path, host_refusal_cooldown_h={HOST_MAPILLARY_TILES: 36.0})
+
+    rc = _assess(tmp_path, cfg=cfg)
+
+    assert [p for _, p in ran] == ["gsv_streets"]
+    assert "cooling down until 2026-08-18 12:00 UTC" in capsys.readouterr().out
+    assert rc == 1
+
+
 def test_an_assess_city_refusal_is_persisted_under_its_own_name(conn, monkeypatch, tmp_path):
     """host_refusals (issue #444) says which command was refused: one row,
     source assess-city, for the refused child alone."""

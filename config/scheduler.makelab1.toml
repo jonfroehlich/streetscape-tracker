@@ -792,9 +792,23 @@ network_type = "drive"
 # snapshots un-pair. Not a failure: no alert, no breaker trip, no change to the
 # exit status, and the cities stay due. `run-due --ignore-host-holds` is the
 # logged operator override.
+#
+# refusal_cooldown_h (#444): for this many hours after the newest refusal in
+# the catalog's host_refusals table, no channel touching the tile CDN launches
+# -- skipped and logged "cooling down until <T>", like a rest night, never a
+# refusal, alert or failure, and the cities stay due. The point is the 02:00
+# nightly: on 10-17 it re-probed this IP ~20 h into a block and was refused on
+# request 1, and if a request made while blocked extends the block (#444's H3)
+# that probe is the worst one we make. 36 h is past every block measured so far
+# (<= 16.6 h on 10-14/15, > 19.8 h on 10-16/17), and a cooldown ends mid-night,
+# so a night starting at 30 h resumes Mapillary 6 h in. A clearance from
+# `scheduler probe-host` does NOT shorten it; only the newest REFUSAL counts.
+# Falsifier for H3: if blocks clear in the same time whether or not we probed
+# at ~20 h, probing does not extend them and this can shrink.
 [hosts.mapillary_tiles]
 rolling_24h_request_budget = 1200
 rest_weekdays = ["Wed", "Sun"]
+refusal_cooldown_h = 36
 
 [download]
 batch_size = 100
