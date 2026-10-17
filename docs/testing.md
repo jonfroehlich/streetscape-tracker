@@ -1091,6 +1091,9 @@ A hold keeps a host's channels from launching without anything having refused us
   - `test_a_busy_host_is_not_a_refusal_and_writes_no_row` (79) and `test_a_failed_refusal_write_never_ends_the_night` (a raising write is logged, the later cities still run, and the `Done:` line and the alert body both say `NOT RECORDED in host_refusals`, since the lost row is a cooldown the next night cannot see, and the probe-host clause says a refusal it meets does arm the cooldown); `test_a_lost_refusal_of_a_host_with_no_cooldown_gets_no_hold_advice` gives a host with no `refusal_cooldown_h` only the plain "not recorded" clause, never the hold-by-hand advice; `test_a_recorded_refusal_says_nothing_about_lost_records` is its control.
   - `test_an_assess_city_refusal_is_persisted_under_its_own_name` (`tests/test_assess_city.py`).
   - `test_status_prints_the_last_refusal_and_clearance_per_host`.
+- A THROTTLED child (exit 87), round 2 of the review:
+  - `test_a_throttled_or_refused_pair_stays_due` — after a night lost to 87, and to 75 beside it, the pair's `last_success_at` is still NULL and `get_due_cities` still returns it (killed by recording a success before either branch's `continue`).
+  - `test_a_throttled_checkpoint_near_the_age_wall_is_warned_about` — a 6-day-old Mapillary checkpoint stopped by 87 gets the 83 branch's age-wall WARNING; a 1-day-old one does not.
 - The cross-night refusal cooldown (`[hosts.<token>].refusal_cooldown_h`):
   - `test_a_refusal_cooldown_loads` (36, 0.5, 168) and `test_an_invalid_refusal_cooldown_fails_closed` (0, −1, 169, a bool, a string, a list).
   - `test_makelab1_cools_the_tile_cdn_for_36_hours_and_it_reaches_the_gate` — prod's 36 h read through `_host_holds` against a refusal 20 h back, held at the night's start and released one second past 36 h.

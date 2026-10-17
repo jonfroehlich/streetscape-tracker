@@ -644,6 +644,32 @@ def test_a_walk_lost_to_a_throttle_strands_and_the_alert_says_throttled(
     assert _refusal_rows(conn) == []
 
 
+@pytest.mark.parametrize("days_old,warned", [(6, True), (1, False)])
+def test_a_throttled_checkpoint_near_the_age_wall_is_warned_about(
+    conn, monkeypatch, tmp_path, caplog, days_old, warned
+):
+    """Round-2 review of #444: the 87 branch keeps the checkpoint exactly as
+    the 83 branch does, so repeated throttle stops can age it into the 7-day
+    CHECKPOINT_MAX_AGE_S wall; it now gives the 83 branch's warning the night
+    before. The fresh case is the control."""
+    from tests.test_scheduler import _write_sweep_checkpoint
+
+    a = _register(conn, "Bend")
+    city = db.resolve_city(conn, a)
+    monkeypatch.setenv("STREETSCAPE_CHECKPOINT_DIR", str(tmp_path / "cp"))
+    _write_sweep_checkpoint(city, "mapillary", roots_done=3, root_count=800, days_old=days_old)
+    with caplog.at_level(logging.INFO, logger="streetscape_scheduler"):
+        _refusing_night(monkeypatch, conn, _cfg(tmp_path, None), exit_code=THROTTLED)
+    age_warnings = [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.WARNING and "not finishing at this nightly budget" in r.getMessage()
+    ]
+    assert len(age_warnings) == (1 if warned else 0), age_warnings
+    if warned:
+        assert age_warnings[0].startswith(f"{a} [mapillary]:")
+
+
 def test_a_throttle_latches_without_a_recheck_and_is_never_recovered():
     breaker = sched.HostBreaker(cooldown_s=0)
     breaker.throttle(HOST_MAPILLARY_TILES)

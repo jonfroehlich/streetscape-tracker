@@ -11373,6 +11373,13 @@ def _run_city_channels(
                             f"counted as a failure for this city; its checkpoint is kept. "
                             f"({reason})"
                         )
+                        # As the 83 branch does, and for the same reason: a
+                        # city that keeps being throttled keeps its checkpoint
+                        # while CHECKPOINT_MAX_AGE_S counts from the first
+                        # commit, so warn the night before the age wall.
+                        _warn_if_checkpoint_near_the_age_wall(
+                            city.city_id, provider, _sweep_checkpoint_progress(cfg, city, provider)
+                        )
                         continue
 
                     if exit_code == ARGV_REJECTED_EXIT_CODE:
