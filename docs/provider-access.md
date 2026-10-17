@@ -125,7 +125,7 @@ That shape is the argument for the capped-and-resume work in #318 as well as for
 **What this actually spends.** Since #290 the walk reuses the grid run's census for zero requests on a paired night, and the table above shows `mapillary_streets` spending 0 on five of the six nights.
 The *combined* per-IP load has therefore been running at 755–2,260/day (six-night mean ~1,330) against the 3,500 that #241 sanctioned — about 38% of it on the mean and 65% at the 09-03 peak — so on a paired night 3,500 + 0 restores that sanctioned combined ceiling rather than exceeding it.
 **Be honest about the un-paired case**: nothing enforces the pairing, and a split pair can reach **5,250**, which is 1.5x the #241 ceiling and the most this host has been configured for since the 2026-08-22 cut (for ~2 days *after* block 2 it still sat at the old 15,000 + 5,000 = 20,000).
-That is accepted rather than overlooked, on the ground that block 3 (1,938/day, against 26,363 spent clean on 08-14) falsified daily volume and every accumulation window from 1 to 8 days (#286).
+That is accepted rather than overlooked, on the ground that block 3 (1,938/day, against 3,190 and 3,292 spent clean on 08-23 and 08-24) falsified daily volume and every accumulation window from 1 to 8 days (#286).
 It is **not** accepted on the ground that volume is safe — nothing about this host's behaviour is known safe, and the even split #241 chose still matters on exactly the nights that reach 5,250.
 The structurally correct fix is a single per-IP pool both channels draw from, which is a scheduler change rather than a config edit and is deliberately not attempted here; until it exists, the sum above is the number to quote, never the grid channel's 3,500 alone.
 **#385 has since built that pool** (after block 4, below): both channels now also draw from one rolling-24h tile-CDN budget, so the un-paired 5,250 is no longer reachable inside 24 h while it is set at 3,000.
@@ -137,7 +137,7 @@ The same reasoning applies to the next person who wants to move this number: che
 ## SUPERSEDED — the daily budgets encoded a rolling 2–3 day per-IP window (issue #241, superseded by #286)
 
 > **SUPERSEDED by block 3 (2026-08-28); kept in full, not deleted, because the ledger analysis and the staff record below are still the evidence base and because #267 was sized on these bands.**
-> Block 3 arrived at **1,938** combined requests/day while 08-14 had spent **26,363** in one day clean, and **no accumulation window from 1 to 8 days** admits a threshold separating blocked days from clean ones (#286).
+> Block 3 arrived at **1,938** combined requests/day while 08-23 and 08-24 had spent **3,190** and **3,292** clean, and **no accumulation window from 1 to 8 days** admits a threshold separating blocked days from clean ones (#286).
 > So the bands quoted below — 2-day (7,061, 10,766], 3-day (10,284, 12,074] — are **dead**, and the ~10,000-per-48 h reading with them.
 > What survives: the budgets stayed at 1,750 each, no longer as a threshold anyone believes in but as a *conservative floor on our exposure* — and on 2026-09-05 the grid channel's half was re-sized to 3,500 for the 40-city night, which is the section above, not this one; the no-`--limit`-catch-ups rule stayed on the general ground that a multi-night burst is the one shape we know preceded a block, and was LIFTED on 2026-09-09 after #292's eleven clean nights — staged, never at the ceiling, per the read-out at the end of this file; and the **repeat-offender** rival named below is likewise dead, since block 3 did not escalate (≤26.3 h, same as block 2).
 > The live hypothesis is request *shape*, not request *volume* — see the request-jitter section at the end of this file.
@@ -330,7 +330,10 @@ Both figures are upper bounds, and the measured/reported/guessed tiers below mus
 
 **After three blocks, both levers we control are falsified as the trigger, and the fourth hypothesis is the *shape* of the traffic rather than its amount.**
 Rate: block 2 arrived with the 60/min limiter provably pinned.
-Daily volume: block 3 arrived at **1,938** combined requests/day, while 08-14 had spent **26,363** in one day clean, and no accumulation window from 1 to 8 days separates blocked days from clean ones (issue #286, which retires #241's bands).
+Daily volume: block 3 arrived at **1,938** combined requests/day, while 08-23 and 08-24 had spent **3,190** and **3,292** clean, and no accumulation window from 1 to 8 days separates blocked days from clean ones (issue #286, which retires #241's bands).
+**Correction (2026-10-17, #444):** earlier versions of this file, #286 and the configs cited "08-14 spent 26,363 in one day clean" as the strongest falsifier.
+It was not clean: the ledger's 26,363 (25,297 `mapillary` + 1,066 `mapillary_streets`) fell **inside block 1** (onset 08-12, silence only from ~44 h after onset, below), so most of it was the detached loop's refused requests.
+The falsification survives without it — on 08-23/08-24 above, and again on 09-29/09-30, which spent 3,500 then 3,006 back to back without a block while October's blocks arrived at ~1,630–2,290 a day (#444).
 What every restart left untouched is that `AsyncRateLimiter`'s token bucket, once saturated, emits tile requests at an **exact `60 / max_per_minute` cadence** — the sleep is computed to the token — over sequential z14 tiles in raster order, from a datacenter IP, with the same UA every time.
 Staff describe the per-IP layer only as a separate system that "can block you at different levels"; if it scores behaviour rather than counting, that regularity is the most machine-like feature we present.
 

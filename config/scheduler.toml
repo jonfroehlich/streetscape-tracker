@@ -330,8 +330,9 @@ daily_request_budget = 3500
 # every Mapillary channel on the host until it lifts.
 #
 # 40, not 60, and JITTERED (issue #292): the third block (2026-08-28) arrived at
-# 1,938 requests/day under a pinned 60/min limiter, while 26,363 in one day had
-# run clean — so neither rate nor daily volume is the trigger. What no restart
+# 1,938 requests/day under a pinned 60/min limiter, while 3,190 and 3,292 had
+# run clean on 08-23/24 (not "26,363 on 08-14": that day was inside block 1,
+# mostly refused requests, #444) — so neither rate nor daily volume is the trigger. What no restart
 # had changed is the SHAPE of the traffic: a saturated token bucket emits tiles
 # at an exact 1.000 s cadence, in raster order, from a datacenter IP.
 #
