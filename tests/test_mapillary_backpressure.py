@@ -803,17 +803,23 @@ def test_responses_inside_one_hold_are_one_episode_not_three_strikes(
         r.delay = 0.01
         slow_429.append(r)
     script = {xy: [slow, ok()] for xy, slow in zip(_TILES[:3], slow_429, strict=True)}
+    # A LATER, separate throttle: the second episode. Counted right, the
+    # crawl is at 2 of 3 and carries on; had the first episode's three
+    # responses each been a strike, this would be the fourth and pause it.
+    script[_TILES[200]] = [status(429), ok()]
     caplog.set_level(logging.INFO, logger=dm.__name__)
+    # Three sockets: tiles 0-2 are the only requests in flight until their
+    # slow 429s land, so tile 200 is sent only after the first hold began.
     result, session = _crawl(
-        monkeypatch, script, connection_limit=5, checkpoint_path=str(tmp_path / "cp")
+        monkeypatch, script, connection_limit=3, checkpoint_path=str(tmp_path / "cp")
     )
 
     assert not isinstance(result, BaseException), result
     assert result["failed_tiles"] == []
-    assert result["api_requests"] == len(session.urls) == len(_TILES) + 3
+    assert result["api_requests"] == len(session.urls) == len(_TILES) + 4
     messages = [r.getMessage() for r in caplog.records]
     assert sum("episode 1/3" in m for m in messages) == 1
-    assert not any("episode 2/3" in m for m in messages)
+    assert sum("episode 2/3" in m for m in messages) == 1
     assert not any("pausing the crawl" in m for m in messages)
     (limiter,) = limiters
     assert limiter.slowdowns == [2.0]
