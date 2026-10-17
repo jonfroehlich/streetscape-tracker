@@ -36,30 +36,46 @@ from streetscape_metadata_tracker.naming import (  # noqa: E402
 # msg[5][0][8] the history as [index, [year, month], ...] keyed into that list.
 
 
-def _node(pano_id, lat, lon, kind=2):
-    return [[kind, pano_id], None, [[None, None, lat, lon]]]
+def _node(pano_id, lat, lon, kind=2, pose=None):
+    """pose: (elevation, heading, pitch_served, roll) as the service encodes them."""
+    geo = [[None, None, lat, lon]]
+    if pose is not None:
+        elev, heading, pitch_served, roll = pose
+        geo += [[elev, None, 28.1], [heading, pitch_served, roll]]
+    return [[kind, pano_id], None, geo]
 
 
-def make_response(main, historical=(), neighbors=(), code=0):
+def make_response(main, historical=(), neighbors=(), code=0, pose=None, extras=None):
     """
-    main:       (pano_id, lat, lon, (year, month)) -- the pano served at the location now
-    historical: (pano_id, lat, lon, (year, month)[, type]) -- dated panos keyed by index
+    main:       (pano_id, lat, lon, (year, month[, day])) -- the pano served at the location now
+    historical: (pano_id, lat, lon, (year, month[, day])[, type[, pose]]) -- dated panos keyed by index
     neighbors:  (pano_id, lat, lon) -- undated nodes (links), never history
+    pose:       the current pano's (elevation, heading, pitch_served, roll)
+    extras:     dict with any of country_code, street_name, upload_date, exact_timestamp
     Returns the raw JSON response body as a string.
     """
     if code != 0:
         return json.dumps([[code, "generic", "Search returned no images."]])
-    mid, mlat, mlon, (my, mm) = main
-    nodes = [_node(mid, mlat, mlon)]
+    extras = extras or {}
+    mid, mlat, mlon, mdate = main
+    nodes = [_node(mid, mlat, mlon, pose=pose)]
     dates = []
     for h in historical:
-        pid, la, lo, (y, m) = h[:4]
+        pid, la, lo, hdate = h[:4]
         kind = h[4] if len(h) > 4 else 2
-        dates.append([len(nodes), [y, m], None, None, None, kind])
-        nodes.append(_node(pid, la, lo, kind))
+        hpose = h[5] if len(h) > 5 else None
+        dates.append([len(nodes), list(hdate), None, None, None, kind])
+        nodes.append(_node(pid, la, lo, kind, pose=hpose))
     for pid, la, lo in neighbors:
         nodes.append(_node(pid, la, lo))
-    subset = [None, [[None, None, mlat, mlon]], None, [nodes], None, None, None, None, dates]
+    # The current pano's own geo node: position, [elevation], [pose], _, country.
+    geo = [[None, None, mlat, mlon], None, None, None, extras.get("country_code")]
+    if pose is not None:
+        geo[1] = [pose[0], None, 28.1]
+        geo[2] = [pose[1], pose[2], pose[3]]
+    subset = [None, geo, None, [nodes], None, None, None, None, dates]
+    if extras.get("street_name"):
+        subset += [None, None, None, [[[[None, None, [extras["street_name"], "en"]]], [12.0]]]]
     msg = [
         None,
         [None, mid],
@@ -67,8 +83,10 @@ def make_response(main, historical=(), neighbors=(), code=0):
         None,
         [[[["© 2026 Google"]]]],
         [subset],
-        [None] * 7 + [[my, mm]],
+        [None] * 7 + [list(mdate), extras.get("upload_date")],
     ]
+    if extras.get("exact_timestamp"):
+        msg += [None] * 5 + [[extras["exact_timestamp"]]]
     return json.dumps([[0], msg])
 
 
@@ -757,6 +775,108 @@ def test_raw_lines_carry_the_request_body_beside_the_response(monkeypatch, tmp_p
     raw = [json.loads(line) for line in gzip.open(result["paths"]["raw"], "rt")]
     assert raw[0]["url"] == dgh.RPC_URL
     assert json.loads(raw[0]["request"])[1][0][2:4] == [44.0, -121.0]
+
+
+def test_parse_keeps_everything_the_response_carries():
+    text = make_response(
+        main=("g2023", 45.0, -122.0, (2023, 6, 14)),
+        historical=[("g2007", 45.0, -122.0, (2007, 10), 2, (51.5, 180.0, 88.0, 1.5))],
+        pose=(50.4, 0.7, 88.1, 359.3),
+        extras={
+            "country_code": "US",
+            "street_name": "NE 45th St",
+            "upload_date": [2023, 7, 1],
+            "exact_timestamp": "x/1718400000000",
+        },
+    )
+    r = dgh.parse_search(text)
+    assert (r.copyright, r.country_code, r.street_name) == ("© 2026 Google", "US", "NE 45th St")
+    assert r.upload_date == "[2023, 7, 1]" and r.exact_timestamp == "x/1718400000000"
+    cur, old = r.panos
+    assert cur.capture_day == 14 and old.capture_day is None
+    assert (cur.pano_type, old.pano_type) == (2, 2)
+    assert (cur.elevation_m, cur.heading_deg, cur.roll_deg) == (50.4, 0.7, 359.3)
+    assert cur.pitch_deg == pytest.approx(90 - 88.1)
+    assert (old.elevation_m, old.heading_deg, old.pitch_deg, old.roll_deg) == (
+        51.5,
+        180.0,
+        2.0,
+        1.5,
+    )
+    # Nothing served is required: a bare response parses with every extra None.
+    bare = dgh.parse_search(make_response(main=("g1", 45.0, -122.0, (2020, 1))))
+    assert bare.country_code is None and bare.panos[0].heading_deg is None
+
+
+def test_rebuild_from_raw_reproduces_the_crawl_and_keeps_the_last_answer_per_key(
+    monkeypatch, tmp_path
+):
+    import scripts.reparse_gsv_history_raw as reparse
+
+    calls = {"n": 0}
+
+    def responder(url):
+        calls["n"] += 1
+        lat = _lat_of(url)
+        return 200, make_response(
+            main=(f"p{lat}", 44.0, -121.0, (2019, 3)),
+            historical=[(f"h{lat}", 44.0, -121.0, (2011, 7))],
+            extras={"country_code": "US"},
+        )
+
+    _patch_fetch(monkeypatch, responder)
+    wl = _worklist(3, anchors={"e0": "p44.0"})
+    result = _run(wl, tmp_path)
+    paths = result["paths"]
+    history, queries = dgh.rebuild_from_raw(paths["raw"], wl, 1)
+
+    def _via_csv(df):  # the crawl's files went through a CSV, so compare on equal footing
+        path = tmp_path / "roundtrip.csv.gz"
+        df.to_csv(path, index=False, compression="gzip")
+        return _read(path)
+
+    pd.testing.assert_frame_equal(_via_csv(history), _read(paths["history"]), check_dtype=False)
+    pd.testing.assert_frame_equal(_via_csv(queries), _read(paths["queries"]), check_dtype=False)
+    assert (
+        history["pano_id"].str.startswith("h").sum() == 3 and queries["country_code"].eq("US").all()
+    )
+
+    # A key answered twice in the raw store (a re-query after a cut ledger)
+    # keeps its LAST response; a refusal line is not an answer.
+    with gzip.open(paths["raw"], "at") as f:
+        f.write(
+            json.dumps(
+                {"edge_id": "e0", "sample_idx": 0, "query_lat": 44.0, "query_lon": -121.0,
+                 "url": dgh.RPC_URL, "request": "{}", "http_status": 200, "fetched_at": "later",
+                 "body": make_response(main=("pNEW", 44.0, -121.0, (2025, 1)))}
+            ) + "\n"
+        )  # fmt: skip
+        f.write(
+            json.dumps(
+                {"edge_id": "e1", "sample_idx": 0, "query_lat": 44.001, "query_lon": -121.0,
+                 "url": dgh.RPC_URL, "request": "{}", "http_status": 429, "fetched_at": "later",
+                 "body": "slow down"}
+            ) + "\n"
+        )  # fmt: skip
+    history, queries = dgh.rebuild_from_raw(paths["raw"], wl, 1)
+    assert set(history.loc[history["edge_id"] == "e0", "pano_id"]) == {"pNEW"}
+    assert (
+        queries.set_index("edge_id").loc["e1", "http_status"] == 200
+    )  # the refusal did not replace it
+    assert len(queries) == 3
+
+    # The script writes the same two files and refuses to overwrite without --force.
+    wl_path = tmp_path / "bend.worklist.csv.gz"
+    wl.to_csv(wl_path, index=False, compression="gzip")
+    out = tmp_path / "rebuilt"
+    argv = ["--raw", paths["raw"], "--worklist", str(wl_path), "--out-dir", str(out)]
+    assert reparse.main(argv) == 0
+    assert sorted(os.listdir(out)) == ["bend.pass1.history.csv.gz", "bend.pass1.queries.csv.gz"]
+    assert reparse.main(argv) == 1
+    assert reparse.main(argv + ["--force"]) == 0
+    assert (
+        reparse.main(["--raw", "nope.gz", "--worklist", str(wl_path), "--out-dir", str(out)]) == 2
+    )
 
 
 # ── The CLI ──────────────────────────────────────────────────────────────────

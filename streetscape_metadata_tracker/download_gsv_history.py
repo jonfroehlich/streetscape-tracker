@@ -134,6 +134,15 @@ class HistoricalPano:
     lon: float
     third_party: bool = False  # user photosphere rather than official Google imagery
     is_current: bool = False  # the pano the search returned as the one served here now
+    # Everything else the node carries, kept because the request was paid for
+    # (the raw body holds the rest, byte for byte). Pose is served in degrees;
+    # pitch is 90 - served, so 0 is level (sk-zk/streetlevel's reading).
+    capture_day: int | None = None  # only when the date node carries a day
+    pano_type: int | None = None  # the node's type code as served (2 official, 10 user)
+    elevation_m: float | None = None
+    heading_deg: float | None = None
+    pitch_deg: float | None = None
+    roll_deg: float | None = None
 
 
 @dataclass(frozen=True)
@@ -143,6 +152,12 @@ class SearchResult:
     response_code: int | None  # 0 ok, 5 "Search returned no images.", None unparseable
     panos: tuple[HistoricalPano, ...]  # every DATED pano: the current one plus its history
     panos_total: int | None  # every pano node the response carries, dated or not
+    # Per-location fields of the current pano, parsed for convenience.
+    copyright: str | None = None  # e.g. "© 2026 Google"
+    country_code: str | None = None
+    street_name: str | None = None  # the first street label the service attaches
+    upload_date: str | None = None  # the raw upload-date node, JSON-encoded, when present
+    exact_timestamp: str | None = None  # the raw exact-time field (third-party panos), when present
 
 
 class HarvestBlockedError(DownloadError):
@@ -189,6 +204,46 @@ def _month_iso(node: Any) -> str:
         return ""
 
 
+def _day_of(node: Any) -> int | None:
+    try:
+        return int(node[2]) if len(node) > 2 and node[2] is not None else None
+    except (IndexError, KeyError, TypeError, ValueError):
+        return None
+
+
+def _float_or_none(value: Any) -> float | None:
+    try:
+        return None if value is None else float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _pose(geo: Any) -> dict[str, float | None]:
+    """``[[_, _, lat, lon], [elevation, ...], [heading, pitch, roll]]`` -> the four pose fields."""
+    out: dict[str, float | None] = {
+        "elevation_m": None,
+        "heading_deg": None,
+        "pitch_deg": None,
+        "roll_deg": None,
+    }
+    try:
+        out["elevation_m"] = _float_or_none(geo[1][0])
+    except (IndexError, KeyError, TypeError):
+        pass
+    try:
+        out["heading_deg"] = _float_or_none(geo[2][0])
+        pitch = _float_or_none(geo[2][1])
+        out["pitch_deg"] = None if pitch is None else 90.0 - pitch
+        out["roll_deg"] = _float_or_none(geo[2][2])
+    except (IndexError, KeyError, TypeError):
+        pass
+    return out
+
+
+def _str_or_none(value: Any) -> str | None:
+    return None if value is None else str(value)
+
+
 def parse_search(text: str) -> SearchResult:
     """
     Parse one RPC response into the dated panos at a location.
@@ -228,6 +283,22 @@ def parse_search(text: str) -> SearchResult:
     except (IndexError, KeyError, TypeError, ValueError):
         main_latlon = None
     try:
+        main_geo = msg[5][0][1]
+    except (IndexError, KeyError, TypeError):
+        main_geo = None
+    extras: dict[str, Any] = {}
+    for key, getter in (
+        ("copyright", lambda: msg[4][0][0][0][0]),
+        ("country_code", lambda: msg[5][0][1][4]),
+        ("street_name", lambda: msg[5][0][12][0][0][0][2][0]),
+        ("upload_date", lambda: json.dumps(msg[6][8]) if msg[6][8] is not None else None),
+        ("exact_timestamp", lambda: msg[12][0] if msg[12] else None),
+    ):
+        try:
+            extras[key] = _str_or_none(getter())
+        except (IndexError, KeyError, TypeError):
+            extras[key] = None
+    try:
         main_date = _month_iso(msg[6][7])
     except (IndexError, KeyError, TypeError):
         main_date = ""
@@ -242,50 +313,88 @@ def parse_search(text: str) -> SearchResult:
         except (IndexError, KeyError, TypeError, ValueError):
             continue
 
-    def _node(node) -> tuple[str, bool, float | None, float | None] | None:
+    def _node(node) -> dict[str, Any] | None:
         try:
             pano_id = str(node[0][1])
         except (IndexError, KeyError, TypeError):
             return None
         try:
-            kind = int(node[0][0])
+            kind: int | None = int(node[0][0])
             third = kind == PANO_TYPE_THIRD_PARTY
         except (IndexError, KeyError, TypeError, ValueError):
+            kind = None
             third = is_third_party_pano_id(pano_id)
         try:
             lat, lon = float(node[2][0][2]), float(node[2][0][3])
         except (IndexError, KeyError, TypeError, ValueError):
             lat = lon = None
-        return pano_id, third or is_third_party_pano_id(pano_id), lat, lon
+        try:
+            geo = node[2]
+        except (IndexError, KeyError, TypeError):
+            geo = None
+        return {
+            "pano_id": pano_id,
+            "third_party": third or is_third_party_pano_id(pano_id),
+            "lat": lat,
+            "lon": lon,
+            "pano_type": kind,
+            **_pose(geo),
+        }
 
     out: list[HistoricalPano] = []
     seen: set[str] = set()
     if main_date and main_latlon is not None:
+        # The current pano's own node (type code, pose) is the one in the
+        # list that carries its id -- normally the first.
+        own = next((n for n in (_node(x) for x in nodes) if n and n["pano_id"] == main_id), None)
+        pose = (
+            {k: own[k] for k in ("elevation_m", "heading_deg", "pitch_deg", "roll_deg")}
+            if own
+            else _pose(main_geo)
+        )
         out.append(
             HistoricalPano(
                 pano_id=main_id,
                 capture_date=main_date,
                 lat=main_latlon[0],
                 lon=main_latlon[1],
-                third_party=is_third_party_pano_id(main_id),
+                third_party=(own["third_party"] if own else is_third_party_pano_id(main_id)),
                 is_current=True,
+                capture_day=_day_of(msg[6][7]),
+                pano_type=own["pano_type"] if own else None,
+                **pose,
             )
         )
         seen.add(main_id)
+    days: dict[int, int | None] = {}
+    for entry in raw_dates:
+        try:
+            days[int(entry[0])] = _day_of(entry[1])
+        except (IndexError, KeyError, TypeError, ValueError):
+            continue
     for idx, iso in sorted(dates.items()):
         if idx >= len(nodes) or not iso:
             continue
         parsed = _node(nodes[idx])
-        if parsed is None:
+        if parsed is None or parsed["pano_id"] in seen or parsed["lat"] is None:
             continue
-        pano_id, third, lat, lon = parsed
-        if pano_id in seen or lat is None:
-            continue
-        seen.add(pano_id)
+        seen.add(parsed["pano_id"])
         out.append(
-            HistoricalPano(pano_id=pano_id, capture_date=iso, lat=lat, lon=lon, third_party=third)
+            HistoricalPano(
+                pano_id=parsed["pano_id"],
+                capture_date=iso,
+                lat=parsed["lat"],
+                lon=parsed["lon"],
+                third_party=parsed["third_party"],
+                capture_day=days.get(idx),
+                pano_type=parsed["pano_type"],
+                elevation_m=parsed["elevation_m"],
+                heading_deg=parsed["heading_deg"],
+                pitch_deg=parsed["pitch_deg"],
+                roll_deg=parsed["roll_deg"],
+            )
         )
-    return SearchResult(code, tuple(out), len(nodes))
+    return SearchResult(code, tuple(out), len(nodes), **extras)
 
 
 def parse_search_response(text: str) -> list[HistoricalPano]:
@@ -382,6 +491,9 @@ QUERY_COLUMNS = [
     "panos_dated",
     "panos_third_party",
     "anchor_in_history",
+    "current_copyright",
+    "country_code",
+    "street_name",
     "fetched_at",
 ]
 
@@ -402,6 +514,12 @@ SAMPLE_HISTORY_COLUMNS = [
     "pano_lon",
     "third_party",
     "is_current",
+    "capture_day",
+    "pano_type",
+    "elevation_m",
+    "heading_deg",
+    "pitch_deg",
+    "roll_deg",
     "harvested_at",
 ]
 
@@ -584,6 +702,104 @@ def clear_latch(out_dir: str) -> bool:
     return False
 
 
+def _anchor_of(row) -> tuple[str | None, str | None]:
+    anchor = (
+        row.anchor_pano_id if isinstance(row.anchor_pano_id, str) and row.anchor_pano_id else None
+    )
+    anchor_date = row.anchor_capture_date if isinstance(row.anchor_capture_date, str) else None
+    return anchor, anchor_date
+
+
+def query_row(row, result: SearchResult, http_status: int, fetched_at: str) -> dict[str, Any]:
+    """One queries-ledger record for a work-list row and its parsed response."""
+    anchor, _ = _anchor_of(row)
+    return {
+        "edge_id": row.edge_id,
+        "sample_idx": int(row.sample_idx),
+        "http_status": http_status,
+        "response_code": result.response_code,
+        "panos_total": result.panos_total,
+        "panos_dated": len(result.panos),
+        "panos_third_party": sum(1 for p in result.panos if p.third_party),
+        "anchor_in_history": (
+            None if anchor is None else any(p.pano_id == anchor for p in result.panos)
+        ),
+        "current_copyright": result.copyright,
+        "country_code": result.country_code,
+        "street_name": result.street_name,
+        "fetched_at": fetched_at,
+    }
+
+
+def history_rows(row, result: SearchResult, pass_no: int, fetched_at: str) -> list[dict[str, Any]]:
+    """The per-sample history records (one per dated pano) for a work-list row."""
+    anchor, anchor_date = _anchor_of(row)
+    return [
+        {
+            "city_id": row.city_id,
+            "walk_csv_filename": row.walk_csv_filename,
+            "pass": pass_no,
+            "edge_id": row.edge_id,
+            "sample_idx": int(row.sample_idx),
+            "query_lat": float(row.query_lat),
+            "query_lon": float(row.query_lon),
+            "anchor_pano_id": anchor,
+            "anchor_capture_date": anchor_date,
+            "pano_id": p.pano_id,
+            "capture_date": p.capture_date,
+            "pano_lat": p.lat,
+            "pano_lon": p.lon,
+            "third_party": p.third_party,
+            "is_current": p.is_current,
+            "capture_day": p.capture_day,
+            "pano_type": p.pano_type,
+            "elevation_m": p.elevation_m,
+            "heading_deg": p.heading_deg,
+            "pitch_deg": p.pitch_deg,
+            "roll_deg": p.roll_deg,
+            "harvested_at": fetched_at,
+        }
+        for p in result.panos
+    ]
+
+
+def rebuild_from_raw(
+    raw_path: str, worklist: pd.DataFrame, pass_no: int
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Re-parse a raw store with the CURRENT parser into (history, queries) frames.
+
+    The raw file is the irreplaceable copy; the parsed files are a view of it.
+    A better parser is applied by re-running this, never by re-querying. Rows
+    the crawl refused (429/403) or could not parse are kept in the queries
+    frame with their status and an empty history, as the crawl recorded them.
+    A key that appears more than once in the raw store (a re-query after a
+    cut ledger) keeps its LAST response.
+    """
+    rows = worklist.loc[worklist["pass"] == pass_no]
+    by_key = {(r.edge_id, int(r.sample_idx)): r for r in rows.itertuples(index=False)}
+    latest: dict[tuple[str, int], dict] = {}
+    with gzip.open(raw_path, "rt", encoding="utf-8") as f:
+        for line in f:
+            rec = json.loads(line)
+            if rec["http_status"] in (429, 403):
+                continue  # a refusal is not an answer and never replaces one
+            latest[(rec["edge_id"], int(rec["sample_idx"]))] = rec
+    history: list[dict] = []
+    queries: list[dict] = []
+    for key, rec in latest.items():
+        row = by_key.get(key)
+        if row is None:
+            continue  # a raw line from another work list; not this pass's
+        result = parse_search(rec["body"])
+        queries.append(query_row(row, result, rec["http_status"], rec["fetched_at"]))
+        history.extend(history_rows(row, result, pass_no, rec["fetched_at"]))
+    return (
+        pd.DataFrame(history, columns=SAMPLE_HISTORY_COLUMNS),
+        pd.DataFrame(queries, columns=QUERY_COLUMNS),
+    )
+
+
 class HarvestIncompleteError(DownloadError):
     """
     The run stopped with rows unanswered and its outputs on disk: the request
@@ -760,51 +976,8 @@ async def harvest_worklist_async(
                         break
                     breaker.record(ok=True)
                     result = parse_search(body)
-                    found = result.panos
-                    anchor = (
-                        r.anchor_pano_id
-                        if isinstance(r.anchor_pano_id, str) and r.anchor_pano_id
-                        else None
-                    )
-                    anchor_in_history = (
-                        None if anchor is None else any(p.pano_id == anchor for p in found)
-                    )
-                    query_buf.append(
-                        {
-                            "edge_id": key[0],
-                            "sample_idx": key[1],
-                            "http_status": status,
-                            "response_code": result.response_code,
-                            "panos_total": result.panos_total,
-                            "panos_dated": len(found),
-                            "panos_third_party": sum(1 for p in found if p.third_party),
-                            "anchor_in_history": anchor_in_history,
-                            "fetched_at": fetched_at,
-                        }
-                    )
-                    for p in found:
-                        history_buf.append(
-                            {
-                                "city_id": r.city_id,
-                                "walk_csv_filename": r.walk_csv_filename,
-                                "pass": pass_no,
-                                "edge_id": key[0],
-                                "sample_idx": key[1],
-                                "query_lat": float(r.query_lat),
-                                "query_lon": float(r.query_lon),
-                                "anchor_pano_id": anchor,
-                                "anchor_capture_date": r.anchor_capture_date
-                                if isinstance(r.anchor_capture_date, str)
-                                else None,
-                                "pano_id": p.pano_id,
-                                "capture_date": p.capture_date,
-                                "pano_lat": p.lat,
-                                "pano_lon": p.lon,
-                                "third_party": p.third_party,
-                                "is_current": p.is_current,
-                                "harvested_at": fetched_at,
-                            }
-                        )
+                    query_buf.append(query_row(r, result, status, fetched_at))
+                    history_buf.extend(history_rows(r, result, pass_no, fetched_at))
                     done.add(key)
                     answered += 1
                     bar.update(1)
