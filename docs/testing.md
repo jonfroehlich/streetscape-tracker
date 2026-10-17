@@ -1093,6 +1093,7 @@ A hold keeps a host's channels from launching without anything having refused us
   - `test_probe_host_refuses_while_a_run_due_is_in_flight`, `test_probe_host_refuses_inside_the_cooldown_unless_forced` and `test_probe_host_refuses_while_another_process_holds_the_host_lock` (busy code 79, nothing sent; the lock is released after a probe) — each with no request sent.
   - `test_probe_host_refuses_an_unknown_host_and_a_missing_token`, `test_probe_host_is_wired_into_the_cli`.
   - `test_the_production_fetch_never_follows_a_redirect` (`allow_redirects=False` reaches `requests.get`) and `test_the_token_comes_from_the_existing_loader`.
+- `test_the_done_line_names_each_metered_hosts_presence_and_the_gap_before_it` — first launch to last finish on the tile CDN, the gap back to the newest ledger stamp from BEFORE the run (tonight's own stamps are seeded and must be ignored), and neither GSV nor Overpass named; killed by marking the launch after the inline child, by dropping the finish mark, by reading tonight's stamps, and by letting Overpass in.
 
 ## The same-day partner path (issue #215)
 

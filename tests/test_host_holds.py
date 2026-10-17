@@ -854,3 +854,48 @@ def test_the_token_comes_from_the_existing_loader(monkeypatch):
     monkeypatch.delenv("MAPILLARY_ACCESS_TOKEN")
     with pytest.raises(ValueError):
         host_probe.load_mapillary_token()
+
+
+# ── per-host presence on the Done: line ──────────────────────────────────
+
+
+def test_the_done_line_names_each_metered_hosts_presence_and_the_gap_before_it(
+    conn, monkeypatch, tmp_path, caplog, frozen_utc_clock
+):
+    """First launch to last finish of any channel on the tile CDN, and the gap
+    back to the newest ledger stamp from before the run. GSV has no per-IP
+    host and Overpass is left out, so neither appears."""
+    conn.execute(
+        "INSERT INTO host_usage VALUES (?, 'mapillary_tiles', 'mapillary', 900)",
+        ((_NIGHT_START - timedelta(hours=17, minutes=30)).isoformat(),),
+    )
+    conn.commit()
+    frozen_utc_clock(_NIGHT_START)
+    _register(conn, "Bend")
+    elapsed = {"min": 0}
+
+    def fake(cfg_, city, today_, provider="gsv", **kw):
+        elapsed["min"] += 30 if provider != "gsv" else 6  # each child's wall clock
+        frozen_utc_clock(_NIGHT_START + timedelta(minutes=elapsed["min"]))
+        if provider in MAPILLARY_PAIR:
+            # Tonight's own stamps, which the gap must NOT measure back to.
+            db.add_api_usage(conn, today_, 10, provider)
+        return True
+
+    monkeypatch.setattr(sched, "_run_one_city", fake)
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+    monkeypatch.setattr(sched.time, "sleep", lambda s: None)
+    monkeypatch.setattr(sched, "generate_aggregate_v2", lambda c, d: None)
+    monkeypatch.setattr(sched, "generate_streetwalk_manifest", lambda c, d: {})
+    monkeypatch.setattr(sched, "_publish", lambda cfg, summary, **kw: 0)
+    monkeypatch.setattr(sched, "send_alert", lambda *a, **k: None)
+    with caplog.at_level(logging.INFO, logger="streetscape_scheduler"):
+        assert sched.cmd_run_due(_cfg(tmp_path, None), today=THURSDAY) == 0
+
+    done = _done_line(caplog)
+    # gsv 09:00-09:06, mapillary 09:06-09:36, mapillary_streets 09:36-10:06.
+    assert (
+        "; on Mapillary's tile CDN (tiles.mapillary.com) 09:06-10:06 UTC (1.0 h), "
+        "17.6 h after its previous ledgered request"
+    ) in done
+    assert done.count("UTC (") == 1

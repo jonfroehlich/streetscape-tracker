@@ -522,6 +522,11 @@ class HostBreaker(set):
         self.held: dict[str, HostHold] = {}
         self.held_skipped: Counter[str] = Counter()
         self.held_launches = 0
+        # host -> [first launch, last finish] of any channel touching it this
+        # run (issue #444): how long this IP was PRESENT on the host, which the
+        # ledger's per-child stamps cannot say (each child stamps once, at its
+        # end). Wall-clock UTC instants.
+        self.presence: dict[str, list[datetime]] = {}
         self.cooldown_s = HOST_RECHECK_COOLDOWN_S if cooldown_s is None else cooldown_s
         self.max_rechecks = HOST_RECHECKS_PER_NIGHT if max_rechecks is None else max_rechecks
         self._clock = clock
@@ -595,6 +600,15 @@ class HostBreaker(set):
     def recovered(self) -> set[str]:
         """Hosts that refused us tonight and are not latched now."""
         return {host for host in self if host not in self.latched}
+
+    def mark_present(self, hosts, *, launched: bool) -> None:
+        """Note a launch (``launched``) or a finish on ``hosts`` now (issue #444)."""
+        now = clock.utc_now()
+        for host in hosts:
+            span = self.presence.setdefault(host, [now, now])
+            if launched:
+                span[0] = min(span[0], now)
+            span[1] = max(span[1], now)
 
     def holding(self, hosts) -> dict[str, HostHold]:
         """The hosts among ``hosts`` held right now (issue #444), each with its hold.
@@ -10129,6 +10143,7 @@ def cmd_run_due(
         # Apart from the refusal clause above (issue #444): nothing refused us
         # and nothing failed; a rest night or a cooldown held the host.
         + _held_summary_note(blocked_hosts)
+        + _presence_note(conn, blocked_hosts, batch_started_iso)
         # The COUNT here and the names in the [alerts] mail (issue #341): a
         # stranded city has no route back for ~83 days, and "1 host(s)
         # UNAVAILABLE" said nothing about that on the two nights it cost 20.
@@ -11053,6 +11068,8 @@ def _run_city_channels(
                             # what the whole batch is doing. A resumable channel took
                             # its own branch further up, where its cap needed the answer.
                             timeout_s = city_timeout_seconds(cfg, city, provider, conn=conn)
+                        # Before the call, which runs the child INLINE at one lane.
+                        blocked_hosts.mark_present(CHANNEL_HOSTS.get(provider, ()), launched=True)
                         future = _start(
                             provider,
                             connection_limit=conn_limit,
@@ -11117,6 +11134,7 @@ def _run_city_channels(
             # on which lane happened to finish first within one wait().
             for future in sorted(done, key=lambda f: providers.index(in_flight[f])):
                 provider = in_flight.pop(future)
+                blocked_hosts.mark_present(CHANNEL_HOSTS.get(provider, ()), launched=False)
 
                 # One channel's outcome, classified in full or not at all.
                 # The `try` covers BOTH the worker's own exception and
@@ -13499,6 +13517,42 @@ def _held_summary_note(breaker: HostBreaker, sep: str = "; ") -> str:
         return ""
     held = ", ".join(hold.describe() for _host, hold in sorted(breaker.held.items()))
     return f"{sep}HELD {held}, {breaker.held_launches} launch(es) held, cities stay due"
+
+
+def _presence_note(conn, breaker: HostBreaker, run_started_iso: str) -> str:
+    """The ``Done:`` line's per-host presence clause (issue #444), or ``""``.
+
+    ``; on Mapillary's tile CDN 09:02-15:44 UTC (6.7 h), 17.3 h after its
+    previous ledgered request`` -- per METERED host a channel ran on: the first
+    launch and the last finish of any channel touching it, and the gap back to
+    the newest ``host_usage`` stamp from before this run (each child stamps once,
+    when it ends, so that stamp is the previous run's last finish). #444's
+    best-fitting reading of the Mapillary blocks is hours of PRESENCE per day,
+    which no other record holds. Overpass is left out: every walk touches it.
+    """
+    metered = set(CHANNEL_METERED_HOST.values())
+    parts = []
+    for host, (first, last) in sorted(breaker.presence.items()):
+        if host not in metered:
+            continue
+        hours = (last - first).total_seconds() / 3600
+        prior = conn.execute(
+            "SELECT MAX(recorded_at) FROM host_usage WHERE host = ? AND recorded_at < ?",
+            (host, run_started_iso),
+        ).fetchone()[0]
+        gap = ""
+        if prior:
+            before = datetime.fromisoformat(prior)
+            if before.tzinfo is None:
+                before = before.replace(tzinfo=UTC)
+            gap = (
+                f", {(first - before).total_seconds() / 3600:.1f} h after its previous "
+                f"ledgered request"
+            )
+        parts.append(
+            f"on {HOST_LABELS.get(host, host)} {first:%H:%M}-{last:%H:%M} UTC ({hours:.1f} h){gap}"
+        )
+    return "".join(f"; {part}" for part in parts)
 
 
 def _blocked_summary_note(breaker: HostBreaker) -> str:
