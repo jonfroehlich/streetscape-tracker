@@ -461,6 +461,149 @@ def test_a_recorded_refusal_says_nothing_about_lost_records(conn, monkeypatch, t
     assert len(alerts) == 1 and "NOT RECORDED" not in alerts[0][2]
 
 
+# ── a THROTTLED child (exit 87, issue #444 review) ────────────────────────
+
+THROTTLED = 87
+
+
+def _failures(conn):
+    return {
+        (r["city_id"], r["provider"]): r["consecutive_failures"]
+        for r in conn.execute(
+            "SELECT city_id, provider, consecutive_failures FROM schedule_state "
+            "WHERE provider IN ('mapillary', 'mapillary_streets')"
+        )
+    }
+
+
+def test_the_throttled_code_is_the_collectors():
+    from streetscape_metadata_tracker.download_common import HOST_THROTTLED_EXIT_CODES
+
+    assert HOST_THROTTLED_EXIT_CODES == {HOST_MAPILLARY_TILES: THROTTLED}
+
+
+def test_a_throttled_child_latches_the_host_for_the_night_and_writes_no_refusal(
+    conn, monkeypatch, tmp_path, caplog
+):
+    """87 trips the breaker like a refusal -- one Mapillary launch, then both
+    Mapillary channels skipped for every later city -- but writes NO
+    host_refusals row, records no failure, and still alerts and exits nonzero."""
+    _register(conn, "Bend")
+    _register(conn, "Corvallis")
+    alerts = []
+    cfg = _cfg(tmp_path, None)
+    cfg.alerts.enabled = True
+    with caplog.at_level(logging.INFO, logger="streetscape_scheduler"):
+        rc, launches = _refusing_night(monkeypatch, conn, cfg, exit_code=THROTTLED, alerts=alerts)
+
+    assert rc != 0
+    providers = [p for _c, p in launches]
+    assert providers.count("mapillary") == 1
+    assert "mapillary_streets" not in providers
+    assert providers.count("gsv") == 2
+    assert _refusal_rows(conn) == []
+    assert set(_failures(conn).values()) <= {0}
+    done = _done_line(caplog)
+    assert "THROTTLED" in done and "unavailable" not in done
+    assert len(alerts) == 1
+    _cfg_arg, subject, body = alerts[0]
+    assert "1 host(s) THROTTLED" in subject
+    assert "UNAVAILABLE" not in subject
+    assert "THROTTLED this host" in body
+    assert "was refused by" not in body
+
+
+@pytest.mark.parametrize("exit_code,counted", [(THROTTLED, False), (1, True)])
+def test_a_throttled_night_quarantines_nothing_however_often_it_repeats(
+    conn, monkeypatch, tmp_path, exit_code, counted
+):
+    """Amnestied: nights of a 429 storm must never quarantine a Mapillary pair
+    (#421). The exit-1 control proves the harness records a real failure."""
+    a = _register(conn, "Bend")
+    cfg = _cfg(tmp_path, None)
+    nights = 3
+    for day in range(nights):
+        _refusing_night(
+            monkeypatch, conn, cfg, exit_code=exit_code, today=THURSDAY + timedelta(days=day)
+        )
+    assert _failures(conn).get((a, "mapillary"), 0) == (nights if counted else 0)
+
+
+def test_a_throttle_arms_no_refusal_cooldown(conn, monkeypatch, tmp_path, frozen_utc_clock):
+    """The next night is not held: a 429 is inconclusive, so only a real
+    refusal (a host_refusals `refused` row) may start the 36 h cooldown."""
+    frozen_utc_clock(datetime(2026, 10, 15, 9, 30, tzinfo=UTC))
+    _register(conn, "Bend")
+    cfg = _cfg(tmp_path, "refusal_cooldown_h = 36\n")
+    _refusing_night(monkeypatch, conn, cfg, exit_code=THROTTLED)
+    assert db.newest_host_verdict(conn, HOST_MAPILLARY_TILES, db.HOST_REFUSED) is None
+    frozen_utc_clock(datetime(2026, 10, 16, 2, 0, tzinfo=UTC))
+    assert sched._host_holds(cfg, date(2026, 10, 16), conn).active(HOST_MAPILLARY_TILES) is None
+
+
+def test_a_walk_lost_to_a_throttle_strands_and_the_alert_says_throttled(
+    conn, monkeypatch, tmp_path, caplog
+):
+    """The grid run lands, the walk exits 87: stranded exactly as for a refused
+    host, named as a throttle -- and the end-of-night retry launches no second
+    child into the latched host."""
+    a = _register(conn, "Bend")
+    launches = []
+
+    def fake(cfg_, city, today_, provider="gsv", **kw):
+        launches.append((city.city_id, provider))
+        if provider == "mapillary_streets":
+            return sched.CollectionOutcome(False, "exited 87 (stub)", exit_code=THROTTLED)
+        return True
+
+    monkeypatch.setattr(sched, "_run_one_city", fake)
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+    monkeypatch.setattr(sched.time, "sleep", lambda s: None)
+    monkeypatch.setattr(sched, "generate_aggregate_v2", lambda c, d: None)
+    monkeypatch.setattr(sched, "generate_streetwalk_manifest", lambda c, d: {})
+    monkeypatch.setattr(sched, "_publish", lambda cfg, summary, **kw: 0)
+    alerts = []
+    monkeypatch.setattr(sched, "send_alert", lambda *a_, **k: alerts.append(a_))
+    cfg = _cfg(tmp_path, None)
+    cfg.alerts.enabled = True
+    with caplog.at_level(logging.INFO, logger="streetscape_scheduler"):
+        rc = sched.cmd_run_due(cfg, today=THURSDAY)
+
+    assert rc != 0
+    assert launches.count((a, "mapillary_streets")) == 1
+    assert "1 city(ies) STRANDED un-walked" in _done_line(caplog)
+    _cfg_arg, subject, body = alerts[0]
+    assert f"{a} (mapillary_streets: a throttled host (HTTP 429/503))" in body
+    assert _refusal_rows(conn) == []
+
+
+def test_a_throttle_latches_without_a_recheck_and_is_never_recovered():
+    breaker = sched.HostBreaker(cooldown_s=0)
+    breaker.throttle(HOST_MAPILLARY_TILES)
+    assert breaker and breaker.throttled_only({HOST_MAPILLARY_TILES})
+    assert breaker.blocking({HOST_MAPILLARY_TILES}) == {HOST_MAPILLARY_TILES}
+    assert breaker.rechecks[HOST_MAPILLARY_TILES] == 0
+    assert breaker.recovered == set()
+    # A refusal on the same night is named as a refusal, not a throttle.
+    breaker.add(HOST_MAPILLARY_TILES)
+    assert not breaker.throttled_only({HOST_MAPILLARY_TILES})
+
+
+def test_the_child_reason_names_a_throttle(tmp_path, monkeypatch):
+    """`_run_collection_subprocess` turns 87 into words, never "unavailable"."""
+    cfg = _cfg(tmp_path, None)
+
+    class _Done:
+        returncode = THROTTLED
+
+    monkeypatch.setattr(sched.subprocess, "run", lambda *a, **k: _Done())
+    row = type("C", (), {"city_id": "bend--oregon--united-states"})()
+    outcome = sched._run_collection_subprocess(cfg, ["true"], 60, row, "mapillary", THURSDAY)
+    assert outcome.exit_code == THROTTLED and not outcome
+    assert "THROTTLED this host" in outcome.reason
+    assert "unavailable" not in outcome.reason
+
+
 def test_status_prints_the_last_refusal_and_clearance_per_host(
     conn, monkeypatch, tmp_path, capsys, frozen_utc_clock
 ):

@@ -585,12 +585,18 @@ A section must hold at least one known key and nothing else, and one bad key ref
 A `refused` row is written wherever the scheduler classifies a child exit as a host refusal (the blocked family, 75/76/81/84), beside the breaker trip, with the command (`run-due` or `assess-city`), channel, city, exit code, reason and `requests_before` — the host's `host_usage` total over the prior 24 h, NULL for an unmetered host such as Overpass.
 A busy exit writes nothing.
 A failed write is caught so it cannot end the night, but it is **not silent**: that row is the only thing that arms the next night's cooldown, so the `Done:` line and the alert (which the night sends anyway, because of the refusal) both say `refusal(s) NOT RECORDED in host_refusals`, with the fix — record one with `probe-host` once the catalog is writable, or hold the channels by hand.
+**A THROTTLED child (exit 87) is not a refusal and writes no row** (#444 review).
+The Mapillary tile census exits 87 on every backpressure stop (`HostThrottledError`).
+The scheduler latches the tile CDN for the rest of the run — both Mapillary channels, the fill included; the host has no `HOST_RECHECKS` entry, so nothing asks it again — and amnesties the child: no `record_attempt`, so no `consecutive_failures` and never a quarantine, and the checkpoint is kept for the next due night.
+It writes no `host_refusals` row and so arms no cooldown, because a 429 is inconclusive, exactly as `probe-host` reads it.
+A walk lost to it (its own 87, or a breaker skip on a host latched only by a throttle) strands like one lost to a refusal, and the alert names it `a throttled host (HTTP 429/503)`.
+The night still alerts and exits nonzero; the subject says `host(s) THROTTLED` and the `Done:` line `THROTTLED (HTTP 429/503, no refusal recorded)`, never "unavailable".
 `scheduler status` prints, per host with a row, the last refusal and how long ago, the last clearance, and the last ledgered request on the host.
 
 **`probe-host HOST` sends exactly one request and records the verdict.**
 For `mapillary_tiles` it is the z14 tile 2581/5921 (downtown Corvallis, Oregon; 269 distinct images in the 2026-07-06 census) with `MAPILLARY_ACCESS_TOKEN`, redirects not followed.
 A redirect or a 200 error page is REFUSED (exit 75); a tile or a 404 is CLEARED (exit 0); a 429 or a 503 is THROTTLED, and that, a rejected token, another 5xx or no response is inconclusive (exit 1) and records nothing.
-A 429/503 is not a refusal because the collector reads both as backpressure (it waits, slows and pauses with exit 83, recording no refusal and tripping no breaker), and a probe that recorded one would arm the cooldown on an answer the collector itself would have waited out; the probe prints the `Retry-After` when there is one.
+A 429/503 is not a refusal because the collector reads both as backpressure (it waits, slows and at worst stops THROTTLED, exit 87, which latches the host for the night but records no refusal), and a probe that recorded one would arm the cooldown on an answer the collector itself would have waited out; the probe prints the `Retry-After` when there is one.
 A request that got an answer is charged to the `mapillary` ledger.
 It refuses (64, nothing sent) while any `run-due` is in flight (`_run_due_in_flight`) and inside the host's cooldown unless `--force`, and exits 79 when another process holds the host lock.
 The lock is taken in `host_probe.py`, never in `scheduler.py`, whose source must not name the lock module (#208): the parent-must-not-hold rule is about children it spawns, and `probe-host` spawns none.

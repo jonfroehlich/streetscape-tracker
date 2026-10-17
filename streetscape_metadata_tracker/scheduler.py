@@ -87,6 +87,7 @@ from .download_common import (
     CHANNEL_METERED_HOST,
     HOST_BY_BUSY_EXIT_CODE,
     HOST_BY_EXIT_CODE,
+    HOST_BY_THROTTLED_EXIT_CODE,
     HOST_KARTAVIEW,
     HOST_LABELS,
     HOST_MAPILLARY_TILES,
@@ -534,6 +535,13 @@ class HostBreaker(set):
         self.max_rechecks = HOST_RECHECKS_PER_NIGHT if max_rechecks is None else max_rechecks
         self._clock = clock
         self.latched: set[str] = set()
+        # Which hosts tripped the breaker and HOW (issue #444): a refusal
+        # (75/76/81/84) or a throttle (87, the CDN asking for a slower pace).
+        # A host can be in both on one night. Both latch alike; only the
+        # wording differs, because the operator's next move does -- a refusal
+        # arms tomorrow's cooldown, a throttle records nothing.
+        self.refused_hosts: set[str] = set()
+        self.throttled_hosts: set[str] = set()
         self.trips: Counter[str] = Counter()
         self.rechecks: Counter[str] = Counter()
         self.recoveries: Counter[str] = Counter()
@@ -572,16 +580,35 @@ class HostBreaker(set):
         # involved, and the retry pass skips them for the same reason it skips
         # an argv rejection: a second ask can only meet the same deadline.
         self.deadline_stranded: set[tuple[str, str]] = set()
+        # (city_id, walk) pairs stranded by a THROTTLED host (exit 87, issue
+        # #444), so the alert names the cause as a throttle, not a refusal.
+        self.throttled_stranded: set[tuple[str, str]] = set()
         self._next_recheck_at: dict[str, float] = {}
 
-    def add(self, host: str) -> None:
-        """Record that ``host`` refused this machine; latch its channels."""
+    def add(self, host: str, *, throttled: bool = False) -> None:
+        """Record that ``host`` refused (or throttled) this machine; latch its channels."""
         super().add(host)
         self.latched.add(host)
+        (self.throttled_hosts if throttled else self.refused_hosts).add(host)
         self.trips[host] += 1
         self._next_recheck_at[host] = self._clock() + self.cooldown_s
 
     trip = add
+
+    def throttle(self, host: str) -> None:
+        """Latch ``host`` for a THROTTLE (exit 87, issue #444), not a refusal.
+
+        Same latch as :meth:`add` -- the next city would walk into the same
+        429s -- but the caller writes no ``host_refusals`` row, and the alert
+        says "throttled". The tile CDN has no ``HOST_RECHECKS`` entry, so the
+        latch holds for the rest of the run.
+        """
+        self.add(host, throttled=True)
+
+    def throttled_only(self, hosts) -> bool:
+        """True when every host in ``hosts`` latched by throttle alone, never a refusal."""
+        hosts = set(hosts)
+        return bool(hosts) and hosts <= self.throttled_hosts - self.refused_hosts
 
     def _refuse(self, *args, **kwargs):
         """Every other ``set`` mutator, and ``copy``, is refused (issue #341).
@@ -660,10 +687,13 @@ class HostBreaker(set):
         busy_host: str | None = None,
         argv_rejected: bool = False,
         deadline: bool = False,
+        throttled: bool = False,
     ) -> None:
         self.stranded.setdefault(city_id, []).append(provider)
         if argv_rejected:
             self.argv_stranded.add((city_id, provider))
+        if throttled:
+            self.throttled_stranded.add((city_id, provider))
         if deadline:
             self.deadline_stranded.add((city_id, provider))
         if busy_host is not None:
@@ -7604,7 +7634,9 @@ def cmd_assess_city(
             "The link above describes the catalog, not what is live. Publish with "
             "`regenerate-aggregate --publish` when you mean to."
         )
-    blocked_note = f", {_host_names(blocked_hosts)} refused this host" if blocked_hosts else ""
+    blocked_note = (
+        f", {_host_names(blocked_hosts)} refused or throttled this host" if blocked_hosts else ""
+    )
     busy_note = f", {_host_names(busy_hosts)} busy locally" if busy_hosts else ""
     summary = (
         f"{succeeded}/{attempted} channel(s) collected"
@@ -8094,8 +8126,16 @@ def _run_collection_subprocess(
         # "another local process is already talking to it" (issue #208).
         blocked = HOST_BY_EXIT_CODE.get(exit_code)
         busy = HOST_BY_BUSY_EXIT_CODE.get(exit_code)
+        throttled = HOST_BY_THROTTLED_EXIT_CODE.get(exit_code)
         if blocked:
             why = f"exited {exit_code} ({HOST_LABELS[blocked]} unavailable to this host)"
+        elif throttled:
+            # Issue #444: the CDN asked for a slower pace (HTTP 429/503) often
+            # enough that the crawl stopped. Not a refusal; checkpoint kept.
+            why = (
+                f"exited {exit_code} ({HOST_LABELS[throttled]} THROTTLED this host: HTTP "
+                f"429/503, not a refusal; checkpoint kept)"
+            )
         elif busy:
             why = f"exited {exit_code} ({HOST_LABELS[busy]} busy with another local process)"
         elif exit_code == ARGV_REJECTED_EXIT_CODE:
@@ -10573,6 +10613,9 @@ def _run_city_channels(
     # ...and those lost to an argv our own CLI rejected (issue #359), which the
     # end-of-night retry must never re-launch (issue #380).
     lost_to_argv: set[str] = set()
+    # ...and those lost to a THROTTLED host (exit 87, or a breaker skip on a
+    # host latched only by a throttle; issue #444), named so in the alert.
+    lost_to_throttle: set[str] = set()
     # ...and the walks the batch deadline deferred (issue #373), stranded
     # below when their grid sibling landed in this same call.
     lost_to_deadline: list[str] = []
@@ -10784,10 +10827,17 @@ def _run_city_channels(
                                 blocked_hosts.skipped[host] += 1
                             blocked_hosts.skipped_launches += 1
                             lost_to_host.append(provider)
+                            throttled_skip = blocked_hosts.throttled_only(unavailable)
+                            if throttled_skip:
+                                lost_to_throttle.add(provider)
                             logger.info(
                                 f"{city.city_id} [{provider}]: skipping — "
                                 f"{_host_names(unavailable)} "
-                                f"already refused this host."
+                                + (
+                                    "already throttled this host tonight (HTTP 429/503)."
+                                    if throttled_skip
+                                    else "already refused this host."
+                                )
                             )
                             continue
 
@@ -11266,6 +11316,38 @@ def _run_city_channels(
                         )
                         continue
 
+                    throttled_host = HOST_BY_THROTTLED_EXIT_CODE.get(exit_code)
+                    if throttled_host is not None:
+                        # The CDN asked for a slower pace (HTTP 429/503) often
+                        # enough that the crawl stopped (issue #444). Two
+                        # halves of the blocked branch's reaction, and one
+                        # deliberate difference:
+                        #   * AMNESTIED -- no record_attempt, so no
+                        #     consecutive_failures and never a quarantine
+                        #     (#421): a few nights of a 429 storm must not
+                        #     quarantine every Mapillary pair. The checkpoint is
+                        #     kept, so the city resumes when it is next due.
+                        #   * LATCHED -- the breaker skips both Mapillary
+                        #     channels for the rest of the run, the fill
+                        #     included, since the next city would walk into the
+                        #     same 429s. The tile CDN has no HOST_RECHECKS
+                        #     entry, so nothing asks it again tonight.
+                        #   * NO host_refusals ROW, so no 36 h refusal cooldown:
+                        #     a 429 is THROTTLED (inconclusive), not REFUSED,
+                        #     exactly as probe-host reads it. `_record_refusal`
+                        #     is the blocked branch's alone.
+                        blocked_hosts.throttle(throttled_host)
+                        lost_to_host.append(provider)
+                        lost_to_throttle.add(provider)
+                        logger.error(
+                            f"{city.city_id} [{provider}]: {HOST_LABELS[throttled_host]} "
+                            f"THROTTLED this host (HTTP 429/503) — skipping its remaining "
+                            f"channels tonight. Not a refusal (no cooldown recorded) and not "
+                            f"counted as a failure for this city; its checkpoint is kept. "
+                            f"({reason})"
+                        )
+                        continue
+
                     if exit_code == ARGV_REJECTED_EXIT_CODE:
                         # Our own CLI refused the argv this process built (issue
                         # #359). The city did nothing and nothing was spent, so it
@@ -11454,11 +11536,12 @@ def _run_city_channels(
                 provider,
                 busy_host=lost_to_busy.get(provider),
                 argv_rejected=provider in lost_to_argv,
+                throttled=provider in lost_to_throttle,
             )
             logger.warning(
                 f"{city.city_id} [{provider}]: STRANDED — its {sibling} grid run succeeded "
-                f"tonight but a refused or busy host, or an argv our own CLI rejected, cost it "
-                f"this walk, so the city leaves the "
+                f"tonight but a refused, throttled or busy host, or an argv our own CLI "
+                f"rejected, cost it this walk, so the city leaves the "
                 f"night un-paired and is not due on {sibling} again for "
                 f"~{cfg.cycle_days - cfg.grace_days} days (issue #341)."
             )
@@ -12778,7 +12861,7 @@ def _fill_prebudget_refusal(
             return FillVerdict(
                 False,
                 _FILL_BLOCKER_HOST_REFUSED,
-                f"{_host_names(refused)} refused this host tonight ({channel})",
+                f"{_host_names(refused)} refused or throttled this host tonight ({channel})",
             )
     return None
 
@@ -13595,9 +13678,17 @@ def _blocked_summary_note(breaker: HostBreaker) -> str:
     if not breaker:
         return ""
     parts = []
-    if breaker.latched:
+    # A host latched by a throttle alone (exit 87, issue #444) is named as
+    # THROTTLED: it recorded no refusal, so "unavailable" would send the
+    # operator looking for a cooldown that does not exist.
+    throttled = {h for h in breaker.latched if breaker.throttled_only({h})}
+    refused = breaker.latched - throttled
+    if refused:
+        parts.append("; ".join(sorted(HOST_LABELS.get(h, h) for h in refused)) + " unavailable")
+    if throttled:
         parts.append(
-            "; ".join(sorted(HOST_LABELS.get(h, h) for h in breaker.latched)) + " unavailable"
+            "; ".join(sorted(HOST_LABELS.get(h, h) for h in throttled))
+            + " THROTTLED (HTTP 429/503, no refusal recorded)"
         )
     if breaker.recovered:
         parts.append(
@@ -13632,12 +13723,25 @@ def _blocked_alert_note(breaker: HostBreaker) -> str:
     """The [alerts] paragraph about the hosts that refused us, or empty."""
     if not breaker:
         return ""
-    note = "This host's IP was refused by " + _host_names(breaker) + "."
-    if breaker.latched:
+    throttled = {h for h in breaker if breaker.throttled_only({h})}
+    refused = set(breaker) - throttled
+    note = ""
+    if throttled:
         note += (
-            f" Still refusing at the end of the night: {_host_names(breaker.latched)} — its "
-            f"channels were skipped from the first refusal on, apart from re-checks "
-            f"({', '.join(f'{breaker.rechecks[h]} for {HOST_LABELS.get(h, h)}' for h in sorted(breaker.latched))} "
+            f"{_host_names(throttled)} THROTTLED this host: it answered HTTP 429/503 often "
+            f"enough that a crawl stopped itself (exit 87, issue #444). Not a refusal: no "
+            f"host_refusals row was written and no cooldown is armed, so the next night "
+            f"collects as usual; its channels were skipped for the rest of this night, the "
+            f"crawl's checkpoint is kept, and no city was marked failed."
+        )
+    if not refused:
+        return note
+    note += (" " if note else "") + "This host's IP was refused by " + _host_names(refused) + "."
+    if breaker.latched - throttled:
+        note += (
+            f" Still refusing at the end of the night: {_host_names(breaker.latched - throttled)} "
+            f"— its channels were skipped from the first refusal on, apart from re-checks "
+            f"({', '.join(f'{breaker.rechecks[h]} for {HOST_LABELS.get(h, h)}' for h in sorted(breaker.latched - throttled))} "
             f"of {breaker.max_rechecks} allowed per night, {breaker.cooldown_s / 60:g} min apart; "
             f"a host with no re-check stays latched all night by design, see HOST_RECHECKS)."
         )
@@ -13754,11 +13858,11 @@ def _stranded_alert_note(cfg: SchedulerConfig, breaker: HostBreaker, today: date
     def _named(cid: str, channel: str) -> str:
         # The reason is on the line because the next move differs: a host
         # stranding waits for the host, a deadline one can run at once.
-        return (
-            f"{channel}: the batch deadline"
-            if (cid, channel) in breaker.deadline_stranded
-            else channel
-        )
+        if (cid, channel) in breaker.deadline_stranded:
+            return f"{channel}: the batch deadline"
+        if (cid, channel) in breaker.throttled_stranded:
+            return f"{channel}: a throttled host (HTTP 429/503)"
+        return channel
 
     lines = [
         f"{cid} ({', '.join(_named(cid, ch) for ch in channels)})"
@@ -13772,7 +13876,7 @@ def _stranded_alert_note(cfg: SchedulerConfig, breaker: HostBreaker, today: date
     ]
     return (
         f"{len(stranded)} city(ies) came out of the night with a grid run but NO road "
-        f"walk, because a refused or locally busy host, an argv our own CLI rejected "
+        f"walk, because a refused, throttled or locally busy host, an argv our own CLI rejected "
         f"(issue #359), or the batch deadline (issue #373) cost them the walk while the grid "
         f"sibling succeeded. The end-of-night retry (issue #380) could not walk the "
         f"host-stranded ones either, and never retries a walk marked `the batch deadline`, "
@@ -14290,8 +14394,12 @@ def _finish_batch(
             parts.append(f"{len(tail_errors)} published index(es) FAILED")
         if plan_error:
             parts.append("DRIVING-PLAN FETCH FAILED")
-        if blocked_hosts.latched:
-            parts.append(f"{len(blocked_hosts.latched)} host(s) UNAVAILABLE")
+        throttled_latched = {h for h in blocked_hosts.latched if blocked_hosts.throttled_only({h})}
+        if blocked_hosts.latched - throttled_latched:
+            parts.append(f"{len(blocked_hosts.latched - throttled_latched)} host(s) UNAVAILABLE")
+        if throttled_latched:
+            # Issue #444: named apart, because there is nothing to wait out.
+            parts.append(f"{len(throttled_latched)} host(s) THROTTLED")
         if blocked_hosts.recovered:
             # Recovered is still a refusal that cost the night launches (and
             # possibly stranded cities), so it is named rather than folded

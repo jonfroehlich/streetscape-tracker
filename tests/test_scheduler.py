@@ -13270,7 +13270,7 @@ def test_a_busy_host_strands_a_city_exactly_like_a_refusal(conn, monkeypatch, ca
     assert "UNAVAILABLE" not in subject, "a busy lock is not the provider refusing us"
     assert f"{alpha} (gsv_streets)" in body
     assert beta not in body.split("came out of the night")[1]
-    assert "refused or locally busy host" in body
+    assert "refused, throttled or locally busy host" in body
 
 
 # ---------------------------------------------------------------------------
