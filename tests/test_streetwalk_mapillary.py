@@ -1091,6 +1091,30 @@ def test_a_walk_whose_tail_dies_still_records_what_the_census_cost(tmp_path, mon
     assert _host_spend(conn, collect.STREET_BUDGET_CHANNELS["mapillary"]) == 11
 
 
+def test_a_throttled_walk_exits_the_throttled_code_and_records_its_spend(tmp_path, monkeypatch):
+    """Issue #444: a backpressure stop in the walk's census is the throttled
+    exit (87), not 1 -- which would count a consecutive_failure -- and not 75,
+    which would record a refusal. Its spend still reaches both ledgers."""
+    from streetscape_metadata_tracker.download_common import (
+        HOST_MAPILLARY_TILES,
+        HOST_THROTTLED_EXIT_CODES,
+        HostThrottledError,
+    )
+
+    data_dir, _ = _setup(tmp_path, monkeypatch, [_image("i-1", 44.0500, -121.3000)])
+
+    async def throttled(city_name, bbox, access_token, **kwargs):
+        error = HostThrottledError("429s", host=HOST_MAPILLARY_TILES)
+        error.api_requests = 3
+        raise error
+
+    monkeypatch.setattr(cm, "fetch_city_images_async", throttled)
+
+    assert collect.run_collect(_args(data_dir)) == HOST_THROTTLED_EXIT_CODES[HOST_MAPILLARY_TILES]
+    conn = db.connect(db.get_default_db_path(data_dir))
+    assert db.get_api_usage(conn, date(2026, 7, 8), provider="mapillary_streets") == 3
+
+
 # --- The shared census cache (issue #290) -----------------------------------
 #
 # A Mapillary walk and its city's grid run read the IDENTICAL z14 census over

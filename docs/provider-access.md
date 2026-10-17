@@ -838,7 +838,7 @@ READ THIS FIRST requires this before any change to retry or identity behaviour, 
 
 ### One status line per crawl
 
-Every HTTP response a crawl receives is tallied by class and logged once, after the fetch, on every way out of it — success, a 302 refusal (exit 75), a pause (exit 83) — and as an all-zero line for a census reused from the cache.
+Every HTTP response a crawl receives is tallied by class and logged once, after the fetch, on every way out of it — success, a 302 refusal (exit 75), a pause (exit 83), a backpressure stop (exit 87) — and as an all-zero line for a census reused from the cache.
 Its shape, with illustrative numbers:
 
 ```
@@ -851,7 +851,7 @@ mapillary tile statuses: 200=81 204=0 404=1 429=0 4xx=0 5xx=0 3xx=5 other=0 nore
 `retries` is attempts beyond a tile's first, whichever layer retried it.
 `retry_after` lists every `Retry-After` value seen, verbatim, capped at 20 with a `+N more`.
 The response is counted in `_fetch_tile` **before** any branch can raise, so a refusal is in the line rather than missing from it.
-The line is a log contract only: the child's exit codes and the pause phrases the scheduler parses are unchanged, except for the one new phrase below.
+The line is a log contract only: the pause phrases the scheduler parses are unchanged, and the one new exit code is the throttled 87 below.
 Rolling it into the scheduler's `Done:` line is #444's scheduler half.
 
 ### An identifying User-Agent
@@ -878,7 +878,7 @@ Now:
    Other 4xx and 5xx keep the old `@backoff` path.
 2. The crawl's pacer is **held** — no request goes out from any of its sockets — for `max(Retry-After, 60 s)`.
    Both RFC 9110 forms are read, delay-seconds and HTTP-date; a missing or unreadable header means 60 s, and so does one that cannot be parsed at all (Unicode digits, thousands of digits, a date `datetime` cannot hold) — parsing never raises.
-3. A `Retry-After` longer than **900 s** is not slept on, and neither is a hold that would end past the crawl's wall-clock budget: the crawl pauses at once (rule 7).
+3. A `Retry-After` longer than **900 s** is not slept on, and neither is a hold that would end past the crawl's wall-clock budget: the crawl stops at once (rule 7).
    Retrying before the time the server named would disobey it, and a sleep that long belongs to the next night rather than to this one's host lock.
 4. The pace is **halved once** for the rest of that crawl (`AsyncRateLimiter.slow_down(2)`), on the limiter the crawl builds for itself, so it cannot reach another crawl or another process.
 5. The tile is then retried by re-entering the in-semaphore checks, so the abort, the request cap with its reservation, and the wall-clock deadline gate the retry exactly as they gate a fresh tile.
@@ -888,17 +888,19 @@ Now:
 6. Strikes are counted in **episodes, not responses**.
    Each attempt records the pacer's generation when it is sent; a 429/503 answering a request sent before the latest hold began belongs to that hold, so it adds no strike (it may still extend the hold to its own wait).
    One throttle window that answers several in-flight requests at once is one episode.
-7. The **third episode** in one crawl pauses it on the request cap's own path: checkpointed, `SweepIncompleteError`, exit 83, raised before the settle loop, with the stop reason `SWEEP_STOP_BACKPRESSURE` and the phrase "stopped by provider backpressure (HTTP 429/503)", which the scheduler's `_pause_stop_phrase` reads back with no scheduler change.
-   With nothing committed it is the cap's plain-`DownloadError` arm, as for any capped stop.
-   The pause **closes** the crawl's pacer: no further request goes out, including ones already waiting for their turn, which are turned away uncommitted and uncounted.
-   **It is not a refusal**: a 302 → `/login` is still the `HostBlockedError` (exit 75) it always was, after a 429 too.
+7. The **third episode** in one crawl stops it on the request cap's own path — turned-away tiles uncommitted, the checkpoint kept, raised before the settle loop — as **`HostThrottledError`, exit 87**, the THROTTLED family (`download_common.HOST_THROTTLED_EXIT_CODES`).
+   Every backpressure stop raises it, committed tiles or not; its message carries the phrase "stopped by provider backpressure (HTTP 429/503)", and says "the next run resumes it" only when a tile is committed, "starts from the first tile" otherwise.
+   It replaced exit 83 plus a plain-`DownloadError` arm for the nothing-committed case: that arm counted a `consecutive_failure`, so a few nights of a 429 storm would have quarantined every Mapillary pair (#421), and nothing latched the host, so the next city walked into the same 429s at full pace.
+   The scheduler amnesties 87 and skips both Mapillary channels for the rest of the night, but records no refusal and arms no cooldown (see `docs/scheduler.md`).
+   The stop **closes** the crawl's pacer: no further request goes out, including ones already waiting for their turn, which are turned away uncommitted and uncounted.
+   **It is not a refusal**: a 302 → `/login` is still the `HostBlockedError` (exit 75) it always was, after a 429 too, and wins if both happen in one crawl.
 
 **Why 900 s.**
 The only cooldown ever reported for a Mapillary tile block is thread 5821's 15-minute sleep, a hint rather than a contract.
 And with the pause at the third episode, a crawl holds in at most two episodes, each lasting the longest wait asked for inside it (at most 900 s), so it holds the machine-wide tile lock for at most 30 minutes of sleeping.
 That is well inside prod's 180-minute per-city timeout floor (`city_timeout_minutes`).
-**A hold that would end past the crawl's wall-clock budget is not slept at all**: the crawl pauses at once instead.
-The scheduler forwards that budget as the child's SIGKILL timeout less a 600 s margin (`_crawl_max_seconds`), so a 900 s hold begun inside the margin would be killed mid-sleep and counted a failure, where pausing is exit 83.
+**A hold that would end past the crawl's wall-clock budget is not slept at all**: the crawl stops at once instead.
+The scheduler forwards that budget as the child's SIGKILL timeout less a 600 s margin (`_crawl_max_seconds`), so a 900 s hold begun inside the margin would be killed mid-sleep and counted a failure, where stopping is the amnestied exit 87.
 A halved pace also doubles the remaining wall clock of the crawl it applies to, so a large city answered 429 early can reach its budget; the clock then pauses it as exit 83, which is the intended outcome.
 
 **One known interaction, left as it is.**

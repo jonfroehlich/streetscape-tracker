@@ -526,6 +526,43 @@ class HostBlockedError(HostUnavailableError):
     """The third party itself is refusing this host's IP (issues #199/#209)."""
 
 
+class HostThrottledError(HostUnavailableError):
+    """
+    The third party asked this host to SLOW DOWN, and the crawl stopped (#444).
+
+    Raised by the Mapillary tile census for every backpressure stop: the third
+    429/503 episode in one crawl, a ``Retry-After`` past the in-process ceiling,
+    or a hold that would outlast the crawl's wall-clock budget. Not a
+    :class:`HostBlockedError`: a 429 says "not this fast", where a 302 to
+    ``/login`` says "not at all", so it maps to its own exit code
+    (:data:`HOST_THROTTLED_EXIT_CODES`) and the scheduler treats it as
+    inconclusive -- it latches the host for the night, amnestied, but records
+    no refusal. Nor a :class:`SweepIncompleteError`, whose exit 83 promises
+    the next city's crawl is unaffected; this one is a property of the host,
+    which every remaining Mapillary city of the night would walk into.
+
+    The checkpoint is kept exactly as for a pause, so the next night resumes.
+    ``checkpoint_path`` is that checkpoint when it holds committed tiles to
+    resume from, and None when it holds nothing -- a stop at the first tile
+    must not claim progress that does not exist. ``units_done`` and
+    ``unit_count`` are the census's tiles, for the log line.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        host: str,
+        *,
+        checkpoint_path: str | None = None,
+        units_done: int = 0,
+        unit_count: int = 0,
+    ):
+        super().__init__(message, host)
+        self.checkpoint_path = checkpoint_path
+        self.units_done = units_done
+        self.unit_count = unit_count
+
+
 # Exit codes a collection child uses to tell the scheduler *which* host is
 # unavailable, and in WHICH of the two senses. The message never crosses the
 # process boundary — the scheduler only sees `subprocess.run(...).returncode` —
@@ -558,6 +595,21 @@ class HostBlockedError(HostUnavailableError):
 #
 # 84/85 continue the same numbering for Panoramax (issue #316), taken after 83
 # rather than filling the 77/78 gap, which stays open for the reason above.
+#
+#   THROTTLED (issue #444) -- the third party asked us to slow down (HTTP
+#     429/503) often enough that the crawl stopped. A third family because it
+#     sits between the other two: like BLOCKED it is a property of the host that
+#     the next city would walk straight into at full pace, so it trips the
+#     night-level breaker; unlike BLOCKED it is not a refusal, so the scheduler
+#     writes no host_refusals row and arms no 36 h cooldown (probe-host reads a
+#     429 as THROTTLED, inconclusive, for the same reason). It is amnestied, as
+#     83 is: the checkpoint is kept and the next night resumes. Only the
+#     Mapillary tile census reads backpressure, so the dict has one entry.
+#
+# 87 continues past 85. 86 is skipped because the GSV capture-history harvester
+# (issue #442) exits 86 for its own blocked endpoint; that script never runs
+# under the scheduler, but one number with two meanings in one repo is the
+# plausible-wrong-answer problem 77/78 are skipped for.
 HOST_EXIT_CODES = {
     HOST_MAPILLARY_TILES: 75,
     HOST_OVERPASS: 76,
@@ -570,8 +622,12 @@ HOST_BUSY_EXIT_CODES = {
     HOST_KARTAVIEW: 82,
     HOST_PANORAMAX: 85,
 }
+HOST_THROTTLED_EXIT_CODES = {
+    HOST_MAPILLARY_TILES: 87,
+}
 HOST_BY_EXIT_CODE = {code: host for host, code in HOST_EXIT_CODES.items()}
 HOST_BY_BUSY_EXIT_CODE = {code: host for host, code in HOST_BUSY_EXIT_CODES.items()}
+HOST_BY_THROTTLED_EXIT_CODE = {code: host for host, code in HOST_THROTTLED_EXIT_CODES.items()}
 
 # A collection stopped part-way and CHECKPOINTED what it had (issue #239). Not a
 # host condition in either sense above: the third party answered every question
@@ -626,10 +682,11 @@ ARGV_REJECTED_EXIT_CODE = 2
 # text is the only way a night's log can say "the clock paused it" rather than
 # "the budget paused it". Defined once so neither side can respell them.
 #
-# The third, backpressure (issue #444), is the Mapillary tile census pausing
-# itself after the CDN answered 429/503 too often in one crawl. The scheduler
-# reads it back like the other two -- `_pause_stop_phrase` iterates this dict --
-# so adding the entry is the whole of its wiring there.
+# The third, backpressure (issue #444), is the Mapillary tile census stopping
+# itself after the CDN answered 429/503 too often in one crawl. That stop is
+# NOT an exit-83 pause: it raises HostThrottledError (exit 87, the throttled
+# family above), whose message carries this phrase verbatim so the child's log
+# still says which ceiling stopped it.
 SWEEP_STOP_REQUESTS = "requests"
 SWEEP_STOP_CLOCK = "clock"
 SWEEP_STOP_BACKPRESSURE = "backpressure"
@@ -853,12 +910,14 @@ def host_exit_code(error: HostUnavailableError) -> int:
     """
     The exit code a collection child should return for ``error``.
 
-    The single place the busy/blocked distinction becomes a number, so the three
+    The single place the busy/blocked/throttled distinction becomes a number, so the three
     child entry points (``cli.py``, ``collect.py``, ``analyze.py``) cannot drift
     from each other or from the scheduler's reverse maps.
     """
     if isinstance(error, HostBusyError):
         return HOST_BUSY_EXIT_CODES[error.host]
+    if isinstance(error, HostThrottledError):
+        return HOST_THROTTLED_EXIT_CODES[error.host]
     return HOST_EXIT_CODES[error.host]
 
 

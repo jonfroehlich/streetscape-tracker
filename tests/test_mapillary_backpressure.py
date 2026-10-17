@@ -27,10 +27,18 @@ from multidict import CIMultiDict, CIMultiDictProxy
 
 from streetscape_metadata_tracker import download_mapillary as dm
 from streetscape_metadata_tracker.download_common import (
+    HOST_MAPILLARY_TILES,
+    HOST_THROTTLED_EXIT_CODES,
+    SWEEP_STOP_BACKPRESSURE,
+    SWEEP_STOP_PHRASES,
     DownloadError,
     HostBlockedError,
+    HostThrottledError,
     SweepIncompleteError,
+    host_exit_code,
 )
+
+_THROTTLED = HOST_THROTTLED_EXIT_CODES[HOST_MAPILLARY_TILES]
 
 # A Chicago frame of 361 z14 tiles: big enough that one failed tile sits under
 # MAX_FAILED_TILE_FRACTION (so a per-tile failure is tolerated, not a refusal).
@@ -504,27 +512,22 @@ def _three_429s(**headers):
     return {xy: [status(429, **headers)] for xy in _TILES[:3]}
 
 
-def test_the_third_429_pauses_the_crawl_with_exit_83_not_a_refusal(
+def test_the_third_429_stops_the_crawl_as_throttled_not_a_refusal(
     monkeypatch, tmp_path, limiters, holds, caplog
 ):
     caplog.set_level(logging.INFO, logger=dm.__name__)
-    error, session = _crawl(
-        monkeypatch, _three_429s(), connection_limit=1, checkpoint_path=str(tmp_path / "cp")
-    )
+    cp = str(tmp_path / "cp")
+    error, session = _crawl(monkeypatch, _three_429s(), connection_limit=1, checkpoint_path=cp)
 
-    assert isinstance(error, SweepIncompleteError), error
-    assert not isinstance(error, HostBlockedError)
-    from streetscape_metadata_tracker.download_common import (
-        SWEEP_STOP_BACKPRESSURE,
-        SWEEP_STOP_PHRASES,
-    )
-
-    assert error.stopped_by == SWEEP_STOP_BACKPRESSURE
-    assert error.stop_phrase == SWEEP_STOP_PHRASES[SWEEP_STOP_BACKPRESSURE]
+    assert isinstance(error, HostThrottledError), error
+    assert not isinstance(error, (HostBlockedError, SweepIncompleteError))
+    assert host_exit_code(error) == _THROTTLED
     assert "backpressure" in str(error)
     # Tiles 0 and 1 were retried and committed; tile 2 was not.
     assert error.units_done == 2
     assert error.unit_count == len(_TILES)
+    assert error.checkpoint_path == cp
+    assert "next run resumes it" in str(error)
     # Two holds; the third response pauses instead of waiting.
     assert holds == [pytest.approx(60.0, abs=1.0)] * 2
     # 2 + 2 + 1 requests, each counted once, on both counters.
@@ -537,24 +540,19 @@ def test_the_third_429_pauses_the_crawl_with_exit_83_not_a_refusal(
     # The pause warning cannot know yet which way the crawl ends, so it must
     # not claim "checkpointed" outright (review of #444): it names both.
     (warning,) = [r.getMessage() for r in caplog.records if "pausing the crawl" in r.getMessage()]
-    assert "exit 83" in warning and "plain failure" in warning
+    assert "exit 87" in warning
     assert "NOT a refusal" in warning
 
 
-def test_the_backpressure_pause_phrase_is_what_the_scheduler_reads_back(
+def test_the_throttled_message_carries_the_backpressure_stop_phrase(
     monkeypatch, tmp_path, limiters, holds
 ):
-    from streetscape_metadata_tracker.scheduler import _pause_stop_phrase
-
+    """The CLIs log the error's message, so the phrase is what says in the
+    child's log which ceiling stopped the crawl."""
     error, _ = _crawl(
         monkeypatch, _three_429s(), connection_limit=1, checkpoint_path=str(tmp_path / "cp")
     )
-    # The CLIs' pause line, as cli.py and collect.py format it.
-    line = (
-        f"mapillary crawl paused at {error.units_done}/{error.unit_count} {error.unit_name} "
-        f"({error.stop_phrase}); re-run to resume from {error.checkpoint_path}"
-    )
-    assert _pause_stop_phrase(line) == error.stop_phrase
+    assert SWEEP_STOP_PHRASES[SWEEP_STOP_BACKPRESSURE] in str(error)
 
 
 def test_a_retry_after_past_the_ceiling_pauses_at_once_without_waiting(
@@ -566,9 +564,14 @@ def test_a_retry_after_past_the_ceiling_pauses_at_once_without_waiting(
     error, session = _crawl(
         monkeypatch, script, connection_limit=1, checkpoint_path=str(tmp_path / "cp")
     )
-    # Nothing committed, so this is the cap's no-checkpoint arm: a plain
-    # DownloadError, never "re-run to resume" over an empty directory.
-    assert type(error) is DownloadError
+    # Nothing committed: still THROTTLED (exit 87), never the plain
+    # DownloadError (exit 1) that counts a consecutive_failure -- and never a
+    # claim of progress over an empty directory.
+    assert type(error) is HostThrottledError
+    assert host_exit_code(error) == _THROTTLED
+    assert error.checkpoint_path is None and error.units_done == 0
+    assert "No tile is committed" in str(error)
+    assert "resumes" not in str(error)
     assert holds == []
     assert len(session.urls) == error.api_requests == 1
 
@@ -580,7 +583,8 @@ def test_a_retry_after_past_the_ceiling_pauses_a_crawl_with_progress(
     error, session = _crawl(
         monkeypatch, script, connection_limit=1, checkpoint_path=str(tmp_path / "cp")
     )
-    assert isinstance(error, SweepIncompleteError)
+    assert isinstance(error, HostThrottledError)
+    assert host_exit_code(error) == _THROTTLED
     assert error.units_done == 3
     assert holds == []
     assert "Retry-After" in str(error)
@@ -641,7 +645,7 @@ def test_a_backpressure_pause_resumes_for_the_missing_tiles_only(
     left, and a full census lands. Nothing was published from the paused night."""
     cp = str(tmp_path / "cp")
     paused, _ = _crawl(monkeypatch, _three_429s(), connection_limit=1, checkpoint_path=cp)
-    assert isinstance(paused, SweepIncompleteError)
+    assert isinstance(paused, HostThrottledError)
 
     resumed, session = _crawl(monkeypatch, {}, checkpoint_path=cp)
     assert not isinstance(resumed, BaseException), resumed
@@ -654,7 +658,7 @@ def test_a_hold_that_would_outlast_the_deadline_pauses_instead(
     monkeypatch, tmp_path, limiters, holds
 ):
     """The scheduler's SIGKILL lands 600 s after the forwarded budget, and a
-    hold can be 900 s: one begun near the deadline must pause (exit 83), not
+    hold can be 900 s: one begun near the deadline must stop (exit 87), not
     sleep into the kill (a counted failure)."""
     import time as _time
 
@@ -666,8 +670,7 @@ def test_a_hold_that_would_outlast_the_deadline_pauses_instead(
         checkpoint_path=str(tmp_path / "cp"),
         deadline_monotonic=_time.monotonic() + 200,
     )
-    assert isinstance(error, SweepIncompleteError), error
-    assert error.stopped_by == "backpressure"
+    assert isinstance(error, HostThrottledError), error
     assert "wall-clock budget" in str(error)
     assert holds == []
     assert error.units_done == 3
@@ -737,9 +740,8 @@ def test_no_request_goes_out_after_the_pause_decision(monkeypatch, tmp_path, lim
     logging.getLogger(dm.__name__).addHandler(handler)
     monkeypatch.setattr(dm.aiohttp, "ClientSession", build)
     try:
-        # A pause either way: exit 83 if a tile committed first, else the
-        # plain no-checkpoint failure. Which one depends on scheduling.
-        with pytest.raises(DownloadError) as excinfo:
+        # THROTTLED either way, whether or not a tile committed first.
+        with pytest.raises(HostThrottledError) as excinfo:
             asyncio.run(
                 dm.fetch_city_images_async(
                     "Test City",
@@ -755,7 +757,7 @@ def test_no_request_goes_out_after_the_pause_decision(monkeypatch, tmp_path, lim
     assert len(sent_at_pause) == 1, "the crawl must decide to pause exactly once"
     assert len(sessions[0].urls) == sent_at_pause[0], "a request went out after the pause"
     assert excinfo.value.api_requests == len(sessions[0].urls)
-    assert "backpressure limit" in str(excinfo.value)
+    assert SWEEP_STOP_PHRASES[SWEEP_STOP_BACKPRESSURE] in str(excinfo.value)
 
 
 def test_a_tile_that_always_answers_503_cannot_stall_its_city(
