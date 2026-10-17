@@ -108,10 +108,12 @@ from .download_common import (
     MAPILLARY_TILE_CONNECTION_LIMIT,
     SWEEP_STOP_BACKPRESSURE,
     SWEEP_STOP_CLOCK,
+    SWEEP_STOP_PHRASES,
     SWEEP_STOP_REQUESTS,
     AsyncRateLimiter,
     DownloadError,
     HostBlockedError,
+    HostThrottledError,
     SweepIncompleteError,
     crawl_budget_seconds,
     crawl_ceiling_needs_checkpoint,
@@ -632,10 +634,13 @@ class TileStatusCounts:
 #    checks as a fresh tile, so `max_requests` + its reservation still bound
 #    the crawl and no attempt is counted twice.
 # 5. The TILE_BACKPRESSURE_PAUSE_AFTER-th backpressure EPISODE in one crawl
-#    pauses it: the same checkpointed, exit-83 path the request cap takes,
-#    raised before the settle loop, and the crawl's pacer is closed so no
-#    request still waiting for its turn goes out. It is NOT a refusal: a
-#    302 -> /login is still the HostBlockedError (exit 75) it always was.
+#    stops it on the request cap's path -- turned-away tiles uncommitted, the
+#    checkpoint kept, raised before the settle loop -- and the crawl's pacer is
+#    closed so no request still waiting for its turn goes out. It raises
+#    HostThrottledError (exit 87), committed tiles or not, so the scheduler
+#    skips this host for the rest of the night without counting a failure. It
+#    is NOT a refusal: a 302 -> /login is still the HostBlockedError (exit 75)
+#    it always was, and wins if both happen in one crawl.
 # 6. One tile is given up as an ordinary failed tile after
 #    TILE_BACKPRESSURE_TILE_TRIES backpressure responses, so a tile stuck on
 #    503 cannot pause its city night after night.
@@ -651,8 +656,9 @@ TILE_BACKPRESSURE_MIN_WAIT_S = 60.0
 # found by trial and error by a forum user (thread 5821) -- a hint, not a
 # contract. And a crawl holds in at most PAUSE_AFTER - 1 = 2 episodes before
 # the third pauses it, each lasting the longest wait asked inside it, so it
-# holds the machine-wide tile lock for at most 30 minutes of sleeping: far
-# inside prod's 180-minute per-city timeout floor. A hold that would run past
+# holds the machine-wide tile lock for about 30 minutes of sleeping -- not
+# exactly, since a same-episode response can extend a hold by up to one request
+# timeout -- far inside prod's 180-minute per-city timeout floor. A hold that would run past
 # the crawl's own deadline is not slept at all (see on_backpressure).
 TILE_BACKPRESSURE_MAX_WAIT_S = 900.0
 # Counted in EPISODES, not responses (review of #444): a 429/503 answering a
@@ -784,6 +790,9 @@ class _BackpressurePacer:
     :meth:`close` is the pause's half of the same rule: once the crawl has
     decided to pause, every request still waiting here -- at the gate, or
     queued on the limiter -- raises :class:`_CrawlPaused` instead of going out.
+    It also cuts short any hold in progress: nothing will be sent after it, so
+    sleeping out the rest of a hold would only keep the host lock (a 302 seen
+    mid-hold used to sleep up to 900 s before exiting 75).
     """
 
     def __init__(self, limiter: Any, clock: Callable[[], float] | None = None):
@@ -802,6 +811,8 @@ class _BackpressurePacer:
         self._hold_until = 0.0
         self.slowed = False
         self.closed = False
+        # Set by close(); a hold in progress waits on it beside its sleep.
+        self._closed_event = asyncio.Event()
 
     def _now(self) -> float:
         if self._clock is not None:
@@ -832,6 +843,7 @@ class _BackpressurePacer:
         # A new generation, so a request mid-way through `acquire` loops back
         # and meets the closed check rather than returning.
         self._holds += 1
+        self._closed_event.set()
 
     async def hold(self, seconds: float) -> None:
         """Keep every request of this crawl from going out for ``seconds``."""
@@ -842,8 +854,16 @@ class _BackpressurePacer:
         self._hold_until = max(self._hold_until, self._now() + seconds)
         async with self._gate:
             remaining = self._hold_until - self._now()
-            if remaining > 0:
-                await _backpressure_sleep(remaining)
+            if remaining > 0 and not self.closed:
+                # The sleep races close(): whichever finishes first ends it,
+                # and the other is cancelled (so is each on our own cancel).
+                sleeper = asyncio.ensure_future(_backpressure_sleep(remaining))
+                closer = asyncio.ensure_future(self._closed_event.wait())
+                try:
+                    await asyncio.wait({sleeper, closer}, return_when=asyncio.FIRST_COMPLETED)
+                finally:
+                    sleeper.cancel()
+                    closer.cancel()
 
     def slow_down(self) -> None:
         """Halve this crawl's pace, once; later calls are no-ops."""
@@ -1696,11 +1716,16 @@ async def _fetch_city_images(
             condition -- both silent fall-backs are wrong in a way nothing
             downstream could see, since ignoring the cap overspends a per-IP
             budget and honouring it burns one for nothing.
-        SweepIncompleteError: the cap or the deadline was reached, or the CDN
-            answered 429/503 TILE_BACKPRESSURE_PAUSE_AFTER times (issue #444),
-            with tiles unfetched and the checkpoint holds them. Progress, not breakage: it
-            maps to exit 83, which the scheduler amnesties rather than counting
-            a failure.
+        SweepIncompleteError: the cap or the deadline was reached, with
+            tiles unfetched and the checkpoint holds them. Progress, not
+            breakage: it maps to exit 83, which the scheduler amnesties rather
+            than counting a failure.
+        HostThrottledError: the CDN's backpressure stopped the crawl (issue
+            #444) -- its TILE_BACKPRESSURE_PAUSE_AFTER-th 429/503 episode, a
+            Retry-After past the ceiling, or a hold past the deadline --
+            whether or not any tile is committed. The checkpoint is kept; it
+            maps to the throttled exit (87), which the scheduler amnesties and
+            uses to skip this host for the rest of the night.
         DownloadError: on a rejected token or tile transport failure, carrying
             ``api_requests`` so the caller can still record what it spent.
     """
@@ -1927,9 +1952,11 @@ async def _fetch_city_images(
         if not same_episode:
             backpressure_events += 1
         pacer.slow_down()
-        if backpressure_paused:
+        if backpressure_paused or fatal is not None:
             # A late answer from a tile that was in flight when the pause
-            # began: counted, never waited on.
+            # began, or after a whole-city error (a 302): counted, never
+            # waited on, and no pause of its own -- `fatal` already ends the
+            # crawl, and the refusal's exit 75 must win.
             return None
         wait = backpressure_wait_seconds(retry_after_seconds(e.retry_after))
         # A hold that would outlast the crawl's wall-clock budget is not slept
@@ -1979,13 +2006,10 @@ async def _fetch_city_images(
         # Nothing more goes out from this crawl, including requests already
         # waiting on the pacer (review of #444: they used to be released).
         pacer.close()
-        # Which way the crawl ends is decided after the gather, by whether any
-        # tile is committed by then, so the warning names both outcomes rather
-        # than guessing.
         logger.warning(
             f"Mapillary tile CDN backpressure for {city_name}: {backpressure_detail}; "
-            f"pausing the crawl, NOT a refusal: it ends as a checkpointed pause (exit 83) "
-            f"if any tile is committed to resume from, otherwise as a plain failure"
+            f"pausing the crawl, NOT a refusal: it ends as THROTTLED (exit 87), keeping "
+            f"whatever tiles are committed for the next run to resume from"
         )
         return None
 
@@ -2110,6 +2134,12 @@ async def _fetch_city_images(
                     # for. Assigned before leaving the semaphore block, so no
                     # waiting task can slip past the check above.
                     fatal = fatal or e
+                    # And nothing more goes out: requests already waiting on
+                    # the pacer would otherwise still be sent (3-4 after a 302,
+                    # measured), and a hold in progress would be slept out
+                    # holding the host lock. Turned away, they set `capped`,
+                    # but the `fatal` raise after the gather runs first.
+                    pacer.close()
                     raise
                 finally:
                     # Every exit from the fetch, exception included: a reservation
@@ -2232,10 +2262,44 @@ async def _fetch_city_images(
     # with no such final night to fall back on -- see the note there.
     if capped:
         committed = len(checkpoint.done) if checkpoint is not None else 0
+        resumable = checkpoint is not None and not checkpoint.degraded and bool(checkpoint.done)
+        if backpressure_paused:
+            # EVERY backpressure stop is THROTTLED (exit 87), committed tiles or
+            # not (issue #444). Before, a stop with nothing committed took the
+            # plain-DownloadError arm below, which counts a consecutive_failure
+            # -- so a few nights of a 429 storm would quarantine every Mapillary
+            # pair (#421) -- and nothing latched the host, so the next city
+            # walked into the same 429s at full pace. Tested on the flag, not on
+            # `stop_reason`: a tile turned away at the cap a moment before the
+            # pause still leaves the CDN asking us to slow down.
+            #
+            # The checkpoint is kept exactly as for exit 83 (`interrupted`
+            # commits the spend; nothing here discards it). What differs by
+            # case is only what the message may claim: with nothing committed
+            # there is no progress, so it must not say "resume".
+            phrase = SWEEP_STOP_PHRASES[SWEEP_STOP_BACKPRESSURE]
+            head = (
+                f"Mapillary tile census for {city_name} {phrase}: {backpressure_detail}. "
+                f"{committed}/{len(tiles)} tiles fetched; {api_requests} requests spent "
+                f"this process, {_census_requests_total(checkpoint, api_requests)} in total. "
+            )
+            if resumable:
+                tail = f"Progress is checkpointed at {checkpoint.path}; the next run resumes it."
+            else:
+                tail = "No tile is committed, so the next run starts from the first tile."
+            raise interrupted(
+                HostThrottledError(
+                    f"{head}{tail} Not a refusal (that is a redirect to /login, exit 75): "
+                    f"the CDN asked for a slower pace, so collect no more Mapillary from this "
+                    f"host tonight. Nothing is finalized.",
+                    host=HOST_MAPILLARY_TILES,
+                    checkpoint_path=checkpoint.path if resumable else None,
+                    units_done=committed,
+                    unit_count=len(tiles),
+                )
+            )
         if stop_reason == SWEEP_STOP_CLOCK:
             ceiling = f"{crawl_budget_seconds(deadline_monotonic):,}-second wall-clock budget"
-        elif stop_reason == SWEEP_STOP_BACKPRESSURE:
-            ceiling = f"backpressure limit ({backpressure_detail})"
         else:
             ceiling = f"{max_requests:,}-request cap"
         detail = (
@@ -2244,7 +2308,7 @@ async def _fetch_city_images(
             f"{api_requests} requests spent this process, "
             f"{_census_requests_total(checkpoint, api_requests)} in total."
         )
-        if checkpoint is None or checkpoint.degraded or not checkpoint.done:
+        if not resumable:
             # NOT a pause, because there is nothing to resume FROM, in any of
             # THREE ways. No checkpoint at all (an unwritable directory --
             # `_open_tile_checkpoint` fails open); one whose commits latched off

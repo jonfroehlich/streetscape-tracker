@@ -336,6 +336,29 @@ def test_every_locked_host_has_a_distinct_exit_code():
         assert code not in HOST_BY_EXIT_CODE and code not in HOST_BY_BUSY_EXIT_CODE
 
 
+def test_the_throttled_family_collides_with_no_other_exit_code():
+    """Issue #444's throttled family (87) is read by the scheduler as its own
+    reaction -- latch the host, amnestied, no refusal recorded -- so it must
+    share a number with no other family, with 83, argparse's 2, or the GSV
+    capture-history harvester's 86 (#442)."""
+    from streetscape_metadata_tracker.download_common import (
+        ARGV_REJECTED_EXIT_CODE,
+        HOST_BY_THROTTLED_EXIT_CODE,
+        HOST_THROTTLED_EXIT_CODES,
+        SWEEP_INCOMPLETE_EXIT_CODE,
+    )
+
+    assert set(HOST_THROTTLED_EXIT_CODES) <= set(HOST_LABELS)
+    assert HOST_THROTTLED_EXIT_CODES == {HOST_MAPILLARY_TILES: 87}
+    assert HOST_BY_THROTTLED_EXIT_CODE == {87: HOST_MAPILLARY_TILES}
+    others = (
+        set(HOST_EXIT_CODES.values())
+        | set(HOST_BUSY_EXIT_CODES.values())
+        | {SWEEP_INCOMPLETE_EXIT_CODE, ARGV_REJECTED_EXIT_CODE, 0, 1, 86}
+    )
+    assert not set(HOST_THROTTLED_EXIT_CODES.values()) & others
+
+
 def test_the_exit_code_distinguishes_a_busy_lock_from_a_refusal():
     """
     The two conditions have opposite lifetimes. A refusal is durable and trips
