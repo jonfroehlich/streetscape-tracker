@@ -95,18 +95,30 @@ And it costs 1.15–1.42× of load wall-clock with no memory cost (the 16.6M-row
 As with #226, the CSV is never rewritten and the repair handle is a whole-series recompute: here `scripts/recompute_streetwalk_stats.py`, since no grid stat moved.
 Numbers: [`experiments/csv-float-parse.md`](experiments/csv-float-parse.md).
 
-## Historical capture-date harvester (`download_gsv_history.py`, issue #2)
+## Historical capture-date harvester (`download_gsv_history.py`, issues #2 and #442)
 
-**Historical capture-date harvester (`download_gsv_history.py`, issue #2).** Separate, opt-in, and out-of-band from the run pipeline.
-A normal run records only the *current* capture date per grid point;
+**Historical capture-date harvester (`download_gsv_history.py`, issues #2 and #442).** Separate, opt-in, and out-of-band from the run pipeline.
+A normal run records only the *current* capture date per point;
 this harvests the FULL official-Google capture history — every past drive-through and its month — which no documented Google API (free or paid) exposes.
 It comes instead from an **unpublished endpoint** (`GeoPhotoService.SingleImageSearch`, the backend behind the Maps-JS `getPanorama().time[]` array), queried directly with no API key.
-Because it is undocumented **there is no guarantee it keeps working**, and it is IP-identified rather than key-metered, so the harvester is deliberately gentle: low concurrency, per-request jitter, exponential backoff on throttle responses (429/403/503), a circuit breaker that aborts on a run of throttles (cf.
-`analysis.detect_systemic_failure`), and a resumable `.harvesting` checkpoint.
-It sweeps the city's frozen grid, keeps only panos that carry a date (a present date is the endpoint-native signal of official Google imagery
-— the analogue of the `© Google` filter), de-dups by pano_id, and writes a distinct dated artifact `{city_id}_..._gsv_history_YYYY-MM-DD.csv.gz` (its own `HISTORY_DTYPES` schema, NOT a run/`METADATA_DTYPES` file; `naming.parse_filename` rejects it, `parse_history_filename` parses it) plus a `history_harvests` catalog row (schema v3).
-History is near-static, so a city is harvested once and re-swept rarely.
-Run via `scripts/harvest_gsv_history.py "City"` (city must already be registered so its grid is frozen).
+Because it is undocumented **there is no guarantee it keeps working**, and it is IP-identified rather than key-metered, which fixes three things about how it runs (#442):
+
+- **Where.** Only from a dedicated address that no lab service shares — never makelab1 or makelab2, whose addresses carry Project Sidewalk and the nightly collection.
+  The crawler is therefore **catalog-free**: it reads nothing but a work list and writes nothing but files, and its outputs come back to the catalog host under gitignored `experiments/`, never `data/`.
+- **How fast.** ONE request in flight, paced by `download_common.AsyncRateLimiter` at a mean of 1/s with jitter 0.6 (the same pacer and coefficient of variation as Mapillary, #292); the pace governs, not sockets.
+- **When to stop, written down in advance.** The FIRST 429 or 403, or 8 consecutive transport failures, ends the run and writes `blocked.json` beside the outputs, and `scripts/harvest_gsv_history.py` refuses to restart until that latch's 24 h cool-down has passed (`--clear-latch` is the operator's deliberate override).
+  `--max-requests` ends a run cleanly instead (exit 83, "re-run to resume"), which is how a timer runs it in daily tranches; a cap is checked per row, so it is a soft ceiling by at most the in-flight row's retries.
+
+The unit of work is a **road-walk sample point**, not a grid point (the grid-point sweep #2 shipped was retired in #442: it cost 560 M requests and kept no link between a past capture and the street it was found on).
+`scripts/build_gsv_history_worklist.py` writes a city's work list on the catalog host, offline — the latest GSV `drive` walk's samples re-derived from the FROZEN network exactly as coverage derives them (`road_sampling.generate_samples` + the `quantize_coord` join), each with the walk's current official pano as its *anchor*; a city whose GraphML is missing is refused rather than fetched, because this is a place that could reach Overpass.
+Pass 1 is each edge's midpoint sample (8.9 M rows catalog-wide), pass 2 the remaining samples, so the two passes query disjoint points ([`experiments/gsv-history-sizing.md`](experiments/gsv-history-sizing.md)).
+Per work list and pass the crawler streams three gzip files, each flush its own gzip member so a crash leaves every earlier member readable, and a cut final member is dropped before the next append:
+the **raw** bodies, verbatim, first — the only copy that survives a parser the endpoint has outgrown;
+the per-sample **history** (one row per sample and dated pano, `SAMPLE_HISTORY_COLUMNS`), keeping only panos that carry a date (a present date is the endpoint-native signal of official Google imagery — the analogue of the `© Google` filter);
+and the **queries** ledger last, one row per request with `anchor_in_history` (does the walk's own pano appear in its history?) as the pilot's parser-health signal.
+The ledger IS the checkpoint: a key is done only once everything it stands for is on disk.
+The per-city, per-pano artifact below (`{city_id}_..._gsv_history_YYYY-MM-DD.csv.gz`, its own `HISTORY_DTYPES` schema, NOT a run/`METADATA_DTYPES` file; `naming.parse_filename` rejects it, `parse_history_filename` parses it) and its `history_harvests` row (schema v3) are **derived** from those per-sample results by the import step that lands them, which #442 leaves to a follow-up.
+History is near-static, so a point is harvested once and re-queried only when its anchor pano changes.
 
 ### The capture-history summary and its guard (issue #109)
 

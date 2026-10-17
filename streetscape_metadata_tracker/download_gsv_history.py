@@ -1,9 +1,9 @@
 """
-Historical Street View capture-date harvester (issue #2).
+Historical Street View capture-date harvester (issues #2, #442).
 
 A normal GSV run answers only "what's the nearest pano to point X, and when was
-it taken?" — one *current* date per grid point. Google's own time-travel
-feature, though, exposes the FULL capture history at a location: every official
+it taken?" — one *current* date per point. Google's own time-travel feature,
+though, exposes the FULL capture history at a location: every official
 Street View drive-through and its date. That history is not in any documented
 Google API (free or paid). It is returned by an **unpublished endpoint**
 (`GeoPhotoService.SingleImageSearch`, the backend the Maps JS
@@ -14,56 +14,74 @@ Because the endpoint is undocumented there is **no guarantee it keeps working**,
 and it is identified by our IP rather than a metered key, so this harvester is
 deliberately the opposite of the aggressive per-point run downloader:
 
-  * low concurrency + randomized inter-request jitter (polite, not a firehose);
-  * exponential backoff on timeouts / throttle responses (429/403/503);
-  * a circuit breaker that aborts gracefully on a run of throttle responses
-    rather than hammering a wall (cf. analysis.detect_systemic_failure);
-  * a resumable `.harvesting` checkpoint so an abort mid-sweep loses no work.
+  * ONE request in flight, paced by the repo's jittered pacer (mean 1/s,
+    coefficient of variation 0.6 by default) — the pace governs, not sockets;
+  * a stopping rule written down in advance (#442): the FIRST 429 or 403, or a
+    run of transport failures, ends the run and writes a cool-down latch that
+    refuses a restart for 24 h; a per-run request cap lets a timer run it in
+    daily tranches;
+  * every response body is kept verbatim, gzipped, before it is parsed — if the
+    endpoint changes shape or disappears, the raw store is the only copy;
+  * resumable: the queries ledger it appends to IS the checkpoint.
 
-Collection model:
-  * We sweep the city's FROZEN sampling grid, one search per grid point.
+Collection model (#442):
+  * The unit of work is a ROAD-WALK SAMPLE POINT from a work list that
+    `scripts/build_gsv_history_worklist.py` writes on the catalog host, keyed
+    `(edge_id, sample_idx)` on the walk's frozen network and carrying the walk's
+    current ("anchor") pano. The crawler runs on a dedicated host that holds
+    no catalog and needs nothing but the file.
+  * Pass 1 queries each edge's midpoint sample; pass 2 the remaining samples.
   * Each search returns a neighbourhood of panoramas; only those carrying a
     capture DATE are kept — in this endpoint a present date is the signal of
     official Google imagery (user photospheres come back undated). This is the
     endpoint-native analogue of the `© Google` filter used elsewhere.
-  * Kept panos are de-duplicated by pano_id across the whole grid, so the
-    output is a census of every official Google panorama (with its capture
-    month) discoverable in the city — the "all previous capture dates for an
-    area" issue #2 asked for.
+  * Results stay keyed to the sample that found them (one row per sample and
+    dated pano), so "how often is THIS street re-captured?" is answerable.
+    Whether the anchor pano appears in its own history (`anchor_in_history`)
+    is the parser-health signal a pilot reads.
 
-History is near-static (Google's archive), so a city is harvested ONCE and only
-re-swept occasionally; this is not part of the cadenced run series.
+The per-city, per-pano `HISTORY_DTYPES` artifact (`_gsv_history_` CSV, #2) and
+its #109 summary are DERIVED from these per-sample results by a later import
+step; the grid-point sweep that used to write them directly was retired in
+#442 (it queried the wrong unit and kept no link to the place it searched).
+
+History is near-static (Google's archive), so a point is harvested ONCE and only
+re-queried when its anchor pano changes; this is not part of the cadenced run
+series.
 
 The parsing of the endpoint's (undocumented, deeply-nested) response is adapted
 from the MIT-licensed `robolyst/streetview` package.
 """
 
 import asyncio
+import csv
 import gzip
+import io
 import json
 import logging
 import os
-import random
 import re
+import zlib
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import aiohttp
 import backoff
-import geopy
 import numpy as np
 import pandas as pd
 
-from .download_common import DownloadError, generate_grid_points, standardize_capture_date
+from .download_common import AsyncRateLimiter, DownloadError, standardize_capture_date
 from .progress import progress
 
 logger = logging.getLogger(__name__)
 
-# Output schema for a harvest file — one row per unique official Google pano.
-# Distinct from config.METADATA_DTYPES (a per-grid-point run sample); this is a
-# per-pano historical census, so it gets its own columns.
+# Schema of the per-city `_gsv_history_` artifact — one row per unique official
+# Google pano. Distinct from config.METADATA_DTYPES (a per-grid-point run sample);
+# this is a per-pano historical census, so it gets its own columns. Read by
+# fileutils.load_history_csv_file and summarized by json_summarizer (#109); since
+# #442 it is DERIVED from the per-sample SAMPLE_HISTORY_COLUMNS output below.
 HISTORY_DTYPES = {
     "pano_id": str,
     "capture_date": str,  # ISO YYYY-MM-DD (day defaults to 01;
@@ -105,20 +123,9 @@ class HistoricalPano:
 
 class HarvestBlockedError(DownloadError):
     """
-    Raised when the endpoint appears to be throttling/blocking us (a run of
-    failed searches tripped the circuit breaker). The `.harvesting` checkpoint
-    is left in place so the sweep can resume later.
-    """
-
-
-class HarvestIncompleteError(HarvestBlockedError):
-    """
-    Raised when isolated point failures survive all retry passes (without
-    tripping the breaker). The sweep must NOT finalize: writing the final
-    csv.gz and deleting the checkpoint would silently publish a harvest
-    with holes — and lose the record that anything was skipped — for an
-    endpoint that may disappear before a re-sweep. Subclasses
-    HarvestBlockedError so existing resume/alert handling applies.
+    The endpoint refused us -- a 429/403, or a run of transport failures that
+    tripped the circuit breaker. The outputs written so far stay on disk and
+    the ``blocked.json`` latch records when a restart may be attempted.
     """
 
 
@@ -208,244 +215,554 @@ class _CircuitBreaker:
         return self.consecutive >= self.limit
 
 
-@backoff.on_exception(
-    backoff.expo, (asyncio.TimeoutError, aiohttp.ClientError), max_tries=4, max_time=90
-)
 async def _fetch_search(
     session: aiohttp.ClientSession, url: str, timeout: aiohttp.ClientTimeout
-) -> str:
+) -> tuple[int, str]:
     """
-    One search request with retry/backoff. Throttle-ish statuses (429/403/503)
-    raise ClientResponseError so backoff retries with growing delay; if the
-    server sends Retry-After we wait at least that long first.
+    One search request, UNRETRIED. Returns ``(http_status, body)``.
+
+    A 429 or 403 is returned to the caller -- under the #442 stopping rule the
+    first one ends the run, so retrying here would be a second request into a
+    refusal. A 503 and any other non-200 raise ``ClientResponseError``, which
+    the driver's paced retry wrapper catches beside transport errors; every
+    retry attempt takes its own pacer slot there, which is why the retry is
+    not a decorator on this function.
     """
     async with session.get(url, timeout=timeout) as resp:
-        if resp.status in (429, 403, 503):
+        if resp.status in (429, 403):
+            return resp.status, await resp.text()
+        if resp.status == 503:
             retry_after = resp.headers.get("Retry-After")
             if retry_after:
                 try:
                     await asyncio.sleep(min(float(retry_after), 30.0))
                 except ValueError:
                     pass
-            resp.raise_for_status()
-        if resp.status != 200:
-            resp.raise_for_status()
-        return await resp.text()
+        resp.raise_for_status()
+        return resp.status, await resp.text()
 
 
-# ── Checkpoint (resume) ────────────────────────────────────────────────────
+# ── Work-list schema (issue #442) ───────────────────────────────────────────
+#
+# The unit of work is a road-walk SAMPLE POINT, keyed (edge_id, sample_idx) on
+# the walk's frozen network, with the walk's current ("anchor") pano beside it.
+# scripts/build_gsv_history_worklist.py writes these files on the catalog host;
+# the crawler needs nothing but the file. Pass 1 rows are each edge's midpoint
+# sample, pass 2 the rest, so the two passes query disjoint points and together
+# cost no more than pass 2 alone.
+
+WORKLIST_COLUMNS = [
+    "city_id",
+    "walk_csv_filename",
+    "network_type",
+    "spacing_m",
+    "edge_id",
+    "sample_idx",
+    "edge_samples",
+    "pass",
+    "query_lat",
+    "query_lon",
+    "anchor_status",
+    "anchor_pano_id",
+    "anchor_capture_date",
+    "anchor_copyright",
+]
+
+# One row per query made (the resume ledger; a key present here is done).
+QUERY_COLUMNS = [
+    "edge_id",
+    "sample_idx",
+    "http_status",
+    "panos_total",
+    "panos_dated",
+    "anchor_in_history",
+    "fetched_at",
+]
+
+# One row per (sample point, dated pano the search returned).
+SAMPLE_HISTORY_COLUMNS = [
+    "city_id",
+    "walk_csv_filename",
+    "pass",
+    "edge_id",
+    "sample_idx",
+    "query_lat",
+    "query_lon",
+    "anchor_pano_id",
+    "anchor_capture_date",
+    "pano_id",
+    "capture_date",
+    "pano_lat",
+    "pano_lon",
+    "harvested_at",
+]
+
+# Sits beside the blocked family (75/76/81/84) but outside HOST_EXIT_CODES on
+# purpose: the scheduler never runs this program and it takes no host lock, so
+# nothing classifies the code as a night-level host verdict. 83 (crawl
+# incomplete, resume) keeps its repo-wide meaning.
+HISTORY_BLOCKED_EXIT_CODE = 86
+
+LATCH_FILENAME = "blocked.json"
+DEFAULT_COOLDOWN_HOURS = 24.0
+DEFAULT_RATE_PER_MINUTE = 60  # 1 request/s mean
+DEFAULT_JITTER = 0.6  # coefficient of variation, as the Mapillary pacer (#292)
+DEFAULT_BREAKER_LIMIT = 8
 
 
-def _checkpoint_path(output_csv_gz_path: str) -> str:
-    return output_csv_gz_path + ".harvesting"
+def load_worklist(path: str) -> pd.DataFrame:
+    """Read a work-list file and check its schema; keys become (str, int)."""
+    df = pd.read_csv(
+        path,
+        dtype={
+            "city_id": str,
+            "walk_csv_filename": str,
+            "edge_id": str,
+            "anchor_status": str,
+            "anchor_pano_id": str,
+            "anchor_capture_date": str,
+            "anchor_copyright": str,
+        },
+    )
+    missing = [c for c in WORKLIST_COLUMNS if c not in df.columns]
+    if missing:
+        raise ValueError(f"{path}: work list is missing columns {missing}")
+    df["sample_idx"] = df["sample_idx"].astype(int)
+    df["pass"] = df["pass"].astype(int)
+    if df.duplicated(["edge_id", "sample_idx"]).any():
+        raise ValueError(f"{path}: duplicate (edge_id, sample_idx) keys")
+    return df
 
 
-def _load_checkpoint(path: str) -> tuple[set, dict[str, dict], int]:
-    """Return (done grid indices, panos-by-id, api_requests) from a checkpoint."""
+def output_paths(out_dir: str, stem: str, pass_no: int) -> dict[str, str]:
+    """The three per-pass output files for a work list."""
+    base = os.path.join(out_dir, f"{stem}.pass{pass_no}")
+    return {
+        "raw": base + ".raw.jsonl.gz",
+        "queries": base + ".queries.csv.gz",
+        "history": base + ".history.csv.gz",
+    }
+
+
+def _append_gz(path: str, text: str) -> None:
+    """Append one gzip MEMBER. Readers see every earlier member even if this one is cut."""
+    if not text:
+        return
+    with gzip.open(path, "ab") as f:
+        f.write(text.encode("utf-8"))
+
+
+def _complete_members_end(data: bytes) -> int:
+    """Byte offset just past the last COMPLETE gzip member in ``data``."""
+    good_end = 0
+    pos = 0
+    while pos < len(data):
+        d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        try:
+            d.decompress(data[pos:])
+        except zlib.error:
+            break
+        if not d.eof:
+            break  # the member runs off the end of the file
+        pos = len(data) - len(d.unused_data)
+        good_end = pos
+    return good_end
+
+
+def repair_gz_tail(path: str) -> int:
+    """
+    Cut a gzip file back to the end of its last COMPLETE member.
+
+    A crash mid-flush leaves the last member short. Appending after it would
+    bury every later member behind damage no sequential reader can cross, so
+    each run repairs its three files before it appends. Returns the bytes
+    dropped (0 when the file is whole or absent). The rows in the dropped
+    member were never recorded as done -- ``read_done_keys`` reads complete
+    members only, and the ledger is written last -- so they are re-queried.
+    """
     if not os.path.exists(path):
-        return set(), {}, 0
-    try:
-        with open(path, encoding="utf-8") as f:
-            state = json.load(f)
-        done = {tuple(ij) for ij in state.get("done", [])}
-        panos = state.get("panos", {})
-        api_requests = int(state.get("api_requests", 0))
-        logger.info(
-            f"Resuming harvest from {path}: "
-            f"{len(done)} grid points already done, "
-            f"{len(panos)} panos so far"
-        )
-        return done, panos, api_requests
-    except (ValueError, OSError, KeyError):
-        logger.warning(f"Ignoring unreadable checkpoint {path}")
-        return set(), {}, 0
+        return 0
+    with open(path, "rb") as f:
+        data = f.read()
+    good_end = _complete_members_end(data)
+    dropped = len(data) - good_end
+    if dropped:
+        with open(path, "r+b") as f:
+            f.truncate(good_end)
+        logger.warning("Dropped %d damaged trailing bytes from %s", dropped, path)
+    return dropped
 
 
-def _save_checkpoint(path: str, done: set, panos: dict[str, dict], api_requests: int) -> None:
+def read_done_keys(queries_path: str) -> set[tuple[str, int]]:
+    """
+    Keys already answered, read back from the queries ledger.
+
+    Only COMPLETE gzip members count: a member a crash cut short is ignored
+    whole (and ``repair_gz_tail`` drops it before the next append), so what
+    this returns and what a plain reader sees after the repair agree. A line
+    without every QUERY_COLUMNS field is dropped too.
+    """
+    done: set[tuple[str, int]] = set()
+    if not os.path.exists(queries_path):
+        return done
+    with open(queries_path, "rb") as f:
+        data = f.read()
+    text = gzip.decompress(data[: _complete_members_end(data)]).decode("utf-8")
+    for row in csv.DictReader(io.StringIO(text, newline="")):
+        if any(row.get(c) in (None, "") for c in ("edge_id", "sample_idx")):
+            continue
+        if any(row.get(c) is None for c in QUERY_COLUMNS):
+            continue
+        try:
+            done.add((row["edge_id"], int(row["sample_idx"])))
+        except ValueError:
+            continue
+    return done
+
+
+def _latch_path(out_dir: str) -> str:
+    return os.path.join(out_dir, LATCH_FILENAME)
+
+
+def write_latch(
+    out_dir: str,
+    *,
+    reason: str,
+    http_status: int | None,
+    cooldown_hours: float,
+    now: datetime | None = None,
+) -> str:
+    """Record a refusal and when a restart may be attempted."""
+    now = now or datetime.now(UTC)
+    path = _latch_path(out_dir)
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(
-            {"done": [list(ij) for ij in done], "panos": panos, "api_requests": api_requests}, f
+            {
+                "at": now.isoformat(),
+                "cooldown_until": (now + timedelta(hours=cooldown_hours)).isoformat(),
+                "reason": reason,
+                "http_status": http_status,
+            },
+            f,
+            indent=2,
         )
-    os.replace(tmp, path)  # atomic
+    os.replace(tmp, path)
+    return path
 
 
-# ── Harvest ────────────────────────────────────────────────────────────────
+def latch_active(out_dir: str, now: datetime | None = None) -> dict[str, Any] | None:
+    """The latch record if its cool-down has not expired, else None."""
+    path = _latch_path(out_dir)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            record = json.load(f)
+        until = datetime.fromisoformat(record["cooldown_until"])
+    except (ValueError, KeyError, OSError, TypeError):
+        # An unreadable latch still means "something refused us"; treat it as
+        # active rather than silently restarting.
+        return {"cooldown_until": None, "reason": f"unreadable latch at {path}"}
+    now = now or datetime.now(UTC)
+    return record if until > now else None
 
 
-async def harvest_gsv_history_async(
-    city_name: str,
-    center_lat: float,
-    center_lon: float,
-    grid_width: float,
-    grid_height: float,
-    step_length: float,
-    output_csv_gz_path: str,
-    connection_limit: int = 2,
+def clear_latch(out_dir: str) -> bool:
+    path = _latch_path(out_dir)
+    if os.path.exists(path):
+        os.remove(path)
+        return True
+    return False
+
+
+class HarvestIncompleteError(DownloadError):
+    """
+    The run stopped with rows unanswered and its outputs on disk: the request
+    cap was reached, or rows kept failing after the retry pass. Re-run to
+    resume -- the queries ledger is the checkpoint. Deliberately NOT a
+    HarvestBlockedError: a cap is the opposite of a refusal.
+    """
+
+    def __init__(self, message: str, *, api_requests: int, remaining: int, capped: bool):
+        super().__init__(message)
+        self.api_requests = api_requests
+        self.remaining = remaining
+        self.capped = capped
+
+
+async def harvest_worklist_async(
+    worklist: pd.DataFrame,
+    out_dir: str,
+    *,
+    stem: str,
+    pass_no: int,
+    rate_per_minute: float = DEFAULT_RATE_PER_MINUTE,
+    jitter: float = DEFAULT_JITTER,
+    max_requests: int | None = None,
+    breaker_limit: int = DEFAULT_BREAKER_LIMIT,
+    chunk_size: int = 50,
     request_timeout: float = 30,
-    jitter_seconds: tuple[float, float] = (0.2, 0.6),
-    chunk_size: int = 25,
-    circuit_breaker_limit: int = 8,
-    retry_passes: int = 2,
+    cooldown_hours: float = DEFAULT_COOLDOWN_HOURS,
+    retry_passes: int = 1,
+    fetch_tries: int = 4,
+    fetch_backoff_factor: float = 1.0,
+    now_func=None,
 ) -> dict[str, Any]:
     """
-    Sweep a city's frozen grid and harvest every official Google panorama's
-    capture date from the unpublished single-image-search endpoint.
+    Query the endpoint once per work-list row of ``pass_no`` and stream the
+    answers to three gzip files under ``out_dir`` (see ``output_paths``).
 
-    Same calling convention as the run downloaders: the caller decides the
-    output filename. Deliberately gentle (low `connection_limit`, per-request
-    jitter, chunked with checkpointing). Resumes from a `.harvesting` sibling
-    if one exists.
+    ONE request in flight, paced by ``AsyncRateLimiter`` at ``rate_per_minute``
+    with coefficient of variation ``jitter``; the pace, not sockets, governs.
+    Stops on the FIRST 429/403 or on ``breaker_limit`` consecutive transport
+    failures, writes the ``blocked.json`` latch and raises HarvestBlockedError.
+    Stops cleanly at ``max_requests`` (no latch) with HarvestIncompleteError,
+    which is also raised when rows still fail after ``retry_passes``. The cap
+    is checked before each row, so it is a SOFT ceiling: the row in flight may
+    still retry, at most ``fetch_tries - 1`` requests past it.
 
-    Returns a dict with: df, filename_with_path, api_requests, grid_points,
-    unique_panos, oldest_capture_date, newest_capture_date, started_at,
-    finished_at.
+    Every request's verbatim body goes to the raw file first -- the one copy
+    that survives a parser that no longer matches the endpoint.
 
-    Raises HarvestBlockedError if the endpoint appears to be throttling us (the
-    checkpoint is kept for a later resume).
+    Returns the counters when every row of the pass is answered.
     """
-    started_at = datetime.now(UTC).isoformat()
-    if not output_csv_gz_path.endswith(".csv.gz"):
-        raise ValueError(f"output_csv_gz_path must end in .csv.gz, got: {output_csv_gz_path}")
-    Path(os.path.dirname(os.path.abspath(output_csv_gz_path))).mkdir(parents=True, exist_ok=True)
-
-    width_steps = int(grid_width / step_length)
-    height_steps = int(grid_height / step_length)
-    origin = geopy.Point(center_lat, center_lon)
-    grid_points = generate_grid_points(origin, width_steps, height_steps, step_length)
-
-    checkpoint = _checkpoint_path(output_csv_gz_path)
-    done, panos, api_requests = _load_checkpoint(checkpoint)
-    remaining = [(lat, lon, i, j) for (lat, lon, i, j) in grid_points if (i, j) not in done]
+    now_func = now_func or (lambda: datetime.now(UTC))
+    rows = worklist.loc[worklist["pass"] == pass_no].reset_index(drop=True)
+    paths = output_paths(out_dir, stem, pass_no)
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    for path in paths.values():
+        repair_gz_tail(path)
+    done = read_done_keys(paths["queries"])
+    pending = [
+        r for r in rows.itertuples(index=False) if (r.edge_id, int(r.sample_idx)) not in done
+    ]
     logger.info(
-        f"Harvesting GSV history for {city_name}: {len(remaining)} of "
-        f"{len(grid_points)} grid points to query "
-        f"(connection_limit={connection_limit}, gentle mode)"
+        "Harvesting GSV history for %s pass %d: %d of %d rows to query (%d already answered), "
+        "%s/min mean, jitter %.2f, one in flight",
+        stem,
+        pass_no,
+        len(pending),
+        len(rows),
+        len(done),
+        rate_per_minute,
+        jitter,
     )
 
-    breaker = _CircuitBreaker(limit=circuit_breaker_limit)
-    semaphore = asyncio.Semaphore(connection_limit)
+    limiter = AsyncRateLimiter(rate_per_minute, jitter=jitter)
+    breaker = _CircuitBreaker(limit=breaker_limit)
     timeout = aiohttp.ClientTimeout(total=request_timeout)
-    progress_bar = progress(
-        total=len(grid_points),
+    bar = progress(
+        total=len(rows),
         initial=len(done),
-        desc=f"Harvesting GSV history for {city_name}",
-        unit="point",
-        # A full-grid sweep against a deliberately gentle, jittered endpoint, so
-        # this is the slowest thing in the repo per request. Ticks are the only
-        # way to tell a live harvest from a wedged one in a redirected log.
+        desc=f"GSV history {stem} pass {pass_no}",
+        unit="sample",
         logger=logger,
     )
 
-    async def query_point(session, lat, lon, i, j):
+    api_requests = 0
+    answered = 0
+
+    @backoff.on_exception(
+        backoff.expo,
+        (asyncio.TimeoutError, aiohttp.ClientError),
+        max_tries=fetch_tries,
+        max_time=90,
+        factor=fetch_backoff_factor,
+    )
+    async def paced_fetch(session, url):
+        # Every attempt, retries included, waits for its own pacer slot and is
+        # counted: a retry is a request the endpoint sees (issue #198).
         nonlocal api_requests
-        async with semaphore:
-            await asyncio.sleep(random.uniform(*jitter_seconds))
-            api_requests += 1
-            try:
-                text = await _fetch_search(session, build_search_url(lat, lon), timeout)
-            except (TimeoutError, aiohttp.ClientError) as e:
-                breaker.record(ok=False)
-                return (i, j, lat, lon, None, e)
-        breaker.record(ok=True)
-        return (i, j, lat, lon, parse_search_response(text), None)
+        await limiter.acquire()
+        api_requests += 1
+        return await _fetch_search(session, url, timeout)
+
+    blocked: tuple[str, int | None] | None = None
+    capped = False
+    raw_buf: list[str] = []
+    query_buf: list[dict] = []
+    history_buf: list[dict] = []
+
+    def flush() -> None:
+        # Raw first, history second, the queries LEDGER last: a key counts as
+        # done only once everything it stands for is on disk, so a crash
+        # between two appends can leave a key unrecorded (re-queried, and its
+        # history rows appended a second time -- importers dedupe on
+        # (edge_id, sample_idx, pano_id)) but never recorded with holes.
+        _append_gz(paths["raw"], "".join(raw_buf))
+        raw_buf.clear()
+        if history_buf:
+            new_file = not os.path.exists(paths["history"])
+            _append_gz(
+                paths["history"], _csv_text(history_buf, SAMPLE_HISTORY_COLUMNS, header=new_file)
+            )
+            history_buf.clear()
+        if query_buf:
+            new_file = not os.path.exists(paths["queries"])
+            _append_gz(paths["queries"], _csv_text(query_buf, QUERY_COLUMNS, header=new_file))
+            query_buf.clear()
 
     headers = {"User-Agent": _USER_AGENT}
-    blocked = False
-    async with aiohttp.ClientSession(headers=headers) as session:
-        # Initial sweep plus up to `retry_passes` re-sweeps of the points
-        # that failed (isolated failures never re-queried used to be
-        # silently finalized as holes in the harvest).
-        for sweep in range(1 + retry_passes):
-            pending = [(lat, lon, i, j) for (lat, lon, i, j) in remaining if (i, j) not in done]
-            if not pending or blocked:
-                break
-            if sweep > 0:
-                logger.info(
-                    f"Retry pass {sweep}/{retry_passes}: re-querying {len(pending)} failed points"
-                )
-            for start in range(0, len(pending), chunk_size):
-                chunk = pending[start : start + chunk_size]
-                results = await asyncio.gather(
-                    *(query_point(session, lat, lon, i, j) for (lat, lon, i, j) in chunk)
-                )
-                for i, j, lat, lon, found, err in results:
-                    if err is not None:
-                        continue  # failed point; stays out of `done` for the next pass
-                    progress_bar.update(1)
-                    done.add((i, j))
+    try:
+        async with aiohttp.ClientSession(headers=headers) as session:
+            for sweep in range(1 + retry_passes):
+                todo = [r for r in pending if (r.edge_id, int(r.sample_idx)) not in done]
+                if not todo or blocked or capped:
+                    break
+                if sweep > 0:
+                    logger.info("Retry pass %d/%d: %d failed rows", sweep, retry_passes, len(todo))
+                for r in todo:
+                    if max_requests is not None and api_requests >= max_requests:
+                        capped = True
+                        break
+                    key = (r.edge_id, int(r.sample_idx))
+                    url = build_search_url(float(r.query_lat), float(r.query_lon))
+                    fetched_at = now_func().isoformat()
+                    try:
+                        status, body = await paced_fetch(session, url)
+                    except (TimeoutError, aiohttp.ClientError) as e:
+                        logger.debug("transport failure at %s: %s", key, e)
+                        breaker.record(ok=False)
+                        if breaker.tripped:
+                            blocked = (
+                                f"{breaker.consecutive} consecutive transport failures",
+                                None,
+                            )
+                            break
+                        continue
+                    raw_buf.append(
+                        json.dumps(
+                            {
+                                "edge_id": key[0],
+                                "sample_idx": key[1],
+                                "query_lat": float(r.query_lat),
+                                "query_lon": float(r.query_lon),
+                                "url": url,
+                                "http_status": status,
+                                "fetched_at": fetched_at,
+                                "body": body,
+                            }
+                        )
+                        + "\n"
+                    )
+                    if status in (429, 403):
+                        blocked = (f"HTTP {status} from the endpoint", status)
+                        break
+                    breaker.record(ok=True)
+                    found = parse_search_response(body)
+                    anchor = (
+                        r.anchor_pano_id
+                        if isinstance(r.anchor_pano_id, str) and r.anchor_pano_id
+                        else None
+                    )
+                    anchor_in_history = (
+                        None if anchor is None else any(p.pano_id == anchor for p in found)
+                    )
+                    query_buf.append(
+                        {
+                            "edge_id": key[0],
+                            "sample_idx": key[1],
+                            "http_status": status,
+                            "panos_total": _count_panos(body),
+                            "panos_dated": len(found),
+                            "anchor_in_history": anchor_in_history,
+                            "fetched_at": fetched_at,
+                        }
+                    )
                     for p in found:
-                        # First grid point to surface a pano wins its query coords;
-                        # keep the earliest capture_date if the same id recurs.
-                        existing = panos.get(p.pano_id)
-                        if existing is None or p.capture_date < existing["capture_date"]:
-                            panos[p.pano_id] = {
+                        history_buf.append(
+                            {
+                                "city_id": r.city_id,
+                                "walk_csv_filename": r.walk_csv_filename,
+                                "pass": pass_no,
+                                "edge_id": key[0],
+                                "sample_idx": key[1],
+                                "query_lat": float(r.query_lat),
+                                "query_lon": float(r.query_lon),
+                                "anchor_pano_id": anchor,
+                                "anchor_capture_date": r.anchor_capture_date
+                                if isinstance(r.anchor_capture_date, str)
+                                else None,
+                                "pano_id": p.pano_id,
                                 "capture_date": p.capture_date,
                                 "pano_lat": p.lat,
                                 "pano_lon": p.lon,
-                                "nearest_query_lat": lat,
-                                "nearest_query_lon": lon,
+                                "harvested_at": fetched_at,
                             }
-                _save_checkpoint(checkpoint, done, panos, api_requests)
-                if breaker.tripped:
-                    blocked = True
-                    break
-    progress_bar.close()
+                        )
+                    done.add(key)
+                    answered += 1
+                    bar.update(1)
+                    if len(query_buf) >= chunk_size:
+                        flush()
+    finally:
+        flush()
+        bar.close()
 
+    remaining = len(rows) - len(done)
     if blocked:
+        reason, status = blocked
+        latch = write_latch(
+            out_dir,
+            reason=reason,
+            http_status=status,
+            cooldown_hours=cooldown_hours,
+            now=now_func(),
+        )
         raise HarvestBlockedError(
-            f"Harvest aborted for {city_name}: {breaker.consecutive} consecutive "
-            f"failed searches suggest the endpoint is throttling us. Progress "
-            f"saved to {checkpoint}; rerun to resume."
+            f"Harvest stopped for {stem} pass {pass_no}: {reason}. {remaining} rows remain; "
+            f"latch written to {latch} (cool-down {cooldown_hours:g} h)."
         )
-
-    unfinished = len(grid_points) - len(done)
-    if unfinished > 0:
+    if capped:
         raise HarvestIncompleteError(
-            f"Harvest incomplete for {city_name}: {unfinished} grid points "
-            f"still failed after {retry_passes} retry passes. Refusing to "
-            f"finalize a harvest with holes; progress saved to {checkpoint}; "
-            f"rerun to resume."
+            f"Request cap {max_requests} reached for {stem} pass {pass_no}: {remaining} rows "
+            "remain; re-run to resume.",
+            api_requests=api_requests,
+            remaining=remaining,
+            capped=True,
         )
-
-    harvested_at = datetime.now(UTC).isoformat()
-    rows = [
-        {
-            "pano_id": pid,
-            "capture_date": rec["capture_date"],
-            "pano_lat": rec["pano_lat"],
-            "pano_lon": rec["pano_lon"],
-            "nearest_query_lat": rec["nearest_query_lat"],
-            "nearest_query_lon": rec["nearest_query_lon"],
-            "harvested_at": harvested_at,
-        }
-        for pid, rec in panos.items()
-    ]
-    df = pd.DataFrame(rows, columns=list(HISTORY_DTYPES.keys()))
-    df = df.sort_values(["capture_date", "pano_id"]).reset_index(drop=True)
-
-    with gzip.open(output_csv_gz_path, "wb") as f:
-        f.write(df.to_csv(index=False).encode("utf-8"))
-    if os.path.exists(checkpoint):
-        os.remove(checkpoint)  # sweep complete; no resume needed
-
-    dates = df["capture_date"].dropna()
-    oldest = dates.min() if len(dates) else None
-    newest = dates.max() if len(dates) else None
+    if remaining:
+        raise HarvestIncompleteError(
+            f"{remaining} rows of {stem} pass {pass_no} still failed after {retry_passes} "
+            "retry pass(es); re-run to resume.",
+            api_requests=api_requests,
+            remaining=remaining,
+            capped=False,
+        )
     logger.info(
-        f"Harvested {len(df)} unique official Google panos for "
-        f"{city_name} ({oldest}..{newest}) from {api_requests} searches "
-        f"-> {output_csv_gz_path}"
+        "Completed %s pass %d: %d rows answered this run from %d requests",
+        stem,
+        pass_no,
+        answered,
+        api_requests,
     )
-
     return {
-        "df": df,
-        "filename_with_path": output_csv_gz_path,
+        "rows": int(len(rows)),
+        "answered": answered,
+        "already_done": int(len(rows) - answered - remaining),
         "api_requests": api_requests,
-        "grid_points": len(grid_points),
-        "unique_panos": len(df),
-        "oldest_capture_date": oldest,
-        "newest_capture_date": newest,
-        "started_at": started_at,
-        "finished_at": harvested_at,
+        "paths": paths,
     }
+
+
+def _csv_text(records: list[dict], columns: list[str], *, header: bool) -> str:
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=columns, lineterminator="\n")
+    if header:
+        w.writeheader()
+    for rec in records:
+        w.writerow({c: ("" if rec.get(c) is None else rec.get(c)) for c in columns})
+    return buf.getvalue()
+
+
+def _count_panos(body: str) -> int | None:
+    """Every pano node the response carries, dated or not (None if unparseable)."""
+    m = _CALLBACK_RE.search(body.strip())
+    if not m:
+        return None
+    try:
+        data = json.loads(m.group(1))
+        return len(data[1][5][0][3][0])
+    except (ValueError, IndexError, KeyError, TypeError):
+        return None

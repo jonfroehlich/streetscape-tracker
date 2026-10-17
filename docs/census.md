@@ -191,9 +191,9 @@ That is the same fix Mapillary's checkpoint already carried; a v1 record has no 
 **(4) A commit always writes the sweep as of the last completed boundary — a root's, or a re-probed failed cell's**
 — that invariant is what makes the `finally` commit safe from any exception path and lets the DFS stack stay un-persisted, at the cost of rolling a partial cell's rows, failed cells and counters back so it is re-swept from its own top.
 **(5) `api_requests` is this PROCESS's spend and `api_requests_total` is the sweep's**, because `db.add_api_usage` is additive and keyed by (date, provider), so a resumed night reporting the whole sweep would charge last night against tonight's budget gate;
-this is the opposite of `download_gsv_history`'s checkpoint, correctly, since its caller writes `record_harvest` and never touches the ledger.
+this is the opposite of `download_gsv_history`'s crawl, correctly, since that runs on a host with no ledger at all (#442).
 **(6) The path key is (city, grid geometry, CHANNEL) and must be DATE-FREE and outside `data/`**
-— a run is dated on the day it *completes*, so a date-bearing path (the `.downloading`/`.harvesting` convention, where a collection finishes in one night) would restart every night from zero;
+— a run is dated on the day it *completes*, so a date-bearing path (the `.downloading` convention, where a collection finishes in one night) would restart every night from zero;
 and the directory holds a partial census, the one artifact that must never reach the publisher.
 The channel is not optional either: a KartaView road walk will sweep the same frozen `grid_bbox` at the same ipp and radius, so bbox, ipp, radius and root_count all match and the two channels would resume each other's sweeps
 — harmless to the census, but they meter into separate `api_usage` ledgers, so one would inherit the other's `api_requests_total`.
