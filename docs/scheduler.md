@@ -612,7 +612,8 @@ It is there because #444's best-fitting reading of the blocks is hours of presen
 **Deploying v22.**
 `import-bundle` requires the bundle's catalog at exactly this host's `SCHEMA_VERSION`, so import any waiting v21 bundle first.
 Pre-#444 code refuses a v22 catalog, so a rollback needs `PRAGMA user_version = 21` set by hand; the extra table is harmless to old code.
-The migration backfills nothing: refusals before the deploy are in the logs only, so the first cooldown a v22 night can see counts from a refusal recorded after it — record one with `probe-host` if the host is mid-block at deploy time.
+The migration backfills nothing: refusals before the deploy are in the logs only, so the first cooldown a v22 night can see counts from a refusal recorded after it.
+If the host is mid-block at deploy time, hold its channels by hand (as for a lost refusal record, above) until `refusal_cooldown_h` after the newest refusal in the logs — not with `probe-host`, which would send a request into the live block.
 
 ## What a capped night spends its slots on (issue #308, added 2026-09-02)
 
