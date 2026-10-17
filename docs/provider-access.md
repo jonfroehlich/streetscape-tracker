@@ -332,8 +332,8 @@ Both figures are upper bounds, and the measured/reported/guessed tiers below mus
 Rate: block 2 arrived with the 60/min limiter provably pinned.
 Daily volume: block 3 arrived at **1,938** combined requests/day, while 08-23 and 08-24 had spent **3,190** and **3,292** clean, and no accumulation window from 1 to 8 days separates blocked days from clean ones (issue #286, which retires #241's bands).
 **Correction (2026-10-17, #444):** earlier versions of this file, #286 and the configs cited "08-14 spent 26,363 in one day clean" as the strongest falsifier.
-It was not clean: the ledger's 26,363 (25,297 `mapillary` + 1,066 `mapillary_streets`) fell **inside block 1** (onset 08-12, silence only from ~44 h after onset, below), so most of it was the detached loop's refused requests.
-The falsification survives without it — on 08-23/08-24 above, and again on 09-29/09-30, which spent 3,500 then 3,006 back to back without a block while October's blocks arrived at ~1,630–2,290 a day (#444).
+It was not clean: the ledger's 26,363 (25,297 `mapillary` + 1,066 `mapillary_streets`) fell **inside block 1** (onset 08-12, silence only from ~44 h after onset, in "Recovering from a block" above), so most of it was the detached loop's refused requests.
+The falsification survives without it — on 08-23/08-24 above, and again in September: in served requests over a trailing window (#444, from `runs` and `street_walks` timestamps), clean night ends carried up to **3,481** in 24 h (09-29) and **5,454** in 48 h (09-30), while October's blocks arrived at 1,631–2,287 (24 h) and 3,560–4,020 (48 h).
 What every restart left untouched is that `AsyncRateLimiter`'s token bucket, once saturated, emits tile requests at an **exact `60 / max_per_minute` cadence** — the sleep is computed to the token — over sequential z14 tiles in raster order, from a datacenter IP, with the same UA every time.
 Staff describe the per-IP layer only as a separate system that "can block you at different levels"; if it scores behaviour rather than counting, that regularity is the most machine-like feature we present.
 
