@@ -555,8 +555,12 @@ It is not a stranding either: a hold covers every channel on the host, so a walk
 It is the same posture as the fill's "holding <channel>" backlog, and it is reported the same way: once at WARNING when the run starts, at INFO per skipped launch, and as `HELD <host>: rest night (Wed), N launch(es) held, cities stay due` (or `cooling down until <T> (...)`) on the `Done:` line, in `run-due --dry-run` and in `assess-city`'s summary.
 `scheduler status` prints each host's rest weekdays (and whether today is one) and whether it is cooling down.
 
-**One gate, every path.**
+**One gate, every SCHEDULER path.**
 The hold is asked at the submit gate in `_run_city_channels`, before the breaker (so a held host never spends a re-check), which means the due loop, the stranded-walk retry, the fill and `assess-city` all honour it — and so does the supported catch-up, `run-due --provider mapillary --limit N`.
+**A collector run directly does not**: `streetscape_tracker.py --provider mapillary` and `python -m streetscape_street_analyzer.collect --provider mapillary` read no scheduler config, so they ignore both rest nights and cooldowns (as they ignore the `[hosts.*]` budget).
+Before running one by hand, check `scheduler status`, which says whether today is a rest night and whether the host is cooling down.
+**A held walk is held even when it would have cost nothing**: a `mapillary_streets` walk whose grid census is already in the census cache (#290) would send the CDN zero requests, and the gate still holds it, because the hold is decided per host before the walk is priced.
+Accepted as conservative: the walk stays due and lands on the next unheld night, when it is still a cache hit if the census is young enough or a full sweep if not.
 The fill declines a city whose channel is on a held host (`_FILL_BLOCKER_HOST_HELD`), because a fill city is admitted whole or not at all; on a rest night the due slate's unattempted Mapillary pairs also hold the fill's Mapillary channels as a backlog, so in practice the fill does not touch the host at all.
 `assess-city` treats a held channel as an incomplete answer (exit 1), like a refused one, without claiming anything refused us.
 `run-due --ignore-host-holds` lifts both kinds for one invocation, logged at WARNING; the nightly unit never passes it.

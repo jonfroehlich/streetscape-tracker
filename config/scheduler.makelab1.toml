@@ -791,7 +791,10 @@ network_type = "drive"
 # rest_weekdays (#444): on a run dated one of these weekdays, NO channel that
 # touches the tile CDN launches -- mapillary and mapillary_streets both, nightly
 # and `run-due --provider mapillary --limit N` catch-ups alike -- while every
-# other channel runs as usual. The date is the run's SNAPSHOT date, the UTC
+# other channel runs as usual. SCHEDULER commands only: a direct
+# `streetscape_tracker.py --provider mapillary` or `collect --provider
+# mapillary` reads no scheduler config and ignores both holds, so check
+# `scheduler status` before running one by hand. The date is the run's SNAPSHOT date, the UTC
 # calendar (#347): the 02:00 Pacific nightly is the same calendar day in both
 # zones, but a hand-run catch-up after 17:00 Pacific is already the next UTC
 # day. Two nights a week of zero presence, because #444's best-fitting reading

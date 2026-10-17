@@ -448,6 +448,8 @@ The 90-day cycle therefore fits on paper with almost no headroom: the backlog ca
 **Rest nights (`rest_weekdays = ["Wed", "Sun"]`):** two nights a week with zero Mapillary presence, on the run's UTC snapshot date, while every other channel runs.
 A Mapillary-only rest, by the Maintainer's choice, so a rested city's Mapillary snapshot lands on a later night than its GSV one; the alternative (rest every channel through the timer) keeps pairing and costs GSV two nights a week.
 A rest night is a standing hold, not a refusal: no alert, no breaker trip, no failure, and the cities stay due.
+Holds bind scheduler commands only (`run-due`, its `--limit` catch-ups, `assess-city`); a collector run directly (`streetscape_tracker.py` or `streetscape_street_analyzer.collect` with `--provider mapillary`) ignores them, so check `scheduler status` before one.
+A held walk that would have been a 0-request census-cache hit is still held — conservative, and accepted.
 
 **The cross-night refusal cooldown (`refusal_cooldown_h = 36`):** for 36 h after the newest recorded refusal, no channel on the tile CDN launches.
 It exists because the 02:00 nightly re-probed the IP ~20 h into the 10-16 block, and if H3 holds, that request is the most expensive one we make.
