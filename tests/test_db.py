@@ -2515,8 +2515,10 @@ def test_concurrent_first_connects_add_the_every_connect_columns_once(tmp_path):
 
 def test_a_v21_catalog_gains_host_refusals_and_keeps_its_rows(tmp_path):
     """v21 -> v22 is purely additive: the table appears, the stamp moves, and
-    nothing else on the catalog changes. Killed by a rung that does not move
-    the stamp, and by dropping the table from _SCHEMA."""
+    nothing else on the catalog changes. Killed by dropping the table from
+    _SCHEMA. The v21 -> v22 rung itself is documentation only: init_schema
+    always ends by stamping SCHEMA_VERSION, so deleting the rung survives
+    every test."""
     path = str(tmp_path / "v21.db")
     conn = db.connect(path)
     db.add_api_usage(conn, date(2026, 10, 16), 7, "mapillary")
