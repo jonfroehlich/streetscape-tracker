@@ -107,7 +107,7 @@ A pair moves together in one transaction, `--no-opt-in` skips it all, an explici
 
 ### One-time and repair scripts (`scripts/`)
 
-Every script in this table is catalog/disk-only (no API calls), dry-run by default, and takes `--execute` — except `prefreeze_street_networks.py`, which queries Overpass on purpose.
+Every script in this table is catalog/disk-only (no API calls), dry-run by default, and takes `--execute` — except `prefreeze_street_networks.py`, which queries Overpass on purpose, and `spot_check_gsv_history.py`, which makes DOCUMENTED Street View metadata requests on the streets key from the catalog host (never from the credential-free crawler host).
 `scripts/` also holds provider probes and operator tools that are NOT in it and DO call APIs (e.g. `mapillary_user_activity.py`, `docs/operations.md`).
 
 | Script | Purpose |
@@ -120,6 +120,7 @@ Every script in this table is catalog/disk-only (no API calls), dry-run by defau
 | `backfill_streetwalk_length.py` | Backfill the schema v12 `street_walks` columns; exits nonzero if an artifact's lengths contradict the row's cataloged coverage (wrong artifact matched) |
 | `backfill_history_json.py` | Write the capture-history summary JSON beside every harvested `_gsv_history_` CSV (#109); then `regenerate-aggregate --publish` |
 | `prefreeze_street_networks.py --config config/scheduler.makelab1.toml [--nights N \| --all-enabled] [--limit N]` | Freeze tonight's walk cities' OSM networks after the night's tail (#341), serially and paced, through the same host lock and probe a walk uses — a walk on a frozen network never contacts Overpass, so a mid-night refusal then strands nothing; refuses while `run-due` is in flight; `--all-enabled` drains the whole catalog's cold backlog stalest-first, 20 per pass (#381). **Makes Overpass requests** (moved earlier, never added); chained from the collection unit's `OnSuccess=`/`OnFailure=` (#355, #389), so it tracks the night's end at any `max_batch_hours`, starts no fetch later than 1 h 15 min before the next fire, normally 00:45 Pacific (so a late night's pass cannot reach the next one), and asks a fail-closed Overpass probe before its first fetch |
+| `spot_check_gsv_history.py --history H --limit 200 --out J [--db-path DB]` | Check a sample of harvested capture months against the documented `pano=` metadata request (#442's pilot check); `--dry-run` samples only |
 | `reparse_gsv_history_raw.py --raw R --worklist W --out-dir D` | Rebuild a #442 history crawl's parsed files from its raw store under the current parser — zero requests; the raw body is the irreplaceable copy and the parsed CSVs are a view of it |
 | `recompute_run_stats.py --provider gsv --regenerate-json` | Re-derive every run's stored stats from its CSV under the current analysis definitions — the repair handle whenever a stats definition moves (#213); a definition change is applied to the WHOLE series in one pass |
 | `recompute_streetwalk_stats.py` | Re-derive every walk's `street_walks` stats, coverage artifact and diffs from its CSV + frozen GraphML under the current definition (#262); whole series or none, refuses a series on a missing GraphML (**never fetches Overpass**) or a sample-frame mismatch; `--catalog-only` leaves the site mixed |
