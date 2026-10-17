@@ -877,23 +877,34 @@ Now:
 1. `_fetch_tile` raises `TileBackpressureError`, which is neither an `aiohttp.ClientError` (so `@backoff` does not retry it) nor a `DownloadError` (so #205's whole-city abort does not fire).
    Other 4xx and 5xx keep the old `@backoff` path.
 2. The crawl's pacer is **held** — no request goes out from any of its sockets — for `max(Retry-After, 60 s)`.
-   Both RFC 9110 forms are read, delay-seconds and HTTP-date; a missing or unreadable header means 60 s.
-3. A `Retry-After` longer than **900 s** is not slept on, and neither is a hold that would end past the crawl's wall-clock budget: the crawl pauses at once (rule 6).
+   Both RFC 9110 forms are read, delay-seconds and HTTP-date; a missing or unreadable header means 60 s, and so does one that cannot be parsed at all (Unicode digits, thousands of digits, a date `datetime` cannot hold) — parsing never raises.
+3. A `Retry-After` longer than **900 s** is not slept on, and neither is a hold that would end past the crawl's wall-clock budget: the crawl pauses at once (rule 7).
    Retrying before the time the server named would disobey it, and a sleep that long belongs to the next night rather than to this one's host lock.
 4. The pace is **halved once** for the rest of that crawl (`AsyncRateLimiter.slow_down(2)`), on the limiter the crawl builds for itself, so it cannot reach another crawl or another process.
 5. The tile is then retried by re-entering the in-semaphore checks, so the abort, the request cap with its reservation, and the wall-clock deadline gate the retry exactly as they gate a fresh tile.
    Every HTTP request, the 429 included, is counted once in `api_requests`.
-6. The **third** 429/503 in one crawl pauses it on the request cap's own path: checkpointed, `SweepIncompleteError`, exit 83, raised before the settle loop, with the stop reason `SWEEP_STOP_BACKPRESSURE` and the phrase "stopped by provider backpressure (HTTP 429/503)", which the scheduler's `_pause_stop_phrase` reads back with no scheduler change.
+   **One tile gets at most two backpressure responses** (`TILE_BACKPRESSURE_TILE_TRIES`); after the second, and after its hold, it is given up as an ordinary failed tile, REQUEST_FAILED under #168's tolerance, as when `@backoff` exhausted it before #444.
+   That limit is below the pause on purpose: without it, one tile answering 503 to everything spent all three strikes by itself, the crawl paused, and the next night hit the same tile first, so the city never completed.
+6. Strikes are counted in **episodes, not responses**.
+   Each attempt records the pacer's generation when it is sent; a 429/503 answering a request sent before the latest hold began belongs to that hold, so it adds no strike (it may still extend the hold to its own wait).
+   One throttle window that answers several in-flight requests at once is one episode.
+7. The **third episode** in one crawl pauses it on the request cap's own path: checkpointed, `SweepIncompleteError`, exit 83, raised before the settle loop, with the stop reason `SWEEP_STOP_BACKPRESSURE` and the phrase "stopped by provider backpressure (HTTP 429/503)", which the scheduler's `_pause_stop_phrase` reads back with no scheduler change.
    With nothing committed it is the cap's plain-`DownloadError` arm, as for any capped stop.
+   The pause **closes** the crawl's pacer: no further request goes out, including ones already waiting for their turn, which are turned away uncommitted and uncounted.
    **It is not a refusal**: a 302 → `/login` is still the `HostBlockedError` (exit 75) it always was, after a 429 too.
 
 **Why 900 s.**
 The only cooldown ever reported for a Mapillary tile block is thread 5821's 15-minute sleep, a hint rather than a contract.
-And with the pause at the third response, a crawl waits at most twice, so it holds the machine-wide tile lock for at most 30 minutes of sleeping.
+And with the pause at the third episode, a crawl holds in at most two episodes, each lasting the longest wait asked for inside it (at most 900 s), so it holds the machine-wide tile lock for at most 30 minutes of sleeping.
 That is well inside prod's 180-minute per-city timeout floor (`city_timeout_minutes`).
 **A hold that would end past the crawl's wall-clock budget is not slept at all**: the crawl pauses at once instead.
 The scheduler forwards that budget as the child's SIGKILL timeout less a 600 s margin (`_crawl_max_seconds`), so a 900 s hold begun inside the margin would be killed mid-sleep and counted a failure, where pausing is exit 83.
 A halved pace also doubles the remaining wall clock of the crawl it applies to, so a large city answered 429 early can reach its budget; the clock then pauses it as exit 83, which is the intended outcome.
+
+**One known interaction, left as it is.**
+`_fetch_tile` waits on the pacer inside its `@backoff`-decorated body, so a tile that is mid-way through ordinary retries (a 500, a timeout) when a hold begins spends the hold against `@backoff`'s 120 s `max_time`.
+After a hold of 60 s or more it may get fewer than its five tries, and then becomes a failed tile under #168's tolerance a little sooner than it would have.
+Fixing that means moving the pacer out of the retried body, which #198 put there on purpose (one token per HTTP request), so it is noted rather than changed.
 
 Both statuses are covered because a CDN shedding load answers 503 and one metering a client answers 429.
 **Neither has ever been observed from `tiles.mapillary.com`**, so this is built ahead of the evidence, on the cheap side of an unknown.

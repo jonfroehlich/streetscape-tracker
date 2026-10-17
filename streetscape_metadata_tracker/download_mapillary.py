@@ -631,10 +631,14 @@ class TileStatusCounts:
 # 4. The tile is then retried, through the same in-semaphore cap and deadline
 #    checks as a fresh tile, so `max_requests` + its reservation still bound
 #    the crawl and no attempt is counted twice.
-# 5. The TILE_BACKPRESSURE_PAUSE_AFTER-th such response in one crawl pauses it:
-#    the same checkpointed, exit-83 path the request cap takes, raised before
-#    the settle loop. It is NOT a refusal: a 302 -> /login is still the
-#    HostBlockedError (exit 75) it always was.
+# 5. The TILE_BACKPRESSURE_PAUSE_AFTER-th backpressure EPISODE in one crawl
+#    pauses it: the same checkpointed, exit-83 path the request cap takes,
+#    raised before the settle loop, and the crawl's pacer is closed so no
+#    request still waiting for its turn goes out. It is NOT a refusal: a
+#    302 -> /login is still the HostBlockedError (exit 75) it always was.
+# 6. One tile is given up as an ordinary failed tile after
+#    TILE_BACKPRESSURE_TILE_TRIES backpressure responses, so a tile stuck on
+#    503 cannot pause its city night after night.
 #
 # Both statuses, because a CDN shedding load answers 503 and one metering a
 # client answers 429; neither has ever been observed from tiles.mapillary.com
@@ -645,10 +649,11 @@ TILE_BACKPRESSURE_MIN_WAIT_S = 60.0
 # 15 minutes. Two reasons, one external and one ours. The only cooldown ever
 # reported for a Mapillary tile block is "the script sleeps for 15 minutes",
 # found by trial and error by a forum user (thread 5821) -- a hint, not a
-# contract. And at most PAUSE_AFTER - 1 = 2 waits happen per crawl before the
-# third response pauses it, so a crawl holds the machine-wide tile lock for at
-# most 30 minutes of sleeping: far inside the scheduler's per-city timeout
-# floor, so a waiting child is never SIGKILLed (which would count a failure).
+# contract. And a crawl holds in at most PAUSE_AFTER - 1 = 2 episodes before
+# the third pauses it, each lasting the longest wait asked inside it, so it
+# holds the machine-wide tile lock for at most 30 minutes of sleeping: far
+# inside prod's 180-minute per-city timeout floor. A hold that would run past
+# the crawl's own deadline is not slept at all (see on_backpressure).
 TILE_BACKPRESSURE_MAX_WAIT_S = 900.0
 # Counted in EPISODES, not responses (review of #444): a 429/503 answering a
 # request that was sent before the latest hold began belongs to that hold's
