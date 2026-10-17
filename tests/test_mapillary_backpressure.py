@@ -922,3 +922,21 @@ def test_a_302_beside_a_backpressure_pause_is_still_exit_75(monkeypatch, tmp_pat
     assert type(error) is HostBlockedError, error
     assert host_exit_code(error) == 75
     assert len(session.urls) == 2
+
+
+def test_a_429_after_a_302_neither_holds_nor_pauses(monkeypatch, limiters, holds, caplog):
+    """The 302 has already ended the crawl; a 429 to a request that was in
+    flight beside it must not open a hold or announce a backpressure stop."""
+    caplog.set_level(logging.INFO, logger=dm.__name__)
+    refusal = status(302, **_LOGIN)
+    refusal.delay = 0.01
+    throttle = status(429)
+    throttle.delay = 0.05
+    script = {_TILES[0]: [refusal], _TILES[1]: [throttle]}
+    error, session = _crawl(monkeypatch, script, connection_limit=2)
+    assert type(error) is HostBlockedError, error
+    assert holds == []
+    messages = [r.getMessage() for r in caplog.records]
+    assert not any("holding every tile request" in m for m in messages)
+    assert not any("pausing the crawl" in m for m in messages)
+    assert len(session.urls) == 2
