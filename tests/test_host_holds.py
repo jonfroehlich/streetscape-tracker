@@ -429,7 +429,7 @@ def test_a_failed_refusal_write_never_ends_the_night(conn, monkeypatch, tmp_path
     _register(conn, "Bend")
     _register(conn, "Corvallis")
     alerts = []
-    cfg = _cfg(tmp_path)
+    cfg = _cfg(tmp_path, "refusal_cooldown_h = 36\n")
     cfg.alerts.enabled = True
     with caplog.at_level(logging.INFO, logger="streetscape_scheduler"):
         rc, launches = _refusing_night(monkeypatch, conn, cfg, exit_code=75, alerts=alerts)
@@ -443,14 +443,45 @@ def test_a_failed_refusal_write_never_ends_the_night(conn, monkeypatch, tmp_path
     )
     assert f"; {lost}" in done
     # The fix it names holds the channels by hand; a probe would ask the
-    # possibly still-blocking host again and record a clearance (#444 review).
+    # possibly still-blocking host again (#444 review). A refusal the probe
+    # meets IS recorded, so the note must not claim it never arms a cooldown.
     assert "systemctl --user disable --now streetscape-tracker.timer" in done
     assert "record one with `probe-host`" not in done
+    assert "never a cooldown" not in done
+    assert "does arm the cooldown" in done
     # Surfaced in the alert too: the night alerts anyway, because of the refusal.
     assert len(alerts) == 1
     _cfg_arg, _subject, body = alerts[0]
     assert "Refusal(s) NOT RECORDED in host_refusals (1 of Mapillary's tile CDN" in body
     assert rc != 0
+
+
+def test_a_lost_refusal_of_a_host_with_no_cooldown_gets_no_hold_advice(
+    conn, monkeypatch, tmp_path, caplog
+):
+    """Round-2 review of #444: "hold until the cooldown would have ended" means
+    nothing for a host with no refusal_cooldown_h (Overpass 76, KartaView 81,
+    Panoramax 84, or a tile CDN configured without one): the lost row changes
+    nothing the next night does. The clause says only that it was lost."""
+
+    def broken(*a, **k):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(sched.db, "record_host_verdict", broken)
+    _register(conn, "Bend")
+    alerts = []
+    cfg = _cfg(tmp_path)
+    assert HOST_MAPILLARY_TILES not in cfg.host_refusal_cooldown_h
+    cfg.alerts.enabled = True
+    with caplog.at_level(logging.INFO, logger="streetscape_scheduler"):
+        _refusing_night(monkeypatch, conn, cfg, exit_code=75, alerts=alerts)
+    done = _done_line(caplog)
+    assert "; refusal(s) NOT RECORDED in host_refusals (1 of Mapillary's tile CDN" in done
+    assert "cooldown" not in done.split("NOT RECORDED", 1)[1]
+    assert "by hand" not in done
+    _cfg_arg, _subject, body = alerts[0]
+    assert "Refusal(s) NOT RECORDED in host_refusals" in body
+    assert "by hand" not in body
 
 
 def test_a_recorded_refusal_says_nothing_about_lost_records(conn, monkeypatch, tmp_path, caplog):

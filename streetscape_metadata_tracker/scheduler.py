@@ -10236,7 +10236,7 @@ def cmd_run_due(
             else ""
         )
         + (f"; {blocked_note}" if blocked_note else "")
-        + _unrecorded_refusal_note(blocked_hosts)
+        + _unrecorded_refusal_note(blocked_hosts, cfg.host_refusal_cooldown_h)
         # Apart from the refusal clause above (issue #444): nothing refused us
         # and nothing failed; a rest night or a cooldown held the host.
         + _held_summary_note(blocked_hosts)
@@ -13723,30 +13723,45 @@ def _blocked_summary_note(breaker: HostBreaker) -> str:
     return ", ".join(parts)
 
 
-def _unrecorded_refusal_note(breaker: HostBreaker, sep: str = "; ") -> str:
+def _unrecorded_refusal_note(
+    breaker: HostBreaker, cooldown_hosts: Collection[str] = (), sep: str = "; "
+) -> str:
     """``; 1 refusal of <host> NOT RECORDED in host_refusals (...)``, or ``""`` (#444 review).
 
     A refusal whose catalog write failed is a cooldown the next night cannot
     see: its 02:00 launch would ask the blocked host again. Shared by the
     ``Done:`` line and the alert.
+
+    ``cooldown_hosts`` are the hosts with a ``refusal_cooldown_h``
+    (``cfg.host_refusal_cooldown_h``). Only for those is there a cooldown to
+    stand in for, so only they get the hold-by-hand advice; for any other host
+    (Overpass, KartaView, Panoramax today) the lost row changes nothing the next
+    night does, and the clause just says it was not recorded.
     """
     if not breaker.unrecorded_refusals:
         return ""
     lost = ", ".join(
         f"{n} of {HOST_LABELS.get(h, h)}" for h, n in sorted(breaker.unrecorded_refusals.items())
     )
+    held = sorted(h for h in breaker.unrecorded_refusals if h in cooldown_hosts)
+    if not held:
+        return f"{sep}refusal(s) NOT RECORDED in host_refusals ({lost})"
     return (
         f"{sep}refusal(s) NOT RECORDED in host_refusals ({lost}): the next night's refusal "
-        f"cooldown cannot see them -- hold the host's channels by hand until the cooldown "
-        f"would have ended (set enabled = false on their [providers.*] blocks, or pause the "
-        f"nightly with `systemctl --user disable --now streetscape-tracker.timer`); NOT "
-        f"`probe-host`, which asks the possibly still-blocking host again and records a "
-        f"clearance, never a cooldown"
+        f"cooldown cannot see them -- hold the channels of {_host_names(held)} by hand until "
+        f"the cooldown would have ended (set enabled = false on their [providers.*] blocks, or "
+        f"pause the nightly with `systemctl --user disable --now streetscape-tracker.timer`); "
+        f"NOT `probe-host`, which asks the possibly still-blocking host again (a refusal it "
+        f"meets is recorded and does arm the cooldown, but the request may itself extend the "
+        f"block)"
     )
 
 
-def _blocked_alert_note(breaker: HostBreaker) -> str:
-    """The [alerts] paragraph about the hosts that refused us, or empty."""
+def _blocked_alert_note(breaker: HostBreaker, cooldown_hosts: Collection[str] = ()) -> str:
+    """The [alerts] paragraph about the hosts that refused us, or empty.
+
+    ``cooldown_hosts`` is passed through to :func:`_unrecorded_refusal_note`.
+    """
     if not breaker:
         return ""
     throttled = {h for h in breaker if breaker.throttled_only({h})}
@@ -13784,7 +13799,7 @@ def _blocked_alert_note(breaker: HostBreaker) -> str:
         f"about an hour is the shape seen on 2026-09-13 and 09-15, while the one confirmed ban "
         f"lasted ~20 h and presented as connection refused (issue #341)."
     )
-    lost = _unrecorded_refusal_note(breaker, sep="")
+    lost = _unrecorded_refusal_note(breaker, cooldown_hosts, sep="")
     if lost:
         note += " " + lost[0].upper() + lost[1:] + "."
     return note
@@ -14338,7 +14353,7 @@ def _finish_batch(
     # went unbacked-up for months because nothing was watching. This is the one
     # thing in the tail that must never degrade quietly.
     blocked_hosts = _as_breaker(blocked_hosts)
-    blocked_note = _blocked_alert_note(blocked_hosts)
+    blocked_note = _blocked_alert_note(blocked_hosts, cfg.host_refusal_cooldown_h)
     stranded_note = _stranded_alert_note(cfg, blocked_hosts, today)
 
     busy_hosts = busy_hosts or Counter()
