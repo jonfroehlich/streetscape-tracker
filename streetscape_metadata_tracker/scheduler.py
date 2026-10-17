@@ -13714,8 +13714,11 @@ def _unrecorded_refusal_note(breaker: HostBreaker, sep: str = "; ") -> str:
     )
     return (
         f"{sep}refusal(s) NOT RECORDED in host_refusals ({lost}): the next night's refusal "
-        f"cooldown cannot see them -- record one with `probe-host` once the catalog is "
-        f"writable, or hold the channels by hand"
+        f"cooldown cannot see them -- hold the host's channels by hand until the cooldown "
+        f"would have ended (set enabled = false on their [providers.*] blocks, or pause the "
+        f"nightly with `systemctl --user disable --now streetscape-tracker.timer`); NOT "
+        f"`probe-host`, which asks the possibly still-blocking host again and records a "
+        f"clearance, never a cooldown"
     )
 
 

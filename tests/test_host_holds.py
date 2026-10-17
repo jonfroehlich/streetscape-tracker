@@ -442,6 +442,10 @@ def test_a_failed_refusal_write_never_ends_the_night(conn, monkeypatch, tmp_path
         "(tiles.mapillary.com)): the next night's refusal cooldown cannot see them"
     )
     assert f"; {lost}" in done
+    # The fix it names holds the channels by hand; a probe would ask the
+    # possibly still-blocking host again and record a clearance (#444 review).
+    assert "systemctl --user disable --now streetscape-tracker.timer" in done
+    assert "record one with `probe-host`" not in done
     # Surfaced in the alert too: the night alerts anyway, because of the refusal.
     assert len(alerts) == 1
     _cfg_arg, _subject, body = alerts[0]
