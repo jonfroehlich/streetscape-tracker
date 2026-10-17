@@ -451,9 +451,11 @@ class HostBreaker(set):
     """
     The night-level per-IP host breaker (issues #208, #341).
 
-    A ``set`` of the hosts that refused this machine at any point tonight --
-    that membership is MONOTONE, so ``bool(breaker)`` still means "a third
-    party refused us tonight" for the alert and the exit status, and a plain
+    A ``set`` of the hosts that refused or THROTTLED this machine at any point
+    tonight (a throttle is exit 87, issue #444; ``throttled_hosts`` says which
+    were throttles alone) -- that membership is MONOTONE, so ``bool(breaker)``
+    still means "a third party refused or throttled us tonight" for the alert
+    and the exit status, and a plain
     ``==`` against a set of host names keeps working. What is new is
     ``latched``: the subset currently blocking launches. A host leaves
     ``latched`` (never the set itself) when a re-check says it is serving
@@ -4521,6 +4523,8 @@ def cmd_probe_host(
 
     Refuses, with ``USAGE_EXIT_CODE`` and nothing sent:
 
+    * on a config the channel-running commands would refuse, an unknown host,
+      or a missing token;
     * while any ``run-due`` is in flight on this machine (``_run_due_in_flight``,
       the check ``import-bundle`` and the pre-freeze pass use) -- a probe in the
       middle of a night is one more talker at the worst moment, and its verdict
@@ -4533,9 +4537,7 @@ def cmd_probe_host(
       silence the probe exists to end, and probing inside it is the re-probe it
       exists to prevent.
 
-    ``force`` skips exactly those two checks, never the in-flight one;
-    * on a config the channel-running commands would refuse, an unknown host,
-      or a missing token.
+    ``force`` skips exactly the last two checks, never the others.
 
     Another local process holding the host lock (a hand-run collector) exits
     with the host's BUSY code, also with nothing sent. ``fetch`` (url ->
@@ -13782,8 +13784,10 @@ def _blocked_alert_note(breaker: HostBreaker, cooldown_hosts: Collection[str] = 
         note += (
             f"{_host_names(throttled)} THROTTLED this host: it answered HTTP 429/503 often "
             f"enough that a crawl stopped itself (exit 87, issue #444). Not a refusal: no "
-            f"host_refusals row was written and no cooldown is armed, so the next night "
-            f"collects as usual; its channels were skipped for the rest of this night, the "
+            f"host_refusals row was written and no cooldown is armed, so the throttle "
+            f"holds nothing tomorrow: the next night collects unless it is the host's rest "
+            f"night or an earlier refusal's cooldown still holds it. Its channels were "
+            f"skipped for the rest of this night, the "
             f"crawl's checkpoint is kept, and no city was marked failed."
         )
     if not refused:
@@ -14786,8 +14790,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Send ONE request to a per-IP host and record the verdict in host_refusals "
         "(issue #444): for mapillary_tiles, one z14 tile, redirects not followed, so a "
         "302 to the login page is REFUSED and a 429/503 is THROTTLED (inconclusive). "
-        "Refuses while a run-due is in flight, and inside the host's refusal cooldown "
-        "unless --force. Exit 0 cleared, 75 refused, 1 inconclusive.",
+        "Refuses while a run-due is in flight, and on the host's rest day or inside its "
+        "refusal cooldown unless --force. Exit 0 cleared, 75 refused, 1 inconclusive.",
     )
     _add_global_flags(p_probe)
     p_probe.add_argument("host", help="The per-IP host token; today only mapillary_tiles")
