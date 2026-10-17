@@ -330,6 +330,7 @@ The rule, the research behind it and the 900 s ceiling are in [`provider-access.
 - **One HTTP request, one count**: the 429 itself is counted inside `_fetch_tile` like any attempt, and the retry is counted when it is sent.
   A request turned away because the crawl paused while it waited on the pacer (`_CrawlPaused`) was never sent and is never counted.
 - **A stuck tile is a failed tile, never a stalled city**: after `TILE_BACKPRESSURE_TILE_TRIES` (2) backpressure responses the tile settles as an exception, so #168's `MAX_FAILED_TILE_FRACTION` judges it exactly as it judged a tile `@backoff` exhausted.
+  Only its first response can be a strike, and that strike is withdrawn once another tile is served, so several stuck tiles cannot pause the city either (round-2 review of #444).
 - **Panoramax is untouched**: there a 429 is a per-IP refusal at the first request (difference 2 in its section below), because with no credential nothing else can be meant.
 - The per-crawl status line (`mapillary tile statuses: …`) is logged by the same function, after the gather, on every way out — see `provider-access.md` for its keys.
 

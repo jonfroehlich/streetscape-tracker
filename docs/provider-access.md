@@ -885,9 +885,14 @@ Now:
    Every HTTP request, the 429 included, is counted once in `api_requests`.
    **One tile gets at most two backpressure responses** (`TILE_BACKPRESSURE_TILE_TRIES`); after the second, and after its hold, it is given up as an ordinary failed tile, REQUEST_FAILED under #168's tolerance, as when `@backoff` exhausted it before #444.
    That limit is below the pause on purpose: without it, one tile answering 503 to everything spent all three strikes by itself, the crawl paused, and the next night hit the same tile first, so the city never completed.
+   Several stuck tiles are covered by rule 6.
 6. Strikes are counted in **episodes, not responses**.
    Each attempt records the pacer's generation when it is sent; a 429/503 answering a request sent before the latest hold began belongs to that hold, so it adds no strike (it may still extend the hold to its own wait).
    One throttle window that answers several in-flight requests at once is one episode.
+   **Only a tile's first backpressure response can be a strike**: its own retry being refused again says something about that tile, not the host.
+   And a tile given up as stuck has its strike **withdrawn as soon as another tile is served**, since a host serving the next tile is not the one refusing.
+   Counted per response, two stuck tiles spent three strikes between them, the crawl paused, and as a failed tile is never committed every resumed night repeated it (round-2 review of #444); first responses alone still let three stuck tiles do the same.
+   A host-wide storm serves nothing between its tiles, so all its strikes stand and the third episode still pauses; so does a throttle whose retries succeed, since none of its tiles is given up.
 7. The **third episode** in one crawl stops it on the request cap's own path — turned-away tiles uncommitted, the checkpoint kept, raised before the settle loop — as **`HostThrottledError`, exit 87**, the THROTTLED family (`download_common.HOST_THROTTLED_EXIT_CODES`).
    Every backpressure stop raises it, committed tiles or not; its message carries the phrase "stopped by provider backpressure (HTTP 429/503)", and says "the next run resumes it" only when a tile is committed, "starts from the first tile" otherwise.
    It replaced exit 83 plus a plain-`DownloadError` arm for the nothing-committed case: that arm counted a `consecutive_failure`, so a few nights of a 429 storm would have quarantined every Mapillary pair (#421), and nothing latched the host, so the next city walked into the same 429s at full pace.

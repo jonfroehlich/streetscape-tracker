@@ -792,6 +792,70 @@ def test_a_tile_that_always_answers_503_cannot_stall_its_city(
     assert result["api_requests"] == len(session.urls) == len(_TILES) - 1 + len(bad_urls)
 
 
+@pytest.mark.parametrize("n_stuck", [2, 3])
+def test_several_tiles_that_always_answer_503_cannot_stall_their_city(
+    monkeypatch, tmp_path, limiters, holds, n_stuck
+):
+    """Round-2 review of #444: two stuck tiles spent three strikes between them
+    (A's two responses, B's first), the crawl paused at B as exit 87, and since
+    a failed tile is never committed every resumed night did the same -- and
+    87 latches the host, so one city blocked all Mapillary every night.
+
+    A tile's own retry is no strike, and a stuck tile's first-response strike
+    is withdrawn once another tile is served, so the city completes on its
+    first night, the stuck tiles failed tiles under #168's tolerance.
+    """
+    cp = str(tmp_path / "cp")
+    bad = [_TILES[50], _TILES[150], _TILES[250]][:n_stuck]
+    outcomes = []
+    for _night in range(3):
+        outcome, session = _crawl(
+            monkeypatch,
+            {b: [status(503)] * 50 for b in bad},
+            connection_limit=1,
+            checkpoint_path=cp,
+        )
+        outcomes.append(outcome)
+        if not isinstance(outcome, BaseException):
+            break
+    assert len(outcomes) == 1, [type(o).__name__ for o in outcomes]
+    result = outcomes[0]
+    assert sorted(result["failed_tiles"]) == sorted(bad)
+    for b in bad:
+        urls = [u for u in session.urls if f"/{b[0]}/{b[1]}?" in u]
+        assert len(urls) == dm.TILE_BACKPRESSURE_TILE_TRIES
+
+
+def test_a_tiles_own_retry_is_no_strike(monkeypatch, tmp_path, limiters, holds):
+    """Two stuck tiles side by side, no tile served between them: no strike is
+    withdrawn before tile 2's first 429, so only the first-response rule keeps
+    the crawl from pausing there (it is the second episode, not the third)."""
+    stuck = {xy: [status(503)] * 5 for xy in _TILES[1:3]}
+    result, session = _crawl(
+        monkeypatch, stuck, connection_limit=1, checkpoint_path=str(tmp_path / "cp")
+    )
+    assert not isinstance(result, BaseException), result
+    assert sorted(result["failed_tiles"]) == sorted(_TILES[1:3])
+
+
+def test_a_host_wide_503_storm_still_pauses_at_the_third_episode(
+    monkeypatch, tmp_path, limiters, holds
+):
+    """Every tile answers 503 to everything: nothing is served between the
+    stuck tiles, so no strike is withdrawn -- tiles 0, 1 and 2 are three
+    episodes and the crawl pauses as THROTTLED, as before the round-2 fix."""
+    storm = {xy: [status(503)] * 5 for xy in _TILES}
+    error, session = _crawl(
+        monkeypatch, storm, connection_limit=1, checkpoint_path=str(tmp_path / "cp")
+    )
+    assert type(error) is HostThrottledError, error
+    assert host_exit_code(error) == _THROTTLED
+    assert "3 HTTP 429/503 episodes" in str(error)
+    assert error.units_done == 0
+    # Tiles 0 and 1 drew both their responses, tile 2 its first: 5 requests.
+    assert len(session.urls) == error.api_requests == 5
+
+
 def test_responses_inside_one_hold_are_one_episode_not_three_strikes(
     monkeypatch, tmp_path, limiters, holds, caplog
 ):
