@@ -1065,6 +1065,8 @@ A hold keeps a host's channels from launching without anything having refused us
   - `test_ignore_host_holds_launches_and_says_so` and `test_the_override_flag_reaches_cmd_run_due`.
   - `test_the_rest_night_is_read_on_the_utc_snapshot_date` — 00:30 UTC Wednesday (Tuesday evening in Pacific) is a Wednesday rest night.
   - `test_the_dry_run_shows_the_hold` and `test_status_names_the_rest_weekdays_and_whether_today_is_one`.
+  - `test_a_wholly_held_city_takes_no_slot_live_or_in_the_preview` — at `--limit 1`, the night passes over a city due only on the held pair and collects the next one, and the preview names that same next city instead of spending its one row on the held one (killed by slicing `due[:day_cap]` again).
+  - `test_the_preview_counts_held_pairs_as_holding_the_fill` — a held due pair is unattempted, so the preview's fill section says it holds the fill on both Mapillary channels, as the live rule does (killed by deleting the held branch's `preview_unfinished` increment, the review's surviving M10).
   - `test_the_fill_declines_a_city_whose_channel_is_on_a_held_host` and `test_the_live_fill_is_handed_the_runs_holds` (the pass-through into `_fill_admission`).
   - `test_a_hold_never_enters_the_breakers_set`.
   - `test_a_rest_night_holds_the_mapillary_pair_and_the_answer_is_incomplete` (assess-city): the GSV walk still runs, the summary says HELD and not "refused", and the exit is 1.

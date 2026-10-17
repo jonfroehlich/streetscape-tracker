@@ -928,3 +928,55 @@ def test_the_done_line_names_each_metered_hosts_presence_and_the_gap_before_it(
         "17.6 h after its previous ledgered request"
     ) in done
     assert done.count("UTC (") == 1
+
+
+# ── the dry run walks the queue the way the night does (#444 review) ─────
+
+
+def _wholly_held_then_due(conn):
+    """A: due only on the held Mapillary pair (its gsv succeeded today). B: due everywhere."""
+    a = _register(conn, "Albany")
+    b = _register(conn, "Bend")
+    db.record_attempt(conn, a, success=True, provider="gsv")
+    return a, b
+
+
+def test_a_wholly_held_city_takes_no_slot_live_or_in_the_preview(
+    conn, monkeypatch, tmp_path, capsys
+):
+    """At --limit 1 the night passes over a city whose every due channel is
+    held and collects the next one; the preview must name the same city,
+    not spend its one row on the held one."""
+    a, b = _wholly_held_then_due(conn)
+    cfg = _cfg(tmp_path)
+
+    rc, launches, _ = _night(monkeypatch, conn, cfg, limit=1)
+    assert rc == 0
+    assert launches == [(b, "gsv")]
+
+    conn.execute("DELETE FROM schedule_state WHERE city_id = ? AND provider = 'gsv'", (b,))
+    conn.commit()
+    capsys.readouterr()
+    rc, launches, _ = _night(monkeypatch, conn, cfg, limit=1, dry_run=True)
+    out = capsys.readouterr().out
+    assert rc == 0 and launches == []
+    rows = [
+        ln.split() for ln in out.splitlines() if ln.startswith("  ") and ln.split()[0] in (a, b)
+    ]
+    assert [r[:2] for r in rows] == [[b, "gsv"], [b, "mapillary"], [b, "mapillary_streets"]], out
+    assert a not in out
+    assert "(1 due city(ies) HELD on every channel passed over" in out
+
+
+def test_the_preview_counts_held_pairs_as_holding_the_fill(conn, monkeypatch, tmp_path, capsys):
+    """A held due pair is unattempted, so -- the live rule -- it holds the fill
+    on that channel; the preview must say so too (mutation M10 of the review)."""
+    _register(conn, "Bend")
+    cfg = _cfg(tmp_path, fill=True)
+    rc, _launches, _ = _night(monkeypatch, conn, cfg, dry_run=True)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert (
+        "Fill: holding mapillary, mapillary_streets — the due slate leaves mapillary 1 "
+        "unfinished, mapillary_streets 1 unfinished."
+    ) in out, out

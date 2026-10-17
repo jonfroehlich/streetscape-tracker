@@ -9854,13 +9854,32 @@ def cmd_run_due(
         for host, hold in holds.current().items():
             if host in run_hosts:
                 print(f"  HELD tonight — {hold.describe()} (issue #444)")
-        for city in due[:day_cap]:
-            for provider in providers_for_city[city.city_id]:
-                held_by = [
-                    hold
-                    for host, hold in holds.current().items()
-                    if host in CHANNEL_HOSTS.get(provider, ())
-                ]
+        current_holds = holds.current()
+
+        def _held_by(provider: str) -> list[HostHold]:
+            hosts = CHANNEL_HOSTS.get(provider, ())
+            return [hold for host, hold in current_holds.items() if host in hosts]
+
+        # Walk the queue the way the live loop does (issue #444 review): a city
+        # whose every due channel is HELD launches nothing, so the night counts
+        # it against no city-cap slot (`processed` moves only on an attempted
+        # city) and asks the next one. Slicing `due[:day_cap]` spent a preview
+        # row on it instead, and the preview then stopped short of cities the
+        # night reaches. Its held pairs still hold the fill, as they do live.
+        previewed = 0
+        passed_over = 0
+        for city in due:
+            if previewed >= day_cap:
+                break
+            city_channels = providers_for_city[city.city_id]
+            if city_channels and all(_held_by(p) for p in city_channels):
+                passed_over += 1
+                for provider in city_channels:
+                    preview_unfinished[provider] += 1
+                continue
+            previewed += 1
+            for provider in city_channels:
+                held_by = _held_by(provider)
                 if held_by:
                     # The live gate's answer, asked of the same instance: a held
                     # channel launches nothing and spends nothing. It is due
@@ -9974,6 +9993,11 @@ def cmd_run_due(
                     # channel unfinished, which holds it in the fill (issue
                     # #404) -- unless no night could run it, the live rule.
                     preview_unfinished[provider] += 1
+        if passed_over:
+            print(
+                f"  ({passed_over:,} due city(ies) HELD on every channel passed over, as the "
+                f"night passes them: they take no city-cap slot; issue #444)"
+            )
         if cfg.fill_min_days is not None:
             _print_fill_preview(
                 cfg,
