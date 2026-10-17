@@ -1008,3 +1008,18 @@ def test_the_preview_counts_held_pairs_as_holding_the_fill(conn, monkeypatch, tm
         "Fill: holding mapillary, mapillary_streets — the due slate leaves mapillary 1 "
         "unfinished, mapillary_streets 1 unfinished."
     ) in out, out
+
+
+def test_a_passed_over_citys_held_pairs_still_hold_the_fill(conn, monkeypatch, tmp_path, capsys):
+    """A city the preview passes over (held on every due channel) is still
+    unattempted due work, so it holds the fill on those channels, as it does live."""
+    a = _register(conn, "Albany")
+    db.record_attempt(conn, a, success=True, provider="gsv")
+    rc, _launches, _ = _night(monkeypatch, conn, _cfg(tmp_path, fill=True), dry_run=True)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "(1 due city(ies) HELD on every channel passed over" in out
+    assert (
+        "Fill: holding mapillary, mapillary_streets — the due slate leaves mapillary 1 "
+        "unfinished, mapillary_streets 1 unfinished."
+    ) in out, out
