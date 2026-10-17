@@ -600,7 +600,9 @@ A redirect or a 200 error page is REFUSED (exit 75); a tile or a 404 is CLEARED 
 A 429/503 is not a refusal because the collector reads both as backpressure (it waits, slows and at worst stops THROTTLED, exit 87, which latches the host for the night but records no refusal), and a probe that recorded one would arm the cooldown on an answer the collector itself would have waited out; the probe prints the `Retry-After` when there is one.
 The two read the statuses from one place: `host_probe.classify_mapillary` imports the collector's `TILE_BACKPRESSURE_STATUSES` and `TILE_REDIRECT_STATUSES`, so a status the collector does not treat as a redirect (a 304) is never a REFUSED probe.
 A request that got an answer is charged to the `mapillary` ledger.
-It refuses (64, nothing sent) while any `run-due` is in flight (`_run_due_in_flight`) and inside the host's cooldown unless `--force`, and exits 79 when another process holds the host lock.
+It refuses (64, nothing sent) while any `run-due` is in flight (`_run_due_in_flight`), on the host's rest day unless `--force`, and inside the host's cooldown unless `--force`, and exits 79 when another process holds the host lock.
+The rest day is read exactly as `run-due` reads it, `rest_weekdays` on the UTC snapshot date, because a rest night is meant to be zero presence on the host for #444's Stage 1 test and a probe is a request.
+`--force` skips the rest-day and cooldown checks and nothing else; it never probes beside a `run-due` in flight.
 The lock is taken in `host_probe.py`, never in `scheduler.py`, whose source must not name the lock module (#208): the parent-must-not-hold rule is about children it spawns, and `probe-host` spawns none.
 It retires the untracked two-request `probe_mapillary_block.sh` on makelab2.
 
@@ -919,7 +921,7 @@ scheduler run-due --provider panoramax,panoramax_streets --limit 5
 The same recipe is how a KartaView tranche is exercised, and it is the only supported bulk path either way — never a detached script.
 The filtered run advances only those channels' clocks, which for a first collection costs nothing (there is no paired snapshot to un-pair yet).
 
-**`probe-host HOST [--force]`** (#444) sends exactly one request to a per-IP host, prints the verdict and records it in `host_refusals`; it refuses while a `run-due` is in flight and inside the host's refusal cooldown unless `--force`. See the standing-holds section above.
+**`probe-host HOST [--force]`** (#444) sends exactly one request to a per-IP host, prints the verdict and records it in `host_refusals`; it refuses while a `run-due` is in flight, and on the host's rest day or inside its refusal cooldown unless `--force` (which never skips the in-flight check). See the standing-holds section above.
 
 **`notify-failure`** emails the recent scheduler-log tail and is wired as the unit's `OnFailure=` hook (`deploy/systemd/streetscape-tracker-notify@.service`), so a crash that never reaches the in-run alerting still produces an email.
 It exits 0 when it alerted (or alerting is intentionally off) and 1 only when a send was attempted and failed, so the notify unit's own status is meaningful.

@@ -888,7 +888,7 @@ def test_a_probe_refusal_starts_the_cooldown_a_night_then_honours(
     assert launches == [(a, "gsv")]
 
 
-@pytest.mark.parametrize("status", [*range(300, 309), 429, 503, 304])
+@pytest.mark.parametrize("status", [*range(300, 309), 429, 503])
 def test_the_probe_reads_redirects_and_backpressure_as_the_collector_does(status):
     """S4 of the #444 review: the probe imports the collector's two status
     sets rather than restating them, and agrees with `_fetch_tile` itself on
@@ -1020,6 +1020,98 @@ def test_probe_host_refuses_inside_the_cooldown_unless_forced(conn, probe_env, c
     assert "cooling down until 2026-10-16 01:00 UTC" in caplog.text
     assert sched.cmd_probe_host(probe_env, HOST_MAPILLARY_TILES, fetch=fetch, force=True) == 0
     assert len(fetch.urls) == 1
+
+
+# ── probe-host on a rest day (S5 of the #444 review) ──────────────────────
+
+# 05:00 UTC Wednesday is 22:00 PDT TUESDAY, and 03:00 UTC Thursday is 20:00 PDT
+# WEDNESDAY: the two instants where the UTC date and the Pacific one differ.
+_WED_UTC_TUE_PACIFIC = datetime(2026, 10, 14, 5, 0, tzinfo=UTC)
+_THU_UTC_WED_PACIFIC = datetime(2026, 10, 15, 3, 0, tzinfo=UTC)
+
+
+@pytest.fixture
+def pacific_tz(monkeypatch):
+    """Run with the machine's local zone set to Pacific, as on makelab2, so a
+    probe reading a LOCAL date reads the other weekday and fails these tests."""
+    import time as _time
+
+    monkeypatch.setenv("TZ", "America/Los_Angeles")
+    _time.tzset()
+    yield
+    monkeypatch.undo()
+    _time.tzset()
+
+
+@pytest.fixture
+def rest_probe_env(probe_env, tmp_path):
+    return _cfg(tmp_path, 'refusal_cooldown_h = 36\nrest_weekdays = ["Wed"]\n')
+
+
+def test_probe_host_refuses_on_a_rest_day_read_in_utc(
+    conn, rest_probe_env, frozen_utc_clock, pacific_tz, caplog
+):
+    frozen_utc_clock(_WED_UTC_TUE_PACIFIC)
+    fetch = _Fetch()
+    with caplog.at_level(logging.ERROR, logger="streetscape_scheduler"):
+        rc = sched.cmd_probe_host(rest_probe_env, HOST_MAPILLARY_TILES, fetch=fetch)
+    assert rc == sched.USAGE_EXIT_CODE
+    assert fetch.urls == [] and _verdicts(conn) == []
+    assert db.get_api_usage(conn, date(2026, 10, 14), provider="mapillary") == 0
+    assert "rest night (Wed)" in caplog.text
+    assert "zero presence" in caplog.text and "Stage 1" in caplog.text
+    assert "--force skips the rest-day and cooldown checks" in caplog.text
+
+
+def test_probe_host_on_a_pacific_wednesday_that_is_a_utc_thursday_proceeds(
+    conn, rest_probe_env, frozen_utc_clock, pacific_tz
+):
+    frozen_utc_clock(_THU_UTC_WED_PACIFIC)
+    fetch = _Fetch()
+    assert sched.cmd_probe_host(rest_probe_env, HOST_MAPILLARY_TILES, fetch=fetch) == 0
+    assert len(fetch.urls) == 1
+
+
+def test_probe_host_on_a_non_rest_day_is_unaffected(conn, rest_probe_env):
+    """probe_env's frozen instant is a Thursday: no rest, no cooldown."""
+    fetch = _Fetch()
+    assert sched.cmd_probe_host(rest_probe_env, HOST_MAPILLARY_TILES, fetch=fetch) == 0
+    assert len(fetch.urls) == 1
+
+
+def test_force_probes_on_a_rest_day(conn, rest_probe_env, frozen_utc_clock, caplog):
+    frozen_utc_clock(_WED_UTC_TUE_PACIFIC)
+    fetch = _Fetch()
+    with caplog.at_level(logging.WARNING, logger="streetscape_scheduler"):
+        rc = sched.cmd_probe_host(rest_probe_env, HOST_MAPILLARY_TILES, fetch=fetch, force=True)
+    assert rc == 0 and len(fetch.urls) == 1
+    assert "probing on a rest day" in caplog.text
+
+
+def test_force_never_skips_the_run_due_in_flight_check(
+    conn, monkeypatch, rest_probe_env, frozen_utc_clock
+):
+    """On a rest day and inside a cooldown alike: --force overrides those two
+    holds, never a probe beside a live night."""
+    monkeypatch.setattr(sched, "_run_due_in_flight", lambda: "pid 4242: python -m ... run-due")
+    for instant, refused in ((_WED_UTC_TUE_PACIFIC, False), (_NIGHT_START, True)):
+        frozen_utc_clock(instant)
+        if refused:
+            _refused(conn, 20)
+        fetch = _Fetch()
+        rc = sched.cmd_probe_host(rest_probe_env, HOST_MAPILLARY_TILES, fetch=fetch, force=True)
+        assert rc == sched.USAGE_EXIT_CODE
+        assert fetch.urls == []
+
+
+def test_the_cooldown_refusal_says_what_force_skips(conn, rest_probe_env, caplog):
+    _refused(conn, 20)
+    with caplog.at_level(logging.ERROR, logger="streetscape_scheduler"):
+        rc = sched.cmd_probe_host(rest_probe_env, HOST_MAPILLARY_TILES, fetch=_Fetch())
+    assert rc == sched.USAGE_EXIT_CODE
+    assert "--force skips the rest-day and cooldown checks, never the run-due-in-flight" in (
+        caplog.text
+    )
 
 
 def test_probe_host_refuses_while_another_process_holds_the_host_lock(conn, probe_env):

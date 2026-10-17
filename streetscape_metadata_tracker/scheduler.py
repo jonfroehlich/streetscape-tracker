@@ -369,10 +369,14 @@ class HostHolds:
 
     def active(self, host: str) -> HostHold | None:
         """The hold on ``host`` right now, or None. A rest night outranks a cooldown."""
+        return self.rest(host) or self.cooldown(host)
+
+    def rest(self, host: str) -> HostHold | None:
+        """The rest-night hold on ``host`` for this run's date, or None."""
         day = self._rest.get(host)
         if day is not None:
             return HostHold(host, HOLD_REST, day)
-        return self.cooldown(host)
+        return None
 
     def cooldown(self, host: str) -> HostHold | None:
         """The refusal cooldown on ``host`` right now, rest night or not, or None."""
@@ -4521,9 +4525,15 @@ def cmd_probe_host(
       the check ``import-bundle`` and the pre-freeze pass use) -- a probe in the
       middle of a night is one more talker at the worst moment, and its verdict
       would race the night's own;
+    * on the host's rest day (``[hosts.<token>].rest_weekdays``, read on the
+      UTC snapshot date exactly as ``run-due`` reads it), unless ``force`` --
+      a rest night is meant to be ZERO presence on the host, for #444's Stage 1
+      test, and one probe is presence;
     * inside the host's refusal cooldown, unless ``force`` -- the cooldown is the
       silence the probe exists to end, and probing inside it is the re-probe it
-      exists to prevent;
+      exists to prevent.
+
+    ``force`` skips exactly those two checks, never the in-flight one;
     * on a config the channel-running commands would refuse, an unknown host,
       or a missing token.
 
@@ -4558,12 +4568,25 @@ def cmd_probe_host(
     conn = db.connect(cfg.db_path)
     if today is None:
         today = clock.snapshot_date_today()
-    cooling = _host_holds(cfg, today, conn).cooldown(host)
+    holds = _host_holds(cfg, today, conn)
+    force_skips = "--force skips the rest-day and cooldown checks, never the run-due-in-flight one"
+    resting = holds.rest(host)
+    if resting is not None:
+        if not force:
+            logger.error(
+                f"probe-host: {resting.describe()} for {today.isoformat()} (UTC) -- refusing "
+                f"to probe. Rest nights are meant to be zero presence on this host for issue "
+                f"#444's Stage 1 test, and a probe is a request. Pass --force to probe anyway "
+                f"({force_skips})."
+            )
+            return USAGE_EXIT_CODE
+        logger.warning(f"probe-host --force: probing on a rest day ({resting.describe()})")
+    cooling = holds.cooldown(host)
     if cooling is not None:
         if not force:
             logger.error(
                 f"probe-host: {cooling.describe()} -- refusing to probe inside the "
-                f"cooldown. Pass --force to probe anyway (issue #444)."
+                f"cooldown. Pass --force to probe anyway ({force_skips}; issue #444)."
             )
             return USAGE_EXIT_CODE
         logger.warning(f"probe-host --force: probing inside the cooldown ({cooling.describe()})")
@@ -14745,7 +14768,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_probe.add_argument(
         "--force",
         action="store_true",
-        help="Probe even inside the host's [hosts.*].refusal_cooldown_h cooldown",
+        help="Probe even on the host's rest day ([hosts.*].rest_weekdays) or inside its "
+        "refusal_cooldown_h cooldown; never while a run-due is in flight",
     )
     p_assess = sub.add_parser(
         "assess-city",

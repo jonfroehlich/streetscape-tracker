@@ -462,7 +462,7 @@ It exists because the 02:00 nightly re-probed the IP ~20 h into the 10-16 block,
 
 **Refusals are now persisted** (`host_refusals`, schema v22), with each one's `requests_before` (the host's 24 h ledger total at the refusal), and the `Done:` line names each metered host's hours of presence and the gap since its previous ledgered request — the two quantities #444 had to rebuild by hand for every onset.
 
-**`scheduler probe-host mapillary_tiles` replaces the untracked probe script** in the recovery protocol below: exactly one request, one z14 tile, one token, redirects not followed, the verdict recorded, and refused while a `run-due` is in flight or inside the cooldown unless `--force`.
+**`scheduler probe-host mapillary_tiles` replaces the untracked probe script** in the recovery protocol below: exactly one request, one z14 tile, one token, redirects not followed, the verdict recorded, and refused while a `run-due` is in flight, or on a rest day or inside the cooldown unless `--force` (a rest night is zero presence for the Stage 1 test).
 A clearance it records does not end the cooldown; only the newest refusal is counted.
 Mechanism, posture and tests: `docs/scheduler.md`, the standing-holds section, and `docs/testing.md`.
 
