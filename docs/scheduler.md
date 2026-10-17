@@ -562,6 +562,9 @@ Before running one by hand, check `scheduler status`, which says whether today i
 **A held walk is held even when it would have cost nothing**: a `mapillary_streets` walk whose grid census is already in the census cache (#290) would send the CDN zero requests, and the gate still holds it, because the hold is decided per host before the walk is priced.
 Accepted as conservative: the walk stays due and lands on the next unheld night, when it is still a cache hit if the census is young enough or a full sweep if not.
 The fill declines a city whose channel is on a held host (`_FILL_BLOCKER_HOST_HELD`), because a fill city is admitted whole or not at all; on a rest night the due slate's unattempted Mapillary pairs also hold the fill's Mapillary channels as a backlog, so in practice the fill does not touch the host at all.
+**A rest night can waste part of the bounded opt-in reservation, and that is left as is.**
+`_collect_due` builds the slate without the holds, so on a rest night it still hoists Mapillary-only-due cities and live-checkpoint resumers into the `opt_in_cities_per_day` slots, the loop then passes over them as held, and those slots are not handed back to the plain queue or the refresh reserve.
+The cost is at most that reservation's share of two nights a week; teaching the slate about holds would make the hoist's rotation depend on the weekday, so it is noted for the Maintainer rather than changed.
 `assess-city` treats a held channel as an incomplete answer (exit 1), like a refused one, without claiming anything refused us.
 `run-due --ignore-host-holds` lifts both kinds for one invocation, logged at WARNING; the nightly unit never passes it.
 
