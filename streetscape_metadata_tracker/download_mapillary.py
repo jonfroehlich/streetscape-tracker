@@ -1951,10 +1951,12 @@ async def _fetch_city_images(
         """
         Record one 429/503: halve the pace, and say how long to hold.
 
-        Returns the seconds to hold every request for, or None when the crawl
-        is to PAUSE instead -- on the TILE_BACKPRESSURE_PAUSE_AFTER-th EPISODE,
-        on a Retry-After past TILE_BACKPRESSURE_MAX_WAIT_S, or on a wait that
-        would outlast the deadline.
+        Returns the seconds to hold every request for, or None when there is
+        to be no hold: either the crawl PAUSES -- on the
+        TILE_BACKPRESSURE_PAUSE_AFTER-th EPISODE, on a Retry-After past
+        TILE_BACKPRESSURE_MAX_WAIT_S, or on a wait that would outlast the
+        deadline -- or it is already stopping (below), when nothing will be
+        sent after the hold anyway.
 
         ``sent_generation`` is the pacer's generation when the answered request
         was sent. Older than the current one means a hold began after it went
@@ -1981,12 +1983,29 @@ async def _fetch_city_images(
             # crawl, and the refusal's exit 75 must win.
             return None
         wait = backpressure_wait_seconds(retry_after_seconds(e.retry_after))
+        # Already stopping (round-2 review of #444): the cap or the clock has
+        # turned a tile away (`capped`), or will turn this one away at its
+        # next check. No retry is going out, so a hold would only sleep with
+        # the machine-wide tile lock held. Escalate to the backpressure pause
+        # only for what says something about the HOST -- the third episode,
+        # or a Retry-After past the in-process ceiling -- and never for
+        # "outlasts the deadline": no wait is going to happen anyway, and
+        # after a clock stop every wait outlasts it, which turned an ordinary
+        # exit 83 into an 87. Otherwise the stop stays the cap's or clock's.
+        stopping = (
+            capped
+            or crawl_deadline_passed(deadline_monotonic)
+            or (max_requests is not None and api_requests + reserved >= max_requests)
+        )
+        if stopping and wait is not None and backpressure_events < TILE_BACKPRESSURE_PAUSE_AFTER:
+            return None
         # A hold that would outlast the crawl's wall-clock budget is not slept
         # either: the scheduler forwards that budget as its SIGKILL timeout
         # less a 600 s margin, and a 900 s hold begun inside the margin would be
-        # killed mid-sleep -- counted a failure, where pausing now is exit 83.
+        # killed mid-sleep -- counted a failure, where pausing now is exit 87.
         outlasts_deadline = (
-            wait is not None
+            not stopping
+            and wait is not None
             and deadline_monotonic is not None
             and time.monotonic() + wait >= deadline_monotonic
         )

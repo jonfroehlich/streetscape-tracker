@@ -880,6 +880,8 @@ Now:
    Both RFC 9110 forms are read, delay-seconds and HTTP-date; a missing or unreadable header means 60 s, and so does one that cannot be parsed at all (Unicode digits, thousands of digits, a date `datetime` cannot hold) — parsing never raises.
 3. A `Retry-After` longer than **900 s** is not slept on, and neither is a hold that would end past the crawl's wall-clock budget: the crawl stops at once (rule 7).
    Retrying before the time the server named would disobey it, and a sleep that long belongs to the next night rather than to this one's host lock.
+   **A crawl already stopping never holds** — once the request cap or the clock has turned a tile away, or would turn the retry away: no retry is going out, so a hold would only sleep with the tile lock held.
+   It escalates to the backpressure stop only for what says something about the host (the third episode, or a `Retry-After` past 900 s), never for outlasting the deadline, which after a clock stop every wait does; otherwise the stop stays the cap's or the clock's exit 83 (round-2 review of #444).
 4. The pace is **halved once** for the rest of that crawl (`AsyncRateLimiter.slow_down(2)`), on the limiter the crawl builds for itself, so it cannot reach another crawl or another process.
 5. The tile is then retried by re-entering the in-semaphore checks, so the abort, the request cap with its reservation, and the wall-clock deadline gate the retry exactly as they gate a fresh tile.
    Every HTTP request, the 429 included, is counted once in `api_requests`.

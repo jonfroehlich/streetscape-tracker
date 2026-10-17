@@ -677,6 +677,81 @@ def test_a_hold_that_would_outlast_the_deadline_pauses_instead(
     assert len(session.urls) == 4
 
 
+# ── Backpressure after the crawl already stopped (round-2 review of #444) ─
+
+
+def _slow(code, delay, **headers):
+    r = status(code, **headers)
+    r.delay = delay
+    return r
+
+
+def test_a_429_after_the_cap_tripped_neither_holds_nor_throttles(
+    monkeypatch, tmp_path, limiters, holds
+):
+    """Tile 0's 429 lands after tile 1 spent the cap and tile 2 was turned
+    away: no retry can go out, so a hold would only sleep holding the
+    machine-wide tile lock. It stays the cap's exit 83."""
+    script = {_TILES[0]: [_slow(429, 0.05, **{"Retry-After": "5"}), ok()]}
+    error, session = _crawl(
+        monkeypatch,
+        script,
+        connection_limit=2,
+        max_requests=2,
+        checkpoint_path=str(tmp_path / "cp"),
+    )
+    assert type(error) is SweepIncompleteError, error
+    assert error.stopped_by == "requests"
+    assert holds == []
+    assert len(session.urls) == error.api_requests == 2
+
+
+def test_a_429_after_a_clock_stop_is_still_the_clocks_83_not_87(
+    monkeypatch, tmp_path, limiters, holds
+):
+    """After a clock stop every wait "outlasts the deadline", so this used to
+    become exit 87 on any first 429. No wait is going to happen, so it no
+    longer escalates: the stop is the clock's."""
+    import time as _time
+
+    script = {
+        _TILES[0]: [_slow(429, 0.3)],
+        _TILES[1]: [_slow(200, 0.1, **{"Content-Type": "application/x-protobuf"})],
+    }
+    error, session = _crawl(
+        monkeypatch,
+        script,
+        connection_limit=2,
+        checkpoint_path=str(tmp_path / "cp"),
+        deadline_monotonic=_time.monotonic() + 0.05,
+    )
+    assert type(error) is SweepIncompleteError, error
+    assert error.stopped_by == "clock"
+    assert holds == []
+    assert len(session.urls) == 2
+
+
+def test_a_long_retry_after_after_the_cap_tripped_is_still_throttled(
+    monkeypatch, tmp_path, limiters, holds
+):
+    """A Retry-After past the ceiling says something about the HOST, so it
+    still escalates to exit 87 after a cap stop -- which also pins that the
+    throttle is chosen on `backpressure_paused`, not on `stop_reason` (the cap
+    set that first, to "requests")."""
+    script = {_TILES[0]: [_slow(429, 0.05, **{"Retry-After": "3600"})]}
+    error, session = _crawl(
+        monkeypatch,
+        script,
+        connection_limit=2,
+        max_requests=2,
+        checkpoint_path=str(tmp_path / "cp"),
+    )
+    assert type(error) is HostThrottledError, error
+    assert host_exit_code(error) == _THROTTLED
+    assert "Retry-After" in str(error)
+    assert holds == []
+
+
 def test_a_shorter_hold_never_cuts_short_a_longer_one(monkeypatch):
     """Overlapping holds end at the LATEST requested end.
 
