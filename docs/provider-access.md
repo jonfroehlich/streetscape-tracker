@@ -898,7 +898,7 @@ Now:
 
 **Why 900 s.**
 The only cooldown ever reported for a Mapillary tile block is thread 5821's 15-minute sleep, a hint rather than a contract.
-And with the pause at the third episode, a crawl holds in at most two episodes, each lasting the longest wait asked for inside it (at most 900 s), so it holds the machine-wide tile lock for at most 30 minutes of sleeping.
+And with the pause at the third episode, a crawl holds in at most two episodes, each lasting the longest wait asked for inside it (at most 900 s), so it holds the machine-wide tile lock for about 30 minutes of sleeping — not exactly, since a same-episode response can extend a hold by up to one request timeout (30 s).
 That is well inside prod's 180-minute per-city timeout floor (`city_timeout_minutes`).
 **A hold that would end past the crawl's wall-clock budget is not slept at all**: the crawl stops at once instead.
 The scheduler forwards that budget as the child's SIGKILL timeout less a 600 s margin (`_crawl_max_seconds`), so a 900 s hold begun inside the margin would be killed mid-sleep and counted a failure, where stopping is the amnestied exit 87.

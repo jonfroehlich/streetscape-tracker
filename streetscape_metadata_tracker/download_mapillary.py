@@ -656,8 +656,9 @@ TILE_BACKPRESSURE_MIN_WAIT_S = 60.0
 # found by trial and error by a forum user (thread 5821) -- a hint, not a
 # contract. And a crawl holds in at most PAUSE_AFTER - 1 = 2 episodes before
 # the third pauses it, each lasting the longest wait asked inside it, so it
-# holds the machine-wide tile lock for at most 30 minutes of sleeping: far
-# inside prod's 180-minute per-city timeout floor. A hold that would run past
+# holds the machine-wide tile lock for about 30 minutes of sleeping -- not
+# exactly, since a same-episode response can extend a hold by up to one request
+# timeout -- far inside prod's 180-minute per-city timeout floor. A hold that would run past
 # the crawl's own deadline is not slept at all (see on_backpressure).
 TILE_BACKPRESSURE_MAX_WAIT_S = 900.0
 # Counted in EPISODES, not responses (review of #444): a 429/503 answering a
