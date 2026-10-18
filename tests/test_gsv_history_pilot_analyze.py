@@ -92,6 +92,7 @@ def test_pass_summary_and_edge_gain(tmp_path):
     assert p1["anchored_samples"] == 2 and p1["anchor_in_history"] == 1
     assert p1["anchor_in_history_share"] == 0.5
     assert p1["zero_history_samples"] == 1 and p1["third_party_rows"] == 1
+    assert p1["unanchored_samples"] == 1 and p1["unanchored_samples_with_history"] == 0
     assert p1["history_rows"] == 5 and p1["distinct_official_panos"] == 4
     assert p1["capture_year_histogram"] == {"2011": 1, "2014": 1, "2019": 2}
     assert p1["elapsed_min"] == 2.0 and p1["achieved_rate_per_min"] == 1.5

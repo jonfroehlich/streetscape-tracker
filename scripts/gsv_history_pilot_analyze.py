@@ -62,6 +62,13 @@ def summarize_pass(queries: pd.DataFrame, history: pd.DataFrame, worklist_rows: 
         "dated_panos_per_sample_mean": round(float(queries["panos_dated"].mean()), 3),
         "dated_panos_per_sample_pctiles": _pct(queries["panos_dated"]),
         "zero_history_samples": int((queries["panos_dated"] == 0).sum()),
+        # Samples the walk found no current official pano at: does the
+        # service still know captures there? (the issue's question 3)
+        "unanchored_samples": int((~anchored).sum()),
+        "unanchored_samples_with_history": int((~anchored & (queries["panos_dated"] > 0)).sum()),
+        "unanchored_dated_panos_mean": round(float(queries.loc[~anchored, "panos_dated"].mean()), 3)
+        if (~anchored).sum()
+        else None,
         "history_rows": int(len(history)),
         "third_party_rows": int(len(history) - len(official)),
         "distinct_official_panos": int(official["pano_id"].nunique()),
