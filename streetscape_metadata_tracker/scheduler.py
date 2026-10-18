@@ -87,6 +87,7 @@ from .download_common import (
     CHANNEL_METERED_HOST,
     HOST_BY_BUSY_EXIT_CODE,
     HOST_BY_EXIT_CODE,
+    HOST_BY_THROTTLED_EXIT_CODE,
     HOST_KARTAVIEW,
     HOST_LABELS,
     HOST_MAPILLARY_TILES,
@@ -298,13 +299,163 @@ HOST_RECHECKS: dict[str, Callable[[], bool]] = {
 }
 
 
+# Why a per-IP host is HELD for a run (issue #444) -- the two standing
+# conditions that keep a host's channels from launching without anything having
+# refused us tonight. Neither is the breaker's business: a hold is decided
+# before the night from config and the catalog, and it never trips, alerts,
+# records a failure or changes the exit status. The cities stay due.
+HOLD_REST = "rest night"
+HOLD_COOLDOWN = "cooling down"
+
+
+@dataclass(frozen=True)
+class HostHold:
+    """One host held for this run, and why, for the log and the ``Done:`` line."""
+
+    host: str
+    reason: str
+    # Human-readable specifics: "Wed" for a rest night; for a cooldown, its end
+    # and the refusal it counts from.
+    detail: str
+
+    def describe(self) -> str:
+        """``...: rest night (Wed)`` or ``...: cooling down until 2026-10-18 21:03 UTC (...)``."""
+        label = HOST_LABELS.get(self.host, self.host)
+        if self.reason == HOLD_COOLDOWN:
+            return f"{label}: {self.reason} {self.detail}"
+        return f"{label}: {self.reason} ({self.detail})"
+
+
+def _utc_minute(when: datetime) -> str:
+    """``2026-10-18 21:03 UTC``: how a hold names an instant."""
+    return when.astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC")
+
+
+class HostHolds:
+    """The standing holds on per-IP hosts for one run (issue #444).
+
+    Built once per run by :func:`_host_holds` from config and the run's snapshot
+    date; asked per launch with :meth:`active`. A rest night holds for the
+    whole run, whatever the wall clock does, because it is a property of the
+    run's DATE: a night that starts on a Tuesday (UTC) and runs past midnight is
+    still a Tuesday night, the same way all its runs are dated Tuesday.
+
+    A refusal COOLDOWN is the other kind: it holds until a fixed instant, the
+    newest refusal before the run plus the host's ``refusal_cooldown_h``, so
+    it is read against the wall clock at each ask and can end mid-run -- a
+    night that starts 30 h after a refusal under a 36 h cooldown launches its
+    Mapillary channels from hour 6 on. It never STARTS mid-run: the refusals
+    it counts from were all recorded before the run began, and a refusal
+    tonight is the breaker's to handle.
+
+    The empty instance (no arguments) holds nothing, which is what every caller
+    that predates #444 gets.
+    """
+
+    def __init__(
+        self,
+        rest: dict[str, str] | None = None,
+        cooldowns: dict[str, tuple[datetime, datetime]] | None = None,
+        now: Callable[[], datetime] | None = None,
+    ):
+        # host -> the weekday name it rests on tonight. Only hosts resting
+        # TONIGHT are here; the config's full weekday list is not needed.
+        self._rest = dict(rest or {})
+        # host -> (the refusal the cooldown counts from, the instant it ends).
+        self._cooldowns = dict(cooldowns or {})
+        # Read at call time, never bound at import, so a frozen test clock
+        # (`clock._utc_clock`) reaches it.
+        self._now = now or (lambda: clock.utc_now())
+
+    def active(self, host: str) -> HostHold | None:
+        """The hold on ``host`` right now, or None. A rest night outranks a cooldown."""
+        return self.rest(host) or self.cooldown(host)
+
+    def rest(self, host: str) -> HostHold | None:
+        """The rest-night hold on ``host`` for this run's date, or None."""
+        day = self._rest.get(host)
+        if day is not None:
+            return HostHold(host, HOLD_REST, day)
+        return None
+
+    def cooldown(self, host: str) -> HostHold | None:
+        """The refusal cooldown on ``host`` right now, rest night or not, or None."""
+        cooldown = self._cooldowns.get(host)
+        if cooldown is not None:
+            refused_at, until = cooldown
+            if self._now() < until:
+                hours = (until - refused_at).total_seconds() / 3600
+                return HostHold(
+                    host,
+                    HOLD_COOLDOWN,
+                    f"until {_utc_minute(until)} ({hours:g} h after the refusal recorded "
+                    f"{_utc_minute(refused_at)})",
+                )
+        return None
+
+    def hosts(self) -> set[str]:
+        """Every host this instance could hold (an expired cooldown included)."""
+        return set(self._rest) | set(self._cooldowns)
+
+    def current(self) -> dict[str, HostHold]:
+        """Every hold in force right now, by host."""
+        found = {host: self.active(host) for host in sorted(self.hosts())}
+        return {host: hold for host, hold in found.items() if hold is not None}
+
+
+def _host_holds(
+    cfg: "SchedulerConfig",
+    today: date,
+    conn=None,
+    *,
+    ignore: bool = False,
+) -> HostHolds:
+    """The holds for a run dated ``today`` (issue #444).
+
+    ``today`` is the run's snapshot date -- the UTC calendar date
+    (``clock.snapshot_date_today()``, #347) that dates every run it collects
+    and keys its ``api_usage`` rows -- so a rest night and the runs it skipped
+    are dated alike. The nightly fires at 02:00 Pacific, i.e. 09:00 or 10:00
+    UTC, the same calendar day in both zones; a hand-run catch-up after 17:00
+    Pacific is already the NEXT UTC day, and is held or not by that day.
+
+    A refusal cooldown (``[hosts.<token>].refusal_cooldown_h``) needs
+    ``conn``: it reads the newest ``refused`` row in ``host_refusals`` for the
+    host and holds until that instant plus the cooldown. Read ONCE, when the
+    run builds its holds, so a refusal recorded later in the run never becomes
+    a hold mid-run -- that one is the breaker's. A CLEARANCE row never shortens
+    it: one positive probe is evidence the wall is down, not that full volume
+    is safe again. No ``conn``, or no refusal on record, means no cooldown.
+
+    ``ignore`` (``run-due --ignore-host-holds``) returns the empty instance;
+    the caller logs that it did so.
+    """
+    if ignore:
+        return HostHolds()
+    weekday = WEEKDAY_NAMES[today.weekday()]
+    rest = {host: weekday for host, days in cfg.host_rest_weekdays.items() if weekday in days}
+    cooldowns: dict[str, tuple[datetime, datetime]] = {}
+    if conn is not None:
+        for host, hours in cfg.host_refusal_cooldown_h.items():
+            row = db.newest_host_verdict(conn, host, db.HOST_REFUSED)
+            if row is None:
+                continue
+            refused_at = datetime.fromisoformat(row["recorded_at"])
+            if refused_at.tzinfo is None:
+                refused_at = refused_at.replace(tzinfo=UTC)
+            cooldowns[host] = (refused_at, refused_at + timedelta(hours=hours))
+    return HostHolds(rest=rest, cooldowns=cooldowns)
+
+
 class HostBreaker(set):
     """
     The night-level per-IP host breaker (issues #208, #341).
 
-    A ``set`` of the hosts that refused this machine at any point tonight --
-    that membership is MONOTONE, so ``bool(breaker)`` still means "a third
-    party refused us tonight" for the alert and the exit status, and a plain
+    A ``set`` of the hosts that refused or THROTTLED this machine at any point
+    tonight (a throttle is exit 87, issue #444; ``throttled_hosts`` says which
+    were throttles alone) -- that membership is MONOTONE, so ``bool(breaker)``
+    still means "a third party refused or throttled us tonight" for the alert
+    and the exit status, and a plain
     ``==`` against a set of host names keeps working. What is new is
     ``latched``: the subset currently blocking launches. A host leaves
     ``latched`` (never the set itself) when a re-check says it is serving
@@ -362,12 +513,41 @@ class HostBreaker(set):
         cooldown_s: float | None = None,
         max_rechecks: int | None = None,
         clock: Callable[[], float] = time.monotonic,
+        holds: HostHolds | None = None,
+        source: str = "run-due",
     ):
         super().__init__()
+        # The command a refusal is recorded under in host_refusals (issue #444).
+        self.source = source
+        # host -> refusals whose host_refusals write FAILED tonight (#444
+        # review). Each one is a cooldown the next night cannot see.
+        self.unrecorded_refusals: Counter[str] = Counter()
+        # The run's standing holds (issue #444): asked through `holding`, kept
+        # OUT of the set itself so `bool(breaker)` -- the alert and the exit
+        # status -- never sees one. A held host did not refuse us.
+        self.holds = holds if holds is not None else HostHolds()
+        # host -> the hold observed on it this run (first sighting), and the
+        # launches each one held back. `held_launches` counts a launch once
+        # however many held hosts it wanted, like `skipped_launches`.
+        self.held: dict[str, HostHold] = {}
+        self.held_skipped: Counter[str] = Counter()
+        self.held_launches = 0
+        # host -> [first launch, last finish] of any channel touching it this
+        # run (issue #444): how long this IP was PRESENT on the host, which the
+        # ledger's per-child stamps cannot say (each child stamps once, at its
+        # end). Wall-clock UTC instants.
+        self.presence: dict[str, list[datetime]] = {}
         self.cooldown_s = HOST_RECHECK_COOLDOWN_S if cooldown_s is None else cooldown_s
         self.max_rechecks = HOST_RECHECKS_PER_NIGHT if max_rechecks is None else max_rechecks
         self._clock = clock
         self.latched: set[str] = set()
+        # Which hosts tripped the breaker and HOW (issue #444): a refusal
+        # (75/76/81/84) or a throttle (87, the CDN asking for a slower pace).
+        # A host can be in both on one night. Both latch alike; only the
+        # wording differs, because the operator's next move does -- a refusal
+        # arms tomorrow's cooldown, a throttle records nothing.
+        self.refused_hosts: set[str] = set()
+        self.throttled_hosts: set[str] = set()
         self.trips: Counter[str] = Counter()
         self.rechecks: Counter[str] = Counter()
         self.recoveries: Counter[str] = Counter()
@@ -406,16 +586,35 @@ class HostBreaker(set):
         # involved, and the retry pass skips them for the same reason it skips
         # an argv rejection: a second ask can only meet the same deadline.
         self.deadline_stranded: set[tuple[str, str]] = set()
+        # (city_id, walk) pairs stranded by a THROTTLED host (exit 87, issue
+        # #444), so the alert names the cause as a throttle, not a refusal.
+        self.throttled_stranded: set[tuple[str, str]] = set()
         self._next_recheck_at: dict[str, float] = {}
 
-    def add(self, host: str) -> None:
-        """Record that ``host`` refused this machine; latch its channels."""
+    def add(self, host: str, *, throttled: bool = False) -> None:
+        """Record that ``host`` refused (or throttled) this machine; latch its channels."""
         super().add(host)
         self.latched.add(host)
+        (self.throttled_hosts if throttled else self.refused_hosts).add(host)
         self.trips[host] += 1
         self._next_recheck_at[host] = self._clock() + self.cooldown_s
 
     trip = add
+
+    def throttle(self, host: str) -> None:
+        """Latch ``host`` for a THROTTLE (exit 87, issue #444), not a refusal.
+
+        Same latch as :meth:`add` -- the next city would walk into the same
+        429s -- but the caller writes no ``host_refusals`` row, and the alert
+        says "throttled". The tile CDN has no ``HOST_RECHECKS`` entry, so the
+        latch holds for the rest of the run.
+        """
+        self.add(host, throttled=True)
+
+    def throttled_only(self, hosts) -> bool:
+        """True when every host in ``hosts`` latched by throttle alone, never a refusal."""
+        hosts = set(hosts)
+        return bool(hosts) and hosts <= self.throttled_hosts - self.refused_hosts
 
     def _refuse(self, *args, **kwargs):
         """Every other ``set`` mutator, and ``copy``, is refused (issue #341).
@@ -438,6 +637,47 @@ class HostBreaker(set):
         """Hosts that refused us tonight and are not latched now."""
         return {host for host in self if host not in self.latched}
 
+    def mark_present(self, hosts, *, launched: bool) -> None:
+        """Note a launch (``launched``) or a finish on ``hosts`` now (issue #444)."""
+        now = clock.utc_now()
+        for host in hosts:
+            span = self.presence.setdefault(host, [now, now])
+            if launched:
+                span[0] = min(span[0], now)
+            span[1] = max(span[1], now)
+
+    def holding(self, hosts) -> dict[str, HostHold]:
+        """The hosts among ``hosts`` held right now (issue #444), each with its hold.
+
+        Records each hold in ``held`` the first time it is seen, so the
+        ``Done:`` line can name it. Counting the launch it costs is the
+        caller's, because only the caller knows whether a launch was asked.
+        """
+        found: dict[str, HostHold] = {}
+        for host in sorted(hosts):
+            hold = self.holds.active(host)
+            if hold is not None:
+                found[host] = hold
+                self.held.setdefault(host, hold)
+        return found
+
+    def note_holds(self, hosts) -> dict[str, HostHold]:
+        """Record and LOG the holds on ``hosts`` at the start of a run (issue #444).
+
+        Logged once here rather than per launch, so a rest night reads as one
+        WARNING naming the channels it holds; each skipped launch then logs at
+        INFO, like a breaker skip.
+        """
+        found = self.holding(hosts)
+        for host, hold in found.items():
+            held_channels = sorted(c for c, hs in CHANNEL_HOSTS.items() if host in hs)
+            logger.warning(
+                f"{hold.describe()} -- holding {', '.join(held_channels)} for this run. "
+                f"Not a refusal and not a failure: no alert, no breaker trip, and the "
+                f"cities stay due (issue #444)."
+            )
+        return found
+
     def blocking(self, hosts) -> set[str]:
         """The hosts among ``hosts`` still latched, after any due re-check."""
         wanted = self.latched.intersection(hosts)
@@ -453,10 +693,13 @@ class HostBreaker(set):
         busy_host: str | None = None,
         argv_rejected: bool = False,
         deadline: bool = False,
+        throttled: bool = False,
     ) -> None:
         self.stranded.setdefault(city_id, []).append(provider)
         if argv_rejected:
             self.argv_stranded.add((city_id, provider))
+        if throttled:
+            self.throttled_stranded.add((city_id, provider))
         if deadline:
             self.deadline_stranded.add((city_id, provider))
         if busy_host is not None:
@@ -517,6 +760,25 @@ class HostBreaker(set):
                     else " for the rest of the night (re-checks exhausted)"
                 )
             )
+
+
+def _record_refusal(conn, breaker: "HostBreaker", host: str, **fields) -> None:
+    """Persist one host refusal in ``host_refusals`` (issue #444); never raise.
+
+    Called where the scheduler classifies a child exit as a host REFUSAL --
+    the blocked family, 75/76/81/84 -- right beside the breaker trip, on the
+    thread that owns the catalog. A failed write must not cost the rest of the
+    night, its publish or its alert, so it is caught -- but it is NOT silent:
+    that row is the only thing that arms the next night's refusal cooldown,
+    so the host is added to ``breaker.unrecorded_refusals``, which the
+    ``Done:`` line and the alert both name (the night alerts anyway, since a
+    refusal tripped the breaker).
+    """
+    try:
+        db.record_host_verdict(conn, host, db.HOST_REFUSED, **fields)
+    except Exception:  # noqa: BLE001 - a lost record must never end the night
+        logger.exception(f"Could not record the {host} refusal in host_refusals")
+        breaker.unrecorded_refusals[host] += 1
 
 
 class ArgvRejections(Counter):
@@ -1063,7 +1325,19 @@ class SchedulerConfig:
     # backup-status and restore-backup too. run-due and assess-city REFUSE while
     # this is non-empty, because falling back to "no budget" would be the
     # fail-OPEN direction for a guard whose whole job is to hold volume down.
+    # Named for the budget it first held; since #444 it holds every [hosts.*]
+    # key's errors (rest_weekdays too), for the same reason.
     host_budget_errors: list[str] = field(default_factory=list)
+    # [hosts.<token>].rest_weekdays (issue #444): host -> the weekdays, as
+    # WEEKDAY_NAMES entries, on which no channel touching that host launches.
+    # Read against the run's snapshot date (UTC, #347). Empty (the default, and
+    # every host without the key) means no rest night.
+    host_rest_weekdays: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    # [hosts.<token>].refusal_cooldown_h (issue #444): host -> hours after its
+    # newest host_refusals `refused` row during which no channel touching it
+    # launches. Empty (the default) means no cooldown: a host refused last night
+    # is asked again tonight, exactly as before #444.
+    host_refusal_cooldown_h: dict[str, float] = field(default_factory=dict)
     # [alerts] — operator email on unhealthy runs (off by default)
     alerts: AlertConfig = field(default_factory=AlertConfig)
     # [resource_guard] — load/RAM-aware concurrency backoff on shared hosts
@@ -1383,13 +1657,66 @@ def _fill_settings(sched: dict, config_path) -> tuple[int | None, dict[str, int]
     return days, ceilings
 
 
-# The one [hosts.*] key (issue #385). Named for its WINDOW so a later per-host
-# knob of a different shape does not have to rename it.
+# The [hosts.*] budget key (issue #385). Named for its WINDOW so a later per-host
+# knob of a different shape does not have to rename it -- and #444 then added
+# two: rest_weekdays and refusal_cooldown_h.
 _HOST_BUDGET_KEY = "rolling_24h_request_budget"
+# The weekdays on which no channel that touches the host launches (issue #444),
+# as three-letter English names. Read against the run's SNAPSHOT date
+# (`clock.snapshot_date_today()`, the UTC calendar, #347), the same date the
+# night's runs are dated and its ledger rows are keyed by.
+_HOST_REST_KEY = "rest_weekdays"
+# Hours after the newest recorded refusal during which the host's channels do
+# not launch (issue #444): the 02:00 nightly must not re-probe a blocked IP ~20 h
+# into a block. Bounded at a week, so a units typo (minutes, seconds) is caught.
+_HOST_COOLDOWN_KEY = "refusal_cooldown_h"
+_HOST_COOLDOWN_MAX_H = 7 * 24
+_HOST_KEYS = (_HOST_BUDGET_KEY, _HOST_REST_KEY, _HOST_COOLDOWN_KEY)
+# Indexed by `date.weekday()`: Monday is 0.
+WEEKDAY_NAMES = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 
 
-def _host_budgets(table: Any, config_path) -> tuple[dict[str, int], list[str]]:
-    """Read ``[hosts.<token>]`` into ``(host_budgets, errors)`` (issue #385).
+class _HostSettings(NamedTuple):
+    """What ``[hosts.*]`` holds, after validation (issues #385, #444)."""
+
+    budgets: dict[str, int]
+    rest_weekdays: dict[str, tuple[str, ...]]
+    cooldown_h: dict[str, float]
+    errors: list[str]
+
+
+def _rest_weekdays(value: Any, where: str) -> tuple[tuple[str, ...] | None, str | None]:
+    """Validate one ``rest_weekdays`` value: ``(weekdays, None)`` or ``(None, error)``.
+
+    A list of distinct three-letter names (``"Wed"``, case-insensitive on
+    input, canonical on output, in weekday order). Empty is legal and means no
+    rest night. All seven is refused: a host that never runs is
+    ``[providers.*].enabled = false``, which says so in the place an operator
+    looks, rather than a rest table that reads like a schedule.
+    """
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+        return None, f"{where}: {_HOST_REST_KEY}={value!r} is not a list of weekday names."
+    canonical = {name.lower(): name for name in WEEKDAY_NAMES}
+    days = []
+    for v in value:
+        name = canonical.get(v.strip().lower())
+        if name is None:
+            return None, (
+                f"{where}: {_HOST_REST_KEY} names {v!r}, not one of {', '.join(WEEKDAY_NAMES)}."
+            )
+        days.append(name)
+    if len(set(days)) != len(days):
+        return None, f"{where}: {_HOST_REST_KEY}={value!r} names a weekday twice."
+    if len(days) == len(WEEKDAY_NAMES):
+        return None, (
+            f"{where}: {_HOST_REST_KEY} names every weekday; to stop a host's channels "
+            f"altogether set [providers.<channel>].enabled = false instead."
+        )
+    return tuple(sorted(days, key=WEEKDAY_NAMES.index)), None
+
+
+def _host_settings(table: Any, config_path) -> _HostSettings:
+    """Read ``[hosts.<token>]`` into budgets, rest weekdays and errors (issues #385, #444).
 
     Neither of the loader's two usual postures fits, which is why this one
     RECORDS its errors the way unwired channels are recorded: warn-and-fall-back
@@ -1408,15 +1735,37 @@ def _host_budgets(table: Any, config_path) -> tuple[dict[str, int], list[str]]:
     that silently cannot fire is worse than a refused config. The value must be
     a positive int (``isinstance(v, bool)`` excluded, since a TOML ``true`` is a
     Python int).
+
+    ``rest_weekdays`` (issue #444) takes the SAME posture, and for the same
+    reason, though it is a different kind of guard: dropping a bad entry would
+    run the host on the very night it was meant to rest -- the fail-OPEN
+    direction for a key whose only effect is less traffic -- so it is recorded
+    and refuses the channel-running commands. Refusing costs the whole night
+    rather than that one host, which is the price of making the error loud
+    (systemd marks the unit failed and ``notify-failure`` emails it); the
+    prod config is pinned by a test, so the refusal is reachable only through
+    an untested edit. Restricted to metered hosts like the budget: Overpass has
+    its own in-night re-check (#341) and no ledger, and nothing has asked to
+    rest it.
+
+    ``refusal_cooldown_h`` (issue #444) likewise: a positive number of hours,
+    at most a week, refused rather than dropped, since dropping it would let the
+    nightly re-probe a blocked IP the cooldown exists to leave alone.
+
+    A section must hold at least one known key and nothing else, and every key
+    in a section must be valid for ANY of it to load: a half-applied section is
+    harder to reason about than a refused one.
     """
     metered = sorted(set(CHANNEL_METERED_HOST.values()))
     budgets: dict[str, int] = {}
+    rest: dict[str, tuple[str, ...]] = {}
+    cooldown: dict[str, float] = {}
     errors: list[str] = []
     if table is None:
-        return budgets, errors
+        return _HostSettings(budgets, rest, cooldown, errors)
     if not isinstance(table, dict):
         errors.append(f"[hosts] in {config_path} is not a table of [hosts.<token>] sections.")
-        return budgets, errors
+        return _HostSettings(budgets, rest, cooldown, errors)
     for token, section in table.items():
         where = f"[hosts.{token}] in {config_path}"
         if token not in metered:
@@ -1425,15 +1774,44 @@ def _host_budgets(table: Any, config_path) -> tuple[dict[str, int], list[str]]:
                 f"(metered hosts: {', '.join(metered)})."
             )
             continue
-        if not isinstance(section, dict) or set(section) != {_HOST_BUDGET_KEY}:
-            errors.append(f"{where} must hold exactly one key, {_HOST_BUDGET_KEY}.")
+        if not isinstance(section, dict) or not section or not set(section) <= set(_HOST_KEYS):
+            errors.append(
+                f"{where} must hold one or more of {', '.join(_HOST_KEYS)}, and nothing else."
+            )
             continue
-        value = section[_HOST_BUDGET_KEY]
-        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-            errors.append(f"{where}: {_HOST_BUDGET_KEY}={value!r} is not a positive integer.")
+        section_errors: list[str] = []
+        budget = section.get(_HOST_BUDGET_KEY)
+        if _HOST_BUDGET_KEY in section and (
+            isinstance(budget, bool) or not isinstance(budget, int) or budget < 1
+        ):
+            section_errors.append(
+                f"{where}: {_HOST_BUDGET_KEY}={budget!r} is not a positive integer."
+            )
+        days: tuple[str, ...] | None = None
+        if _HOST_REST_KEY in section:
+            days, error = _rest_weekdays(section[_HOST_REST_KEY], where)
+            if error is not None:
+                section_errors.append(error)
+        hours = section.get(_HOST_COOLDOWN_KEY)
+        if _HOST_COOLDOWN_KEY in section and (
+            isinstance(hours, bool)
+            or not isinstance(hours, int | float)
+            or not 0 < hours <= _HOST_COOLDOWN_MAX_H
+        ):
+            section_errors.append(
+                f"{where}: {_HOST_COOLDOWN_KEY}={hours!r} is not a number of hours in "
+                f"(0, {_HOST_COOLDOWN_MAX_H}]."
+            )
+        if section_errors:
+            errors.extend(section_errors)
             continue
-        budgets[token] = value
-    return budgets, errors
+        if _HOST_BUDGET_KEY in section:
+            budgets[token] = budget
+        if days:
+            rest[token] = days
+        if _HOST_COOLDOWN_KEY in section:
+            cooldown[token] = float(hours)
+    return _HostSettings(budgets, rest, cooldown, errors)
 
 
 def _config_refusals(cfg: SchedulerConfig) -> list[str]:
@@ -1463,7 +1841,8 @@ def load_scheduler_config(path: str | None = None) -> SchedulerConfig:
     al = raw.get("alerts", {})
     rg = raw.get("resource_guard", {})
     dp = raw.get("driving_plan", {})
-    host_budgets, host_budget_errors = _host_budgets(raw.get("hosts"), config_path)
+    host_settings = _host_settings(raw.get("hosts"), config_path)
+    host_budgets, host_budget_errors = host_settings.budgets, host_settings.errors
     fill_min_days, fill_host_ceilings = _fill_settings(sched, config_path)
     for message in host_budget_errors:
         logger.error(message)
@@ -1558,6 +1937,8 @@ def load_scheduler_config(path: str | None = None) -> SchedulerConfig:
         refresh_slots=_refresh_slots(sched, config_path),
         fill_min_days=fill_min_days,
         fill_host_ceilings=fill_host_ceilings,
+        host_rest_weekdays=host_settings.rest_weekdays,
+        host_refusal_cooldown_h=host_settings.cooldown_h,
         timer_watchdog_max_age_h=float(sched.get("timer_watchdog_max_age_h", 0.0)),
         batch_size=dl.get("batch_size", 100),
         connection_limit=dl.get("connection_limit", 50),
@@ -3921,6 +4302,10 @@ def cmd_status(cfg: SchedulerConfig) -> int:
     # that host draws from, over the rolling window the gate reads.
     for window in _host_windows(cfg, conn):
         print(f"{window.status_line()} requests used.")
+    for line in _host_hold_status_lines(cfg, conn, today):
+        print(line)
+    for line in _host_refusal_status_lines(conn):
+        print(line)
 
     if cfg.driving_plan.enabled:
         latest = db.get_latest_driving_plan_snapshot(conn)
@@ -3938,6 +4323,83 @@ def cmd_status(cfg: SchedulerConfig) -> int:
                 f"{last_changed['fetch_date'] if last_changed else '—'})."
             )
     return 0
+
+
+def _host_hold_status_lines(cfg: SchedulerConfig, conn, today: date) -> list[str]:
+    """``scheduler status``'s standing-hold lines (issue #444), one per configured host.
+
+    Says which weekdays the host rests on and whether TODAY's snapshot date is
+    one, so an operator reading ``status`` on a rest day is not left to
+    wonder why the host's cities are due and untouched.
+    """
+    lines = []
+    weekday = WEEKDAY_NAMES[today.weekday()]
+    holds = _host_holds(cfg, today, conn)
+    for host, hours in sorted(cfg.host_refusal_cooldown_h.items()):
+        cooling = holds.cooldown(host)
+        state = cooling.describe().split(": ", 1)[1] if cooling is not None else "not cooling down"
+        lines.append(f"{HOST_LABELS.get(host, host)} refusal cooldown {hours:g} h: {state}.")
+    for host, days in sorted(cfg.host_rest_weekdays.items()):
+        state = "a REST night" if weekday in days else "not a rest night"
+        lines.append(
+            f"{HOST_LABELS.get(host, host)} rests on {', '.join(days)} (UTC snapshot date); "
+            f"today ({today}, {weekday}) is {state}."
+        )
+    return lines
+
+
+def _ago(stamp: str, now: datetime) -> str:
+    """``"31.4 h ago"`` for an ISO-8601 UTC stamp."""
+    when = datetime.fromisoformat(stamp)
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=UTC)
+    return f"{(now - when).total_seconds() / 3600:.1f} h ago"
+
+
+def _host_refusal_status_lines(conn) -> list[str]:
+    """``scheduler status``'s per-host refusal lines (issue #444).
+
+    One line per host ``host_refusals`` has ever recorded: the newest
+    refusal (when, who, how) and the silence since it, the newest clearance a
+    probe recorded, and -- for a metered host -- when the ledger last
+    stamped a request on it, which is the silence that matters to a per-IP
+    block. Printed nothing for a host that has never refused us.
+    """
+    now = clock.utc_now()
+    lines = []
+    for host in db.host_verdict_hosts(conn):
+        label = HOST_LABELS.get(host, host)
+        refused = db.newest_host_verdict(conn, host, db.HOST_REFUSED)
+        cleared = db.newest_host_verdict(conn, host, db.HOST_CLEARED)
+        if refused is None:
+            refusal = "never refused us"
+        else:
+            who = refused["source"] + (
+                f", {refused['city_id']} [{refused['channel']}]" if refused["city_id"] else ""
+            )
+            code = f", exit {refused['exit_code']}" if refused["exit_code"] is not None else ""
+            before = (
+                f", {refused['requests_before']:,} requests in the 24 h before"
+                if refused["requests_before"] is not None
+                else ""
+            )
+            refusal = (
+                f"last refused {refused['recorded_at']} ({who}{code}{before}), "
+                f"{_ago(refused['recorded_at'], now)}"
+            )
+        clearance = (
+            f"last cleared {cleared['recorded_at']} ({_ago(cleared['recorded_at'], now)})"
+            if cleared is not None
+            else "no clearance recorded"
+        )
+        last_stamp = conn.execute(
+            "SELECT MAX(recorded_at) FROM host_usage WHERE host = ?", (host,)
+        ).fetchone()[0]
+        ledger = (
+            f"; last ledgered request {last_stamp} ({_ago(last_stamp, now)})" if last_stamp else ""
+        )
+        lines.append(f"{label}: {refusal}; {clearance}{ledger}.")
+    return lines
 
 
 def _describe_membership(channel: str, value: int | None) -> str:
@@ -4034,6 +4496,126 @@ def _print_membership_footer(conn, providers) -> None:
             continue
         n_member = db.count_channel_members(conn, provider, CHANNEL_DEFAULT_MEMBERSHIP[provider])
         print(_exclusion_line(conn, provider, n_member, n_enabled, n_excluded, listing=True))
+
+
+def cmd_probe_host(
+    cfg: SchedulerConfig,
+    host: str,
+    *,
+    force: bool = False,
+    fetch=None,
+    today: date | None = None,
+) -> int:
+    """``probe-host HOST``: send ONE request to a per-IP host, print and record the verdict (#444).
+
+    The operator's single-request probe after a block (the recovery recipe
+    since August: full silence, then one request). Exactly one request -- for
+    Mapillary's tile CDN, one z14 tile (``host_probe.MAPILLARY_PROBE_TILE``)
+    with ``MAPILLARY_ACCESS_TOKEN``, redirects NOT followed, so a 302 to the
+    login page reads as REFUSED, while a 429/503 reads as THROTTLED
+    (inconclusive: the collector's backpressure reading) -- and the verdict
+    goes to ``host_refusals``:
+    a refusal (which the cross-night cooldown then counts from) or a clearance
+    (which it never does). An inconclusive answer (throttled, a rejected token,
+    another 5xx, no response) records nothing. A request that got an HTTP answer is charged to
+    the ``mapillary`` ledger like any other, so the host's rolling window
+    sees it.
+
+    Refuses, with ``USAGE_EXIT_CODE`` and nothing sent:
+
+    * on a config the channel-running commands would refuse, an unknown host,
+      or a missing token;
+    * while any ``run-due`` is in flight on this machine (``_run_due_in_flight``,
+      the check ``import-bundle`` and the pre-freeze pass use) -- a probe in the
+      middle of a night is one more talker at the worst moment, and its verdict
+      would race the night's own;
+    * on the host's rest day (``[hosts.<token>].rest_weekdays``, read on the
+      UTC snapshot date exactly as ``run-due`` reads it), unless ``force`` --
+      a rest night is meant to be ZERO presence on the host, for #444's Stage 1
+      test, and one probe is presence;
+    * inside the host's refusal cooldown, unless ``force`` -- the cooldown is the
+      silence the probe exists to end, and probing inside it is the re-probe it
+      exists to prevent.
+
+    ``force`` skips exactly the last two checks, never the others.
+
+    Another local process holding the host lock (a hand-run collector) exits
+    with the host's BUSY code, also with nothing sent. ``fetch`` (url ->
+    (status, headers)) is the test seam; production uses ``requests`` with
+    ``allow_redirects=False``.
+
+    Exit status: 0 cleared, the host's blocked code (75 for the tile CDN)
+    refused, 1 inconclusive.
+    """
+    from . import host_probe
+
+    if host not in host_probe.PROBES:
+        logger.error(
+            f"probe-host: no probe for {host!r} (known: {', '.join(sorted(host_probe.PROBES))})"
+        )
+        return USAGE_EXIT_CODE
+    if _config_refusals(cfg):
+        for message in _config_refusals(cfg):
+            logger.error(message)
+        return USAGE_EXIT_CODE
+    in_flight = _run_due_in_flight()
+    if in_flight:
+        logger.error(
+            f"probe-host: a run-due is in flight on this machine ({in_flight}); not probing "
+            f"{HOST_LABELS[host]} beside it. Wait for it to finish."
+        )
+        return USAGE_EXIT_CODE
+    # Not closed on return, like `status`: a one-shot command's process exit
+    # closes it, and tests hand every command the same shared handle.
+    conn = db.connect(cfg.db_path)
+    if today is None:
+        today = clock.snapshot_date_today()
+    holds = _host_holds(cfg, today, conn)
+    force_skips = "--force skips the rest-day and cooldown checks, never the run-due-in-flight one"
+    resting = holds.rest(host)
+    if resting is not None:
+        if not force:
+            logger.error(
+                f"probe-host: {resting.describe()} for {today.isoformat()} (UTC) -- refusing "
+                f"to probe. Rest nights are meant to be zero presence on this host for issue "
+                f"#444's Stage 1 test, and a probe is a request. Pass --force to probe anyway "
+                f"({force_skips})."
+            )
+            return USAGE_EXIT_CODE
+        logger.warning(f"probe-host --force: probing on a rest day ({resting.describe()})")
+    cooling = holds.cooldown(host)
+    if cooling is not None:
+        if not force:
+            logger.error(
+                f"probe-host: {cooling.describe()} -- refusing to probe inside the "
+                f"cooldown. Pass --force to probe anyway ({force_skips}; issue #444)."
+            )
+            return USAGE_EXIT_CODE
+        logger.warning(f"probe-host --force: probing inside the cooldown ({cooling.describe()})")
+    token_loader, _url, _classify = host_probe.PROBES[host]
+    try:
+        token = token_loader()
+    except ValueError as exc:
+        logger.error(f"probe-host: {exc}")
+        return USAGE_EXIT_CODE
+    try:
+        result, sent = host_probe.probe(host, token, fetch or host_probe.requests_fetch)
+    except HostBusyError as exc:
+        logger.error(f"probe-host: {exc}")
+        return host_probe.busy_exit_code(host)
+    if sent:
+        # The one request is a real tile request on the grid channel's token,
+        # so the ledger -- and through it the host's rolling-24h window --
+        # counts it like any other.
+        db.add_api_usage(conn, today, 1, "mapillary")
+    if result.verdict is not None:
+        db.record_host_verdict(
+            conn, host, result.verdict, source="probe-host", detail=result.detail
+        )
+    verdict = (result.verdict or "inconclusive").upper()
+    recorded = "recorded" if result.verdict is not None else "not recorded"
+    print(f"{HOST_LABELS[host]}: {verdict} — {result.detail} ({recorded}).")
+    return host_probe.exit_code_for(host, result)
 
 
 def cmd_assign(cfg: SchedulerConfig) -> int:
@@ -6981,7 +7563,12 @@ def cmd_assess_city(
         print(report.render())
         enrolled_opt_in = report.enrolled
 
-    blocked_hosts = HostBreaker()
+    # Standing host holds (issue #444) bind an operator inquiry too: a rest
+    # night or a refusal cooldown exists to keep this IP off the host, and an
+    # inquiry is one more presence on it. The summary says so, and a held
+    # channel makes the answer incomplete (exit 1), like a refused one.
+    blocked_hosts = HostBreaker(holds=_host_holds(cfg, today, conn), source="assess-city")
+    blocked_hosts.note_holds({h for c in channels for h in CHANNEL_HOSTS.get(c, ())})
     busy_hosts: Counter[str] = Counter()
     # Unreachable for this command as it stands — assess-city's channel
     # vocabulary has no KartaView in it, and the sibling deferral is a property
@@ -7072,7 +7659,9 @@ def cmd_assess_city(
             "The link above describes the catalog, not what is live. Publish with "
             "`regenerate-aggregate --publish` when you mean to."
         )
-    blocked_note = f", {_host_names(blocked_hosts)} refused this host" if blocked_hosts else ""
+    blocked_note = (
+        f", {_host_names(blocked_hosts)} refused or throttled this host" if blocked_hosts else ""
+    )
     busy_note = f", {_host_names(busy_hosts)} busy locally" if busy_hosts else ""
     summary = (
         f"{succeeded}/{attempted} channel(s) collected"
@@ -7084,6 +7673,7 @@ def cmd_assess_city(
             else ""
         )
         + blocked_note
+        + _held_summary_note(blocked_hosts, sep=", ")
         + busy_note
         + (
             f", {sum(rejected_argv.values())} channel(s) REJECTED by our own CLI"
@@ -7164,7 +7754,7 @@ def cmd_assess_city(
     nothing_deferred = (
         skipped_budget == 0 and not deferred_channels and sum(deferred_host_budget.values()) == 0
     )
-    hosts_were_fine = not blocked_hosts and not busy_hosts
+    hosts_were_fine = not blocked_hosts and not busy_hosts and not blocked_hosts.held_launches
     complete = collected_everything and nothing_deferred and hosts_were_fine and not rejected_argv
     if complete and (published or not publish_wanted):
         return 0
@@ -7561,8 +8151,16 @@ def _run_collection_subprocess(
         # "another local process is already talking to it" (issue #208).
         blocked = HOST_BY_EXIT_CODE.get(exit_code)
         busy = HOST_BY_BUSY_EXIT_CODE.get(exit_code)
+        throttled = HOST_BY_THROTTLED_EXIT_CODE.get(exit_code)
         if blocked:
             why = f"exited {exit_code} ({HOST_LABELS[blocked]} unavailable to this host)"
+        elif throttled:
+            # Issue #444: the CDN asked for a slower pace (HTTP 429/503) often
+            # enough that the crawl stopped. Not a refusal; checkpoint kept.
+            why = (
+                f"exited {exit_code} ({HOST_LABELS[throttled]} THROTTLED this host: HTTP "
+                f"429/503, not a refusal; checkpoint kept)"
+            )
         elif busy:
             why = f"exited {exit_code} ({HOST_LABELS[busy]} busy with another local process)"
         elif exit_code == ARGV_REJECTED_EXIT_CODE:
@@ -9000,6 +9598,7 @@ def cmd_run_due(
     requested_providers: list[str] | None = None,
     requested_cities: list[str] | None = None,
     force: bool = False,
+    ignore_host_holds: bool = False,
 ) -> int:
     """
     Collect all cities due today, within per-provider budgets, publish.
@@ -9033,6 +9632,12 @@ def cmd_run_due(
     also collecting is refused with ``USAGE_EXIT_CODE`` unless ``force``
     (issue #412); ``dry_run`` is never checked. The NIGHTLY is never refused:
     it proceeds and alerts (``_alert_nightly_gsv_overlap``).
+
+    Standing host holds (issue #444, :func:`_host_holds`) apply to EVERY
+    run-due, the ``--provider mapillary --limit N`` catch-up included: on a rest
+    night no channel touching that host launches. ``ignore_host_holds``
+    (``--ignore-host-holds``) lifts them for this one invocation and logs a
+    WARNING saying so; the nightly unit never passes it.
     """
     # Validate BEFORE opening the catalog, so an operator typo costs nothing.
     # Returning rather than propagating is deliberate: main()'s run-due branch
@@ -9101,6 +9706,22 @@ def cmd_run_due(
         only_city_ids = frozenset(row.city_id for row in resolved.values())
     if today is None:
         today = clock.snapshot_date_today()
+    # The run's standing host holds (issue #444), decided ONCE from the run's
+    # snapshot date, before the dry-run branch so a preview shows them too.
+    # Built once, here: a refusal recorded later tonight is the breaker's and
+    # never turns into a hold mid-night.
+    holds = _host_holds(cfg, today, conn, ignore=ignore_host_holds)
+    if ignore_host_holds:
+        would_hold = _host_holds(cfg, today, conn).current()
+        logger.warning(
+            "--ignore-host-holds: launching on hosts this run would otherwise hold"
+            + (
+                " (" + "; ".join(hold.describe() for hold in would_hold.values()) + ")"
+                if would_hold
+                else " (none would have been held)"
+            )
+            + ". An operator override; the nightly unit never passes it (issue #444)."
+        )
     batch_started = time.monotonic()
     batch_deadline = batch_started + cfg.max_batch_hours * 3600.0
     # The instant the fill's backlog test reads attempts against (issue #404):
@@ -9301,8 +9922,46 @@ def cmd_run_due(
         if windows:
             left_str += "; " + ", ".join(w.status_line() for w in windows)
         print(f"DRY RUN — would process (budget remaining {left_str}):")
-        for city in due[:day_cap]:
-            for provider in providers_for_city[city.city_id]:
+        run_hosts = {h for p in providers for h in CHANNEL_HOSTS.get(p, ())}
+        for host, hold in holds.current().items():
+            if host in run_hosts:
+                print(f"  HELD tonight — {hold.describe()} (issue #444)")
+        current_holds = holds.current()
+
+        def _held_by(provider: str) -> list[HostHold]:
+            hosts = CHANNEL_HOSTS.get(provider, ())
+            return [hold for host, hold in current_holds.items() if host in hosts]
+
+        # Walk the queue the way the live loop does (issue #444 review): a city
+        # whose every due channel is HELD launches nothing, so the night counts
+        # it against no city-cap slot (`processed` moves only on an attempted
+        # city) and asks the next one. Slicing `due[:day_cap]` spent a preview
+        # row on it instead, and the preview then stopped short of cities the
+        # night reaches. Its held pairs still hold the fill, as they do live.
+        previewed = 0
+        passed_over = 0
+        for city in due:
+            if previewed >= day_cap:
+                break
+            city_channels = providers_for_city[city.city_id]
+            if city_channels and all(_held_by(p) for p in city_channels):
+                passed_over += 1
+                for provider in city_channels:
+                    preview_unfinished[provider] += 1
+                continue
+            previewed += 1
+            for provider in city_channels:
+                held_by = _held_by(provider)
+                if held_by:
+                    # The live gate's answer, asked of the same instance: a held
+                    # channel launches nothing and spends nothing. It is due
+                    # and unattempted, so -- the live rule -- it holds the fill.
+                    print(
+                        f"  {city.city_id:60s} {provider:16s} {'':>14s}  HELD "
+                        f"({'; '.join(h.reason for h in held_by)})"
+                    )
+                    preview_unfinished[provider] += 1
+                    continue
                 # Via _channel_estimate, not estimate_requests: the dry run has
                 # to price what the night will ACTUALLY spend, and a census
                 # already in the shared cache is free (issue #290). Reading the
@@ -9406,6 +10065,11 @@ def cmd_run_due(
                     # channel unfinished, which holds it in the fill (issue
                     # #404) -- unless no night could run it, the live rule.
                     preview_unfinished[provider] += 1
+        if passed_over:
+            print(
+                f"  ({passed_over:,} due city(ies) HELD on every channel passed over, as the "
+                f"night passes them: they take no city-cap slot; issue #444)"
+            )
         if cfg.fill_min_days is not None:
             _print_fill_preview(
                 cfg,
@@ -9420,6 +10084,7 @@ def cmd_run_due(
                 host_spent=host_spent,
                 unfinished=preview_unfinished,
                 window_start=preview_now - HOST_BUDGET_WINDOW,
+                held_hosts=set(holds.current()),
             )
         if cfg.driving_plan.enabled:
             print("Would also snapshot the GSV driving-plan feed (issue #176).")
@@ -9464,6 +10129,8 @@ def cmd_run_due(
             batch_deadline,
             sigterm_seen,
             max_cities=max_cities,
+            holds=holds,
+            run_channels=providers,
         )
         # The fill (issue #404) runs only behind a due loop that ENDED ON ITS
         # OWN: a cap, deadline, SIGTERM or error stop means the night had no
@@ -9571,6 +10238,11 @@ def cmd_run_due(
             else ""
         )
         + (f"; {blocked_note}" if blocked_note else "")
+        + _unrecorded_refusal_note(blocked_hosts, cfg.host_refusal_cooldown_h)
+        # Apart from the refusal clause above (issue #444): nothing refused us
+        # and nothing failed; a rest night or a cooldown held the host.
+        + _held_summary_note(blocked_hosts)
+        + _presence_note(conn, blocked_hosts, batch_started_iso)
         # The COUNT here and the names in the [alerts] mail (issue #341): a
         # stranded city has no route back for ~83 days, and "1 host(s)
         # UNAVAILABLE" said nothing about that on the two nights it cost 20.
@@ -9966,6 +10638,9 @@ def _run_city_channels(
     # ...and those lost to an argv our own CLI rejected (issue #359), which the
     # end-of-night retry must never re-launch (issue #380).
     lost_to_argv: set[str] = set()
+    # ...and those lost to a THROTTLED host (exit 87; issue #444), named so in
+    # the alert.
+    lost_to_throttle: set[str] = set()
     # ...and the walks the batch deadline deferred (issue #373), stranded
     # below when their grid sibling landed in this same call.
     lost_to_deadline: list[str] = []
@@ -10151,16 +10826,47 @@ def _run_city_channels(
                                 f"contacts it — launching."
                             )
                             wanted.discard(HOST_OVERPASS)
+                        # A standing HOLD (issue #444): a rest night or a
+                        # cross-night refusal cooldown. Asked before the
+                        # breaker, so a held host never spends a re-check, and
+                        # deliberately NOT appended to `lost_to_host`: a hold
+                        # cannot strand a walk, because it holds every channel
+                        # on the host for the whole run (or, for a cooldown,
+                        # only ever lifts during it), so the walk's grid
+                        # sibling on the same host is held too. A final skip
+                        # with no `record_attempt` -- the city stays due.
+                        held = blocked_hosts.holding(wanted)
+                        if held:
+                            for host in held:
+                                blocked_hosts.held_skipped[host] += 1
+                            blocked_hosts.held_launches += 1
+                            logger.info(
+                                f"{city.city_id} [{provider}]: holding — "
+                                + "; ".join(h.describe() for h in held.values())
+                                + ". Not a failure; the city stays due."
+                            )
+                            continue
                         unavailable = blocked_hosts.blocking(wanted)
                         if unavailable:
                             for host in unavailable:
                                 blocked_hosts.skipped[host] += 1
                             blocked_hosts.skipped_launches += 1
                             lost_to_host.append(provider)
+                            throttled_skip = blocked_hosts.throttled_only(unavailable)
+                            if throttled_skip:
+                                # Defensive: a breaker-skipped walk never strands,
+                                # since its grid sibling is on the same latched host
+                                # and was skipped too. Kept so the stranded wording
+                                # agrees with this line's if a sibling ever lands.
+                                lost_to_throttle.add(provider)
                             logger.info(
                                 f"{city.city_id} [{provider}]: skipping — "
                                 f"{_host_names(unavailable)} "
-                                f"already refused this host."
+                                + (
+                                    "already throttled this host tonight (HTTP 429/503)."
+                                    if throttled_skip
+                                    else "already refused this host."
+                                )
                             )
                             continue
 
@@ -10475,6 +11181,8 @@ def _run_city_channels(
                             # what the whole batch is doing. A resumable channel took
                             # its own branch further up, where its cap needed the answer.
                             timeout_s = city_timeout_seconds(cfg, city, provider, conn=conn)
+                        # Before the call, which runs the child INLINE at one lane.
+                        blocked_hosts.mark_present(CHANNEL_HOSTS.get(provider, ()), launched=True)
                         future = _start(
                             provider,
                             connection_limit=conn_limit,
@@ -10539,6 +11247,7 @@ def _run_city_channels(
             # on which lane happened to finish first within one wait().
             for future in sorted(done, key=lambda f: providers.index(in_flight[f])):
                 provider = in_flight.pop(future)
+                blocked_hosts.mark_present(CHANNEL_HOSTS.get(provider, ()), launched=False)
 
                 # One channel's outcome, classified in full or not at all.
                 # The `try` covers BOTH the worker's own exception and
@@ -10618,11 +11327,60 @@ def _run_city_channels(
                         # first step, so there is never a paid-for artifact to salvage
                         # here. Keep that true if either fetch ever moves later.
                         blocked_hosts.add(blocked_host)
+                        _record_refusal(
+                            conn,
+                            blocked_hosts,
+                            blocked_host,
+                            source=blocked_hosts.source,
+                            channel=provider,
+                            city_id=city.city_id,
+                            exit_code=exit_code,
+                            detail=reason,
+                        )
                         lost_to_host.append(provider)
                         logger.error(
                             f"{city.city_id} [{provider}]: {HOST_LABELS[blocked_host]} is "
                             f"unavailable to this host — skipping its remaining channels. "
                             f"Not counted as a failure for this city. ({reason})"
+                        )
+                        continue
+
+                    throttled_host = HOST_BY_THROTTLED_EXIT_CODE.get(exit_code)
+                    if throttled_host is not None:
+                        # The CDN asked for a slower pace (HTTP 429/503) often
+                        # enough that the crawl stopped (issue #444). Two
+                        # halves of the blocked branch's reaction, and one
+                        # deliberate difference:
+                        #   * AMNESTIED -- no record_attempt, so no
+                        #     consecutive_failures and never a quarantine
+                        #     (#421): a few nights of a 429 storm must not
+                        #     quarantine every Mapillary pair. The checkpoint is
+                        #     kept, so the city resumes when it is next due.
+                        #   * LATCHED -- the breaker skips both Mapillary
+                        #     channels for the rest of the run, the fill
+                        #     included, since the next city would walk into the
+                        #     same 429s. The tile CDN has no HOST_RECHECKS
+                        #     entry, so nothing asks it again tonight.
+                        #   * NO host_refusals ROW, so no 36 h refusal cooldown:
+                        #     a 429 is THROTTLED (inconclusive), not REFUSED,
+                        #     exactly as probe-host reads it. `_record_refusal`
+                        #     is the blocked branch's alone.
+                        blocked_hosts.throttle(throttled_host)
+                        lost_to_host.append(provider)
+                        lost_to_throttle.add(provider)
+                        logger.error(
+                            f"{city.city_id} [{provider}]: {HOST_LABELS[throttled_host]} "
+                            f"THROTTLED this host (HTTP 429/503) — skipping its remaining "
+                            f"channels tonight. Not a refusal (no cooldown recorded) and not "
+                            f"counted as a failure for this city; its checkpoint is kept. "
+                            f"({reason})"
+                        )
+                        # As the 83 branch does, and for the same reason: a
+                        # city that keeps being throttled keeps its checkpoint
+                        # while CHECKPOINT_MAX_AGE_S counts from the first
+                        # commit, so warn the night before the age wall.
+                        _warn_if_checkpoint_near_the_age_wall(
+                            city.city_id, provider, _sweep_checkpoint_progress(cfg, city, provider)
                         )
                         continue
 
@@ -10814,11 +11572,12 @@ def _run_city_channels(
                 provider,
                 busy_host=lost_to_busy.get(provider),
                 argv_rejected=provider in lost_to_argv,
+                throttled=provider in lost_to_throttle,
             )
             logger.warning(
                 f"{city.city_id} [{provider}]: STRANDED — its {sibling} grid run succeeded "
-                f"tonight but a refused or busy host, or an argv our own CLI rejected, cost it "
-                f"this walk, so the city leaves the "
+                f"tonight but a refused, throttled or busy host, or an argv our own CLI "
+                f"rejected, cost it this walk, so the city leaves the "
                 f"night un-paired and is not due on {sibling} again for "
                 f"~{cfg.cycle_days - cfg.grace_days} days (issue #341)."
             )
@@ -11131,6 +11890,8 @@ def _run_city_loop(
     batch_deadline: float,
     sigterm_seen: threading.Event,
     max_cities: int,
+    holds: HostHolds | None = None,
+    run_channels: Sequence[str] = (),
 ) -> tuple[
     int,
     int,
@@ -11203,10 +11964,19 @@ def _run_city_loop(
     ``_retry_stranded_walks`` (issue #380); its runs count in
     ``attempted``/``succeeded`` but not in ``processed``, since each city was
     already counted once.
+
+    ``holds`` is the run's standing host holds (issue #444, :func:`_host_holds`),
+    handed to the breaker so every launch path below -- the due loop, the
+    stranded-walk retry and the fill -- asks it at the one submit gate. None
+    holds nothing. The holds on any host ``run_channels`` (the run's channel
+    list) uses are logged once, here, before the first city, so a rest night
+    with nothing due on the host still reaches the ``Done:`` line.
     """
     processed = succeeded = attempted = skipped_budget = 0
     stop_reason: str | None = None
-    blocked_hosts = HostBreaker()
+    blocked_hosts = HostBreaker(holds=holds)
+    channels_tonight = set(run_channels).union(*providers_for_city.values())
+    blocked_hosts.note_holds({h for c in channels_tonight for h in CHANNEL_HOSTS.get(c, ())})
     busy_hosts: Counter[str] = Counter()
     deferred_channels: Counter[str] = Counter()
     deferred_host_budget: Counter[str] = Counter()
@@ -11396,6 +12166,8 @@ class FillVerdict(NamedTuple):
 
 _FILL_BLOCKER_DEADLINE = "deadline"
 _FILL_BLOCKER_HOST_REFUSED = "host refused tonight"
+# A standing hold (issue #444): a rest night or a refusal cooldown.
+_FILL_BLOCKER_HOST_HELD = "host held"
 _FILL_BLOCKER_UNFROZEN = "unfrozen street network"
 _FILL_BLOCKER_BACKLOG = "backlog"
 # Its own wording rather than the city loop's: an operator reading "unexpected
@@ -12083,7 +12855,11 @@ def _fill_city_price(
 
 
 def _fill_prebudget_refusal(
-    cfg: "SchedulerConfig", city: db.CityRow, channels: Sequence[str], latched: set[str]
+    cfg: "SchedulerConfig",
+    city: db.CityRow,
+    channels: Sequence[str],
+    latched: set[str],
+    held_hosts: set[str] | frozenset[str] = frozenset(),
 ) -> FillVerdict | None:
     """The two refusals that precede the budget rule, or None (issue #404).
 
@@ -12092,6 +12868,11 @@ def _fill_prebudget_refusal(
     anything; and a channel whose host refused this machine tonight would be
     stood down by the breaker at launch, collecting a SUBSET of the city.
     Shared with the dry run, which passes an empty ``latched``.
+
+    A channel on a HELD host (issue #444, ``held_hosts``: a rest night or a
+    refusal cooldown) is refused for the same reason -- the launch gate would
+    hold it, and the city would land without it. The dry run passes the same
+    holds the night would see.
     """
     for channel in channels:
         wanted = set(CHANNEL_HOSTS.get(channel, ()))
@@ -12104,12 +12885,19 @@ def _fill_prebudget_refusal(
                     f"Overpass; the fill never adds Overpass traffic",
                 )
             wanted.discard(HOST_OVERPASS)
+        on_hold = wanted & held_hosts
+        if on_hold:
+            return FillVerdict(
+                False,
+                _FILL_BLOCKER_HOST_HELD,
+                f"{_host_names(on_hold)} is held tonight ({channel}): rest night or cooldown",
+            )
         refused = wanted & latched
         if refused:
             return FillVerdict(
                 False,
                 _FILL_BLOCKER_HOST_REFUSED,
-                f"{_host_names(refused)} refused this host tonight ({channel})",
+                f"{_host_names(refused)} refused or throttled this host tonight ({channel})",
             )
     return None
 
@@ -12127,6 +12915,7 @@ def _fill_judge(
     reserve: dict[str, int] | None = None,
     fill_spent: dict[str, int] | None = None,
     held: set[str] | frozenset[str] = frozenset(),
+    held_hosts: set[str] | frozenset[str] = frozenset(),
 ) -> tuple[FillVerdict, dict[str, int]]:
     """Every admission question in order, against ledgers already read (#404).
 
@@ -12146,7 +12935,7 @@ def _fill_judge(
             ),
             {},
         )
-    refusal = _fill_prebudget_refusal(cfg, city, channels, latched)
+    refusal = _fill_prebudget_refusal(cfg, city, channels, latched, held_hosts)
     if refusal is not None:
         return refusal, {}
     est, need = _fill_city_price(cfg, conn, city, channels)
@@ -12203,6 +12992,7 @@ def _fill_admission(
         city,
         channels,
         latched=set(blocked_hosts.latched),
+        held_hosts=set(blocked_hosts.holds.current()),
         channel_room=channel_room,
         used_by_host=used,
         remaining_s=remaining_s,
@@ -12343,6 +13133,7 @@ def _print_fill_preview(
     host_spent: Counter[str],
     unfinished: Counter[str],
     window_start: datetime,
+    held_hosts: set[str] | frozenset[str] = frozenset(),
 ) -> None:
     """``run-due --dry-run``'s fill section (issue #404), through the live rule.
 
@@ -12392,6 +13183,7 @@ def _print_fill_preview(
             city,
             city_channels,
             latched=set(),
+            held_hosts=held_hosts,
             channel_room={c: budget_left[c] for c in city_channels},
             used_by_host={h: window_used[h] + host_spent[h] for h in hosts},
             remaining_s=None,
@@ -12714,7 +13506,11 @@ def _run_fill(
                     ended = f"deadline ({cfg.max_batch_hours:g} h)"
                 elif blocker == _FILL_BLOCKER_BACKLOG:
                     ended = backlog_note
-                elif blocker in (_FILL_BLOCKER_HOST_REFUSED, _FILL_BLOCKER_UNFROZEN):
+                elif blocker in (
+                    _FILL_BLOCKER_HOST_REFUSED,
+                    _FILL_BLOCKER_HOST_HELD,
+                    _FILL_BLOCKER_UNFROZEN,
+                ):
                     ended = blocker
                 else:
                     ended = f"budget ({blocker})"
@@ -12862,14 +13658,73 @@ def _as_breaker(blocked_hosts: HostBreaker | set[str] | None) -> HostBreaker:
     return breaker
 
 
+def _held_summary_note(breaker: HostBreaker, sep: str = "; ") -> str:
+    """The ``Done:`` line's standing-hold clause (issue #444), or ``""``.
+
+    ``; HELD Mapillary's tile CDN (...): rest night (Wed), 12 launch(es) held,
+    cities stay due``. Named apart from the refusal clause because the next
+    move differs: nothing is wrong, and the held cities lead a later night.
+    Printed whenever a hold was observed, even if it held no launch (nothing
+    was due on the host), so a rest night is never invisible.
+    """
+    if not breaker.held:
+        return ""
+    held = ", ".join(hold.describe() for _host, hold in sorted(breaker.held.items()))
+    return f"{sep}HELD {held}, {breaker.held_launches} launch(es) held, cities stay due"
+
+
+def _presence_note(conn, breaker: HostBreaker, run_started_iso: str) -> str:
+    """The ``Done:`` line's per-host presence clause (issue #444), or ``""``.
+
+    ``; on Mapillary's tile CDN 09:02-15:44 UTC (6.7 h), 17.3 h after its
+    previous ledgered request`` -- per METERED host a channel ran on: the first
+    launch and the last finish of any channel touching it, and the gap back to
+    the newest ``host_usage`` stamp from before this run (each child stamps once,
+    when it ends, so that stamp is the previous run's last finish). #444's
+    best-fitting reading of the Mapillary blocks is hours of PRESENCE per day,
+    which no other record holds. Overpass is left out: every walk touches it.
+    """
+    metered = set(CHANNEL_METERED_HOST.values())
+    parts = []
+    for host, (first, last) in sorted(breaker.presence.items()):
+        if host not in metered:
+            continue
+        hours = (last - first).total_seconds() / 3600
+        prior = conn.execute(
+            "SELECT MAX(recorded_at) FROM host_usage WHERE host = ? AND recorded_at < ?",
+            (host, run_started_iso),
+        ).fetchone()[0]
+        gap = ""
+        if prior:
+            before = datetime.fromisoformat(prior)
+            if before.tzinfo is None:
+                before = before.replace(tzinfo=UTC)
+            gap = (
+                f", {(first - before).total_seconds() / 3600:.1f} h after its previous "
+                f"ledgered request"
+            )
+        parts.append(
+            f"on {HOST_LABELS.get(host, host)} {first:%H:%M}-{last:%H:%M} UTC ({hours:.1f} h){gap}"
+        )
+    return "".join(f"; {part}" for part in parts)
+
+
 def _blocked_summary_note(breaker: HostBreaker) -> str:
     """The ``Done:`` line's host-refusal clause, empty when nothing refused us."""
     if not breaker:
         return ""
     parts = []
-    if breaker.latched:
+    # A host latched by a throttle alone (exit 87, issue #444) is named as
+    # THROTTLED: it recorded no refusal, so "unavailable" would send the
+    # operator looking for a cooldown that does not exist.
+    throttled = {h for h in breaker.latched if breaker.throttled_only({h})}
+    refused = breaker.latched - throttled
+    if refused:
+        parts.append("; ".join(sorted(HOST_LABELS.get(h, h) for h in refused)) + " unavailable")
+    if throttled:
         parts.append(
-            "; ".join(sorted(HOST_LABELS.get(h, h) for h in breaker.latched)) + " unavailable"
+            "; ".join(sorted(HOST_LABELS.get(h, h) for h in throttled))
+            + " THROTTLED (HTTP 429/503, no refusal recorded)"
         )
     if breaker.recovered:
         parts.append(
@@ -12881,16 +13736,68 @@ def _blocked_summary_note(breaker: HostBreaker) -> str:
     return ", ".join(parts)
 
 
-def _blocked_alert_note(breaker: HostBreaker) -> str:
-    """The [alerts] paragraph about the hosts that refused us, or empty."""
+def _unrecorded_refusal_note(
+    breaker: HostBreaker, cooldown_hosts: Collection[str] = (), sep: str = "; "
+) -> str:
+    """``; 1 refusal of <host> NOT RECORDED in host_refusals (...)``, or ``""`` (#444 review).
+
+    A refusal whose catalog write failed is a cooldown the next night cannot
+    see: its 02:00 launch would ask the blocked host again. Shared by the
+    ``Done:`` line and the alert.
+
+    ``cooldown_hosts`` are the hosts with a ``refusal_cooldown_h``
+    (``cfg.host_refusal_cooldown_h``). Only for those is there a cooldown to
+    stand in for, so only they get the hold-by-hand advice; for any other host
+    (Overpass, KartaView, Panoramax today) the lost row changes nothing the next
+    night does, and the clause just says it was not recorded.
+    """
+    if not breaker.unrecorded_refusals:
+        return ""
+    lost = ", ".join(
+        f"{n} of {HOST_LABELS.get(h, h)}" for h, n in sorted(breaker.unrecorded_refusals.items())
+    )
+    held = sorted(h for h in breaker.unrecorded_refusals if h in cooldown_hosts)
+    if not held:
+        return f"{sep}refusal(s) NOT RECORDED in host_refusals ({lost})"
+    return (
+        f"{sep}refusal(s) NOT RECORDED in host_refusals ({lost}): the next night's refusal "
+        f"cooldown cannot see them -- hold the channels of {_host_names(held)} by hand until "
+        f"the cooldown would have ended (set enabled = false on their [providers.*] blocks, or "
+        f"pause the nightly with `systemctl --user disable --now streetscape-tracker.timer`); "
+        f"NOT `probe-host`, which asks the possibly still-blocking host again (a refusal it "
+        f"meets is recorded and does arm the cooldown, but the request may itself extend the "
+        f"block)"
+    )
+
+
+def _blocked_alert_note(breaker: HostBreaker, cooldown_hosts: Collection[str] = ()) -> str:
+    """The [alerts] paragraph about the hosts that refused us, or empty.
+
+    ``cooldown_hosts`` is passed through to :func:`_unrecorded_refusal_note`.
+    """
     if not breaker:
         return ""
-    note = "This host's IP was refused by " + _host_names(breaker) + "."
-    if breaker.latched:
+    throttled = {h for h in breaker if breaker.throttled_only({h})}
+    refused = set(breaker) - throttled
+    note = ""
+    if throttled:
         note += (
-            f" Still refusing at the end of the night: {_host_names(breaker.latched)} — its "
-            f"channels were skipped from the first refusal on, apart from re-checks "
-            f"({', '.join(f'{breaker.rechecks[h]} for {HOST_LABELS.get(h, h)}' for h in sorted(breaker.latched))} "
+            f"{_host_names(throttled)} THROTTLED this host: it answered HTTP 429/503 often "
+            f"enough that a crawl stopped itself (exit 87, issue #444). Not a refusal: no "
+            f"host_refusals row was written and no cooldown is armed, so the throttle "
+            f"holds nothing tomorrow: the next night collects unless it is the host's rest "
+            f"night or an earlier refusal's cooldown still holds it. Its channels were "
+            f"skipped for the rest of this night, the "
+            f"crawl's checkpoint is kept, and no city was marked failed."
+        )
+    if not refused:
+        return note
+    note += (" " if note else "") + "This host's IP was refused by " + _host_names(refused) + "."
+    if breaker.latched - throttled:
+        note += (
+            f" Still refusing at the end of the night: {_host_names(breaker.latched - throttled)} "
+            f"— its channels were skipped from the first refusal on, apart from re-checks "
+            f"({', '.join(f'{breaker.rechecks[h]} for {HOST_LABELS.get(h, h)}' for h in sorted(breaker.latched - throttled))} "
             f"of {breaker.max_rechecks} allowed per night, {breaker.cooldown_s / 60:g} min apart; "
             f"a host with no re-check stays latched all night by design, see HOST_RECHECKS)."
         )
@@ -12907,6 +13814,9 @@ def _blocked_alert_note(breaker: HostBreaker) -> str:
         f"about an hour is the shape seen on 2026-09-13 and 09-15, while the one confirmed ban "
         f"lasted ~20 h and presented as connection refused (issue #341)."
     )
+    lost = _unrecorded_refusal_note(breaker, cooldown_hosts, sep="")
+    if lost:
+        note += " " + lost[0].upper() + lost[1:] + "."
     return note
 
 
@@ -13004,11 +13914,11 @@ def _stranded_alert_note(cfg: SchedulerConfig, breaker: HostBreaker, today: date
     def _named(cid: str, channel: str) -> str:
         # The reason is on the line because the next move differs: a host
         # stranding waits for the host, a deadline one can run at once.
-        return (
-            f"{channel}: the batch deadline"
-            if (cid, channel) in breaker.deadline_stranded
-            else channel
-        )
+        if (cid, channel) in breaker.deadline_stranded:
+            return f"{channel}: the batch deadline"
+        if (cid, channel) in breaker.throttled_stranded:
+            return f"{channel}: a throttled host (HTTP 429/503)"
+        return channel
 
     lines = [
         f"{cid} ({', '.join(_named(cid, ch) for ch in channels)})"
@@ -13022,7 +13932,7 @@ def _stranded_alert_note(cfg: SchedulerConfig, breaker: HostBreaker, today: date
     ]
     return (
         f"{len(stranded)} city(ies) came out of the night with a grid run but NO road "
-        f"walk, because a refused or locally busy host, an argv our own CLI rejected "
+        f"walk, because a refused, throttled or locally busy host, an argv our own CLI rejected "
         f"(issue #359), or the batch deadline (issue #373) cost them the walk while the grid "
         f"sibling succeeded. The end-of-night retry (issue #380) could not walk the "
         f"host-stranded ones either, and never retries a walk marked `the batch deadline`, "
@@ -13458,7 +14368,7 @@ def _finish_batch(
     # went unbacked-up for months because nothing was watching. This is the one
     # thing in the tail that must never degrade quietly.
     blocked_hosts = _as_breaker(blocked_hosts)
-    blocked_note = _blocked_alert_note(blocked_hosts)
+    blocked_note = _blocked_alert_note(blocked_hosts, cfg.host_refusal_cooldown_h)
     stranded_note = _stranded_alert_note(cfg, blocked_hosts, today)
 
     busy_hosts = busy_hosts or Counter()
@@ -13540,8 +14450,12 @@ def _finish_batch(
             parts.append(f"{len(tail_errors)} published index(es) FAILED")
         if plan_error:
             parts.append("DRIVING-PLAN FETCH FAILED")
-        if blocked_hosts.latched:
-            parts.append(f"{len(blocked_hosts.latched)} host(s) UNAVAILABLE")
+        throttled_latched = {h for h in blocked_hosts.latched if blocked_hosts.throttled_only({h})}
+        if blocked_hosts.latched - throttled_latched:
+            parts.append(f"{len(blocked_hosts.latched - throttled_latched)} host(s) UNAVAILABLE")
+        if throttled_latched:
+            # Issue #444: named apart, because there is nothing to wait out.
+            parts.append(f"{len(throttled_latched)} host(s) THROTTLED")
         if blocked_hosts.recovered:
             # Recovered is still a refusal that cost the night launches (and
             # possibly stranded cities), so it is named rather than folded
@@ -13864,6 +14778,29 @@ def build_parser() -> argparse.ArgumentParser:
         "issue #412: a second process on one GSV key oversubscribes its quota; the "
         "nightly unit proceeds and alerts instead). The check is a heuristic over `ps`.",
     )
+    p_run.add_argument(
+        "--ignore-host-holds",
+        action="store_true",
+        help="Launch on hosts this run would otherwise HOLD: a [hosts.*].rest_weekdays "
+        "rest night or a refusal_cooldown_h cooldown (issue #444). Logged at WARNING; "
+        "an operator override the nightly unit never passes.",
+    )
+    p_probe = sub.add_parser(
+        "probe-host",
+        help="Send ONE request to a per-IP host and record the verdict in host_refusals "
+        "(issue #444): for mapillary_tiles, one z14 tile, redirects not followed, so a "
+        "302 to the login page is REFUSED and a 429/503 is THROTTLED (inconclusive). "
+        "Refuses while a run-due is in flight, and on the host's rest day or inside its "
+        "refusal cooldown unless --force. Exit 0 cleared, 75 refused, 1 inconclusive.",
+    )
+    _add_global_flags(p_probe)
+    p_probe.add_argument("host", help="The per-IP host token; today only mapillary_tiles")
+    p_probe.add_argument(
+        "--force",
+        action="store_true",
+        help="Probe even on the host's rest day ([hosts.*].rest_weekdays) or inside its "
+        "refusal_cooldown_h cooldown; never while a run-due is in flight",
+    )
     p_assess = sub.add_parser(
         "assess-city",
         help="Register a new city, walk its streets on both providers, publish, "
@@ -14108,6 +15045,8 @@ def main() -> int:
         return cmd_fetch_driving_plan(
             cfg, force=args.force, from_file=args.from_file, target_date=target
         )
+    if args.command == "probe-host":
+        return cmd_probe_host(cfg, args.host, force=args.force)
     if args.command == "assess-city":
         return cmd_assess_city(
             cfg,
@@ -14134,6 +15073,7 @@ def main() -> int:
                 requested_providers=args.providers,
                 requested_cities=args.cities,
                 force=args.force,
+                ignore_host_holds=args.ignore_host_holds,
             )
         except Exception as exc:
             # A DRY RUN whose stdout reader went away is the one crash here

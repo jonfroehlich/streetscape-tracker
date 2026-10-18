@@ -320,6 +320,7 @@ Both figures are upper bounds, and the measured/reported/guessed tiers below mus
   That claim remains untested in both directions: both times we chose silence over the retry experiment, deliberately.
 - **The protocol, proven twice:** disable both Mapillary channels **immediately**, sweep for detached processes, keep true silence, then a **single-request** probe per application daily starting ~24 h after the last refused request.
   An automated version (`probe_mapillary_block.sh` plus a self-disarming systemd user timer, untracked, emails the verdict either way) lives on makelab2 from the second incident.
+  Since #444 the single request is `scheduler probe-host mapillary_tiles`, which sends one request (the script sends two) and records the verdict in `host_refusals`.
   Re-enabling the channels stays a human decision — make it **promptly** on a clean probe, since both incidents' channels sat dark longer than their bans.
   And n=2 with upper bounds only: do not infer a shorter wait works, and do not probe more than once a day.
 
@@ -429,6 +430,48 @@ Like every budget here it is a **soft ceiling**: in-flight retries can overshoot
 Mechanism, ledger and reporting: `docs/scheduler.md`, the rolling-24h section.
 
 Mapillary's own documentation and forum were re-read before this landed (2026-09-29): the API docs still give only the per-app `tiles.mapillary.com` limit of 50,000 per day, and [thread 10644](https://forum.mapillary.com/t/50-000-requests-day-rate-limit-scope/10644) still ends at this project's own 2026-08-28 question, unanswered, so nothing published speaks to the per-IP layer beyond the staff reply above.
+
+## Every-second-night blocks, and the staged response (issue #444, 2026-10-17)
+
+**From 2026-10-10 the tile CDN refused makelab2 every second night, and on 10-17 the block carried over**: the night's first tile was refused about 20 h after the 10-16 onset.
+The diagnosis, the measured tables and the ranked hypotheses are in [#444](https://github.com/jonfroehlich/streetscape-tracker/issues/444); what follows is what changed in code and config, and why.
+The short version of the diagnosis: no volume window from 12 h to 7 d, and no leaky bucket, separates blocked onsets (rolling 24 h at 1,631–2,287) from clean night ends (up to 3,481); what changed on 10-05 is that the fill (#404) made every night a ~2k-request Mapillary night with 6–9 h of presence, back to back, and the blocks began on the sixth such night.
+The best fit, **inferred and not measured**, is a per-IP reputation with slow decay that sustained daily presence feeds (H1); the cheap discriminators are whether the CDN sends 429s before the wall (H2, needs the per-status counts) and whether a request made while blocked extends the block (H3).
+
+**Stage 1 (config, prod):** `[hosts.mapillary_tiles].rolling_24h_request_budget` 3,000 → **1,200**, `[schedule].fill_host_ceilings.mapillary_tiles` 2,260 → **600**, `[providers.mapillary].daily_request_budget` 3,500 → **1,500**.
+The pace stays at 40/min with CV 0.6: slowing it would lengthen presence, the axis that moved most.
+Steady-state need is ~800/day (#385), averaged over the week; **with two rest nights it has to land on five**, so a Mapillary night needs ~800 × 7/5 ≈ **1,120, 93% of the 1,200 pool**, before any cooldown night takes another night away.
+The 90-day cycle therefore fits on paper with almost no headroom: the backlog can grow on any week with a cooldown, and the fill effectively stops on this host.
+**Falsifier for the sizing:** watch the Mapillary due backlog over the three-week Stage 1 window; if it grows week over week, the pool is too small for the rest schedule, independent of whether the blocks stop.
+Watch beside it **the size of the Mapillary-only-due population**: cities due on `mapillary` or `mapillary_streets` but not on `gsv`.
+A rest night still collects the gsv half of a city due on gsv and Mapillary, which leaves its Mapillary half in exactly that population — the STRANDED tier, reached only through the bounded `[schedule].opt_in_cities_per_day` reservation or when the city is next gsv-due, about one cycle (~83 days) later.
+Read it on a Thursday, after the Wednesday rest: `run-due --dry-run` builds the night's slate and logs `N of M cities not due on gsv are inside tonight's ...-city cap`.
+**M is a noisy proxy, not that population**: in code it is every city not due on gsv, so it also counts the gsv-excluded cities (#301) and the cities due only on the KartaView or Panoramax opt-in channels.
+Read its week-over-week trend, not its level; if it grows while those enrolments and exclusions stand still, rest nights are deferring Mapillary by a cycle rather than by a night.
+The dry run does not split M by channel: its per-city rows list each previewed city's due channels, so the Mapillary-only cities inside tonight's cap are the rows naming only `mapillary`/`mapillary_streets`, and the ones past the cap are not shown.
+**Falsifier:** blocks continue at ≤ 1,200/night with two rest nights a week → volume and daily presence are not the inputs. Clean for three weeks → step up at most 25% a week, one knob at a time.
+
+**Rest nights (`rest_weekdays = ["Wed", "Sun"]`):** two nights a week with zero Mapillary presence, on the run's UTC snapshot date, while every other channel runs.
+A Mapillary-only rest, by the Maintainer's choice, so a rested city's Mapillary snapshot lands on a later night than its GSV one; the alternative (rest every channel through the timer) keeps pairing and costs GSV two nights a week.
+A rest night is a standing hold, not a refusal: no alert, no breaker trip, no failure, and the cities stay due.
+**Staying due is not leading the queue**: a city due on gsv and Mapillary still collects gsv on a rest night, so its held Mapillary channels re-enter through the stranded (Mapillary-only-due) tier — the bounded opt-in reservation — not at the head of the next night's queue (see the sizing falsifier above).
+Holds bind scheduler commands only (`run-due`, its `--limit` catch-ups, `assess-city`); a collector run directly (`streetscape_tracker.py` or `streetscape_street_analyzer.collect` with `--provider mapillary`) ignores them, so check `scheduler status` before one.
+A held walk that would have been a 0-request census-cache hit is still held — conservative, and accepted.
+
+**The cross-night refusal cooldown (`refusal_cooldown_h = 36`):** for 36 h after the newest recorded refusal, no channel on the tile CDN launches.
+It exists because the 02:00 nightly re-probed the IP ~20 h into the 10-16 block, and if H3 holds, that request is the most expensive one we make.
+36 h is past every block measured so far (≤ 16.6 h on 10-14/15, > 19.8 h on 10-16/17), and the hold ends mid-night rather than costing the whole night.
+**Falsifier for H3:** if blocks clear in the same time whether or not we probed at ~20 h, probing does not extend them, and the cooldown can shrink.
+
+**Refusals are now persisted** (`host_refusals`, schema v22), with each one's `requests_before` (the host's 24 h ledger total at the refusal), and the `Done:` line names each metered host's hours of presence and the gap since its previous ledgered request — the two quantities #444 had to rebuild by hand for every onset.
+
+**`scheduler probe-host mapillary_tiles` replaces the untracked probe script** in the recovery protocol below: exactly one request, one z14 tile, one token, redirects not followed, the verdict recorded, and refused while a `run-due` is in flight, or on a rest day or inside the cooldown unless `--force` (a rest night is zero presence for the Stage 1 test).
+A clearance it records does not end the cooldown; only the newest refusal is counted.
+Mechanism, posture and tests: `docs/scheduler.md`, the standing-holds section, and `docs/testing.md`.
+
+Not done here, and why: the per-status response counts, the identifying User-Agent and the 429/`Retry-After` backoff (Stages 2 and 4) live in `download_mapillary.py` and `download_common.py`, on a separate branch.
+The forum post and the support email (Stage 5) each need the Maintainer's OK.
+Per this file's opening rule, Mapillary's API docs and forum must be re-read before this is DEPLOYED: it changes how often and how much we ask (every change in the direction of less), and they were not re-read in the session that wrote it.
 
 ## Per-IP hosts and the cross-process host lock (issue #208)
 
@@ -898,7 +941,7 @@ Now:
 7. The **third episode** in one crawl stops it on the request cap's own path — turned-away tiles uncommitted, the checkpoint kept, raised before the settle loop — as **`HostThrottledError`, exit 87**, the THROTTLED family (`download_common.HOST_THROTTLED_EXIT_CODES`).
    Every backpressure stop raises it, committed tiles or not; its message carries the phrase "stopped by provider backpressure (HTTP 429/503)", and says "the next run resumes it" only when a tile is committed, "starts from the first tile" otherwise.
    It replaced exit 83 plus a plain-`DownloadError` arm for the nothing-committed case: that arm counted a `consecutive_failure`, so a few nights of a 429 storm would have quarantined every Mapillary pair (#421), and nothing latched the host, so the next city walked into the same 429s at full pace.
-   The scheduler half of #444 (PR #449, meant to merge with this one) amnesties 87 and skips both Mapillary channels for the rest of the night, but records no refusal and arms no cooldown, and documents that in `docs/scheduler.md`; until it lands the scheduler counts 87 as an ordinary failure.
+   The scheduler amnesties 87 and skips both Mapillary channels for the rest of the night, but records no refusal and arms no cooldown (see `docs/scheduler.md`).
    The stop **closes** the crawl's pacer: no further request goes out, including ones already waiting for their turn, which are turned away uncommitted and uncounted.
    **It is not a refusal**: a 302 → `/login` is still the `HostBlockedError` (exit 75) it always was, after a 429 too, and wins if both happen in one crawl.
    A refusal also closes the pacer and cuts short any hold in progress, so no request follows a 302 and the host lock is not held through a hold the crawl will never use.
@@ -908,7 +951,7 @@ The only cooldown ever reported for a Mapillary tile block is thread 5821's 15-m
 And with the pause at the third episode, a crawl holds in at most two episodes, each lasting the longest wait asked for inside it (at most 900 s), so it holds the machine-wide tile lock for about 30 minutes of sleeping — not exactly, since a same-episode response can extend a hold by up to one request timeout (30 s).
 That is well inside prod's 180-minute per-city timeout floor (`city_timeout_minutes`).
 **A hold that would end past the crawl's wall-clock budget is not slept at all**: the crawl stops at once instead.
-The scheduler forwards that budget as the child's SIGKILL timeout less a 600 s margin (`_crawl_max_seconds`), so a 900 s hold begun inside the margin would be killed mid-sleep and counted a failure, where stopping is exit 87, which the scheduler half (PR #449) amnesties.
+The scheduler forwards that budget as the child's SIGKILL timeout less a 600 s margin (`_crawl_max_seconds`), so a 900 s hold begun inside the margin would be killed mid-sleep and counted a failure, where stopping is the amnestied exit 87.
 A halved pace also doubles the remaining wall clock of the crawl it applies to, so a large city answered 429 early can reach its budget; the clock then pauses it as exit 83, which is the intended outcome.
 
 **One known interaction, left as it is.**

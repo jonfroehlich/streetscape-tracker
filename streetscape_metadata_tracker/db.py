@@ -30,7 +30,7 @@ from .naming import sanitize_city_query_str
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 21
+SCHEMA_VERSION = 22
 
 # The v16 per-host ledger (issue #385). One constant, spliced into _SCHEMA
 # below AND executed by _migrate_v15_to_v16, which runs before _SCHEMA and needs
@@ -542,6 +542,42 @@ CREATE TABLE IF NOT EXISTS fill_attempts (
     run_date TEXT NOT NULL,
     PRIMARY KEY (city_id, run_date)
 );
+-- v22 (issue #444): every verdict this machine has had from a per-IP host.
+-- A `refused` row is written wherever the scheduler classifies a child exit
+-- as a host REFUSAL (the blocked family: 75/76/81/84), and by `scheduler
+-- probe-host` when its one request is refused; a `cleared` row only by
+-- probe-host. Before this a refusal lived only in the rotating log, so "how
+-- long has the tile CDN been silent" and "when did it last refuse us" had to
+-- be re-derived from log archaeology. The cross-night refusal cooldown keys on
+-- the newest `refused` row ONLY: a clearance never shortens it.
+--
+-- recorded_at is the UTC ISO-8601 instant of the classification. `source` is
+-- the command that wrote it (run-due, assess-city, probe-host); `channel` and
+-- `city_id` are the refused child's, NULL for a probe. requests_before is the
+-- host's host_usage total over the 24 h before recorded_at (NULL for a host
+-- no ledger meters, e.g. Overpass) -- the rolling figure #444 had to rebuild
+-- by hand for every onset, and it includes whatever the refused child itself
+-- charged. `detail` is the outcome's reason (redacted) or the probe's status
+-- line. No FK on city_id: a probe row has none, and a refusal is a fact about
+-- the host that must survive whatever happens to the city.
+--
+-- Purely additive (the v2 -> v3 pattern): no migration function; the
+-- CREATE TABLE IF NOT EXISTS builds it on any older catalog, and pre-#444 code
+-- ignores it after a rollback (though it refuses the v22 stamp).
+CREATE TABLE IF NOT EXISTS host_refusals (
+    id              INTEGER PRIMARY KEY,
+    recorded_at     TEXT NOT NULL,
+    host            TEXT NOT NULL,
+    verdict         TEXT NOT NULL CHECK (verdict IN ('refused', 'cleared')),
+    source          TEXT NOT NULL,
+    channel         TEXT,
+    city_id         TEXT,
+    exit_code       INTEGER,
+    detail          TEXT,
+    requests_before INTEGER
+);
+CREATE INDEX IF NOT EXISTS host_refusals_host_verdict_time
+    ON host_refusals(host, verdict, recorded_at);
 """
 )
 
@@ -921,6 +957,12 @@ def init_schema(conn: sqlite3.Connection) -> None:
     if user_version == 20:
         _migrate_add_quarantine_alerted_at_column(conn)
         user_version = 21
+    # v21 -> v22 (issue #444): the host_refusals table. Purely additive, so
+    # like v2 -> v3 it needs no migration function -- the CREATE TABLE IF NOT
+    # EXISTS in _SCHEMA below builds it on any older catalog, and on one another
+    # branch stamped v22 for a different reason.
+    if user_version == 21:
+        user_version = 22
     conn.executescript(_SCHEMA)
     # The GSV query-radius pair (issue #367) is ALSO added on every connect, not
     # only on its rung: while in flight it and PR #388 both stamped v16, so a
@@ -2483,6 +2525,87 @@ def get_host_usage(conn: sqlite3.Connection, host: str, since: datetime) -> int:
         (host, _utc_iso(since)),
     ).fetchone()
     return int(row[0])
+
+
+# The two verdicts host_refusals holds (issue #444); its CHECK constraint names
+# the same pair.
+HOST_REFUSED = "refused"
+HOST_CLEARED = "cleared"
+
+
+def record_host_verdict(
+    conn: sqlite3.Connection,
+    host: str,
+    verdict: str,
+    *,
+    source: str,
+    channel: str | None = None,
+    city_id: str | None = None,
+    exit_code: int | None = None,
+    detail: str | None = None,
+    at: datetime | None = None,
+) -> None:
+    """Record one per-IP host verdict in ``host_refusals`` and commit (issue #444).
+
+    ``verdict`` is :data:`HOST_REFUSED` or :data:`HOST_CLEARED`. ``at``
+    defaults to now (UTC, through ``clock``). ``requests_before`` is filled
+    here from ``host_usage`` over the 24 h before ``at``, or left NULL for a
+    host no channel's ledger meters. Example::
+
+        record_host_verdict(conn, "mapillary_tiles", HOST_REFUSED,
+                            source="run-due", channel="mapillary",
+                            city_id="carlsbad--california--united-states",
+                            exit_code=75, detail="exited 75 (...)")
+    """
+    if verdict not in (HOST_REFUSED, HOST_CLEARED):
+        raise ValueError(f"verdict must be {HOST_REFUSED!r} or {HOST_CLEARED!r}, not {verdict!r}")
+    at = clock.utc_now() if at is None else at
+    from .download_common import CHANNEL_METERED_HOST
+
+    requests_before = (
+        get_host_usage(conn, host, at - timedelta(hours=24))
+        if host in set(CHANNEL_METERED_HOST.values())
+        else None
+    )
+    conn.execute(
+        """INSERT INTO host_refusals
+           (recorded_at, host, verdict, source, channel, city_id, exit_code, detail,
+            requests_before)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            _utc_iso(at),
+            host,
+            verdict,
+            source,
+            channel,
+            city_id,
+            exit_code,
+            detail,
+            requests_before,
+        ),
+    )
+    conn.commit()
+
+
+def newest_host_verdict(
+    conn: sqlite3.Connection, host: str, verdict: str, *, before: datetime | None = None
+) -> sqlite3.Row | None:
+    """The newest ``host_refusals`` row for ``host`` with ``verdict``, or None (issue #444).
+
+    ``before`` (exclusive) limits it to rows recorded before that instant --
+    how a night asks about refusals from BEFORE it started.
+    """
+    sql = "SELECT * FROM host_refusals WHERE host = ? AND verdict = ?"
+    params: list[Any] = [host, verdict]
+    if before is not None:
+        sql += " AND recorded_at < ?"
+        params.append(_utc_iso(before))
+    return conn.execute(sql + " ORDER BY recorded_at DESC, id DESC LIMIT 1", params).fetchone()
+
+
+def host_verdict_hosts(conn: sqlite3.Connection) -> list[str]:
+    """Every host ``host_refusals`` holds a row for, sorted (issue #444)."""
+    return [r[0] for r in conn.execute("SELECT DISTINCT host FROM host_refusals ORDER BY host")]
 
 
 def record_early_refresh(
