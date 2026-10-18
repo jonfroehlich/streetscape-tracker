@@ -1,6 +1,6 @@
 {
   "generated_by": "scripts/gsv_history_pilot_analyze.py",
-  "generated_at": "2026-10-17T18:07:48+00:00",
+  "generated_at": "2026-10-18T00:03:11+00:00",
   "worklist": "seattle--washington--united-states_width_17689_height_28145_step_20_streetwalk_sp15_2026-09-11.worklist.csv.gz",
   "city_id": "seattle--washington--united-states",
   "passes": {
@@ -26,6 +26,9 @@
         "90": 12.0
       },
       "zero_history_samples": 2,
+      "unanchored_samples": 16,
+      "unanchored_samples_with_history": 14,
+      "unanchored_dated_panos_mean": 7.312,
       "history_rows": 15515,
       "third_party_rows": 20,
       "distinct_official_panos": 15490,
@@ -57,68 +60,86 @@
     },
     "2": {
       "worklist_rows": 21728,
-      "requests_answered": 700,
+      "requests_answered": 21728,
       "http_status": {
-        "200": 700
+        "200": 21728
       },
       "response_code": {
-        "0": 700
+        "0": 21690,
+        "5": 38
       },
-      "anchored_samples": 690,
-      "anchor_in_history": 535,
-      "anchor_in_history_share": 0.7754,
-      "dated_panos_per_sample_mean": 11.05,
+      "anchored_samples": 21556,
+      "anchor_in_history": 18584,
+      "anchor_in_history_share": 0.8621,
+      "dated_panos_per_sample_mean": 8.82,
       "dated_panos_per_sample_pctiles": {
-        "10": 5.0,
-        "25": 8.0,
-        "50": 10.0,
-        "75": 17.0,
-        "90": 18.0
+        "10": 4.0,
+        "25": 6.0,
+        "50": 8.0,
+        "75": 11.0,
+        "90": 15.0
       },
-      "zero_history_samples": 0,
-      "history_rows": 7735,
-      "third_party_rows": 25,
-      "distinct_official_panos": 7136,
-      "official_captures_per_sample_mean": 11.014,
+      "zero_history_samples": 38,
+      "unanchored_samples": 172,
+      "unanchored_samples_with_history": 135,
+      "unanchored_dated_panos_mean": 7.709,
+      "history_rows": 191644,
+      "third_party_rows": 179,
+      "distinct_official_panos": 181706,
+      "official_captures_per_sample_mean": 8.812,
       "capture_year_histogram": {
-        "2007": 259,
-        "2008": 436,
-        "2011": 638,
-        "2012": 123,
-        "2013": 111,
-        "2014": 886,
-        "2015": 442,
-        "2016": 244,
-        "2017": 507,
-        "2018": 599,
-        "2019": 678,
-        "2021": 1124,
-        "2022": 1,
-        "2023": 487,
-        "2024": 340,
-        "2025": 835
+        "2007": 10444,
+        "2008": 13470,
+        "2009": 25,
+        "2010": 1,
+        "2011": 18911,
+        "2012": 2410,
+        "2013": 1090,
+        "2014": 19339,
+        "2015": 11603,
+        "2016": 8473,
+        "2017": 12275,
+        "2018": 16577,
+        "2019": 18781,
+        "2021": 16090,
+        "2022": 5371,
+        "2023": 10476,
+        "2024": 6235,
+        "2025": 19825,
+        "2026": 69
       },
       "first_fetched_at": "2026-10-17T17:55:48.278257+00:00",
-      "last_fetched_at": "2026-10-17T18:07:31.336322+00:00",
-      "elapsed_min": 11.72,
-      "achieved_rate_per_min": 59.74
+      "last_fetched_at": "2026-10-17T23:59:01.946200+00:00",
+      "elapsed_min": 363.23,
+      "achieved_rate_per_min": 59.82
     }
   },
   "edges": {
-    "edges": 1998,
+    "months_per_edge_pass1_mean": 7.747,
+    "months_per_edge_both_mean": 11.368,
+    "edges_where_midpoint_sees_every_month": 664,
+    "midpoint_month_coverage_share_pctiles": {
+      "10": 0.3448275862068966,
+      "25": 0.625,
+      "50": 0.8333333333333334,
+      "75": 1.0,
+      "90": 1.0
+    },
+    "midpoint_month_coverage_share_mean": 0.7632,
+    "edges": 2000,
     "distinct_official_panos_pass1_sum": 15495,
-    "distinct_official_panos_both_sum": 23183,
-    "ratio_both_to_pass1": 1.4962,
-    "edges_where_pass2_added_panos": 53,
+    "distinct_official_panos_both_sum": 206337,
+    "ratio_both_to_pass1": 13.3164,
+    "edges_where_pass2_added_panos": 1895,
     "pass2_added_per_edge_pctiles": {
-      "10": 0.0,
-      "25": 0.0,
-      "50": 0.0,
-      "75": 0.0,
-      "90": 0.0
+      "10": 6.0,
+      "25": 19.0,
+      "50": 42.0,
+      "75": 87.0,
+      "90": 202.10000000000014
     },
     "distinct_official_panos_global_pass1": 15490,
-    "distinct_official_panos_global_both": 22604
+    "distinct_official_panos_global_both": 196427
   },
   "spot_check": {
     "requests": 200,

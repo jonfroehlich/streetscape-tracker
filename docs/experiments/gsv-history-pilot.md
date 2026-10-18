@@ -2,7 +2,7 @@
 
 **Ran:** 2026-10-17, from the dedicated crawler host ·
 **Verdict:** the endpoint [#2](https://github.com/jonfroehlich/streetscape-tracker/issues/2) shipped against is **gone**, and the one the Maps JavaScript API uses **answers in full**: 2,000 Seattle edge midpoints at 1 request/s returned **15,515** capture-history rows, **7.8 dated captures per sample**, spanning 2007 to 2026, and a 200-id sample agreed with the documented metadata API on the capture month **200 times out of 200**.
-A pass over the remaining 21,728 samples of the same edges is running; its section below is filled when it completes.
+**The midpoint query does not stand in for its street**: pass 2 over the same edges' other 21,728 samples found **13.3×** the distinct panos pass 1 had, and the midpoint alone saw on average **76 %** of the capture months its edge was driven in (every one of them on only 664 of 2,000 edges) — so a per-edge backfill measures re-capture frequency low by about a quarter, and the query unit is a real decision, taken below.
 
 Issue: [#442](https://github.com/jonfroehlich/streetscape-tracker/issues/442) (step 3 of its plan).
 Numbers: [`gsv-history-pilot_metrics.json`](gsv-history-pilot_metrics.json), written by `scripts/gsv_history_pilot_analyze.py` over the crawl's parsed files and the spot check's own metrics.
@@ -91,23 +91,56 @@ Every year in the sample matched completely (2007: 13 of 13 … 2025: 25 of 25).
 So the undocumented list and the documented per-pano request describe the same captures, and a harvested month can be quoted with the documented API's confidence.
 It also means none of the 200 historical panos has been retired from the documented API — the history the RPC lists is still individually addressable.
 
-## Finding 4: samples with no current official pano
+## Finding 4: samples with no current official pano still hold history
 
-Pending pass 2, which holds most of the 188 unanchored samples (16 were in pass 1; 14 of those still returned dated panos — 2 returned nothing).
+188 of the 23,728 samples carry no anchor: the walk found no current official pano within its radius there.
 
-## Finding 5: what pass 2 adds per edge
+| | Pass 1 | Pass 2 |
+|---|---|---|
+| Unanchored samples | 16 | 172 |
+| …that returned dated panos | 14 | 135 (78 %) |
+| Dated panos per unanchored sample, mean | 7.3 | 7.7 |
 
-Pending. Filled from the `edges` block of the metrics file when pass 2 completes.
+So a street that reads as uncovered today was, three times out of four, driven before, and about as often as a covered one.
+Those samples stay in scope: they are exactly the "lost coverage" the temporal series cannot see from current dates.
+(Why the walk found nothing there while the search did is the same question as the absent anchors in finding 2 — the walk's documented request and this RPC pick their nearest pano differently at the margin — and is answerable from the raw bodies.)
+
+## Finding 5: what pass 2 adds per edge — the query unit
+
+Pass 2: 21,728 requests in 363 min (59.8/min), all HTTP 200; 21,690 with imagery and 38 with none; 191,644 history rows (179 third-party), **181,706 distinct official panos**; dated panos per sample mean 8.8 (p10 4, p50 8, p90 15); the anchor present in its own history for 86.2 % of anchored samples.
+
+The issue's sizing assumed a search near an edge's midpoint returns the segment's history.
+It does not: a search returns the captures **at that point** (the current pano and the panos of earlier drives within reach of it), so each 15 m sample contributes its own set.
+
+| Per edge, official panos | Pass 1 (midpoint) | Pass 1 + 2 |
+|---|---|---|
+| Distinct panos, summed over the 2,000 edges | 15,495 | 206,337 (**13.3×**) |
+| Distinct panos, global | 15,490 | 196,427 |
+| Edges where pass 2 added at least one pano | — | 1,895 of 2,000 |
+| Panos pass 2 added per edge: p10 · p50 · p90 | — | 6 · 42 · 202 |
+
+For the re-capture question the unit is the **capture month**, not the pano: how many distinct months was this street driven in?
+
+| Per edge, distinct capture months | Pass 1 | Pass 1 + 2 |
+|---|---|---|
+| Mean | 7.7 | 11.4 |
+| Edges where the midpoint saw every month | 664 of 2,000 (33 %) | — |
+| Share of the edge's months the midpoint saw: p10 · p25 · p50 · p75 | 0.34 · 0.63 · 0.83 · 1.00 (mean 0.76) | — |
+
+So one query per edge sees three quarters of the drives a street had, complete on a third of streets, and biases re-capture frequency low by about a quarter on the rest.
+Whether two or three well-placed samples per edge close that gap is answerable from pass 2's data alone (the samples are already there), and is the next analysis, not the next crawl.
 
 ## Decisions
 
 - **Switch routes and keep raw.** Done in [#446](https://github.com/jonfroehlich/streetscape-tracker/pull/446): the RPC route, `third_party` and `is_current` on every row, and `scripts/reparse_gsv_history_raw.py` so the parsed files are a view of the raw store that any later parser can regenerate for zero requests.
-- **The pace held.** 2,000 requests at a measured 60.8/min with no non-200 answer; nothing here argues for raising it, and READ THIS FIRST argues against resolving that by experiment.
-- **The backfill's query unit waits on finding 5.**
+- **The pace held.** 23,728 requests over 6.6 hours at a measured ~60/min with no non-200 answer; nothing here argues for raising it, and READ THIS FIRST argues against resolving that by experiment.
+- **Unanchored samples stay in the work lists** (finding 4).
+- **The query unit is not settled by this pilot.** The issue's pass-1-then-pass-2 plan still holds as a *sequence* — pass 1 everywhere yields a usable 76 %-of-months dataset early — but the issue's claim that pass 1 "yields segment-level history" is false as stated and is corrected there.
+  Before the backfill starts, measure from pass 2's data how month coverage grows with k evenly spaced samples per edge; that sets whether the catalog-wide cost is nearer 8.9 M (k = 1), a small multiple of it, or the 59 M of every sample.
 
 ## Caveats
 
-- One city, 2,000 edges in sample order (so spatially clustered), one day. The capture-year shape is Seattle's, not a catalog property.
+- One city, 2,000 edges in sample order (so spatially clustered), one day. The capture-year shape and the 76 % month coverage are Seattle's, where streets have been driven ~11 times; a town driven twice will look different.
 - The spot check samples official ids only; third-party ids were not checked against the documented API.
 - Finding 1's 100 requests were spent before anything could be read; a pilot that starts with one request would have cost one.
 

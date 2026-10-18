@@ -1,6 +1,7 @@
 """Pins for scripts/gsv_history_pilot_analyze.py (#442): offline, synthetic crawl files."""
 
 import json
+import os
 
 import pandas as pd
 import pytest
@@ -134,3 +135,42 @@ def test_summarize_edges_counts_distinct_panos_not_rows():
         e["distinct_official_panos_pass1_sum"] == 1 and e["distinct_official_panos_both_sum"] == 1
     )
     assert e["ratio_both_to_pass1"] == 1.0 and e["edges_where_pass2_added_panos"] == 0
+
+
+def test_committed_pilot_metrics_hold_the_figures_the_writeup_quotes():
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, "docs", "experiments", "gsv-history-pilot_metrics.json")) as f:
+        m = json.load(f)
+    p1, p2, e, sc = m["passes"]["1"], m["passes"]["2"], m["edges"], m["spot_check"]
+    assert m["generated_by"] == "scripts/gsv_history_pilot_analyze.py"
+    assert (p1["requests_answered"], p2["requests_answered"]) == (2000, 21728)
+    assert p1["http_status"] == {"200": 2000} and p2["http_status"] == {"200": 21728}
+    assert (p1["history_rows"], p1["third_party_rows"], p1["distinct_official_panos"]) == (
+        15515,
+        20,
+        15490,
+    )
+    assert (p2["history_rows"], p2["third_party_rows"], p2["distinct_official_panos"]) == (
+        191644,
+        179,
+        181706,
+    )
+    assert (
+        round(p1["anchor_in_history_share"], 3) == 0.854
+        and round(p2["anchor_in_history_share"], 3) == 0.862
+    )
+    assert (p1["unanchored_samples"], p1["unanchored_samples_with_history"]) == (16, 14)
+    assert (p2["unanchored_samples"], p2["unanchored_samples_with_history"]) == (172, 135)
+    assert round(e["ratio_both_to_pass1"], 1) == 13.3 and e["edges_where_pass2_added_panos"] == 1895
+    assert e["edges_where_midpoint_sees_every_month"] == 664
+    assert round(e["midpoint_month_coverage_share_mean"], 2) == 0.76
+    assert (e["months_per_edge_pass1_mean"], e["months_per_edge_both_mean"]) == (
+        pytest.approx(7.7, abs=0.05),
+        pytest.approx(11.4, abs=0.05),
+    )
+    assert (sc["requests"], sc["month_match"], sc["month_mismatch"], sc["unknown"]) == (
+        200,
+        200,
+        0,
+        0,
+    )
