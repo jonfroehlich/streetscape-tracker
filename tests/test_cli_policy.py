@@ -663,6 +663,27 @@ def test_a_busy_lock_exits_with_the_busy_code_not_the_blocked_one(monkeypatch, c
     assert rc != HOST_EXIT_CODES[HOST_MAPILLARY_TILES]
 
 
+def test_a_throttled_host_exits_with_the_throttled_code(monkeypatch, catalog):
+    """Issue #444: a backpressure stop is neither the refusal (75) nor a pause
+    (83) -- the scheduler latches the host on it without recording a refusal
+    or a failure, so the grid CLI must hand it over as its own number."""
+    from streetscape_metadata_tracker.download_common import (
+        HOST_THROTTLED_EXIT_CODES,
+        HostThrottledError,
+    )
+
+    _, city_id, data_dir = catalog
+    gsv_configs(monkeypatch)
+    monkeypatch.setattr(
+        cli,
+        "download_mapillary_metadata_async",
+        stub_downloader([], error=HostThrottledError("429s", host=HOST_MAPILLARY_TILES)),
+    )
+
+    rc = run_cli(monkeypatch, city_id, data_dir, provider="mapillary")
+    assert rc == HOST_THROTTLED_EXIT_CODES[HOST_MAPILLARY_TILES] == 87
+
+
 def test_a_mixed_failure_exits_1_rather_than_a_host_code(monkeypatch, catalog):
     """
     Mapillary blocked AND GSV genuinely broken. Reporting the host code would

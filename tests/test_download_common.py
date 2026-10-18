@@ -557,3 +557,71 @@ def test_grid_ordinal_arithmetic_locates_every_point():
         computed = (i - i_values[0]) * n_j + (j - j_values[0])
         assert computed == ordinal
         assert (lats[computed], lons[computed]) == (lats[ordinal], lons[ordinal])
+
+
+# ── AsyncRateLimiter.slow_down (issue #444) ──────────────────────────────────
+
+
+def test_slow_down_doubles_the_spaced_pacers_gaps(monkeypatch):
+    """The Mapillary census halves its pace after a 429/503. The gap already
+    drawn stands; every gap drawn after the call is around twice the mean."""
+    clock, now = _make_clock()
+    sleeps = []
+    _patch_sleep(monkeypatch, clock, sleeps)
+    limiter = AsyncRateLimiter(40, time_func=now, jitter=0.6, draw_func=_draws([1.0] * 10))
+
+    async def scenario():
+        await limiter.acquire()
+        await limiter.acquire()  # waits the 1.5 s drawn before the slowdown
+        limiter.slow_down(2)
+        await limiter.acquire()  # waits the gap drawn by the 2nd: still 1.5 s
+        await limiter.acquire()  # waits a gap drawn after: 3.0 s
+        await limiter.acquire()
+
+    _run(scenario())
+    assert sleeps == [
+        pytest.approx(1.5),
+        pytest.approx(1.5),
+        pytest.approx(3.0),
+        pytest.approx(3.0),
+    ]
+
+
+def test_slow_down_halves_the_token_buckets_rate(monkeypatch):
+    clock, now = _make_clock()
+    sleeps = []
+    _patch_sleep(monkeypatch, clock, sleeps)
+    limiter = AsyncRateLimiter(60, time_func=now)  # 1/s, burst 1
+
+    async def scenario():
+        await limiter.acquire()
+        await limiter.acquire()
+        limiter.slow_down(2)
+        await limiter.acquire()
+
+    _run(scenario())
+    assert sleeps == [pytest.approx(1.0), pytest.approx(2.0)]
+
+
+def test_slow_down_is_scoped_to_one_limiter_instance(monkeypatch):
+    """Nothing here is module or class state: a second limiter, like a second
+    crawl's, starts at the configured pace whatever the first one did."""
+    clock, now = _make_clock()
+    sleeps = []
+    _patch_sleep(monkeypatch, clock, sleeps)
+    slowed = AsyncRateLimiter(40, time_func=now, jitter=0.6, draw_func=_draws([1.0] * 10))
+    slowed.slow_down(2)
+    fresh = AsyncRateLimiter(40, time_func=now, jitter=0.6, draw_func=_draws([1.0] * 10))
+
+    async def scenario():
+        await fresh.acquire()
+        await fresh.acquire()
+
+    _run(scenario())
+    assert sleeps == [pytest.approx(1.5)]
+
+
+@pytest.mark.parametrize("factor", [0.5, 0, -1])
+def test_slow_down_refuses_a_speed_up(factor):
+    with pytest.raises(ValueError):
+        AsyncRateLimiter(40).slow_down(factor)

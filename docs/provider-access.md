@@ -816,3 +816,106 @@ Pacing stays correct regardless, because every attempt, inner retries included, 
 
 If the first nights after deploy show OVER_QUERY_LIMIT rows, a rise in REQUEST_FAILED, or an HTTP 403/429 from the metadata endpoint, lower `[download].max_requests_per_minute` first.
 Do not revert the connector or the pipelining: they change nothing about the rate, only how much of it is reached.
+
+## The tile census now counts what the CDN answers, says who it is, and backs off on 429/503 (issue #444)
+
+**Three changes to how the Mapillary tile census calls `tiles.mapillary.com`, all in `download_mapillary.py`, shared by the grid run and the road walk.**
+None of them changes the pace: the default is still 40/min at jitter CV 0.6 (#292), and nothing here retunes it.
+
+### What Mapillary documents and what its forum says, re-read 2026-10-17
+
+READ THIS FIRST requires this before any change to retry or identity behaviour, so it was done first; the reads went through a web fetcher, never from a host that collects.
+
+- **Documented** ([API documentation](https://www.mapillary.com/developer/api-documentation), rate-limits section): tiles are limited to 50,000 per day per app, "(not per minute)", and exceeding it returns "status code 4xx".
+  The page says **nothing** about HTTP 429, `Retry-After`, a `User-Agent`, or IP-level blocking.
+- **Reported by staff, informally.** [Thread 10644](https://forum.mapillary.com/t/50-000-requests-day-rate-limit-scope/10644) (2026-08-24): an IP-level layer "might block you earlier" on "a sudden spike"; the thread still ends at this project's own 2026-08-28 question, unanswered.
+  [Thread 10574](https://forum.mapillary.com/t/missing-images-and-green-coverage-lines-is-it-just-me/10574) (2026-07-23): "IP blocks are a strong possibility", "the block is 24 hours, as I remember", and "we have multiple levels of rate-limiting".
+  [Thread 8336](https://forum.mapillary.com/t/receiving-html-response-instead-of-json/8336): "Rate limits reset every 24 hours", and a promise to "look into the rate limit errors".
+- **Reported by users only.** [Thread 5821](https://forum.mapillary.com/t/inconsistent-authentication-issues/5821) (2022): the block is per IP, "retrying seemed to extend the block" at 5–10 minute waits, and a 15-minute sleep was found "purely [by] trial and error".
+- **Not found anywhere**: a 429 or a `Retry-After` from the tile CDN, any statement that a `User-Agent` is read, or any thread about a 302 → `/login` from `tiles.mapillary.com` other than our own.
+- **Unknown**: whether the CDN ever sends 429 or 503 before the redirect wall (H2 in #444).
+  Nothing counted it before the status line below, so the answer will come from our own logs, not from Mapillary.
+
+### One status line per crawl
+
+Every HTTP response a crawl receives is tallied by class and logged once, after the fetch, on every way out of it — success, a 302 refusal (exit 75), a pause (exit 83), a backpressure stop (exit 87) — and as an all-zero line for a census reused from the cache.
+Its shape, with illustrative numbers:
+
+```
+mapillary tile statuses: 200=81 204=0 404=1 429=0 4xx=0 5xx=0 3xx=5 other=0 noresp=0 requests=87 retries=1 retry_after=[] city='Carlsbad, CA'
+```
+
+`3xx` is every redirect, in practice the `/login` refusal.
+`4xx` is every 4xx except 404 and 429, which have their own keys.
+`noresp` is requests that got no HTTP status at all (a timeout, a reset), derived as `requests` minus the statuses so the two cannot disagree.
+`retries` is attempts beyond a tile's first, whichever layer retried it.
+`retry_after` lists every `Retry-After` value seen, verbatim, capped at 20 with a `+N more`.
+The response is counted in `_fetch_tile` **before** any branch can raise, so a refusal is in the line rather than missing from it.
+The line is a log contract only: the pause phrases the scheduler parses are unchanged, and the one new exit code is the throttled 87 below.
+Rolling it into the scheduler's `Done:` line is #444's scheduler half.
+
+### An identifying User-Agent
+
+The one session the census opens is built with
+
+```
+StreetscapeTracker/1.0 (+https://github.com/jonfroehlich/streetscape-tracker; sidewalk@cs.uw.edu) aiohttp/<version>
+```
+
+(`download_mapillary.MAPILLARY_USER_AGENT`) in place of aiohttp's stock agent, the one every scraper sends.
+It is the **same string the Panoramax collector sends**, built by one function, `download_common.streetscape_user_agent`, so the two providers cannot drift apart.
+The contact address was chosen by Jon for the Panoramax agent in #405 (commit `8bc6f35`): a shared lab address rather than a personal one.
+The layout is RFC 9110's product token plus a comment, as the Panoramax section above describes.
+Since no Mapillary page says a `User-Agent` is read, **its effect on blocking is unknown**: what it buys is that someone reading Mapillary's logs can write to a person instead of refusing an IP.
+It also makes our traffic trivially identifiable, which is the point.
+
+### Backpressure on 429 and 503
+
+Before #444 a 429 or 503 was an ordinary `ClientResponseError`, which `@backoff` retried up to `TILE_MAX_TRIES` times on a seconds-long exponential, at pace, ignoring `Retry-After` — answering "slow down" by asking again almost at once, on the host where users report that retrying into a block extends it.
+Now:
+
+1. `_fetch_tile` raises `TileBackpressureError`, which is neither an `aiohttp.ClientError` (so `@backoff` does not retry it) nor a `DownloadError` (so #205's whole-city abort does not fire).
+   Other 4xx and 5xx keep the old `@backoff` path.
+2. The crawl's pacer is **held** — no request goes out from any of its sockets — for `max(Retry-After, 60 s)`.
+   Both RFC 9110 forms are read, delay-seconds and HTTP-date; a missing or unreadable header means 60 s, and so does one that cannot be parsed at all (Unicode digits, thousands of digits, a date `datetime` cannot hold) — parsing never raises.
+3. A `Retry-After` longer than **900 s** is not slept on, and neither is a hold that would end past the crawl's wall-clock budget: the crawl stops at once (rule 7).
+   Retrying before the time the server named would disobey it, and a sleep that long belongs to the next night rather than to this one's host lock.
+   **A crawl already stopping never holds** — once the request cap or the clock has turned a tile away, or would turn the retry away: no retry is going out, so a hold would only sleep with the tile lock held.
+   It escalates to the backpressure stop only for what says something about the host (the third episode, or a `Retry-After` past 900 s), never for outlasting the deadline, which after a clock stop every wait does; otherwise the stop stays the cap's or the clock's exit 83 (round-2 review of #444).
+4. The pace is **halved once** for the rest of that crawl (`AsyncRateLimiter.slow_down(2)`), on the limiter the crawl builds for itself, so it cannot reach another crawl or another process.
+5. The tile is then retried by re-entering the in-semaphore checks, so the abort, the request cap with its reservation, and the wall-clock deadline gate the retry exactly as they gate a fresh tile.
+   Every HTTP request, the 429 included, is counted once in `api_requests`.
+   **One tile gets at most two backpressure responses** (`TILE_BACKPRESSURE_TILE_TRIES`); after the second, and after its hold, it is given up as an ordinary failed tile, REQUEST_FAILED under #168's tolerance, as when `@backoff` exhausted it before #444.
+   That limit is below the pause on purpose: without it, one tile answering 503 to everything spent all three strikes by itself, the crawl paused, and the next night hit the same tile first, so the city never completed.
+   Several stuck tiles are covered by rule 6.
+6. Strikes are counted in **episodes, not responses**.
+   Each attempt records the pacer's generation when it is sent; a 429/503 answering a request sent before the latest hold began belongs to that hold, so it adds no strike (it may still extend the hold to its own wait).
+   One throttle window that answers several in-flight requests at once is one episode.
+   **Only a tile's first backpressure response can be a strike**: its own retry being refused again says something about that tile, not the host.
+   And a tile given up as stuck has its strike **withdrawn as soon as another tile is served**, since a host serving the next tile is not the one refusing.
+   Counted per response, two stuck tiles spent three strikes between them, the crawl paused, and as a failed tile is never committed every resumed night repeated it (round-2 review of #444); first responses alone still let three stuck tiles do the same.
+   A host-wide storm serves nothing between its tiles, so all its strikes stand and the third episode still pauses; so does a throttle whose retries succeed, since none of its tiles is given up.
+7. The **third episode** in one crawl stops it on the request cap's own path — turned-away tiles uncommitted, the checkpoint kept, raised before the settle loop — as **`HostThrottledError`, exit 87**, the THROTTLED family (`download_common.HOST_THROTTLED_EXIT_CODES`).
+   Every backpressure stop raises it, committed tiles or not; its message carries the phrase "stopped by provider backpressure (HTTP 429/503)", and says "the next run resumes it" only when a tile is committed, "starts from the first tile" otherwise.
+   It replaced exit 83 plus a plain-`DownloadError` arm for the nothing-committed case: that arm counted a `consecutive_failure`, so a few nights of a 429 storm would have quarantined every Mapillary pair (#421), and nothing latched the host, so the next city walked into the same 429s at full pace.
+   The scheduler half of #444 (PR #449, meant to merge with this one) amnesties 87 and skips both Mapillary channels for the rest of the night, but records no refusal and arms no cooldown, and documents that in `docs/scheduler.md`; until it lands the scheduler counts 87 as an ordinary failure.
+   The stop **closes** the crawl's pacer: no further request goes out, including ones already waiting for their turn, which are turned away uncommitted and uncounted.
+   **It is not a refusal**: a 302 → `/login` is still the `HostBlockedError` (exit 75) it always was, after a 429 too, and wins if both happen in one crawl.
+   A refusal also closes the pacer and cuts short any hold in progress, so no request follows a 302 and the host lock is not held through a hold the crawl will never use.
+
+**Why 900 s.**
+The only cooldown ever reported for a Mapillary tile block is thread 5821's 15-minute sleep, a hint rather than a contract.
+And with the pause at the third episode, a crawl holds in at most two episodes, each lasting the longest wait asked for inside it (at most 900 s), so it holds the machine-wide tile lock for about 30 minutes of sleeping — not exactly, since a same-episode response can extend a hold by up to one request timeout (30 s).
+That is well inside prod's 180-minute per-city timeout floor (`city_timeout_minutes`).
+**A hold that would end past the crawl's wall-clock budget is not slept at all**: the crawl stops at once instead.
+The scheduler forwards that budget as the child's SIGKILL timeout less a 600 s margin (`_crawl_max_seconds`), so a 900 s hold begun inside the margin would be killed mid-sleep and counted a failure, where stopping is exit 87, which the scheduler half (PR #449) amnesties.
+A halved pace also doubles the remaining wall clock of the crawl it applies to, so a large city answered 429 early can reach its budget; the clock then pauses it as exit 83, which is the intended outcome.
+
+**One known interaction, left as it is.**
+`_fetch_tile` waits on the pacer inside its `@backoff`-decorated body, so a tile that is mid-way through ordinary retries (a 500, a timeout) when a hold begins spends the hold against `@backoff`'s 120 s `max_time`.
+After a hold of 60 s or more it may get fewer than its five tries, and then becomes a failed tile under #168's tolerance a little sooner than it would have.
+Fixing that means moving the pacer out of the retried body, which #198 put there on purpose (one token per HTTP request), so it is noted rather than changed.
+
+Both statuses are covered because a CDN shedding load answers 503 and one metering a client answers 429.
+**Neither has ever been observed from `tiles.mapillary.com`**, so this is built ahead of the evidence, on the cheap side of an unknown.
+If the status line shows zero 429s and zero 503s across the next block, that is itself a finding: it means the 302 wall arrives with no warning, and H2 in #444 is false.
