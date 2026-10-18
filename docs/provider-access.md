@@ -363,7 +363,7 @@ The budgets were left at 1,750 for the restart because a fourth cut has no mecha
 
 **This is a pre-registered test, not a fix**, and the prediction is recorded in #286 before the restart.
 Blocks 2 and 3 each landed **on the 6th active collection night**: 08-13…08-20 and 08-23…08-28 are each a run of six collecting nights ending in the block.
-**Caveat (2026-10-17, #444):** 08-13 and 08-14 fell inside block 1 (see the correction above), so their traffic was mostly refused requests; counting only nights that were served, block 2 came after four nights, not six, and the regularity holds for block 3 alone.
+**Caveat (2026-10-17, #444):** 08-13 and 08-14 fell inside block 1 (see the correction above), so their traffic was mostly refused requests; counting only nights that were served, block 2 landed on the 4th served night, not the 6th, and the regularity holds for block 3 alone.
 Two observations, not three — block 1 (08-12) came from a bulk catch-up sustaining ~370 req/min rather than from a six-night restart — so this is an n=2 regularity and the read-out below is only as strong as that.
 Those two runs were also 8 calendar days apart, but only because each happened to contain exactly two paused days — so the calendar reading and the active-night reading coincided by accident.
 This restart has no paused days, so the two PREDICTIONS diverge — six active nights lands on 09-04, where carrying the priors' 8-calendar-day block-to-block spacing forward from 08-28 lands on 09-05 — and the active-night rule is the one stated here.
