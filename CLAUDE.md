@@ -107,7 +107,7 @@ A pair moves together in one transaction, `--no-opt-in` skips it all, an explici
 
 ### One-time and repair scripts (`scripts/`)
 
-Every script in this table is catalog/disk-only (no API calls), dry-run by default, and takes `--execute` — except `prefreeze_street_networks.py`, which queries Overpass on purpose.
+Every script in this table is catalog/disk-only (no API calls), dry-run by default, and takes `--execute` — except `prefreeze_street_networks.py`, which queries Overpass on purpose, and `spot_check_gsv_history.py`, which makes DOCUMENTED Street View metadata requests on the streets key from the catalog host (never from the credential-free crawler host).
 `scripts/` also holds provider probes and operator tools that are NOT in it and DO call APIs (e.g. `mapillary_user_activity.py`, `docs/operations.md`).
 
 | Script | Purpose |
@@ -120,6 +120,8 @@ Every script in this table is catalog/disk-only (no API calls), dry-run by defau
 | `backfill_streetwalk_length.py` | Backfill the schema v12 `street_walks` columns; exits nonzero if an artifact's lengths contradict the row's cataloged coverage (wrong artifact matched) |
 | `backfill_history_json.py` | Write the capture-history summary JSON beside every harvested `_gsv_history_` CSV (#109); then `regenerate-aggregate --publish` |
 | `prefreeze_street_networks.py --config config/scheduler.makelab1.toml [--nights N \| --all-enabled] [--limit N]` | Freeze tonight's walk cities' OSM networks after the night's tail (#341), serially and paced, through the same host lock and probe a walk uses — a walk on a frozen network never contacts Overpass, so a mid-night refusal then strands nothing; refuses while `run-due` is in flight; `--all-enabled` drains the whole catalog's cold backlog stalest-first, 20 per pass (#381). **Makes Overpass requests** (moved earlier, never added); chained from the collection unit's `OnSuccess=`/`OnFailure=` (#355, #389), so it tracks the night's end at any `max_batch_hours`, starts no fetch later than 1 h 15 min before the next fire, normally 00:45 Pacific (so a late night's pass cannot reach the next one), and asks a fail-closed Overpass probe before its first fetch |
+| `spot_check_gsv_history.py --history H --limit 200 --out J [--db-path DB]` | Check a sample of harvested capture months against the documented `pano=` metadata request (#442's pilot check); `--dry-run` samples only |
+| `reparse_gsv_history_raw.py --raw R --worklist W --out-dir D` | Rebuild a #442 history crawl's parsed files from its raw store under the current parser — zero requests; the raw body is the irreplaceable copy and the parsed CSVs are a view of it |
 | `recompute_run_stats.py --provider gsv --regenerate-json` | Re-derive every run's stored stats from its CSV under the current analysis definitions — the repair handle whenever a stats definition moves (#213); a definition change is applied to the WHOLE series in one pass |
 | `recompute_streetwalk_stats.py` | Re-derive every walk's `street_walks` stats, coverage artifact and diffs from its CSV + frozen GraphML under the current definition (#262); whole series or none, refuses a series on a missing GraphML (**never fetches Overpass**) or a sample-frame mismatch; `--catalog-only` leaves the site mixed |
 | `recompute_run_diffs.py --provider gsv --city C --regenerate-json` | Re-derive existing `run_diffs` rows and their detail files from both CSVs under the current reader (#245; #394's re-diff); updates in place so `diff_id` never moves, deletes only a diff-shaped file no other row names, heals stale per-run JSON on a re-run, refuses `--execute` while `run-due` is in flight |
@@ -176,7 +178,8 @@ A run ≥95% REQUEST_DENIED/OVER_QUERY_LIMIT is rejected before cataloging (rena
 `analysis.dated_unique_panos` is the single seam every date-derived statistic reads; it drops dates that cannot be true (a per-provider floor, the observation date as an inclusive ceiling) and, for gsv, third-party imagery.
 The CSV is never rewritten — a run file records what the provider said — so the guard repeats at every reader, and each reader must be **at least as permissive as the data on disk**: `fileutils.load_city_csv_file` pins `format="ISO8601"` because legacy runs carry month precision, and a strict or inferred format silently nulls whole series (#226); `city.js` and `vis.py` carry the same widening.
 The repair handle is `scripts/recompute_run_stats.py` over the **whole series in one pass** (a city's history must not mix two definitions), with `--regenerate-json` because repairing the catalog does not repair the site — and a repair tool that reads through the loader inherits the loader's blind spot (#226).
-The out-of-band GSV capture-history harvester (#2) is documented there too — and its published summary and city-page section (#109).
+The out-of-band GSV capture-history harvester (#2, reworked in #442) is documented there too — and its published summary and city-page section (#109).
+**It queries an undocumented, IP-identified endpoint, so it runs ONLY from a dedicated address no lab service shares (never makelab1 or makelab2), catalog-free, one request in flight at a paced 1/s, and stops on the FIRST 429/403 behind a 24 h latch**; its unit is the road-walk sample point from a work list built offline on the catalog host, and its raw responses are kept verbatim because the endpoint may outgrow the parser.
 
 **The census seam and the census providers → [`docs/census.md`](docs/census.md).**
 The census pipeline — record → rows → grid assignment → written CSV — lives **once** in `census.py`, parameterized per provider; never copy it into a provider module, because the contracts it enforces are invisible in a review of the second copy.
@@ -362,6 +365,7 @@ Keep any list a doc enumerates **alphabetical**, so two branches adding an entry
   - `carto-basemap-key.md`
   - `csv-float-parse.md`
   - `grid-density.md`
+  - `gsv-history-pilot.md`
   - `gsv-query-radius.md`
   - `gsv-throughput.md`
   - `kartaview-feasibility.md`

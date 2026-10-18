@@ -84,7 +84,7 @@ Out-of-window years are dropped **individually** (`_compact_capture_years`, boun
 Grouped by (country, region), *not* by record: keyed by record, a `publish` flip reads as an unrelated delete plus insert.
 This is where the Austria/Steiermark **`ibraltar`** corruption surfaces as what it is — a district list rewritten, not a region removed.
 Counters are exact; example lists are capped (`_MAX_DETAIL`) so a feed-wide edit can't republish the feed.
-**What is NOT available**: per-pano capture history needs #2's harvester and `history_harvests` is **empty — it has never been run**, so "the past" here means dates on *currently published* imagery plus our own snapshot diffs.
+**What is NOT available**: per-pano capture history needs the #442 crawl (#2's harvester reworked) and `history_harvests` is **empty — it has never been run**, so "the past" here means dates on *currently published* imagery plus our own snapshot diffs.
 The page states both that and the 2026-07-31 archive start, so a short revision log can't read as "Google rarely changes anything".
 Regenerated wherever the aggregate is, plus **unconditionally in `_finish_batch`**
 — unlike the aggregate and manifest, which gate on `succeeded > 0`, because the feed changes on its own ~weekly schedule and gating would leave the plan stale on exactly the quiet nights.
