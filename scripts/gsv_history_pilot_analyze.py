@@ -96,7 +96,29 @@ def summarize_edges(h1: pd.DataFrame, h2: pd.DataFrame) -> dict:
     both = both.reindex(edges, fill_value=0)
     gain = both - p1
     ratio = both.sum() / p1.sum() if p1.sum() else None
+    # Capture MONTHS per edge: the re-capture question needs the campaigns a
+    # street was driven in, not every pano. Does the midpoint see them all?
+    m1 = off1.assign(month=off1["capture_date"].astype(str).str[:7]).groupby("edge_id")["month"]
+    mboth = pd.concat([off1, off2])
+    mboth = mboth.assign(month=mboth["capture_date"].astype(str).str[:7]).groupby("edge_id")[
+        "month"
+    ]
+    months_p1 = m1.agg(set).reindex(edges).apply(lambda v: v if isinstance(v, set) else set())
+    months_both = mboth.agg(set).reindex(edges).apply(lambda v: v if isinstance(v, set) else set())
+    seen_share = pd.Series(
+        [len(a) / len(b) if b else None for a, b in zip(months_p1, months_both, strict=True)],
+        index=edges,
+        dtype=float,
+    ).dropna()
+    complete = int(sum(1 for a, b in zip(months_p1, months_both, strict=True) if b and a == b))
     return {
+        "months_per_edge_pass1_mean": round(float(months_p1.apply(len).mean()), 3),
+        "months_per_edge_both_mean": round(float(months_both.apply(len).mean()), 3),
+        "edges_where_midpoint_sees_every_month": complete,
+        "midpoint_month_coverage_share_pctiles": _pct(seen_share),
+        "midpoint_month_coverage_share_mean": round(float(seen_share.mean()), 4)
+        if len(seen_share)
+        else None,
         "edges": int(len(edges)),
         "distinct_official_panos_pass1_sum": int(p1.sum()),
         "distinct_official_panos_both_sum": int(both.sum()),

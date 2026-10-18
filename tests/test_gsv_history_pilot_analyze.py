@@ -3,6 +3,7 @@
 import json
 
 import pandas as pd
+import pytest
 
 from scripts.gsv_history_pilot_analyze import analyze, main, summarize_edges
 from streetscape_metadata_tracker.download_gsv_history import (
@@ -102,6 +103,11 @@ def test_pass_summary_and_edge_gain(tmp_path):
     assert (e["distinct_official_panos_pass1_sum"], e["distinct_official_panos_both_sum"]) == (4, 5)
     assert e["ratio_both_to_pass1"] == 1.25 and e["edges_where_pass2_added_panos"] == 1
     assert e["distinct_official_panos_global_both"] == 5
+    # Months: e0 midpoint saw {2011-06, 2019-06}, both passes add 2008-06 (2 of 3);
+    # e1 saw both of its months (complete).
+    assert e["edges_where_midpoint_sees_every_month"] == 1
+    assert e["months_per_edge_pass1_mean"] == 2.0 and e["months_per_edge_both_mean"] == 2.5
+    assert e["midpoint_month_coverage_share_mean"] == pytest.approx((2 / 3 + 1) / 2, abs=1e-4)
     assert m["spot_check"]["month_match"] == 5 and m["city_id"] == "bend"
 
 
