@@ -8,6 +8,7 @@ could reach Overpass is pinned shut.
 import gzip
 import json
 import os
+import sqlite3
 from datetime import date
 
 import geopandas as gpd
@@ -256,4 +257,24 @@ def test_script_refuses_an_unknown_city_and_a_missing_catalog(data_dir, tmp_path
     assert "no catalog" in capsys.readouterr().err
     db.connect(os.path.join(data_dir, "streetscape_tracker.db")).close()
     assert build_main(["--city", "nowhere", "--data-dir", data_dir]) == 2
+    assert "catalogs no runs or walks" in capsys.readouterr().err
+
+
+def test_script_refuses_an_unknown_city(catalog, data_dir, capsys):
+    assert build_main(["--city", "nowhere", "--data-dir", data_dir]) == 2
     assert "not a registered city" in capsys.readouterr().err
+
+
+def test_script_never_migrates_the_catalog(catalog, data_dir, tmp_path, capsys):
+    """The 2026-10-17 outage: a newer checkout's db.connect migrated PROD."""
+    db_path = os.path.join(data_dir, "streetscape_tracker.db")
+    conn = sqlite3.connect(db_path)
+    conn.execute(f"PRAGMA user_version = {db.SCHEMA_VERSION - 1}")
+    conn.commit()
+    conn.close()
+    before = open(db_path, "rb").read()
+    out = tmp_path / "w"
+    assert build_main(["--all", "--data-dir", data_dir, "--out-dir", str(out)]) == 2
+    assert f"schema version {db.SCHEMA_VERSION - 1}" in capsys.readouterr().err
+    assert open(db_path, "rb").read() == before
+    assert not out.exists()

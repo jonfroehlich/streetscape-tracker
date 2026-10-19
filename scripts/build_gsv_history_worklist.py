@@ -29,6 +29,13 @@ import osmnx as ox
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Read-only, never db.connect: connect runs init_schema, and on 2026-10-17 a
+# newer checkout's spot check migrated the PROD catalog that way and crashed
+# the next nightly. The sweep's opener refuses a schema mismatch instead.
+from scripts.sweep_orphan_diff_details import (  # noqa: E402
+    CatalogRefused,
+    open_catalog_readonly,
+)
 from streetscape_metadata_tracker import db  # noqa: E402
 from streetscape_metadata_tracker.download_common import positive_int  # noqa: E402
 from streetscape_metadata_tracker.fileutils import load_city_csv_file  # noqa: E402
@@ -129,11 +136,12 @@ def build_city(conn, city_id: str, args, out_dir: str) -> int:
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     db_path = args.db_path or db.get_default_db_path(args.data_dir)
-    if not os.path.isfile(db_path):
-        print(f"no catalog at {db_path}", file=sys.stderr)
+    try:
+        conn = open_catalog_readonly(db_path)
+    except CatalogRefused as exc:
+        print(exc, file=sys.stderr)
         return 2
     out_dir = args.out_dir or default_out_dir(args.data_dir)
-    conn = db.connect(db_path)
     if args.all:
         city_ids = [
             r["city_id"]
