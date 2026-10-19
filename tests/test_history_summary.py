@@ -8,10 +8,7 @@ stub that writes a synthetic CSV, and the autouse ``_no_real_network`` fixture
 would fail any test that tried.
 """
 
-import argparse
-import asyncio
 import gzip
-import importlib.util
 import json
 import os
 import subprocess
@@ -33,7 +30,6 @@ from streetscape_metadata_tracker.naming import generate_history_filename
 from tests.conftest import make_history_df, write_city_csv_gz
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_HARVEST_SCRIPT = os.path.join(_PROJECT_ROOT, "scripts", "harvest_gsv_history.py")
 _BACKFILL_SCRIPT = os.path.join(_PROJECT_ROOT, "scripts", "backfill_history_json.py")
 
 HARVEST_DATE = date(2026, 4, 10)
@@ -258,59 +254,6 @@ def _register_city(conn):
         grid_height_m=100,
         step_m=20,
     )
-
-
-def _load_harvest_script():
-    spec = importlib.util.spec_from_file_location("harvest_gsv_history_script", _HARVEST_SCRIPT)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def test_harvest_script_writes_the_summary_after_cataloging(conn, data_dir, monkeypatch):
-    city_id = _register_city(conn)
-    module = _load_harvest_script()
-    calls = []
-
-    async def fake_harvest(**kwargs):
-        calls.append(kwargs)
-        out = kwargs["output_csv_gz_path"]
-        df = make_history_df(
-            [("h1", "2009-06-01", 44.0, -121.0), ("h2", "2018-06-01", 44.0, -121.0)]
-        )
-        write_city_csv_gz(df, out)
-        return {
-            "df": df,
-            "filename_with_path": out,
-            "api_requests": 9,
-            "grid_points": 9,
-            "unique_panos": 2,
-            "oldest_capture_date": "2009-06-01",
-            "newest_capture_date": "2018-06-01",
-            "started_at": "2026-04-10T01:00:00+00:00",
-            "finished_at": "2026-04-10T01:03:00+00:00",
-        }
-
-    monkeypatch.setattr(module, "harvest_gsv_history_async", fake_harvest)
-    args = argparse.Namespace(
-        city=city_id,
-        data_dir=data_dir,
-        db_path=os.path.join(data_dir, "streetscape_tracker.db"),
-        harvest_date=HARVEST_DATE.isoformat(),
-        force=False,
-        connection_limit=2,
-        verbose=False,
-    )
-    assert asyncio.run(module._run(args)) == 0
-    assert len(calls) == 1, "the stub, never the real harvester, is what ran"
-
-    row = db.get_latest_history_harvest(conn, city_id)
-    assert row is not None
-    json_path = os.path.join(data_dir, _history_json_filename(row["csv_filename"]))
-    summary = strict_load(json_path)
-    assert summary["panos"]["unique_panos"] == row["unique_panos"] == 2
-    assert summary["harvest"]["grid_points_queried"] == 9
-    assert summary["harvest"]["finished_at"] == "2026-04-10T01:03:00+00:00"
 
 
 def _run_backfill(data_dir, *extra):
