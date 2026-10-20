@@ -325,13 +325,14 @@ The rule, the research behind it and the 900 s ceiling are in [`provider-access.
 - **The stop takes the request cap's path**: `backpressure_paused` joins `over_cap` and the deadline in the in-semaphore check, so a turned-away tile returns an uncommitted empty frame and the `if capped: raise` before the settle loop is still what keeps it from ever reading as an empty tile.
   What it raises is its own: `HostThrottledError` (exit 87), committed tiles or not, with the checkpoint kept as for exit 83 — never `SweepIncompleteError`, whose 83 promises the next city is unaffected, and never the cap's plain `DownloadError`, which counts a failure.
   The `fatal` raise runs before it, so a 302 in the same crawl is still exit 75.
-  A 429 answered after the cap or the clock already stopped the crawl opens no hold, and is 87 only on a third episode or a `Retry-After` past the ceiling.
+  A 429 answered after the cap or the clock already stopped the crawl opens no hold, and is 87 only on a third standing strike or a `Retry-After` past the ceiling.
+  A hold that would outlast the deadline stops the crawl on the **clock's** path below the strike limit (`clock_stopped` joins the same check, exit 83), never as 87.
 - **A retried tile re-enters at the top of that check**, so the abort, the cap with its reservation, and the deadline gate it as they gate a fresh tile.
   The cap's soft-ceiling residue is unchanged — still only `@backoff` retries by tiles already in flight — because a backpressure retry is a fresh admission, never an in-flight retry.
 - **One HTTP request, one count**: the 429 itself is counted inside `_fetch_tile` like any attempt, and the retry is counted when it is sent.
   A request turned away because the crawl paused while it waited on the pacer (`_CrawlPaused`) was never sent and is never counted.
 - **A stuck tile is a failed tile, never a stalled city**: after `TILE_BACKPRESSURE_TILE_TRIES` (2) backpressure responses the tile settles as an exception, so #168's `MAX_FAILED_TILE_FRACTION` judges it exactly as it judged a tile `@backoff` exhausted.
-  Only its first response can be a strike, and that strike is withdrawn once another tile is served, so several stuck tiles cannot pause the city either (round-2 review of #444).
+  Only its first response can be a strike, and that strike stops counting once another tile is served from a later pacer generation, so several stuck tiles cannot pause the city either — unless three sit in a row in request order, which one crawl cannot tell from a storm (rule 6 in `provider-access.md`, rounds 2 and 3 of the review of #444).
 - **Panoramax is untouched**: there a 429 is a per-IP refusal at the first request (difference 2 in its section below), because with no credential nothing else can be meant.
 - The per-crawl status line (`mapillary tile statuses: …`) is logged by the same function, after the gather, on every way out — see `provider-access.md` for its keys.
 

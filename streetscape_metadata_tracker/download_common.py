@@ -531,8 +531,9 @@ class HostThrottledError(HostUnavailableError):
     The third party asked this host to SLOW DOWN, and the crawl stopped (#444).
 
     Raised by the Mapillary tile census for every backpressure stop: the third
-    429/503 episode in one crawl, a ``Retry-After`` past the in-process ceiling,
-    or a hold that would outlast the crawl's wall-clock budget. Not a
+    standing 429/503 strike in one crawl, or a ``Retry-After`` past the
+    in-process ceiling. (A hold that would outlast the crawl's wall-clock
+    budget stops it on the clock instead, as exit 83, below that limit.) Not a
     :class:`HostBlockedError`: a 429 says "not this fast", where a 302 to
     ``/login`` says "not at all", so it maps to its own exit code
     (:data:`HOST_THROTTLED_EXIT_CODES`), which the scheduler half of #444

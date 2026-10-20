@@ -654,14 +654,18 @@ def test_a_backpressure_pause_resumes_for_the_missing_tiles_only(
     assert resumed["failed_tiles"] == []
 
 
-def test_a_hold_that_would_outlast_the_deadline_pauses_instead(
-    monkeypatch, tmp_path, limiters, holds
+def test_a_hold_that_would_outlast_the_deadline_stops_on_the_clock(
+    monkeypatch, tmp_path, limiters, holds, caplog
 ):
     """The scheduler's SIGKILL lands 600 s after the forwarded budget, and a
-    hold can be 900 s: one begun near the deadline must stop (exit 87), not
-    sleep into the kill (a counted failure)."""
+    hold can be 900 s: one begun near the deadline must not sleep into the
+    kill (a counted failure). Below the strike limit it is the CLOCK's stop,
+    exit 83 (round-3 review of #444): it used to be 87, which skips the whole
+    Mapillary host for the night on one 429 that anywhere else in the crawl
+    would have been waited out. Nor does the retry go out without its wait."""
     import time as _time
 
+    caplog.set_level(logging.INFO, logger=dm.__name__)
     script = {_TILES[3]: [status(429, **{"Retry-After": "300"})]}
     error, session = _crawl(
         monkeypatch,
@@ -670,11 +674,41 @@ def test_a_hold_that_would_outlast_the_deadline_pauses_instead(
         checkpoint_path=str(tmp_path / "cp"),
         deadline_monotonic=_time.monotonic() + 200,
     )
-    assert isinstance(error, HostThrottledError), error
-    assert "wall-clock budget" in str(error)
+    assert type(error) is SweepIncompleteError, error
+    assert error.stopped_by == "clock"
     assert holds == []
     assert error.units_done == 3
-    assert len(session.urls) == 4
+    # Tiles 0-2 and tile 3's 429: no retry, and no tile after it.
+    assert len(session.urls) == error.api_requests == 4
+    assert any("stopping on the clock now (exit 83)" in r.getMessage() for r in caplog.records)
+
+
+def test_a_third_episode_near_the_deadline_is_still_throttled(
+    monkeypatch, tmp_path, limiters, holds
+):
+    """The clock-stop rule above applies BELOW the strike limit only: the
+    third standing episode says something about the host wherever in the
+    crawl it lands, so it is 87 even when its wait would outlast the budget."""
+    import time as _time
+
+    # Three tiles refused with nothing served between: three episodes. The
+    # deadline sits 90 s ahead (holds are recorded, not slept, so it never
+    # moves): the 60 s holds of the first two fit, the third's 120 s would not.
+    storm = {
+        _TILES[0]: [status(503)] * 2,
+        _TILES[1]: [status(503)] * 2,
+        _TILES[2]: [status(503, **{"Retry-After": "120"})],
+    }
+    error, session = _crawl(
+        monkeypatch,
+        storm,
+        connection_limit=1,
+        checkpoint_path=str(tmp_path / "cp"),
+        deadline_monotonic=_time.monotonic() + 90,
+    )
+    assert type(error) is HostThrottledError, error
+    assert host_exit_code(error) == _THROTTLED
+    assert "3 HTTP 429/503 episodes" in str(error)
 
 
 # ── Backpressure after the crawl already stopped (round-2 review of #444) ─
@@ -929,6 +963,109 @@ def test_a_host_wide_503_storm_still_pauses_at_the_third_episode(
     assert error.units_done == 0
     # Tiles 0 and 1 drew both their responses, tile 2 its first: 5 requests.
     assert len(session.urls) == error.api_requests == 5
+
+
+def _nights_until_complete(monkeypatch, script, checkpoint_path, connection_limit, nights=3):
+    """Run the census over one checkpoint, night after night, as the scheduler
+    would, until it completes or ``nights`` run out. Returns (outcomes, last session)."""
+    outcomes = []
+    for _night in range(nights):
+        outcome, session = _crawl(
+            monkeypatch,
+            script(),
+            connection_limit=connection_limit,
+            checkpoint_path=checkpoint_path,
+        )
+        outcomes.append(outcome)
+        if not isinstance(outcome, BaseException):
+            break
+    return outcomes, session
+
+
+@pytest.mark.parametrize("connection_limit", [1, 5])
+@pytest.mark.parametrize(
+    "stuck",
+    [(0, 2, 4), (10, 11, 13), (10, 12, 14), (100, 103, 106)],
+    ids=["start-two-apart", "pair-then-one", "two-apart", "three-apart"],
+)
+def test_closely_spaced_stuck_tiles_complete_their_city(
+    monkeypatch, tmp_path, limiters, holds, connection_limit, stuck
+):
+    """Round-3 review of #444: round 2 withdrew a stuck tile's strike only on a
+    success AFTER its give-up, which takes two holds -- and the hold's FIFO gate
+    sends the next stuck tile's first request before any success lands. Three
+    stuck tiles two apart at five sockets (prod's) paused the city as 87 every
+    night with no progress, and 87 skips the host for the night.
+
+    A strike now stops counting as soon as another tile is served from a later
+    pacer generation, so any stuck tiles with a served tile between them in
+    request order complete the city on its FIRST night, as failed tiles.
+    """
+    bad = [_TILES[i] for i in stuck]
+    outcomes, session = _nights_until_complete(
+        monkeypatch,
+        lambda: {b: [status(503)] * 50 for b in bad},
+        str(tmp_path / "cp"),
+        connection_limit,
+    )
+    assert len(outcomes) == 1, [type(o).__name__ for o in outcomes]
+    result = outcomes[0]
+    assert not isinstance(result, BaseException), result
+    assert sorted(result["failed_tiles"]) == sorted(bad)
+    for b in bad:
+        urls = [u for u in session.urls if f"/{b[0]}/{b[1]}?" in u]
+        assert len(urls) == dm.TILE_BACKPRESSURE_TILE_TRIES
+    assert result["api_requests"] == len(session.urls)
+    assert len(session.urls) == len(_TILES) - len(bad) + len(bad) * dm.TILE_BACKPRESSURE_TILE_TRIES
+
+
+@pytest.mark.parametrize("connection_limit", [1, 5])
+def test_three_stuck_tiles_in_a_row_cannot_be_told_from_a_storm(
+    monkeypatch, tmp_path, limiters, holds, connection_limit
+):
+    """The rule's documented limit, pinned so that changing it is a decision:
+    three stuck tiles NEXT to each other in request order are refused with
+    nothing served between them, which is exactly what a host-wide storm looks
+    like from inside one crawl, so the third is a third episode and the crawl
+    stops as 87. (Holds release requests in FIFO order, so five sockets do not
+    interleave a served tile between them.) Nothing a single night observes
+    tells the two apart; see docs/provider-access.md, rule 6."""
+    bad = [_TILES[i] for i in (10, 11, 12)]
+    error, session = _crawl(
+        monkeypatch,
+        {b: [status(503)] * 50 for b in bad},
+        connection_limit=connection_limit,
+        checkpoint_path=str(tmp_path / "cp"),
+    )
+    assert type(error) is HostThrottledError, error
+    assert "3 HTTP 429/503 episodes" in str(error)
+    assert error.units_done == 10
+
+
+def test_a_throttle_whose_retries_succeed_still_pauses_with_tiles_served_between(
+    monkeypatch, tmp_path, limiters, holds, caplog
+):
+    """The other half of the withdrawal rule: a tile refused, held and then
+    SERVED confirms its episode as a real throttle, and a confirmed strike is
+    never withdrawn by other tiles being served. Five sockets interleave served
+    tiles between the three 429s, so at each 429 the earlier strikes are still
+    pending and do not count (episode 1/3 each time) -- and the crawl must
+    still stop as 87 when their retries succeed and confirm them."""
+    caplog.set_level(logging.INFO, logger=dm.__name__)
+    script = {t: [status(429), ok()] for t in (_TILES[0], _TILES[2], _TILES[4])}
+    error, session = _crawl(
+        monkeypatch, script, connection_limit=5, checkpoint_path=str(tmp_path / "cp")
+    )
+    assert type(error) is HostThrottledError, error
+    assert host_exit_code(error) == _THROTTLED
+    assert "3 HTTP 429/503 episodes" in str(error)
+    # Every 429-answered tile was retried and served, so none is failed and
+    # the confirming tiles are committed for the resume.
+    for t in (_TILES[0], _TILES[2], _TILES[4]):
+        assert sum(f"/{t[0]}/{t[1]}?" in u for u in session.urls) == 2
+    messages = [r.getMessage() for r in caplog.records]
+    assert not any("episode 3/3" in m for m in messages)
+    assert error.api_requests == len(session.urls)
 
 
 def test_responses_inside_one_hold_are_one_episode_not_three_strikes(
