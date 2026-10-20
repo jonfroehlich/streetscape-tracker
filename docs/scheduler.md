@@ -574,8 +574,9 @@ A hand-run catch-up after 17:00 Pacific is already the next UTC day, and is held
 A night is held for its whole run by its date, even past UTC midnight, exactly as all its runs carry one date.
 **A rested city's Mapillary snapshot un-pairs from its GSV one**: the Maintainer chose a Mapillary-only rest over resting every channel (which would have kept pairing), and #444 records that trade.
 
-**The cooldown is read once, when the run builds its holds, and against the wall clock at each launch.**
+**The cooldown is read once, when the run builds its holds, and against the wall clock once per city.**
 It holds until the newest refusal plus the cooldown, so it can END mid-night (a night that starts 30 h after a refusal under 36 h resumes Mapillary 6 h in), and it never STARTS mid-night: a refusal tonight is the breaker's.
+The clock is read once per CITY (`city_holds` in `_run_city_channels`), not per launch, so a cooldown that ends between a city's grid gate and its walk's cannot run the walk alone and pay a full census in place of the paired cache hit; the lift takes effect from the next city.
 **Only the newest REFUSAL counts**; a clearance from `probe-host` never shortens it, because one positive probe says the wall is down, not that full volume is safe again.
 It exists for the 02:00 nightly: on 2026-10-17 that launch re-probed the IP about 20 h into a block and was refused on its first request.
 

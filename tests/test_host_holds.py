@@ -842,13 +842,13 @@ def test_a_clearance_does_not_shorten_the_cooldown(conn, tmp_path, frozen_utc_cl
 def test_the_cooldown_ends_mid_night_and_the_host_resumes(
     conn, monkeypatch, tmp_path, frozen_utc_clock
 ):
-    """Read against the wall clock at each launch: a night that starts 35.5 h
-    after the refusal holds the first city's pair and runs the second's once
-    the 36 h have passed."""
+    """Read against the wall clock once per CITY: a night that starts 35.5 h
+    after the refusal holds the pair of every city that starts inside the 36 h
+    (the second starts at 35.83 h and keeps its hold even after its gsv run
+    crosses 36 h) and runs the pair of the first city that starts past it."""
     _refused(conn, 35.5)
     frozen_utc_clock(_NIGHT_START)
-    first = _register(conn, "Bend")
-    second = _register(conn, "Corvallis")
+    cities = [_register(conn, name) for name in ("Bend", "Corvallis", "Eugene")]
     launches = []
     elapsed = {"h": 0.0}
 
@@ -869,11 +869,10 @@ def test_the_cooldown_ends_mid_night_and_the_host_resumes(
     cfg = _cfg(tmp_path, "refusal_cooldown_h = 36\n")
     assert sched.cmd_run_due(cfg, today=THURSDAY) == 0
 
-    by_city = {cid: [p for c, p in launches if c == cid] for cid in (first, second)}
-    ran_first = launches[0][0]
-    ran_second = second if ran_first == first else first
-    assert by_city[ran_first] == ["gsv"]
-    assert by_city[ran_second] == ["gsv", "mapillary", "mapillary_streets"]
+    order = list(dict.fromkeys(c for c, _p in launches))
+    assert sorted(order) == sorted(cities)
+    by_city = [[p for c, p in launches if c == cid] for cid in order]
+    assert by_city == [["gsv"], ["gsv"], ["gsv", "mapillary", "mapillary_streets"]]
 
 
 def test_status_says_whether_the_host_is_cooling_down(
@@ -1426,3 +1425,100 @@ def test_a_passed_over_citys_held_pairs_still_hold_the_fill(conn, monkeypatch, t
         "Fill: holding mapillary, mapillary_streets — the due slate leaves mapillary 1 "
         "unfinished, mapillary_streets 1 unfinished."
     ) in out, out
+
+
+# ── review round 3 (#444): one hold decision per city; fill-aware 87 wording ──
+
+
+def _city_channels(monkeypatch, conn, cfg, city_id, providers, breaker, outcome, **kwargs):
+    """``_run_city_channels`` for ONE city with a fake child; returns the launches."""
+    from collections import Counter
+
+    launches = []
+
+    def fake(cfg_, city, today_, provider="gsv", **kw):
+        launches.append(provider)
+        return outcome(provider)
+
+    monkeypatch.setattr(sched, "_run_one_city", fake)
+    sched._run_city_channels(
+        cfg,
+        conn,
+        db.resolve_city(conn, city_id),
+        THURSDAY,
+        list(providers),
+        blocked_hosts=breaker,
+        busy_hosts=Counter(),
+        deferred_channels=Counter(),
+        deferred_host_budget=Counter(),
+        rejected_argv=sched.ArgvRejections(),
+        deadline_deferred=Counter(),
+        batch_deadline=None,
+        stop_requested=None,
+        **kwargs,
+    )
+    return launches
+
+
+def test_a_cooldown_lifting_mid_city_never_runs_the_walk_without_its_grid(
+    conn, monkeypatch, tmp_path
+):
+    """The hold is decided ONCE per city: a cooldown that ends between the
+    grid's gate and the walk's must not launch the walk alone, which would pay
+    a full census instead of the paired cache hit. Killed by reading the
+    wall clock per launch again: the second read is already past the end."""
+    a = _register(conn, "Bend")
+    until = _NIGHT_START + timedelta(hours=1)
+    reads = iter([until - timedelta(minutes=1)])  # the first read is inside it
+
+    def now():
+        return next(reads, until + timedelta(minutes=1))
+
+    holds = sched.HostHolds(
+        cooldowns={HOST_MAPILLARY_TILES: (until - timedelta(hours=36), until)}, now=now
+    )
+    breaker = sched.HostBreaker(holds=holds)
+    launches = _city_channels(
+        monkeypatch,
+        conn,
+        _cfg(tmp_path, None),
+        a,
+        MAPILLARY_PAIR,
+        breaker,
+        lambda provider: True,
+    )
+    assert launches == []
+    assert breaker.held_launches == 2
+
+
+@pytest.mark.parametrize(
+    "fill,wording",
+    [
+        (False, "it stays due and resumes on the next run."),
+        (True, "it is NOT due, so the next night's fill resumes it first"),
+    ],
+)
+def test_the_throttled_line_says_who_resumes_the_checkpoint(
+    conn, monkeypatch, tmp_path, caplog, fill, wording
+):
+    """As the 83 branch does: a FILL city is not due, so "stays due" is false
+    for it, and the next night's fill is what resumes its checkpoint (#404)."""
+    a = _register(conn, "Bend")
+    with caplog.at_level(logging.INFO, logger="streetscape_scheduler"):
+        _city_channels(
+            monkeypatch,
+            conn,
+            _cfg(tmp_path, None),
+            a,
+            ["mapillary"],
+            sched.HostBreaker(),
+            lambda provider: sched.CollectionOutcome(
+                False, f"exited {THROTTLED} (stub)", exit_code=THROTTLED
+            ),
+            fill=fill,
+        )
+    lines = [r.getMessage() for r in caplog.records if "THROTTLED this host" in r.getMessage()]
+    assert len(lines) == 1, lines
+    assert wording in lines[0]
+    other = "NOT due" if not fill else "stays due"
+    assert other not in lines[0]

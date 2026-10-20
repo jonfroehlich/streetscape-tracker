@@ -335,14 +335,15 @@ class HostHolds:
     """The standing holds on per-IP hosts for one run (issue #444).
 
     Built once per run by :func:`_host_holds` from config and the run's snapshot
-    date; asked per launch with :meth:`active`. A rest night holds for the
+    date; asked once per city (``current()``, #444 review) and otherwise with
+    :meth:`active`. A rest night holds for the
     whole run, whatever the wall clock does, because it is a property of the
     run's DATE: a night that starts on a Tuesday (UTC) and runs past midnight is
     still a Tuesday night, the same way all its runs are dated Tuesday.
 
     A refusal COOLDOWN is the other kind: it holds until a fixed instant, the
     newest refusal before the run plus the host's ``refusal_cooldown_h``, so
-    it is read against the wall clock at each ask and can end mid-run -- a
+    it is read against the wall clock (once per city) and can end mid-run -- a
     night that starts 30 h after a refusal under a 36 h cooldown launches its
     Mapillary channels from hour 6 on. It never STARTS mid-run: the refusals
     it counts from were all recorded before the run began, and a refusal
@@ -646,16 +647,20 @@ class HostBreaker(set):
                 span[0] = min(span[0], now)
             span[1] = max(span[1], now)
 
-    def holding(self, hosts) -> dict[str, HostHold]:
+    def holding(self, hosts, snapshot: dict[str, HostHold] | None = None) -> dict[str, HostHold]:
         """The hosts among ``hosts`` held right now (issue #444), each with its hold.
 
         Records each hold in ``held`` the first time it is seen, so the
         ``Done:`` line can name it. Counting the launch it costs is the
         caller's, because only the caller knows whether a launch was asked.
+
+        ``snapshot`` (``holds.current()`` taken once per city) answers instead
+        of the wall clock, so a cooldown that ends between a city's grid
+        launch and its walk cannot run the walk alone and re-pay the census.
         """
         found: dict[str, HostHold] = {}
         for host in sorted(hosts):
-            hold = self.holds.active(host)
+            hold = self.holds.active(host) if snapshot is None else snapshot.get(host)
             if hold is not None:
                 found[host] = hold
                 self.held.setdefault(host, hold)
@@ -10641,6 +10646,11 @@ def _run_city_channels(
     # ...and those lost to a THROTTLED host (exit 87; issue #444), named so in
     # the alert.
     lost_to_throttle: set[str] = set()
+    # The standing holds, decided ONCE for this city (issue #444): a cooldown
+    # read per launch could lift between the grid run and its walk, and the
+    # walk would then run alone and pay a full census instead of the paired
+    # cache hit. A hold that lifts mid-city takes effect from the next city.
+    city_holds = blocked_hosts.holds.current()
     # ...and the walks the batch deadline deferred (issue #373), stranded
     # below when their grid sibling landed in this same call.
     lost_to_deadline: list[str] = []
@@ -10832,10 +10842,11 @@ def _run_city_channels(
                         # deliberately NOT appended to `lost_to_host`: a hold
                         # cannot strand a walk, because it holds every channel
                         # on the host for the whole run (or, for a cooldown,
-                        # only ever lifts during it), so the walk's grid
-                        # sibling on the same host is held too. A final skip
-                        # with no `record_attempt` -- the city stays due.
-                        held = blocked_hosts.holding(wanted)
+                        # only ever lifts during it, and is read once per city
+                        # in `city_holds`), so the walk's grid sibling on the
+                        # same host is held too. A final skip with no
+                        # `record_attempt` -- the city stays due.
+                        held = blocked_hosts.holding(wanted, city_holds)
                         if held:
                             for host in held:
                                 blocked_hosts.held_skipped[host] += 1
@@ -11355,7 +11366,9 @@ def _run_city_channels(
                         #     consecutive_failures and never a quarantine
                         #     (#421): a few nights of a 429 storm must not
                         #     quarantine every Mapillary pair. The checkpoint is
-                        #     kept, so the city resumes when it is next due.
+                        #     kept, so the city resumes when it is next due -- or,
+                        #     for a FILL city (not due, #404), from the next
+                        #     night's fill, as the 83 branch says.
                         #   * LATCHED -- the breaker skips both Mapillary
                         #     channels for the rest of the run, the fill
                         #     included, since the next city would walk into the
@@ -11368,12 +11381,20 @@ def _run_city_channels(
                         blocked_hosts.throttle(throttled_host)
                         lost_to_host.append(provider)
                         lost_to_throttle.add(provider)
+                        # Fill-aware, as the 83 branch's `resumes` is: a fill
+                        # city is not due, so "stays due" would be false.
+                        throttled_resumes = (
+                            "it is NOT due, so the next night's fill resumes it first, "
+                            "before the checkpoint reaches its age wall."
+                            if fill
+                            else "it stays due and resumes on the next run."
+                        )
                         logger.error(
                             f"{city.city_id} [{provider}]: {HOST_LABELS[throttled_host]} "
                             f"THROTTLED this host (HTTP 429/503) — skipping its remaining "
                             f"channels tonight. Not a refusal (no cooldown recorded) and not "
-                            f"counted as a failure for this city; its checkpoint is kept. "
-                            f"({reason})"
+                            f"counted as a failure for this city; its checkpoint is kept and "
+                            f"{throttled_resumes} ({reason})"
                         )
                         # As the 83 branch does, and for the same reason: a
                         # city that keeps being throttled keeps its checkpoint
