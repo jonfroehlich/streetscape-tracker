@@ -921,10 +921,13 @@ Now:
    Other 4xx and 5xx keep the old `@backoff` path.
 2. The crawl's pacer is **held** — no request goes out from any of its sockets — for `max(Retry-After, 60 s)`.
    Both RFC 9110 forms are read, delay-seconds and HTTP-date; a missing or unreadable header means 60 s, and so does one that cannot be parsed at all (Unicode digits, thousands of digits, a date `datetime` cannot hold) — parsing never raises.
-3. A `Retry-After` longer than **900 s** is not slept on, and neither is a hold that would end past the crawl's wall-clock budget: the crawl stops at once (rule 7).
+3. A `Retry-After` longer than **900 s** is not slept on: the crawl stops at once as THROTTLED (rule 7).
    Retrying before the time the server named would disobey it, and a sleep that long belongs to the next night rather than to this one's host lock.
+   **Nor is a hold that would end past the crawl's wall-clock budget**, but below the strike limit that crawl stops on its **clock** instead — exit 83, as if the budget had run out at that moment, with the pacer closed so the retry never goes out without its wait (round-3 review of #444).
+   One 429 near the end of a long crawl says no more about the host than one anywhere else, which the crawl would have waited out and continued; making it the 87 that skips the host for the rest of the night was out of proportion.
+   A third standing strike is still 87 there, as anywhere.
    **A crawl already stopping never holds** — once the request cap or the clock has turned a tile away, or would turn the retry away: no retry is going out, so a hold would only sleep with the tile lock held.
-   It escalates to the backpressure stop only for what says something about the host (the third episode, or a `Retry-After` past 900 s), never for outlasting the deadline, which after a clock stop every wait does; otherwise the stop stays the cap's or the clock's exit 83 (round-2 review of #444).
+   It escalates to the backpressure stop only for what says something about the host (the third standing strike, or a `Retry-After` past 900 s); otherwise the stop stays the cap's or the clock's exit 83 (round-2 review of #444).
 4. The pace is **halved once** for the rest of that crawl (`AsyncRateLimiter.slow_down(2)`), on the limiter the crawl builds for itself, so it cannot reach another crawl or another process.
 5. The tile is then retried by re-entering the in-semaphore checks, so the abort, the request cap with its reservation, and the wall-clock deadline gate the retry exactly as they gate a fresh tile.
    Every HTTP request, the 429 included, is counted once in `api_requests`.
@@ -935,9 +938,16 @@ Now:
    Each attempt records the pacer's generation when it is sent; a 429/503 answering a request sent before the latest hold began belongs to that hold, so it adds no strike (it may still extend the hold to its own wait).
    One throttle window that answers several in-flight requests at once is one episode.
    **Only a tile's first backpressure response can be a strike**: its own retry being refused again says something about that tile, not the host.
-   And a tile given up as stuck has its strike **withdrawn as soon as another tile is served**, since a host serving the next tile is not the one refusing.
-   Counted per response, two stuck tiles spent three strikes between them, the crawl paused, and as a failed tile is never committed every resumed night repeated it (round-2 review of #444); first responses alone still let three stuck tiles do the same.
-   A host-wide storm serves nothing between its tiles, so all its strikes stand and the third episode still pauses; so does a throttle whose retries succeed, since none of its tiles is given up.
+   **Whether a strike still counts is decided by what the CDN did after it.**
+   Each strike is stamped with the pacer generation its request was sent under.
+   If the tile's own retry is later served, the strike is **confirmed** — the CDN asked it to wait, then served it, which is a real throttle — and it always counts.
+   If the tile is still retrying, or was given up as stuck, the strike counts **only while no other tile has been served from a request sent in a later generation**; once one has, the host is serving and this tile is what refuses, so the strike stops counting (for a tile still retrying, until its retry is served and confirms it).
+   The limit is checked when a strike is charged and again when a strike is confirmed, since a confirmation is the only thing that can raise the count.
+   Counted per response, two stuck tiles spent three strikes between them, the crawl paused, and as a failed tile is never committed every resumed night repeated it (round-2 review of #444).
+   Round 2 then withdrew a stuck tile's strike only on a success *after its give-up*, which was too late: give-up takes two holds, and the hold's FIFO gate sends the next stuck tile's first request before any success lands, so three stuck tiles two apart at five sockets paused the city as 87 every night with no progress (round-3 review).
+   A host-wide storm serves nothing between its refusals, so all its strikes stand and the third episode still pauses; so does a throttle whose retries succeed, served tiles between them or not, since each such strike is confirmed.
+   **The one case this cannot help**: three stuck tiles in a row in request order are refused with nothing served between them, which is exactly a storm as seen from inside one crawl, so that crawl stops as 87, and since failed tiles are not committed the next night meets them again.
+   Telling the two apart needs evidence from outside the crawl (a tile far away, or the previous night's outcome), which this rule does not use; `test_three_stuck_tiles_in_a_row_cannot_be_told_from_a_storm` pins the behaviour so that changing it is a decision.
 7. The **third episode** in one crawl stops it on the request cap's own path — turned-away tiles uncommitted, the checkpoint kept, raised before the settle loop — as **`HostThrottledError`, exit 87**, the THROTTLED family (`download_common.HOST_THROTTLED_EXIT_CODES`).
    Every backpressure stop raises it, committed tiles or not; its message carries the phrase "stopped by provider backpressure (HTTP 429/503)", and says "the next run resumes it" only when a tile is committed, "starts from the first tile" otherwise.
    It replaced exit 83 plus a plain-`DownloadError` arm for the nothing-committed case: that arm counted a `consecutive_failure`, so a few nights of a 429 storm would have quarantined every Mapillary pair (#421), and nothing latched the host, so the next city walked into the same 429s at full pace.
@@ -950,8 +960,8 @@ Now:
 The only cooldown ever reported for a Mapillary tile block is thread 5821's 15-minute sleep, a hint rather than a contract.
 And with the pause at the third episode, a crawl holds in at most two episodes, each lasting the longest wait asked for inside it (at most 900 s), so it holds the machine-wide tile lock for about 30 minutes of sleeping — not exactly, since a same-episode response can extend a hold by up to one request timeout (30 s).
 That is well inside prod's 180-minute per-city timeout floor (`city_timeout_minutes`).
-**A hold that would end past the crawl's wall-clock budget is not slept at all**: the crawl stops at once instead.
-The scheduler forwards that budget as the child's SIGKILL timeout less a 600 s margin (`_crawl_max_seconds`), so a 900 s hold begun inside the margin would be killed mid-sleep and counted a failure, where stopping is the amnestied exit 87.
+**A hold that would end past the crawl's wall-clock budget is not slept at all**: the crawl stops at once instead, on its clock (exit 83) below the strike limit (rule 3).
+The scheduler forwards that budget as the child's SIGKILL timeout less a 600 s margin (`_crawl_max_seconds`), so a 900 s hold begun inside the margin would be killed mid-sleep and counted a failure, where stopping is an amnestied exit.
 A halved pace also doubles the remaining wall clock of the crawl it applies to, so a large city answered 429 early can reach its budget; the clock then pauses it as exit 83, which is the intended outcome.
 
 **One known interaction, left as it is.**

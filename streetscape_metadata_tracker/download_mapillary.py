@@ -627,13 +627,16 @@ class TileStatusCounts:
 #    than to this one's host lock. Nor is a hold that would end past the
 #    crawl's wall-clock budget (`deadline_monotonic`), which the scheduler sets
 #    600 s before its SIGKILL: sleeping into the kill would count a failure.
+#    Below the strike limit that crawl stops as the CLOCK's pause (exit 83),
+#    as if its budget had run out now -- one 429 near the end of a crawl says
+#    no more about the host than one anywhere else (round-3 review of #444).
 # 3. The pace is halved for the REST OF THIS CRAWL (once, on the first such
 #    response). The limiter is built per crawl, so this cannot reach another
 #    crawl or another process; see AsyncRateLimiter.slow_down.
 # 4. The tile is then retried, through the same in-semaphore cap and deadline
 #    checks as a fresh tile, so `max_requests` + its reservation still bound
 #    the crawl and no attempt is counted twice.
-# 5. The TILE_BACKPRESSURE_PAUSE_AFTER-th backpressure EPISODE in one crawl
+# 5. The TILE_BACKPRESSURE_PAUSE_AFTER-th standing strike in one crawl
 #    stops it on the request cap's path -- turned-away tiles uncommitted, the
 #    checkpoint kept, raised before the settle loop -- and the crawl's pacer is
 #    closed so no request still waiting for its turn goes out. It raises
@@ -644,8 +647,10 @@ class TileStatusCounts:
 # 6. One tile is given up as an ordinary failed tile after
 #    TILE_BACKPRESSURE_TILE_TRIES backpressure responses, so a tile stuck on
 #    503 cannot pause its city night after night. Only a tile's FIRST response
-#    can be a strike, and a given-up tile's strike is withdrawn once another
-#    tile is served (round-2 review of #444), so neither can several.
+#    can be a strike, and a strike stops counting once another tile is served
+#    from a later pacer generation unless its own retry was served (rounds 2
+#    and 3 of the review of #444), so neither can several -- except three in a
+#    row in request order, which nothing in one crawl tells from a storm.
 #
 # Both statuses, because a CDN shedding load answers 503 and one metering a
 # client answers 429; neither has ever been observed from tiles.mapillary.com
@@ -671,11 +676,15 @@ TILE_BACKPRESSURE_MAX_WAIT_S = 900.0
 # request that was sent before the latest hold began belongs to that hold's
 # episode -- one throttle window can answer several in-flight requests at once
 # -- so it adds no strike. It may still EXTEND the hold, to its own wait.
-# Nor is a tile's own repeated response a strike, only its first; and a tile
-# given up as stuck (below) has that strike withdrawn as soon as another tile
-# is served, because a host that serves the next tile is not the one refusing
-# (round-2 review of #444). A storm serves nothing in between, so it still
-# pauses at its third episode.
+# Nor is a tile's own repeated response a strike, only its first (round 2).
+# And a strike whose tile is still retrying or was given up as stuck stops
+# COUNTING as soon as another tile is served from a request sent after it, in
+# a later pacer generation, because a host serving other tiles is not the one
+# refusing (round 3; see `strikes` in _fetch_city_images). A strike whose own
+# retry is served is a CONFIRMED throttle and always counts. A storm serves
+# nothing between its refusals, so it still pauses at its third episode -- and
+# so, by the same token, do three stuck tiles in a row in request order, which
+# no rule that reads one crawl can tell from a storm.
 TILE_BACKPRESSURE_PAUSE_AFTER = 3
 # Backpressure responses ONE TILE may draw before it is given up as an ordinary
 # failed tile -- REQUEST_FAILED under MAX_FAILED_TILE_FRACTION (#168), exactly
@@ -1733,9 +1742,10 @@ async def _fetch_city_images(
             breakage: it maps to exit 83, which the scheduler amnesties rather
             than counting a failure.
         HostThrottledError: the CDN's backpressure stopped the crawl (issue
-            #444) -- its TILE_BACKPRESSURE_PAUSE_AFTER-th 429/503 episode, a
-            Retry-After past the ceiling, or a hold past the deadline --
-            whether or not any tile is committed. The checkpoint is kept; it
+            #444) -- its TILE_BACKPRESSURE_PAUSE_AFTER-th standing 429/503
+            strike, or a Retry-After past the ceiling -- whether or not any
+            tile is committed. (A hold that would outlast the deadline is the
+            clock's SweepIncompleteError below that limit.) The checkpoint is kept; it
             maps to the throttled exit (87), which the scheduler amnesties and
             uses to skip this host for the rest of the night.
         DownloadError: on a rejected token or tile transport failure, carrying
@@ -1940,113 +1950,49 @@ async def _fetch_city_images(
     # in flight. That residue is the honest remaining bound, below.
     reserved = 0
 
-    # Backpressure (issue #444): 429/503 responses seen by this crawl, whether
-    # the crawl has decided to pause on them, and why, for the pause message.
-    backpressure_events = 0
+    # Backpressure (issue #444): the strikes this crawl's 429/503 responses
+    # charged, whether the crawl has decided to pause on them, and why, for the
+    # pause message.
+    #
+    # A strike is a tile's FIRST backpressure response that opened a new
+    # episode, keyed by tile and stamped with the pacer generation its request
+    # was sent under. Whether it still COUNTS toward the pause is decided live,
+    # by `standing_strikes`, from what the CDN did after it (round-3 review of
+    # #444):
+    #   * CONFIRMED -- the tile was served on a later attempt. The CDN asked it
+    #     to wait and then served it: a real throttle, so the strike stands.
+    #   * PENDING (still retrying) or GIVEN UP (stuck) -- it stands only while
+    #     no OTHER tile has been served from a request sent after it, i.e. in a
+    #     later pacer generation. Once one has, the host is serving and this
+    #     tile is the thing refusing, so the strike is (provisionally, for a
+    #     pending one) withdrawn.
+    # A storm serves nothing between its refusals, so all its strikes stand and
+    # its third episode pauses. Withdrawing a given-up tile's strike only on a
+    # success AFTER its give-up (round 2) was too late: give-up takes two holds,
+    # and the hold's FIFO gate sends the next stuck tile's first request before
+    # any success can land, so three stuck tiles two apart at five sockets paused
+    # the city as 87 every night with no progress.
+    strikes: dict[tuple[int, int], list] = {}  # tile -> [generation, state]
+    # The highest pacer generation any successful request was sent under.
+    served_generation = -1
     backpressure_paused = False
     backpressure_detail: str | None = None
-    # Strikes charged by tiles since given up as stuck, not yet forgiven: a
-    # later SUCCESS from any tile withdraws them (see on_tile_success).
-    stuck_strikes = 0
+    # A hold that would outlast the deadline turned the crawl into a clock
+    # stop (exit 83) rather than a backpressure pause; see on_backpressure.
+    clock_stopped = False
 
-    def on_backpressure(
-        e: TileBackpressureError, sent_generation: int, tile_first: bool
-    ) -> float | None:
-        """
-        Record one 429/503: halve the pace, and say how long to hold.
-
-        Returns the seconds to hold every request for, or None when there is
-        to be no hold: either the crawl PAUSES -- on the
-        TILE_BACKPRESSURE_PAUSE_AFTER-th EPISODE, on a Retry-After past
-        TILE_BACKPRESSURE_MAX_WAIT_S, or on a wait that would outlast the
-        deadline -- or it is already stopping (below), when nothing will be
-        sent after the hold anyway.
-
-        ``sent_generation`` is the pacer's generation when the answered request
-        was sent. Older than the current one means a hold began after it went
-        out: the same episode, so no strike (see TILE_BACKPRESSURE_PAUSE_AFTER).
-
-        ``tile_first`` is whether this is the tile's FIRST backpressure
-        response. Only a first one can be a strike (round-2 review of #444): a
-        tile's own retry being refused again says something about that tile,
-        not the host. Counted per response, two tiles that always answer 503
-        spent three strikes between them (A's two, B's first), the crawl paused
-        at B, and since a failed tile is never committed every resumed night
-        repeated it -- exit 87, which latches the host, for ever.
-        """
-        nonlocal backpressure_events, backpressure_paused, backpressure_detail, stop_reason
-        same_episode = sent_generation != pacer.generation
-        strike = tile_first and not same_episode
-        if strike:
-            backpressure_events += 1
-        pacer.slow_down()
-        if backpressure_paused or fatal is not None:
-            # A late answer from a tile that was in flight when the pause
-            # began, or after a whole-city error (a 302): counted, never
-            # waited on, and no pause of its own -- `fatal` already ends the
-            # crawl, and the refusal's exit 75 must win.
-            return None
-        wait = backpressure_wait_seconds(retry_after_seconds(e.retry_after))
-        # Already stopping (round-2 review of #444): the cap or the clock has
-        # turned a tile away (`capped`), or will turn this one away at its
-        # next check. No retry is going out, so a hold would only sleep with
-        # the machine-wide tile lock held. Escalate to the backpressure pause
-        # only for what says something about the HOST -- the third episode,
-        # or a Retry-After past the in-process ceiling -- and never for
-        # "outlasts the deadline": no wait is going to happen anyway, and
-        # after a clock stop every wait outlasts it, which turned an ordinary
-        # exit 83 into an 87. Otherwise the stop stays the cap's or clock's.
-        stopping = (
-            capped
-            or crawl_deadline_passed(deadline_monotonic)
-            or (max_requests is not None and api_requests + reserved >= max_requests)
+    def standing_strikes() -> int:
+        """The strikes that still count toward TILE_BACKPRESSURE_PAUSE_AFTER."""
+        return sum(
+            1
+            for generation, state in strikes.values()
+            if state == "confirmed" or served_generation <= generation
         )
-        if stopping and wait is not None and backpressure_events < TILE_BACKPRESSURE_PAUSE_AFTER:
-            return None
-        # A hold that would outlast the crawl's wall-clock budget is not slept
-        # either: the scheduler forwards that budget as its SIGKILL timeout
-        # less a 600 s margin, and a 900 s hold begun inside the margin would be
-        # killed mid-sleep -- counted a failure, where pausing now is exit 87.
-        outlasts_deadline = (
-            not stopping
-            and wait is not None
-            and deadline_monotonic is not None
-            and time.monotonic() + wait >= deadline_monotonic
-        )
-        if wait is not None and not outlasts_deadline and not strike:
-            # No strike -- the hold already open covers it, or it is a tile's
-            # own retry. Returning the wait lets it EXTEND an open hold if it
-            # asked for longer (holds end at the latest requested end), costs
-            # nothing if it did not, and otherwise holds the other tiles once
-            # more before this one is given up.
-            return wait
-        if (
-            wait is not None
-            and not outlasts_deadline
-            and backpressure_events < TILE_BACKPRESSURE_PAUSE_AFTER
-        ):
-            logger.warning(
-                f"Mapillary tile CDN answered HTTP {e.status} (Retry-After: {e.retry_after}) "
-                f"for {city_name}: holding every tile request for {wait:.0f} s, then "
-                f"continuing at HALF the pace for the rest of this crawl (backpressure "
-                f"episode {backpressure_events}/{TILE_BACKPRESSURE_PAUSE_AFTER}; issue #444)"
-            )
-            return wait
-        if outlasts_deadline:
-            backpressure_detail = (
-                f"HTTP {e.status} asking for a {wait:.0f} s wait that would outlast this "
-                f"crawl's wall-clock budget"
-            )
-        elif wait is None:
-            backpressure_detail = (
-                f"HTTP {e.status} with a Retry-After of {e.retry_after!r}, longer than the "
-                f"{TILE_BACKPRESSURE_MAX_WAIT_S:.0f} s it will wait in-process"
-            )
-        else:
-            backpressure_detail = (
-                f"{backpressure_events} HTTP 429/503 episodes in one crawl "
-                f"(the limit is {TILE_BACKPRESSURE_PAUSE_AFTER})"
-            )
+
+    def pause_for_backpressure(detail: str) -> None:
+        """Stop the crawl as THROTTLED (exit 87): see the capped branch below."""
+        nonlocal backpressure_paused, backpressure_detail, stop_reason
+        backpressure_detail = detail
         backpressure_paused = True
         if stop_reason is None:
             stop_reason = SWEEP_STOP_BACKPRESSURE
@@ -2058,18 +2004,137 @@ async def _fetch_city_images(
             f"pausing the crawl, NOT a refusal: it ends as THROTTLED (exit 87), keeping "
             f"whatever tiles are committed for the next run to resume from"
         )
-        return None
+
+    def episodes_detail(count: int) -> str:
+        return (
+            f"{count} HTTP 429/503 episodes in one crawl "
+            f"(the limit is {TILE_BACKPRESSURE_PAUSE_AFTER})"
+        )
+
+    def on_backpressure(
+        e: TileBackpressureError, sent_generation: int, tile_first: bool, tile: tuple[int, int]
+    ) -> float | None:
+        """
+        Record one 429/503: halve the pace, and say how long to hold.
+
+        Returns the seconds to hold every request for, or None when there is
+        to be no hold: either the crawl PAUSES as THROTTLED -- on the
+        TILE_BACKPRESSURE_PAUSE_AFTER-th standing strike, or on a Retry-After
+        past TILE_BACKPRESSURE_MAX_WAIT_S -- or it STOPS ON ITS CLOCK, because
+        the wait would outlast the deadline, or it is already stopping
+        (below), when nothing will be sent after the hold anyway.
+
+        ``sent_generation`` is the pacer's generation when the answered request
+        was sent. Older than the current one means a hold began after it went
+        out: the same episode, so no strike (see TILE_BACKPRESSURE_PAUSE_AFTER).
+
+        ``tile_first`` is whether this is the tile's FIRST backpressure
+        response. Only a first one can be a strike (round-2 review of #444): a
+        tile's own retry being refused again says something about that tile,
+        not the host.
+        """
+        nonlocal capped, stop_reason, clock_stopped
+        same_episode = sent_generation != pacer.generation
+        strike = tile_first and not same_episode
+        if strike:
+            strikes[tile] = [sent_generation, "pending"]
+        pacer.slow_down()
+        if backpressure_paused or clock_stopped or fatal is not None:
+            # A late answer from a tile that was in flight when the crawl
+            # decided to stop, or after a whole-city error (a 302): counted,
+            # never waited on, and no stop of its own -- `fatal` already ends
+            # the crawl, and the refusal's exit 75 must win.
+            return None
+        wait = backpressure_wait_seconds(retry_after_seconds(e.retry_after))
+        if wait is None:
+            # Says something about the HOST whatever else is happening: the
+            # server named a time past what this process will sleep.
+            pause_for_backpressure(
+                f"HTTP {e.status} with a Retry-After of {e.retry_after!r}, longer than the "
+                f"{TILE_BACKPRESSURE_MAX_WAIT_S:.0f} s it will wait in-process"
+            )
+            return None
+        standing = standing_strikes()
+        if strike and standing >= TILE_BACKPRESSURE_PAUSE_AFTER:
+            pause_for_backpressure(episodes_detail(standing))
+            return None
+        # Already stopping (round-2 review of #444): the cap or the clock has
+        # turned a tile away (`capped`), or will turn this one away at its
+        # next check. No retry is going out, so a hold would only sleep with
+        # the machine-wide tile lock held, and the stop stays the cap's or
+        # the clock's.
+        stopping = (
+            capped
+            or crawl_deadline_passed(deadline_monotonic)
+            or (max_requests is not None and api_requests + reserved >= max_requests)
+        )
+        if stopping:
+            return None
+        if deadline_monotonic is not None and time.monotonic() + wait >= deadline_monotonic:
+            # A hold that would outlast the crawl's wall-clock budget is not
+            # slept: the scheduler forwards that budget as its SIGKILL timeout
+            # less a 600 s margin, and a 900 s hold begun inside the margin
+            # would be killed mid-sleep and counted a failure. Below the strike
+            # limit this is the CLOCK's stop, exactly as if the budget had run
+            # out now (round-3 review of #444): one 429 near the end of a long
+            # crawl says no more about the host than one 429 anywhere else,
+            # which the crawl would wait out and continue -- it must not become
+            # the 87 that skips the host for the rest of the night. Nor may the
+            # retry go out without its wait, so the crawl stops admitting tiles
+            # here, turned away uncommitted as at the deadline.
+            clock_stopped = True
+            capped = True
+            if stop_reason is None:
+                stop_reason = SWEEP_STOP_CLOCK
+            pacer.close()
+            logger.warning(
+                f"Mapillary tile CDN answered HTTP {e.status} (Retry-After: {e.retry_after}) "
+                f"for {city_name}, asking for a {wait:.0f} s wait that would outlast this "
+                f"crawl's wall-clock budget: stopping on the clock now (exit 83), keeping "
+                f"whatever tiles are committed (issue #444)"
+            )
+            return None
+        if strike:
+            logger.warning(
+                f"Mapillary tile CDN answered HTTP {e.status} (Retry-After: {e.retry_after}) "
+                f"for {city_name}: holding every tile request for {wait:.0f} s, then "
+                f"continuing at HALF the pace for the rest of this crawl (backpressure "
+                f"episode {standing}/{TILE_BACKPRESSURE_PAUSE_AFTER}; issue #444)"
+            )
+        # No strike -- the hold already open covers it, or it is a tile's own
+        # retry -- still returns the wait: it may EXTEND an open hold if it
+        # asked for longer (holds end at the latest requested end), costs
+        # nothing if it did not, and otherwise holds the other tiles once more
+        # before this one is given up.
+        return wait
+
+    def on_tile_served(tile: tuple[int, int], generation: int) -> None:
+        """A tile was served from a request sent under pacer ``generation``."""
+        nonlocal served_generation
+        served_generation = max(served_generation, generation)
+        record = strikes.get(tile)
+        if record is None or record[1] != "pending":
+            return
+        # Refused, waited, then served: a real throttle episode, confirmed.
+        record[1] = "confirmed"
+        if backpressure_paused or clock_stopped or fatal is not None:
+            return
+        standing = standing_strikes()
+        if standing >= TILE_BACKPRESSURE_PAUSE_AFTER:
+            # A confirmation can only RAISE the count (a served tile withdraws
+            # pending strikes, never confirmed ones), so this is the other
+            # place the limit can be reached. This tile itself is served and
+            # commits; every tile still to go is turned away.
+            pause_for_backpressure(episodes_detail(standing))
 
     async def fetch_one(x: int, y: int) -> pd.DataFrame:
-        nonlocal fatal, capped, reserved, stop_reason, backpressure_events, stuck_strikes
+        nonlocal fatal, capped, reserved, stop_reason
         url = f"{TILE_URL_TEMPLATE.format(z=TILE_ZOOM, x=x, y=y)}?access_token={access_token}"
         attempts = 0
         # This tile's backpressure responses (TILE_BACKPRESSURE_TILE_TRIES), and
         # the pacer generation its latest attempt was sent under.
         tile_backpressure = 0
         sent_generation = pacer.generation
-        # Whether this tile's first backpressure response was a strike.
-        charged_strike = False
 
         def on_attempt() -> None:
             # One call per HTTP request, from inside _fetch_tile: the ledger's
@@ -2111,8 +2176,15 @@ async def _fetch_city_images(
                 # same reason a cap is, and a tile already in flight finishes its
                 # retries under it with the same residue the cap documents.
                 # A backpressure pause (issue #444) takes this path too: the
-                # crawl is not over, the CDN asked it to stop for now.
-                if backpressure_paused or over_cap or crawl_deadline_passed(deadline_monotonic):
+                # crawl is not over, the CDN asked it to stop for now. So does a
+                # clock stop decided early, by a hold that would outlast the
+                # deadline (`clock_stopped`, which set its own reason).
+                if (
+                    backpressure_paused
+                    or clock_stopped
+                    or over_cap
+                    or crawl_deadline_passed(deadline_monotonic)
+                ):
                     # THE CAP IS CHECKED HERE FOR THE REASON THE ABORT ABOVE IS, and
                     # it inherits that check's shape but not its bound. A tile
                     # admitted here reserves its request before releasing control,
@@ -2205,12 +2277,17 @@ async def _fetch_city_images(
                     progress_bar.update(1)
                     return records_to_census([])
                 if slow_down_please is None:
+                    # Served: a confirmation of this tile's own strike, if it
+                    # charged one, and a withdrawal of every pending or stuck
+                    # strike older than this request (see `strikes`).
+                    on_tile_served((x, y), sent_generation)
                     break
-                strikes_before = backpressure_events
                 wait = on_backpressure(
-                    slow_down_please, sent_generation, tile_first=tile_backpressure == 0
+                    slow_down_please,
+                    sent_generation,
+                    tile_first=tile_backpressure == 0,
+                    tile=(x, y),
                 )
-                charged_strike = charged_strike or backpressure_events > strikes_before
                 if wait is not None:
                     await pacer.hold(wait)
                 tile_backpressure += 1
@@ -2223,25 +2300,13 @@ async def _fetch_city_images(
                         f"{slow_down_please.status} {tile_backpressure} times; giving it up "
                         f"as a failed tile (issue #444)"
                     )
-                    if charged_strike:
-                        # Its strike stands until another tile succeeds: see
-                        # the withdrawal after the loop.
-                        stuck_strikes += 1
+                    if (x, y) in strikes:
+                        # Its strike stands only until another tile is served
+                        # from a later generation: see `standing_strikes`.
+                        strikes[(x, y)][1] = "given_up"
                     raise slow_down_please
                 # Back to the top: retried if the checks there still admit it,
                 # or turned away as a pause (issue #444).
-        if stuck_strikes:
-            # A tile served after a tile was given up as stuck: the CDN is
-            # serving this host, so that stuck tile's strike was about the
-            # tile, not the host, and is withdrawn (round-2 review of #444).
-            # Without this, N tiles that always answer 503 still spent N
-            # strikes -- first responses only -- and three of them paused the
-            # city every night for ever, exactly as two did before. A host-wide
-            # storm serves nothing in between, so its strikes all stand and its
-            # third episode still pauses; so does a throttle whose retries
-            # succeed, since no tile of it is given up.
-            backpressure_events -= stuck_strikes
-            stuck_strikes = 0
         progress_bar.update(1)
         # Convert to columns HERE, not after the gather: asyncio.gather holds
         # every tile's result until the last one lands, so returning dicts kept
