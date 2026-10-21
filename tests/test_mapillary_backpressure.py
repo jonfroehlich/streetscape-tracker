@@ -18,6 +18,7 @@ so nothing here uses it: a stub has no HTTP status to count.
 import asyncio
 import json
 import logging
+import os
 import re
 
 import aiohttp
@@ -1127,6 +1128,106 @@ def test_a_storm_still_pauses_a_resume_on_its_fresh_tiles(monkeypatch, tmp_path,
     assert "3 HTTP 429/503 episodes" in str(error)
     asked = {tuple(int(g) for g in _URL_TILE.search(u).groups()) for u in session.urls}
     assert asked.isdisjoint(bad)
+
+
+def _seed_resume(cp, n_fresh, recorded):
+    """A checkpoint holding every tile but ``n_fresh`` fresh ones and the
+    ``recorded`` stuck ones, all committed empty (an empty tile has no part)."""
+    os.makedirs(cp, exist_ok=True)
+    rest = [t for t in _TILES if t not in recorded]
+    done = dict.fromkeys(rest[n_fresh:], 0)
+    dm._write_checkpoint_state(
+        dm.TileCheckpoint(path=cp, stuck=set(recorded)),
+        done,
+        bbox=_BBOX,
+        tiles=_TILES,
+        api_requests_total=len(done),
+    )
+    return rest[:n_fresh]
+
+
+@pytest.mark.parametrize("connection_limit", [1, 5])
+@pytest.mark.parametrize("n_fresh", [0, 2])
+def test_a_storm_pauses_a_resume_whose_fresh_tiles_cannot(
+    monkeypatch, tmp_path, limiters, holds, connection_limit, n_fresh
+):
+    """Round-5 review of #444: recorded tiles charge no strike, so with fewer
+    than three fresh tiles left a host-wide storm could not pause the resume --
+    it finalized with the storm's tiles as holes, or failed as a counted
+    failure after holding the host lock. A recorded tile refused with nothing
+    served since now re-requests a COMMITTED tile, whose refusal is a strike."""
+    cp = str(tmp_path / "cp")
+    recorded = [_TILES[i] for i in (5, 6, 7)]
+    _seed_resume(cp, n_fresh, recorded)
+    error, session = _crawl(
+        monkeypatch,
+        {xy: [status(503)] * 10 for xy in _TILES},
+        connection_limit=connection_limit,
+        checkpoint_path=cp,
+    )
+    assert type(error) is HostThrottledError, error
+    assert host_exit_code(error) == _THROTTLED
+    assert "3 HTTP 429/503 episodes" in str(error)
+    assert error.api_requests == len(session.urls)
+
+
+@pytest.mark.parametrize("connection_limit", [1, 5])
+def test_recorded_tiles_alone_complete_when_the_host_serves(
+    monkeypatch, tmp_path, limiters, holds, connection_limit
+):
+    """The probe's other answer: the host serves the committed tile, so the
+    recorded tiles are the ones refusing and the resume completes, each
+    drawing its two requests and at most one probe."""
+    cp = str(tmp_path / "cp")
+    recorded = [_TILES[i] for i in (5, 6, 7)]
+    _seed_resume(cp, 0, recorded)
+    result, session = _crawl(
+        monkeypatch,
+        {b: [status(503)] * 10 for b in recorded},
+        connection_limit=connection_limit,
+        checkpoint_path=cp,
+    )
+    assert not isinstance(result, BaseException), result
+    assert sorted(result["failed_tiles"]) == sorted(recorded)
+    asked = [tuple(int(g) for g in _URL_TILE.search(u).groups()) for u in session.urls]
+    for b in recorded:
+        assert asked.count(b) == dm.TILE_BACKPRESSURE_TILE_TRIES
+    probes = [t for t in asked if t not in recorded]
+    assert 1 <= len(probes) <= len(recorded)
+    assert result["api_requests"] == len(session.urls)
+
+
+def test_a_served_probe_withdraws_the_strikes_before_it(monkeypatch, tmp_path, limiters, holds):
+    """A probe served is the host serving: it withdraws pending strikes like
+    any served tile. Two stuck fresh tiles leave two pending strikes; the
+    first probe is served, so the second probe's lone 429 is episode 1, not
+    a third -- without the withdrawal this resume stopped as 87."""
+    cp = str(tmp_path / "cp")
+    recorded = [_TILES[i] for i in (5, 6, 7)]
+    fresh = _seed_resume(cp, 2, recorded)
+    pool = [t for t in _TILES if t not in recorded][2:]
+    script = {t: [status(503)] * 10 for t in fresh + recorded}
+    script[pool[1]] = [status(429)]
+    result, session = _crawl(monkeypatch, script, connection_limit=1, checkpoint_path=cp)
+    assert not isinstance(result, BaseException), result
+    assert sorted(result["failed_tiles"]) == sorted(fresh + recorded)
+    asked = [tuple(int(g) for g in _URL_TILE.search(u).groups()) for u in session.urls]
+    assert pool[1] in asked
+
+
+def test_a_malformed_stuck_record_costs_nothing_but_the_record(tmp_path):
+    """Round-5 nit: a bad `stuck_tiles` entry must not discard the checkpoint."""
+    cp = str(tmp_path / "cp")
+    _seed_resume(cp, 10, [])
+    path = dm._state_path(cp)
+    with open(path, encoding="utf-8") as f:
+        state = json.load(f)
+    state["stuck_tiles"] = [["a", "b"], [1]]
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(state, f)
+    loaded = dm.load_tile_checkpoint(cp, bbox=_BBOX, tiles=_TILES)
+    assert loaded is not None and loaded.stuck == set()
+    assert len(loaded.done) == len(_TILES) - 10
 
 
 def test_a_checkpoint_without_a_stuck_record_still_resumes(monkeypatch, tmp_path, limiters, holds):
