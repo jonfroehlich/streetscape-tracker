@@ -810,6 +810,95 @@ def test_a_429_after_a_clock_stop_is_still_the_clocks_83_not_87(
     assert len(session.urls) == 2
 
 
+@pytest.fixture
+def quick_backoff(monkeypatch):
+    """``@backoff``'s retry sleep, cut to a few event-loop turns.
+
+    Patched on backoff's own module rather than ``asyncio`` globally, so the
+    responses' scripted delays (real sleeps) still order the requests.
+    """
+    import backoff._async as backoff_async
+
+    real_sleep = asyncio.sleep
+
+    async def quick(delay, *args, **kwargs):
+        await real_sleep(0.02)
+
+    monkeypatch.setattr(backoff_async.asyncio, "sleep", quick)
+
+
+def _asked(session):
+    return [tuple(int(g) for g in _URL_TILE.search(u).groups()) for u in session.urls]
+
+
+def test_a_backoff_retry_after_a_429_at_the_cap_waits_out_the_hold(
+    monkeypatch, tmp_path, limiters, holds, quick_backoff
+):
+    """Round-9 review: tile 0 is on the wire when tile 1's 429 lands at a
+    spent cap. Nothing admitted is left to send, so the hold was skipped --
+    but tile 0's 500 is then retried by `@backoff`, which holds no
+    reservation, and that retry went out unheld. The hold is now ARMED: the
+    retry sleeps it before it goes out."""
+    script = {
+        _TILES[0]: [_slow(500, 0.01), ok()],
+        _TILES[1]: [_slow(429, 0.005, **{"Retry-After": "60"}), ok()],
+    }
+    error, session = _crawl(
+        monkeypatch,
+        script,
+        connection_limit=2,
+        max_requests=2,
+        checkpoint_path=str(tmp_path / "cp"),
+    )
+    assert type(error) is SweepIncompleteError, error
+    assert error.stopped_by == "requests"
+    # The retry did go out (it holds no reservation; the residue the cap
+    # tolerates), but only after the 429's hold.
+    assert _asked(session) == [_TILES[0], _TILES[1], _TILES[0]]
+    assert len(holds) == 1 and holds[0] == pytest.approx(60, abs=1)
+
+
+def test_a_backoff_retry_after_a_429_past_the_clock_is_turned_away(
+    monkeypatch, tmp_path, limiters, holds, quick_backoff
+):
+    """Round-9 review, clock variant: past the deadline no retry may wait, so
+    the pacer closes instead of arming, and tile 0's `@backoff` retry is
+    turned away rather than sent unheld. (No tile is committed in a two-tile
+    script, so this is the no-checkpoint `DownloadError`, not exit 83.)"""
+    import time as _time
+
+    script = {
+        _TILES[0]: [_slow(500, 0.01), ok()],
+        _TILES[1]: [_slow(429, 0.005, **{"Retry-After": "60"}), ok()],
+    }
+    error, session = _crawl(
+        monkeypatch,
+        script,
+        connection_limit=2,
+        checkpoint_path=str(tmp_path / "cp"),
+        deadline_monotonic=_time.monotonic() + 0.003,
+    )
+    assert isinstance(error, DownloadError), error
+    assert holds == []
+    assert _asked(session) == [_TILES[0], _TILES[1]]
+
+
+def test_a_stuck_last_tile_does_not_sleep_the_hold_it_gives_up_on(
+    monkeypatch, tmp_path, limiters, holds
+):
+    """Round-9 review: the LAST tile, refused on its final try, slept a full
+    899 s Retry-After holding the tile lock with nothing left to send. Its
+    first refusal still holds (its own retry follows); the give-up's hold is
+    armed, and nothing goes out after it, so nobody sleeps it."""
+    script = {_TILES[-1]: [status(429, **{"Retry-After": "899"})] * 5}
+    result, session = _crawl(
+        monkeypatch, script, connection_limit=1, checkpoint_path=str(tmp_path / "cp")
+    )
+    assert result["failed_tiles"] == [_TILES[-1]]
+    assert len(holds) == 1 and holds[0] == pytest.approx(899, abs=1)
+    assert len(session.urls) == len(_TILES) - 1 + dm.TILE_BACKPRESSURE_TILE_TRIES
+
+
 def test_a_long_retry_after_after_the_cap_tripped_is_still_throttled(
     monkeypatch, tmp_path, limiters, holds
 ):
@@ -1517,6 +1606,72 @@ def test_jittered_crawls_hold_every_refusal_and_keep_their_cap(
         assert len(urls) <= max_requests
     if storm_from and max_requests is None:
         assert type(outcome) is HostThrottledError, outcome
+
+
+@pytest.mark.parametrize("seed", range(150))
+def test_jittered_crawls_with_transport_errors_hold_every_refusal(
+    monkeypatch, tmp_path, limiters, seed
+):
+    """Round-9 review, as a sweep: the round-7 sweep above has no 5xx, so it
+    never meets a `@backoff` retry -- a request that holds no reservation
+    and can go out after a stopping crawl decided nothing more would. Here
+    500/502/504s and 429s land anywhere, under caps from tight to none and
+    with or without a storm. No request may follow a 429/503 unheld, every
+    request is counted, and a cap is passed by no more than the retries of
+    tiles already in flight (the documented residue)."""
+    import random
+
+    import backoff._async as backoff_async
+
+    rng = random.Random(seed)
+    events: list = []
+
+    async def record_hold(seconds):
+        events.append(("hold", seconds))
+
+    real_sleep = asyncio.sleep
+
+    async def jittered_backoff(delay, *args, **kwargs):
+        for _ in range(rng.choice([0, 1, 3, 6])):
+            await real_sleep(0)
+
+    monkeypatch.setattr(dm, "_backpressure_sleep", record_hold)
+    monkeypatch.setattr(backoff_async.asyncio, "sleep", jittered_backoff)
+    connection_limit = rng.choice([1, 2, 3, 5])
+    max_requests = rng.choice([None, 2, 3, 5, 8, 20, 60])
+    script = {}
+    for t in rng.sample(_TILES[:80], rng.choice([2, 5, 10])):
+        script[t] = [status(rng.choice([500, 502, 504]))] * rng.choice([1, 2, 4]) + [ok()]
+    for t in rng.sample(_TILES[:80], rng.choice([0, 1, 2])):
+        script[t] = [status(429, **{"Retry-After": rng.choice(["60", "300"])}), ok()]
+    storm_from = (_TILES[rng.randrange(40)],) if rng.random() < 0.3 else ()
+    sessions = []
+
+    def build(**kwargs):
+        session = _JitteredSession(script, rng, events, storm_from=storm_from, **kwargs)
+        sessions.append(session)
+        return session
+
+    monkeypatch.setattr(dm.aiohttp, "ClientSession", build)
+    try:
+        outcome = asyncio.run(
+            dm.fetch_city_images_async(
+                "Test City",
+                _BBOX,
+                "MLY|test|token",
+                connection_limit=connection_limit,
+                checkpoint_path=str(tmp_path / "cp"),
+                max_requests=max_requests,
+            )
+        )
+    except DownloadError as e:
+        outcome = e
+    urls = sessions[0].urls
+    spent = outcome.api_requests if isinstance(outcome, BaseException) else outcome["api_requests"]
+    assert spent == len(urls)
+    assert not _sent_after_unheld_refusal(events), events
+    if max_requests is not None:
+        assert len(urls) <= max_requests + connection_limit * (dm.TILE_MAX_TRIES - 1)
 
 
 def test_a_malformed_stuck_record_costs_nothing_but_the_record(tmp_path):
