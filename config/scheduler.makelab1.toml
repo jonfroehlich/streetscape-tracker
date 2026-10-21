@@ -61,15 +61,24 @@ max_cities_per_day = 80    # cities/day (a city runs all enabled providers)
 #
 # This and refresh_slots below are the night's TWO reservations, applied in
 # that order: the bounded hoist takes the head of the slate, then the refresh
-# reserve leads what the hoist did not take. At the pair (10 + 10, explicit
-# since the cap began its staged raise) 20 cities lead the night and the rest is pure
+# reserve leads what the hoist did not take. At the pair (25 + 10, explicit
+# since the cap began its staged raise) 35 cities lead the night and the rest is pure
 # stalest-first — raise either one and check the other, since it is the SUM
 # that bounds how much of a night the plain queue still governs.
 #
 # Set explicitly on 2026-09-25, when max_cities_per_day began a staged raise
 # from 40: the derived quarter would grow with every step (20 at 80), a faster
-# opt-in widening nobody decided on. 10 keeps the rate #282 has been running at.
-opt_in_cities_per_day = 10
+# opt-in widening nobody decided on. 10 kept the rate #282 had been running at.
+#
+# Raised 10 -> 25 on 2026-10-21 to reach provider parity: tranche 1 enrols
+# ~200 Panoramax-screen-positive and ~300 more KartaView cities (both channels
+# each), and a freshly enrolled channel is due at once, so at 10 a night the
+# tranche would take ~50 nights to reach. Hoisted cities run only their opt-in
+# channels (no GSV spend), and KartaView/Panoramax were spending ~100-160 of
+# their 10,000/8,000 daily budgets, so the budgets are not what this moves —
+# the KartaView/Panoramax lane time and per-IP volume are, and they step up
+# here in one stage.
+opt_in_cities_per_day = 25
 max_consecutive_failures = 5
 city_timeout_minutes = 180
 # Stop STARTING cities after this many hours so the aggregate/manifest/publish
@@ -167,7 +176,7 @@ timer_watchdog_max_age_h = 48
 #     kartaview_streets  502 enrolled        panoramax_streets   20 enrolled
 # So a city due on gsv + gsv_streets + mapillary + mapillary_streets +
 # kartaview + kartaview_streets is an ORDINARY nightly occurrence rather than a
-# hypothetical, and [schedule].opt_in_cities_per_day reserves ~10 slots a night
+# hypothetical, and [schedule].opt_in_cities_per_day reserves ~25 slots a night
 # for opt-in-only cities. For such a city the largest host-disjoint set is FOUR:
 #     gsv          ()                  <- declares no per-IP host
 #     gsv_streets  (overpass)

@@ -594,7 +594,7 @@ This is the reverse of the order #308 shipped with, and the reversal is a fix ra
 Hoist-then-reserve gives each reservation its own slots, and at a cap too small to hold both the reserve reports `0 promoted` rather than a promotion the night will not reach.
 
 **So a night's cap is split three ways: at most `opt_in_cities_per_day` opt-in-only cities, then at most `refresh_slots` refreshes in what remains, then pure stalest-first.**
-It is the **sum** of the two reservations that bounds how much of a night the plain queue still governs — 20 reserved slots lead a prod night, and, as the cap is raised in stages, the deadline increasingly ends it — so raising either one is a decision about the other, and `test_makelab1_production_config_is_wired` pins the sum for that reason.
+It is the **sum** of the two reservations that bounds how much of a night the plain queue still governs — 35 reserved slots lead a prod night (25 opt-in since 2026-10-21, 10 refresh), and, as the cap is raised in stages, the deadline increasingly ends it — so raising either one is a decision about the other, and `test_makelab1_production_config_is_wired` pins the sum for that reason.
 A hoisted city that is itself a refresh is not counted against `refresh_slots`, so a night can exceed it: the key is a floor on second intervals, not a ration of them.
 `cmd_run_due` logs `refresh_slots=N (M promoted)` on its opening line **unconditionally**, unlike the `hoisted=` clause, because the reserve is live by default and its derived value follows `max_cities_per_day`, so which policy a night ran under is not recoverable from the config file alone once either knob has moved.
 

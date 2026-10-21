@@ -1220,20 +1220,22 @@ def test_makelab1_production_config_is_wired():
     #
     # 2026-09-25: the cap began a STAGED raise, 40 -> 80 first (Mapillary
     # per-IP volume must step up in stages, docs/provider-access.md), and both
-    # reservations are now SET at 10 rather than derived, since a quarter would
+    # reservations are now SET rather than derived, since a quarter would
     # move with every step. Pinning the resolved numbers is still the point.
+    # 2026-10-21: the opt-in share was raised 10 -> 25 for provider parity
+    # (KartaView/Panoramax enrolment tranches); refresh_slots stays at 10.
     assert cfg.max_cities_per_day == 80
-    assert cfg.opt_in_cities_per_day == 10
-    assert _sched._opt_in_reservation(cfg, cfg.max_cities_per_day) == 10
+    assert cfg.opt_in_cities_per_day == 25
+    assert _sched._opt_in_reservation(cfg, cfg.max_cities_per_day) == 25
     assert cfg.refresh_slots == 10
     assert cfg.effective_refresh_slots(cfg.max_cities_per_day) == 10
-    # The SUM is the number to read: 20 reserved slots lead the night, and the
+    # The SUM is the number to read: 35 reserved slots lead the night, and the
     # rest is the plain stalest-first queue until the deadline stops it.
     # Raising either share without this failing would be raising it blind.
     assert (
         _sched._opt_in_reservation(cfg, cfg.max_cities_per_day)
         + cfg.effective_refresh_slots(cfg.max_cities_per_day)
-        == 20
+        == 35
     )
     # The inter-city pause (issue #306). Pinned in production, not just at the
     # dataclass default, because this is a knob whose only symptom when wrong is
