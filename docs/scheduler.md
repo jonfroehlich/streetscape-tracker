@@ -829,7 +829,7 @@ Raise the key for the duration of a rollout rather than expecting ten cities on 
 **Seeding an opt-in channel: DUE IMMEDIATELY is not REACHABLE TONIGHT, and the gap can be weeks.**
 Dueness is per-(city, channel), so a fresh `schedule_state` row has `last_success_at` NULL and the city is due on the next run regardless of any sibling channel's 90-day clock.
 That is the whole of the eligibility question and none of the reachability one — the #328 lesson, arrived at from the enrolment side instead of the exclusion side.
-A newly enrolled city is stranded (not due on rank 0), so it enters the bounded hoist, competing for `opt_in_cities_per_day` (10 on prod) against every other stranded city: mapillary-stranded cities, and every never-collected KartaView-enrolled city from the #282 widening — ~380 of the 502 enrolled on 2026-09-03 still had a NULL `last_success_at`.
+A newly enrolled city is stranded (not due on rank 0), so it enters the bounded hoist, competing for `opt_in_cities_per_day` (25 on prod since 2026-10-21; 10 before) against every other stranded city: mapillary-stranded cities, and every never-collected KartaView-enrolled city from the #282 widening — ~380 of the 502 enrolled on 2026-09-03 still had a NULL `last_success_at`.
 Ordering inside the reservation is live-checkpoint first, then union order, then `city_id`, so a seed city with an unlucky slug can sit behind hundreds of them.
 **So do not wait for the nightly batch to prove a new channel works.** Run it filtered, which makes the new channel rank 0 and therefore strands nobody:
 

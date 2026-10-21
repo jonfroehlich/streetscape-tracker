@@ -72,12 +72,16 @@ max_cities_per_day = 80    # cities/day (a city runs all enabled providers)
 #
 # Raised 10 -> 25 on 2026-10-21 to reach provider parity: tranche 1 enrols
 # ~200 Panoramax-screen-positive and ~300 more KartaView cities (both channels
-# each), and a freshly enrolled channel is due at once, so at 10 a night the
-# tranche would take ~50 nights to reach. Hoisted cities run only their opt-in
-# channels (no GSV spend), and KartaView/Panoramax were spending ~100-160 of
-# their 10,000/8,000 daily budgets, so the budgets are not what this moves —
-# the KartaView/Panoramax lane time and per-IP volume are, and they step up
-# here in one stage.
+# each). A freshly enrolled channel is due at once and these cities are not
+# gsv-due, so they reach a night only through this hoist — whose slots are
+# shared round-robin with the gsv-excluded and the otherwise-stranded kinds
+# (`_stranded_kind`, docs/scheduler.md), roughly a third each while all three
+# are non-empty. At 10 the opt-in kind got ~3-4 a night (~150 nights for the
+# tranche); at 25 it gets ~8-9 (~60). The other kinds run their own due
+# channels, Mapillary and gsv_streets included, so this also hoists more of
+# them, within the same budget and host gates. KartaView/Panoramax were
+# spending ~100-160 of their 10,000/8,000 daily budgets, so the budgets are not
+# what this moves — lane time and per-IP volume on those hosts are.
 opt_in_cities_per_day = 25
 max_consecutive_failures = 5
 city_timeout_minutes = 180
