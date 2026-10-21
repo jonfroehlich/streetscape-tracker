@@ -653,9 +653,10 @@ class TileStatusCounts:
 #    row in request order, which nothing in one crawl tells from a storm. The
 #    checkpoint is the evidence from outside the crawl: every tile refused and
 #    not since served is recorded (`TileCheckpoint.stuck`), and a resume asks
-#    for those LAST, charging no strike (round 4) -- and asks a committed tile
-#    instead when one is refused with nothing served since, so a storm still
-#    pauses once the fresh tiles run out (round 5). Without it a resume, whose
+#    for those LAST, charging no strike (round 4) -- and asks committed tiles
+#    instead when one is refused with nothing served since, until one is
+#    served or the crawl pauses, so a storm still pauses once the fresh tiles
+#    run out (rounds 5 and 6). Without it a resume, whose
 #    `todo` has lost the served tiles between them, lined up stuck tiles from
 #    anywhere in a capped night as three in a row, and paused every night.
 #    Left: three stuck tiles that stop a crawl before it has served a single
@@ -2205,54 +2206,74 @@ async def _fetch_city_images(
 
     async def probe_host() -> None:
         """
-        Re-request one committed tile: a strike if refused, a served tile if not.
+        Ask the host, not a recorded tile, whether it is refusing.
+
+        Re-requests committed tiles until one is SERVED -- a served tile,
+        which withdraws the pending strikes -- or the crawl stops. Each refusal
+        is a fresh tile's first response: an ordinary strike (unless an open
+        hold already covers it), held before the next probe like any other.
+        So a storm reaches its third episode inside this loop however many
+        recorded tiles are in flight together; one probe per recorded tile was
+        not enough, since probes sent together are one episode (round-6
+        review of #444). Bounded by TILE_BACKPRESSURE_PAUSE_AFTER rounds: every
+        round some prober's refusal opens a new episode, so a storm pauses
+        first; a host serving ends it at the first probe.
 
         Sent by a recorded tile refused with nothing served since its request
         went out -- the one moment a recorded tile cannot tell a storm from its
-        own refusal. Gated like a fresh tile (abort, pause, cap with its
-        reservation, deadline), counted once, never committed: its rows are in
-        the checkpoint already. Any other failure is inconclusive and ignored.
+        own refusal. Each probe is gated like a fresh tile (abort, pause, cap
+        with its reservation, deadline), counted once and never committed: its
+        rows are in the checkpoint already. Any other failure is inconclusive.
         """
         nonlocal probes_sent, fatal, reserved
-        if not probe_pool or backpressure_paused or clock_stopped or fatal is not None:
-            return
-        if (
-            max_requests is not None and api_requests + reserved >= max_requests
-        ) or crawl_deadline_passed(deadline_monotonic):
-            return
-        px, py = probe_pool[probes_sent % len(probe_pool)]
-        # Keyed apart from every real tile, and from every other probe, so a
-        # probe's strike is never overwritten by a later probe of the same tile.
-        key = ("probe", probes_sent)
-        probes_sent += 1
-        url = f"{TILE_URL_TEMPLATE.format(z=TILE_ZOOM, x=px, y=py)}?access_token={access_token}"
-        generation = pacer.generation
-
-        def on_probe() -> None:
-            nonlocal generation
-            count_request()
+        for _round in range(TILE_BACKPRESSURE_PAUSE_AFTER):
+            if not probe_pool or backpressure_paused or clock_stopped or fatal is not None:
+                return
+            if (
+                max_requests is not None and api_requests + reserved >= max_requests
+            ) or crawl_deadline_passed(deadline_monotonic):
+                return
+            px, py = probe_pool[probes_sent % len(probe_pool)]
+            # Keyed apart from every real tile, and from every other probe, so
+            # a probe's strike is never overwritten by a later probe.
+            key = ("probe", probes_sent)
+            probes_sent += 1
+            url = f"{TILE_URL_TEMPLATE.format(z=TILE_ZOOM, x=px, y=py)}?access_token={access_token}"
             generation = pacer.generation
 
-        reserved += 1
-        try:
-            await _fetch_tile(session, url, timeout, pacer, on_probe, statuses.record)
-        except TileBackpressureError as e:
-            wait = on_backpressure(e, generation, tile_first=True, tile=key)
-            if wait is not None:
-                await pacer.hold(wait)
-        except _CrawlPaused:
-            pass
-        except DownloadError as e:
-            # A refusal (302) answers the probe for the whole city.
-            fatal = fatal or e
-            pacer.close()
-            raise
-        except (TimeoutError, aiohttp.ClientError):
-            pass
-        else:
-            on_tile_served(key, generation)
-        finally:
-            reserved -= 1
+            def on_probe() -> None:
+                nonlocal generation
+                count_request()
+                generation = pacer.generation
+
+            refused: TileBackpressureError | None = None
+            reserved += 1
+            try:
+                await _fetch_tile(session, url, timeout, pacer, on_probe, statuses.record)
+            except TileBackpressureError as e:
+                refused = e
+            except _CrawlPaused:
+                return
+            except DownloadError as e:
+                # A refusal (302) answers the probe for the whole city.
+                fatal = fatal or e
+                pacer.close()
+                raise
+            except (TimeoutError, aiohttp.ClientError):
+                return
+            finally:
+                # Released BEFORE the backpressure handling and its hold, as in
+                # fetch_one: the request is in `api_requests` by now, and a
+                # reservation held through a hold would read as one request
+                # too many to every cap check meanwhile (round-6 review).
+                reserved -= 1
+            if refused is None:
+                on_tile_served(key, generation)
+                return
+            wait = on_backpressure(refused, generation, tile_first=True, tile=key)
+            if wait is None:
+                return
+            await pacer.hold(wait)
 
     async def fetch_one(x: int, y: int) -> pd.DataFrame:
         nonlocal fatal, capped, reserved, stop_reason
@@ -2425,13 +2446,13 @@ async def _fetch_city_images(
                 )
                 if wait is not None:
                     await pacer.hold(wait)
-                    if (
-                        tile_backpressure == 0
-                        and (x, y) in prior_stuck
-                        and served_generation < sent_generation
-                    ):
-                        # Nothing served since this recorded tile was asked
-                        # for: ask the host instead (see `probe_pool`).
+                    if (x, y) in prior_stuck and served_generation <= sent_generation:
+                        # Nothing served from a LATER generation than this
+                        # recorded tile's request: ask the host instead (see
+                        # `probe_host`). `<=`, not `<` (round-6 review): a tile
+                        # served in the same generation may have gone out
+                        # before the storm began, and a needless probe costs
+                        # one served request.
                         await probe_host()
                 tile_backpressure += 1
                 if wait is not None and tile_backpressure >= TILE_BACKPRESSURE_TILE_TRIES:
