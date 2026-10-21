@@ -2183,7 +2183,11 @@ async def _fetch_city_images(
                 or time.monotonic() + wait >= deadline_monotonic
             ):
                 if stop_reason is None:
-                    stop_reason = SWEEP_STOP_CLOCK
+                    # The cap, if it is what stopped the crawl, names the stop
+                    # (round-10 review): the wait outlasting a deadline not
+                    # yet passed only decides closing over arming.
+                    over = max_requests is not None and api_requests >= max_requests
+                    stop_reason = SWEEP_STOP_REQUESTS if over else SWEEP_STOP_CLOCK
                 capped = True
                 pacer.close()
             else:

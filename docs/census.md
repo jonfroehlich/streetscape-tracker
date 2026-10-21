@@ -326,7 +326,7 @@ The rule, the research behind it and the 900 s ceiling are in [`provider-access.
   What it raises is its own: `HostThrottledError` (exit 87), committed tiles or not, with the checkpoint kept as for exit 83 — never `SweepIncompleteError`, whose 83 promises the next city is unaffected, and never the cap's plain `DownloadError`, which counts a failure.
   The `fatal` raise runs before it, so a 302 in the same crawl is still exit 75.
   A 429 answered after the cap or the clock already stopped the crawl sleeps no hold, and is 87 only on a third standing strike or a `Retry-After` past the ceiling.
-  Its hold is ARMED instead (`_BackpressurePacer.arm`), so an in-flight tile's `@backoff` retry, which holds no reservation, waits it out before it goes out; past the clock the pacer closes and that retry is turned away (round-9 review).
+  Its hold is ARMED instead (`_BackpressurePacer.arm`), so an in-flight tile's `@backoff` retry, which holds no reservation, waits it out before it goes out; past the clock, or when the wait would outlast it, the pacer closes and that retry is turned away (round-9 review).
   A hold that would outlast the deadline stops the crawl on the **clock's** path below the strike limit (`clock_stopped` joins the same check, exit 83), never as 87.
 - **A retried tile re-enters at the top of that check**, so the abort, the cap with its reservation, and the deadline gate it as they gate a fresh tile.
   The cap's soft-ceiling residue is unchanged — still only `@backoff` retries by tiles already in flight — because a backpressure retry is a fresh admission, never an in-flight retry.
