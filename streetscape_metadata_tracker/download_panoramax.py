@@ -102,6 +102,7 @@ from .checkpointing import (
 from .config import PANORAMAX_METADATA_DTYPES
 from .download_common import (
     HOST_PANORAMAX,
+    STREETSCAPE_USER_AGENT_CONTACT,
     SWEEP_STOP_CLOCK,
     SWEEP_STOP_REQUESTS,
     AsyncRateLimiter,
@@ -114,6 +115,7 @@ from .download_common import (
     grid_bbox,
     points_in_tiles,
     redact_credentials,
+    streetscape_user_agent,
     tile_frac_to_lonlat,
 )
 from .download_common import tiles_for_bbox as common_tiles_for_bbox
@@ -149,23 +151,14 @@ TYPE_360 = "equirectangular"
 # host whose maintainer has said rate-limiting "will come", and an operator who
 # sees our traffic should be able to write to a person rather than block an IP.
 #
-# Shape, per RFC 9110 sec. 10.1.5 (`product *( RWS ( product / comment ) )`,
-# where a product is `token ["/" version]` and a token has NO spaces -- hence
-# `StreetscapeTracker`, not "Streetscape Tracker") and per the Wikimedia
-# User-Agent policy's `<client name>/<version> (<contact information>)
-# <library>/<version>`, which is the convention OSM's own services (Nominatim:
-# "identifying the application ... stock User-Agents ... will not do") read.
-# The library token is the real aiohttp version, so it cannot drift.
+# The string itself is the project's, shared with the Mapillary tile census
+# since #444: see download_common.streetscape_user_agent for its RFC 9110 shape.
 #
-# Panoramax ONLY. The screen imports this constant, so it sends the same
-# string; the Nominatim and Overpass agents are separate constants and are
-# deliberately not changed here.
-USER_AGENT_CONTACT = "sidewalk@cs.uw.edu"
-USER_AGENT = (
-    "StreetscapeTracker/1.0 "
-    f"(+https://github.com/jonfroehlich/streetscape-tracker; {USER_AGENT_CONTACT}) "
-    f"aiohttp/{aiohttp.__version__}"
-)
+# The screen imports this constant, so it sends the same string; the Nominatim
+# and Overpass agents are separate constants and are deliberately not changed
+# here.
+USER_AGENT_CONTACT = STREETSCAPE_USER_AGENT_CONTACT
+USER_AGENT = streetscape_user_agent(f"aiohttp/{aiohttp.__version__}")
 
 
 # ── Slippy-map tile math ───────────────────────────────────────────────────

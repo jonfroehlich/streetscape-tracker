@@ -856,7 +856,10 @@ async def async_main():
                 # If one channel found the host blocked and another merely found
                 # it busy, report BLOCKED: over-reacting costs the night's
                 # remaining channels on that host, under-reacting keeps firing
-                # into a CDN that is already refusing us.
+                # into a CDN that is already refusing us. THROTTLED (#444) needs
+                # no rank of its own: only the Mapillary tile host raises it, and
+                # a grid run has one Mapillary provider, so it never meets a
+                # BLOCKED error from the same host here.
                 worst = next(
                     (e for e in unavailable if not isinstance(e, HostBusyError)), unavailable[0]
                 )
