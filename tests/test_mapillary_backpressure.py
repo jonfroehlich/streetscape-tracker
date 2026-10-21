@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import re
+import time
 
 import aiohttp
 import mapbox_vector_tile
@@ -791,8 +792,6 @@ def test_a_429_after_a_clock_stop_is_still_the_clocks_83_not_87(
     """After a clock stop every wait "outlasts the deadline", so this used to
     become exit 87 on any first 429. No wait is going to happen, so it no
     longer escalates: the stop is the clock's."""
-    import time as _time
-
     script = {
         _TILES[0]: [_slow(429, 0.3)],
         _TILES[1]: [_slow(200, 0.1, **{"Content-Type": "application/x-protobuf"})],
@@ -802,7 +801,7 @@ def test_a_429_after_a_clock_stop_is_still_the_clocks_83_not_87(
         script,
         connection_limit=2,
         checkpoint_path=str(tmp_path / "cp"),
-        deadline_monotonic=_time.monotonic() + 0.05,
+        deadline_monotonic=_clock_runs_out_after(monkeypatch, 2),
     )
     assert type(error) is SweepIncompleteError, error
     assert error.stopped_by == "clock"
@@ -825,6 +824,32 @@ def quick_backoff(monkeypatch):
         await real_sleep(0.02)
 
     monkeypatch.setattr(backoff_async.asyncio, "sleep", quick)
+
+
+def _clock_runs_out_after(monkeypatch, n_requests):
+    """A wall-clock deadline that passes once ``n_requests`` have gone out.
+
+    The clock tests need every tile ADMITTED before the deadline and the
+    deadline PASSED by the time a slow response lands. A real deadline a few
+    milliseconds away encodes that as a race against the runner: on a loaded
+    CI box (py3.14, twice on 2026-10-21) it passed before the first tile was
+    admitted, nothing went out, and the test failed on `_asked() == []`.
+    Counting requests makes the order the test means the order it gets.
+
+    Returns a far-future ``deadline_monotonic``, so the real clock never stops
+    the crawl and the "a wait would outlast the deadline" arm is decided by
+    ``crawl_deadline_passed`` alone, as it is once a real deadline has passed.
+    """
+    sent = []
+    real_get = _ScriptedSession.get
+
+    def counting_get(self, url, **kwargs):
+        sent.append(url)
+        return real_get(self, url, **kwargs)
+
+    monkeypatch.setattr(_ScriptedSession, "get", counting_get)
+    monkeypatch.setattr(dm, "crawl_deadline_passed", lambda deadline: len(sent) >= n_requests)
+    return time.monotonic() + 3600
 
 
 def _asked(session):
@@ -865,8 +890,6 @@ def test_a_backoff_retry_after_a_429_past_the_clock_is_turned_away(
     the pacer closes instead of arming, and tile 0's `@backoff` retry is
     turned away rather than sent unheld. (No tile is committed in a two-tile
     script, so this is the no-checkpoint `DownloadError`, not exit 83.)"""
-    import time as _time
-
     script = {
         _TILES[0]: [_slow(500, 0.01), ok()],
         _TILES[1]: [_slow(429, 0.005, **{"Retry-After": "60"}), ok()],
@@ -876,7 +899,7 @@ def test_a_backoff_retry_after_a_429_past_the_clock_is_turned_away(
         script,
         connection_limit=2,
         checkpoint_path=str(tmp_path / "cp"),
-        deadline_monotonic=_time.monotonic() + 0.003,
+        deadline_monotonic=_clock_runs_out_after(monkeypatch, 2),
     )
     assert isinstance(error, DownloadError), error
     assert holds == []
