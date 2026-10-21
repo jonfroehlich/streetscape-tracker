@@ -1326,6 +1326,167 @@ def test_a_302_to_a_probe_is_the_refusal_at_once(monkeypatch, tmp_path, limiters
     assert asked == [recorded[0], pool[0]]
 
 
+@pytest.mark.parametrize("overlap", [False, True], ids=["serial", "overlap"])
+@pytest.mark.parametrize("connection_limit", [1, 5])
+def test_a_pause_decided_by_the_probe_on_a_tiles_last_try_is_87(
+    monkeypatch, tmp_path, limiters, holds, connection_limit, overlap
+):
+    """Round-7 review: the recorded tile's retry is refused, and the probe it
+    sends runs into a storm and pauses the crawl. The tile then took the
+    give-up branch -- a failed tile, not a turned-away one -- so nothing set
+    `capped`, and with no other tile left the census FINALIZED (exit 0) under
+    a pause already logged as exit 87, the host unlatched."""
+    cp = str(tmp_path / "cp")
+    recorded = [_TILES[5]]
+    _seed_resume(cp, 0, recorded)
+    pool = [t for t in _TILES if t not in recorded]
+    error, session = _crawl(
+        monkeypatch,
+        {recorded[0]: [status(503)] * 10},
+        overlap=overlap,
+        storm_from=[pool[1]],
+        connection_limit=connection_limit,
+        checkpoint_path=cp,
+    )
+    assert type(error) is HostThrottledError, error
+    assert "3 HTTP 429/503 episodes" in str(error)
+
+
+def test_a_probe_refused_one_request_short_of_the_cap_still_holds(
+    monkeypatch, tmp_path, limiters, holds
+):
+    """A probe answered 429 one request short of the cap is not a stopping
+    crawl's 429: it holds, and the next probe spends the last request."""
+    cp = str(tmp_path / "cp")
+    recorded = [_TILES[5]]
+    _seed_resume(cp, 0, recorded)
+    pool = [t for t in _TILES if t not in recorded]
+    script = {recorded[0]: [status(503)] * 10, pool[0]: [status(429)]}
+    error, session = _crawl(
+        monkeypatch, script, connection_limit=1, checkpoint_path=cp, max_requests=3
+    )
+    assert type(error) is SweepIncompleteError, error
+    assert error.stopped_by == "requests"
+    # R refused (hold), probe 1 refused at request 2 of 3 (hold), probe 2
+    # served at the cap; R's retry is turned away.
+    assert len(session.urls) == 3
+    assert len(holds) == 2
+
+
+class _JitteredSession(_ScriptedSession):
+    """Answers after a random number of yields, logging sends, answers and
+    holds in one event list, so request order and hold discipline can be
+    read back across overlapping sockets."""
+
+    def __init__(self, script, rng, events, **kwargs):
+        super().__init__(script, **kwargs)
+        self._rng = rng
+        self._events = events
+
+    def get(self, url, **kwargs):
+        m = _URL_TILE.search(url)
+        tile = (int(m.group(1)), int(m.group(2)))
+        self._events.append(("send", tile))
+        inner = super().get(url, **kwargs)
+        yields = self._rng.choice([0, 1, 2, 3, 5, 8])
+        events = self._events
+
+        class _Ctx:
+            async def __aenter__(self):
+                for _ in range(yields):
+                    await asyncio.sleep(0)
+                response = await inner.__aenter__()
+                events.append(("answer", response.status, tile))
+                return response
+
+            async def __aexit__(self, *exc):
+                return False
+
+        return _Ctx()
+
+
+def _sent_after_unheld_refusal(events) -> bool:
+    """True if any request went out after a 429/503 with no hold between.
+
+    A refusal answering a request sent BEFORE some hold began is already
+    covered by that hold -- the same episode, rule 6 -- so it owes nothing.
+    """
+    owed = False
+    last_hold = -1
+    sent_at: dict = {}
+    for i, event in enumerate(events):
+        if event[0] == "send":
+            if owed:
+                return True
+            sent_at[event[1]] = i
+        elif event[0] == "hold":
+            owed = False
+            last_hold = i
+        elif event[1] in dm.TILE_BACKPRESSURE_STATUSES and sent_at[event[2]] > last_hold:
+            owed = True
+    return False
+
+
+@pytest.mark.parametrize("seed", range(60))
+def test_jittered_crawls_hold_every_refusal_and_keep_their_cap(
+    monkeypatch, tmp_path, limiters, seed
+):
+    """Round-7 review, as a seeded sweep over overlapping responses: fresh and
+    resumed crawls, stuck tiles, storms starting anywhere, caps from tight to
+    none. Whatever the outcome, (a) no request follows a 429/503 without a
+    hold first -- a stopping crawl used to skip its hold while tiles already
+    admitted under the cap still went out -- (b) every request is counted,
+    (c) a cap is never passed (no transport errors here, so no residue), and
+    (d) a storm on every remaining request ends as 87, never a census."""
+    import random
+
+    rng = random.Random(seed)
+    events: list = []
+
+    async def record_hold(seconds):
+        events.append(("hold", seconds))
+
+    monkeypatch.setattr(dm, "_backpressure_sleep", record_hold)
+    cp = str(tmp_path / "cp")
+    n_recorded = rng.choice([0, 1, 3, 6])
+    recorded = [_TILES[i] for i in sorted(rng.sample(range(40), n_recorded))]
+    fresh = _seed_resume(cp, rng.choice([2, 5, 30]), recorded) if recorded else list(_TILES)
+    stuck = list(rng.sample(fresh, min(2, len(fresh))))
+    script = {t: [status(503)] * 10 for t in recorded + stuck}
+    storm_at = rng.choice(["none", "none", "first", "recorded"])
+    storm_from = {"none": (), "first": fresh[:1], "recorded": recorded[:1]}[storm_at]
+    max_requests = rng.choice([None, 3, 8, 20])
+    sessions = []
+
+    def build(**kwargs):
+        session = _JitteredSession(script, rng, events, storm_from=storm_from, **kwargs)
+        sessions.append(session)
+        return session
+
+    monkeypatch.setattr(dm.aiohttp, "ClientSession", build)
+    try:
+        outcome = asyncio.run(
+            dm.fetch_city_images_async(
+                "Test City",
+                _BBOX,
+                "MLY|test|token",
+                connection_limit=rng.choice([1, 5]),
+                checkpoint_path=cp,
+                max_requests=max_requests,
+            )
+        )
+    except DownloadError as e:
+        outcome = e
+    urls = sessions[0].urls
+    spent = outcome.api_requests if isinstance(outcome, BaseException) else outcome["api_requests"]
+    assert spent == len(urls)
+    assert not _sent_after_unheld_refusal(events), events
+    if max_requests is not None:
+        assert len(urls) <= max_requests
+    if storm_from and max_requests is None:
+        assert type(outcome) is HostThrottledError, outcome
+
+
 def test_a_malformed_stuck_record_costs_nothing_but_the_record(tmp_path):
     """Round-5 nit: a bad `stuck_tiles` entry must not discard the checkpoint."""
     cp = str(tmp_path / "cp")

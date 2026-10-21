@@ -2123,16 +2123,22 @@ async def _fetch_city_images(
             return None
         # Already stopping (round-2 review of #444): the cap or the clock has
         # turned a tile away (`capped`), or will turn this one away at its
-        # next check. No retry is going out, so a hold would only sleep with
-        # the machine-wide tile lock held, and the stop stays the cap's or
-        # the clock's.
+        # next check. When no admitted tile is waiting to send either, nothing
+        # is going out, so a hold would only sleep with the machine-wide tile
+        # lock held, and the stop stays the cap's or the clock's.
         stopping = (
             capped
             or crawl_deadline_passed(deadline_monotonic)
             or (max_requests is not None and api_requests + reserved >= max_requests)
         )
-        if stopping:
+        if stopping and reserved == 0:
             return None
+        # Stopping, but a tile already admitted under the cap -- its request
+        # reserved, not yet sent -- WILL still go out: so this is not a stop
+        # with nothing to protect, and it holds like any other (round-7
+        # review of #444; skipping it sent those requests at once after a 429
+        # with no wait). Not turned away instead: those requests are inside
+        # the budget, and a crawl that commits nothing is a counted failure.
         if deadline_monotonic is not None and time.monotonic() + wait >= deadline_monotonic:
             # A hold that would outlast the crawl's wall-clock budget is not
             # slept: the scheduler forwards that budget as its SIGKILL timeout
@@ -2212,9 +2218,11 @@ async def _fetch_city_images(
         So a storm reaches its third episode inside this loop however many
         recorded tiles are in flight together; one probe per recorded tile was
         not enough, since probes sent together are one episode (round-6
-        review of #444). Bounded by TILE_BACKPRESSURE_PAUSE_AFTER rounds: every
-        round some prober's refusal opens a new episode, so a storm pauses
-        first; a host serving ends it at the first probe.
+        review of #444). Bounded by TILE_BACKPRESSURE_PAUSE_AFTER rounds; a
+        refusal answering a request sent before another hold began is that
+        hold's episode, so a round may add no strike, but across the probers
+        in flight a storm reaches its third episode first in every layout
+        measured (round 7); a host serving ends it at the first probe.
 
         Sent by a recorded tile refused with nothing served since its request
         went out -- the one moment a recorded tile cannot tell a storm from its
@@ -2555,7 +2563,11 @@ async def _fetch_city_images(
     # set and the tolerance sees it in full. The same sentence is NOT free in
     # download_panoramax, whose moved-endpoint guard sits in the same stretch
     # with no such final night to fall back on -- see the note there.
-    if capped:
+    # `backpressure_paused` as well as `capped`: a pause decided as the LAST
+    # tile settled -- its own confirmation, or a probe -- turns no tile away,
+    # so nothing sets `capped`, and the census would finalize and publish
+    # under a pause the log already announced as exit 87 (round-7 review).
+    if capped or backpressure_paused:
         committed = len(checkpoint.done) if checkpoint is not None else 0
         resumable = checkpoint is not None and not checkpoint.degraded and bool(checkpoint.done)
         if backpressure_paused:
