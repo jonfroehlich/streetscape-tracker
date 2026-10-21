@@ -883,6 +883,57 @@ def test_a_backoff_retry_after_a_429_past_the_clock_is_turned_away(
     assert _asked(session) == [_TILES[0], _TILES[1]]
 
 
+def test_a_capped_429_whose_hold_outlasts_the_deadline_closes_and_names_the_cap(
+    monkeypatch, tmp_path, limiters, holds, quick_backoff
+):
+    """Round-10 review: the cap is spent and the 60 s hold would outlast a
+    deadline 30 s away (not yet passed). Arming it would have the `@backoff`
+    retry sleep into the SIGKILL margin, so the pacer closes and the retry is
+    turned away -- and the stop is named for the cap that caused it, not the
+    clock. (No tile is committed in a two-tile script, so this is the
+    no-checkpoint `DownloadError`.)"""
+    import time as _time
+
+    script = {
+        _TILES[0]: [_slow(500, 0.01), ok()],
+        _TILES[1]: [_slow(429, 0.005, **{"Retry-After": "60"}), ok()],
+    }
+    error, session = _crawl(
+        monkeypatch,
+        script,
+        connection_limit=2,
+        max_requests=2,
+        checkpoint_path=str(tmp_path / "cp"),
+        deadline_monotonic=_time.monotonic() + 30,
+    )
+    assert isinstance(error, DownloadError), error
+    assert "wall-clock" not in str(error), error
+    assert holds == []
+    assert _asked(session) == [_TILES[0], _TILES[1]]
+
+
+def test_a_shorter_armed_hold_does_not_cut_a_longer_one(
+    monkeypatch, tmp_path, limiters, holds, quick_backoff
+):
+    """Round-10 review: two 429s at a spent cap, Retry-After 300 then 10,
+    while a 500's `@backoff` retry is in flight. The armed hold keeps the
+    LATER end, as overlapping holds do, so the retry waits the full 300 s."""
+    script = {
+        _TILES[0]: [_slow(500, 0.02), ok()],
+        _TILES[1]: [_slow(429, 0.005, **{"Retry-After": "300"}), ok()],
+        _TILES[2]: [_slow(429, 0.01, **{"Retry-After": "10"}), ok()],
+    }
+    error, session = _crawl(
+        monkeypatch,
+        script,
+        connection_limit=3,
+        max_requests=3,
+        checkpoint_path=str(tmp_path / "cp"),
+    )
+    assert type(error) is SweepIncompleteError, error
+    assert len(holds) == 1 and holds[0] == pytest.approx(300, abs=1), holds
+
+
 def test_a_stuck_last_tile_does_not_sleep_the_hold_it_gives_up_on(
     monkeypatch, tmp_path, limiters, holds
 ):
