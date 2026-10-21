@@ -735,12 +735,14 @@ def _slow(code, delay, **headers):
     return r
 
 
-def test_a_429_after_the_cap_tripped_neither_holds_nor_throttles(
+def test_a_429_after_the_cap_is_spent_neither_holds_nor_throttles(
     monkeypatch, tmp_path, limiters, holds
 ):
-    """Tile 0's 429 lands after tile 1 spent the cap and tile 2 was turned
-    away: no retry can go out, so a hold would only sleep holding the
-    machine-wide tile lock. It stays the cap's exit 83."""
+    """Tile 0's 429 lands after tile 1 spent the cap: no admitted tile is left
+    to send, so a hold would only sleep holding the machine-wide tile lock.
+    It stays the cap's exit 83. (Under round 7's reservations, held to the
+    ANSWER, tile 1 was turned away while tile 0's request was still counted
+    twice, and tile 0's retry then went out at once, unheld -- round 8.)"""
     script = {_TILES[0]: [_slow(429, 0.05, **{"Retry-After": "5"}), ok()]}
     error, session = _crawl(
         monkeypatch,
@@ -752,7 +754,35 @@ def test_a_429_after_the_cap_tripped_neither_holds_nor_throttles(
     assert type(error) is SweepIncompleteError, error
     assert error.stopped_by == "requests"
     assert holds == []
+    asked = [tuple(int(g) for g in _URL_TILE.search(u).groups()) for u in session.urls]
+    assert asked == [_TILES[0], _TILES[1]]
+    assert error.units_done == 1
     assert len(session.urls) == error.api_requests == 2
+
+
+def test_a_429_at_the_cap_with_every_reserved_request_on_the_wire_does_not_hold(
+    monkeypatch, tmp_path, limiters, holds
+):
+    """Round-8 review: a reservation is released only when its ANSWER comes
+    back, so `reserved` also counts requests already sent. At the cap with
+    every admitted request already on the wire nothing more can go out, and
+    a hold would only sleep -- up to 899 s holding the tile lock. Round 7
+    gated the hold on `reserved` and slept it; the gate is now on requests
+    admitted but not yet sent."""
+    script = {_TILES[0]: [_slow(429, 0.1, **{"Retry-After": "899"}), ok()]}
+    for t in _TILES[1:5]:
+        script[t] = [_slow(200, 0.3, **{"Content-Type": "application/x-protobuf"})]
+    error, session = _crawl(
+        monkeypatch,
+        script,
+        connection_limit=5,
+        max_requests=5,
+        checkpoint_path=str(tmp_path / "cp"),
+    )
+    assert type(error) is SweepIncompleteError, error
+    assert error.stopped_by == "requests"
+    assert holds == []
+    assert len(session.urls) == error.api_requests
 
 
 def test_a_429_after_a_clock_stop_is_still_the_clocks_83_not_87(
@@ -1427,7 +1457,7 @@ def _sent_after_unheld_refusal(events) -> bool:
     return False
 
 
-@pytest.mark.parametrize("seed", range(60))
+@pytest.mark.parametrize("seed", range(150))
 def test_jittered_crawls_hold_every_refusal_and_keep_their_cap(
     monkeypatch, tmp_path, limiters, seed
 ):
@@ -1451,7 +1481,9 @@ def test_jittered_crawls_hold_every_refusal_and_keep_their_cap(
     n_recorded = rng.choice([0, 1, 3, 6])
     recorded = [_TILES[i] for i in sorted(rng.sample(range(40), n_recorded))]
     fresh = _seed_resume(cp, rng.choice([2, 5, 30]), recorded) if recorded else list(_TILES)
-    stuck = list(rng.sample(fresh, min(2, len(fresh))))
+    # Early in request order half the time, where a tight cap meets them
+    # (the round-8 layouts).
+    stuck = list(rng.sample(fresh[:12] if rng.random() < 0.5 else fresh, min(2, len(fresh))))
     script = {t: [status(503)] * 10 for t in recorded + stuck}
     storm_at = rng.choice(["none", "none", "first", "recorded"])
     storm_from = {"none": (), "first": fresh[:1], "recorded": recorded[:1]}[storm_at]
