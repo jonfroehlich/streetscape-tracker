@@ -993,6 +993,73 @@ def test_a_mapillary_tile_block_still_lets_the_gsv_walk_run(conn, monkeypatch, t
     assert rc == 1  # a refused host is never a clean run
 
 
+def test_a_rest_night_holds_the_mapillary_pair_and_the_answer_is_incomplete(
+    conn, monkeypatch, tmp_path, capsys
+):
+    """
+    A standing hold (issue #444) binds an inquiry too: on the tile CDN's rest
+    weekday the Mapillary pair launches nothing, the GSV walk still runs, the
+    summary says HELD, and the answer is incomplete (exit 1) -- not because
+    anything refused us, which the summary must not claim.
+    """
+    ran = _stub_collection(monkeypatch, conn)
+    cfg = _cfg(tmp_path, host_rest_weekdays={HOST_MAPILLARY_TILES: ("Mon",)})
+    assert TODAY.weekday() == 0, "TODAY must be the configured rest weekday"
+
+    rc = _assess(tmp_path, cfg=cfg)
+
+    out = capsys.readouterr().out
+    assert [p for _, p in ran] == ["gsv_streets"]
+    assert "HELD Mapillary's tile CDN (tiles.mapillary.com): rest night (Mon)" in out
+    assert "2 launch(es) held" in out
+    assert "refused this host" not in out
+    assert rc == 1
+
+
+def test_a_refusal_cooldown_holds_an_inquiry_off_the_tile_cdn(
+    conn, monkeypatch, tmp_path, capsys, frozen_utc_clock
+):
+    """The cooldown (issue #444) is read from the catalog for assess-city too:
+    an inquiry 10 h after a recorded refusal sends the CDN nothing."""
+    refused_at = datetime(2026, 8, 17, 0, 0, tzinfo=UTC)
+    db.record_host_verdict(
+        conn, HOST_MAPILLARY_TILES, db.HOST_REFUSED, source="run-due", at=refused_at
+    )
+    frozen_utc_clock(datetime(2026, 8, 17, 10, 0, tzinfo=UTC))
+    ran = _stub_collection(monkeypatch, conn)
+    cfg = _cfg(tmp_path, host_refusal_cooldown_h={HOST_MAPILLARY_TILES: 36.0})
+
+    rc = _assess(tmp_path, cfg=cfg)
+
+    assert [p for _, p in ran] == ["gsv_streets"]
+    assert "cooling down until 2026-08-18 12:00 UTC" in capsys.readouterr().out
+    assert rc == 1
+
+
+def test_an_assess_city_refusal_is_persisted_under_its_own_name(conn, monkeypatch, tmp_path):
+    """host_refusals (issue #444) says which command was refused: one row,
+    source assess-city, for the refused child alone."""
+    blocked = _blocked_outcome(HOST_MAPILLARY_TILES)
+    _stub_collection(
+        monkeypatch,
+        conn,
+        outcome=lambda city, provider: blocked if provider.startswith("mapillary") else True,
+    )
+    _assess(tmp_path)
+    rows = conn.execute(
+        "SELECT host, source, channel, city_id, exit_code FROM host_refusals"
+    ).fetchall()
+    assert [tuple(r) for r in rows] == [
+        (
+            HOST_MAPILLARY_TILES,
+            "assess-city",
+            "mapillary",
+            CITY_ID,
+            HOST_EXIT_CODES[HOST_MAPILLARY_TILES],
+        )
+    ]
+
+
 def test_an_overpass_refusal_skips_every_channel_that_needs_it(conn, monkeypatch, tmp_path):
     """
     Overpass is the first step of both road walks, so once it refuses this host

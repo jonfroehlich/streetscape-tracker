@@ -779,12 +779,14 @@ def test_a_bad_fill_key_turns_the_fill_off_rather_than_unbounded(tmp_path, lines
     assert any("fill" in r.message for r in caplog.records)
 
 
-def test_makelab1_fills_at_30_days_under_the_measured_mapillary_ceiling():
-    """Pinned with the host budget it must stay BELOW: 2,260 is the highest
-    combined night #292 measured clean, and the due slate keeps the 3,000."""
+def test_makelab1_fills_at_30_days_under_its_mapillary_ceiling():
+    """Pinned with the host budget it must stay BELOW. It started at 2,260 (the
+    highest combined night #292 measured clean) under a 3,000 due-slate budget;
+    #444 Stage 1 cut both, to 600 under 1,200, after the back-to-back ~2,255
+    fill nights preceded the every-second-night blocks."""
     cfg = load_scheduler_config(os.path.join(_PROJECT_ROOT, "config", "scheduler.makelab1.toml"))
     assert cfg.fill_min_days == 30
-    assert cfg.fill_host_ceilings == {"mapillary_tiles": 2_260}
+    assert cfg.fill_host_ceilings == {"mapillary_tiles": 600}
     assert cfg.fill_host_ceilings["mapillary_tiles"] < cfg.host_budgets["mapillary_tiles"]
     assert cfg.fill_min_days < cfg.cycle_days - cfg.grace_days
     assert (
@@ -803,7 +805,7 @@ def test_a_v17_catalog_gains_the_early_refreshes_table(tmp_path):
     conn.close()
 
     conn = db.connect(path)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 21
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 22
     cid = _register(conn, "Bend")
     db.record_early_refresh(
         conn, cid, "gsv", TODAY, prior_success_at="2026-08-01T00:00:00+00:00", floor_days=30

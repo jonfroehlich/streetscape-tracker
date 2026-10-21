@@ -1911,7 +1911,7 @@ def test_a_v15_catalog_takes_both_rungs_backfill_and_columns(tmp_path, frozen_ut
     raw.close()
 
     conn = db.connect(db_path)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 21
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 22
     cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
     assert set(db._QUERY_RADIUS_RUN_COLUMNS) <= cols
     assert _host_rows(conn) == [("2026-09-28T06:00:00+00:00", "mapillary_tiles", "mapillary", 194)]
@@ -1974,7 +1974,7 @@ def test_migrate_v19_to_v20_adds_total_grid_points_as_null(tmp_path):
     count that overstates the grid -- and every stored stat survives. Killed by
     an ADD COLUMN with a DEFAULT, or a backfill from total_points."""
     conn = db.connect(_pre_total_grid_points_catalog(tmp_path))
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 21
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 22
     cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
     assert "total_grid_points" in cols
     run = db.get_latest_run(conn, "bend--or", provider="mapillary")
@@ -2026,7 +2026,7 @@ def test_migrate_v20_to_v21_adds_quarantine_alerted_at_as_null(tmp_path):
     survives. Killed by an ADD COLUMN with a DEFAULT, or a backfill -- either
     would silence the one email a pre-#423 quarantine never got."""
     conn = db.connect(_pre_quarantine_alerted_catalog(tmp_path))
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 21
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 22
     cols = {r[1] for r in conn.execute("PRAGMA table_info(schedule_state)").fetchall()}
     assert "quarantine_alerted_at" in cols
     row = conn.execute(
@@ -2232,7 +2232,7 @@ def test_migrate_v15_to_v16_backfills_two_utc_dates_of_metered_channels(tmp_path
     raw.close()
 
     conn = db.connect(db_path)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 21
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 22
     assert _host_rows(conn) == [
         ("2026-09-27T23:59:59+00:00", "kartaview", "kartaview", 16),
         ("2026-09-27T23:59:59+00:00", "mapillary_tiles", "mapillary", 1198),
@@ -2508,3 +2508,118 @@ def test_concurrent_first_connects_add_the_every_connect_columns_once(tmp_path):
         assert version == db.SCHEMA_VERSION, path
         assert wanted <= cols, path
         assert "quarantine_alerted_at" in state_cols, path
+
+
+# ── host_refusals (schema v22, issue #444) ─────────────────────────────────
+
+
+def test_a_v21_catalog_gains_host_refusals_and_keeps_its_rows(tmp_path):
+    """v21 -> v22 is purely additive: the table appears, the stamp moves, and
+    nothing else on the catalog changes. Killed by dropping the table from
+    _SCHEMA. The v21 -> v22 rung itself is documentation only: init_schema
+    always ends by stamping SCHEMA_VERSION, so deleting the rung survives
+    every test."""
+    path = str(tmp_path / "v21.db")
+    conn = db.connect(path)
+    db.add_api_usage(conn, date(2026, 10, 16), 7, "mapillary")
+    conn.execute("DROP TABLE host_refusals")
+    conn.execute("PRAGMA user_version = 21")
+    conn.commit()
+    conn.close()
+
+    conn = db.connect(path)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 22
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(host_refusals)").fetchall()]
+    assert cols == [
+        "id",
+        "recorded_at",
+        "host",
+        "verdict",
+        "source",
+        "channel",
+        "city_id",
+        "exit_code",
+        "detail",
+        "requests_before",
+    ]
+    assert db.get_api_usage(conn, date(2026, 10, 16), "mapillary") == 7
+    conn.close()
+
+
+def test_record_host_verdict_fills_requests_before_from_the_24h_ledger(conn):
+    """requests_before is the host's ledger over the 24 h BEFORE the verdict:
+    a row 23 h back counts, one 25 h back does not, and another host's does not."""
+    at = datetime(2026, 10, 17, 9, 0, tzinfo=UTC)
+    for hours, host, n in (
+        (23, "mapillary_tiles", 1631),
+        (25, "mapillary_tiles", 900),
+        (1, "kartaview", 40),
+    ):
+        conn.execute(
+            "INSERT INTO host_usage VALUES (?, ?, 'x', ?)",
+            ((at - timedelta(hours=hours)).isoformat(), host, n),
+        )
+    db.record_host_verdict(
+        conn,
+        "mapillary_tiles",
+        db.HOST_REFUSED,
+        source="run-due",
+        channel="mapillary",
+        city_id="carlsbad",
+        exit_code=75,
+        detail="exited 75",
+        at=at,
+    )
+    row = db.newest_host_verdict(conn, "mapillary_tiles", db.HOST_REFUSED)
+    assert dict(row) | {"id": None} == {
+        "id": None,
+        "recorded_at": "2026-10-17T09:00:00+00:00",
+        "host": "mapillary_tiles",
+        "verdict": "refused",
+        "source": "run-due",
+        "channel": "mapillary",
+        "city_id": "carlsbad",
+        "exit_code": 75,
+        "detail": "exited 75",
+        "requests_before": 1631,
+    }
+
+
+def test_an_unmetered_hosts_verdict_has_no_requests_before(conn):
+    """No ledger counts Overpass, so 0 would be a false measurement: NULL."""
+    db.record_host_verdict(conn, "overpass", db.HOST_REFUSED, source="run-due")
+    assert db.newest_host_verdict(conn, "overpass", db.HOST_REFUSED)["requests_before"] is None
+
+
+def test_a_verdict_outside_the_pair_is_refused(conn):
+    with pytest.raises(ValueError):
+        db.record_host_verdict(conn, "mapillary_tiles", "maybe", source="probe-host")
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO host_refusals (recorded_at, host, verdict, source) "
+            "VALUES ('2026-10-17T00:00:00+00:00', 'mapillary_tiles', 'maybe', 'x')"
+        )
+
+
+def test_newest_host_verdict_is_per_verdict_and_before_is_exclusive(conn):
+    t0 = datetime(2026, 10, 16, 9, 0, tzinfo=UTC)
+    db.record_host_verdict(conn, "mapillary_tiles", db.HOST_REFUSED, source="run-due", at=t0)
+    db.record_host_verdict(
+        conn, "mapillary_tiles", db.HOST_CLEARED, source="probe-host", at=t0 + timedelta(hours=30)
+    )
+    later = t0 + timedelta(hours=40)
+    db.record_host_verdict(conn, "mapillary_tiles", db.HOST_REFUSED, source="run-due", at=later)
+
+    newest = db.newest_host_verdict(conn, "mapillary_tiles", db.HOST_REFUSED)
+    assert newest["recorded_at"] == later.isoformat()
+    assert (
+        db.newest_host_verdict(conn, "mapillary_tiles", db.HOST_REFUSED, before=later)[
+            "recorded_at"
+        ]
+        == t0.isoformat()
+    )
+    assert (
+        db.newest_host_verdict(conn, "mapillary_tiles", db.HOST_CLEARED)["source"] == "probe-host"
+    )
+    assert db.newest_host_verdict(conn, "kartaview", db.HOST_REFUSED) is None
+    assert db.host_verdict_hosts(conn) == ["mapillary_tiles"]

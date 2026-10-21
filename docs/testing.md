@@ -78,6 +78,7 @@ a geocode that lands on a city the catalog already holds (a second spelling of a
     `test_a_repeated_gsv_row_is_one_grid_point`: a gsv frame with one row repeated, the shape of a resumed legacy baseline run, stores `total_points` 4 and `total_grid_points` 3, so "gsv rows are points" is never pinned as a rule.
   - `tests/test_json_v2.py::test_published_total_search_points_is_the_deduplicated_grid_size` — for gsv and each census provider, the per-run JSON's `total_search_points` and the aggregate's `latest.total_search_points` are 5, the same as `total_grid_points`, never the row count.
   - The v20→v21 migration (`tests/test_db.py`, #424): `schedule_state.quarantine_alerted_at` arrives NULL on an existing at-cap row whose counter, membership, `last_error` and `day_of_cycle` survive (killed by a `DEFAULT` or a backfill, either of which would silence the one email a pre-#423 quarantine never got); a catalog already stamped v21 without the column gains it (killed by running the step only from its rung).
+  - The v21→v22 migration (`tests/test_db.py`, #444): the additive `host_refusals` table appears with its pinned columns on a v21 catalog, whose other rows survive; the rest of its tests are in the #444 section below.
   - The v19→v20 migration (`tests/test_db.py`): the column arrives NULL on an existing mapillary row whose row counts and coverage survive (killed by a `DEFAULT` or a copy from `total_points`); a catalog already stamped v20 without the column gains it (killed by running the step only from its rung); `register_run` round-trips it and stores NULL when omitted.
   - `test_concurrent_first_connects_add_the_every_connect_columns_once` (PR #422 review): six spawned processes, lined up on a barrier, first-connect each of six v20 catalogs lacking `schedule_state.quarantine_alerted_at` (#424), six v19 catalogs lacking `total_grid_points` and six v16 catalogs lacking the query-radius pair; no connect may fail and every catalog ends current with every column.
     All three every-connect steps go through `db._add_missing_columns` (which takes the table since #424), whose PRAGMA check and ALTERs share one `BEGIN IMMEDIATE`; the review measured the bare check-then-ALTER at 164 of 240 connects raising `duplicate column name`.
@@ -504,7 +505,7 @@ Incidental coverage of a deprecated spelling trains readers to ignore the notice
   - `test_an_invalid_host_budget_refuses_the_channel_running_commands` — eight invalid spellings, `[hosts.overpass]` among them, are each recorded and logged at load and refuse `run-due` and `assess-city` before the catalog opens; killed by validating against `HOST_LABELS` instead of the metered hosts, and by not logging the errors.
   - `test_block_4s_catch_up_then_night_is_gated_across_the_utc_boundary` — 1,444 spent 9 h earlier on the PREVIOUS UTC date caps the next city at 3,000 − 1,444 and the one after at that minus the first's spend; killed by keying the window on the UTC date.
   - `test_dry_run_and_status_print_the_host_window`; killed by dropping the status line.
-  - `test_makelab1_production_config_is_wired` pins prod's 3,000 exactly.
+  - `test_makelab1_production_config_is_wired` pins prod's budget exactly (1,200 since #444 Stage 1, with `[providers.mapillary]` at 1,500).
   - `test_no_host_budget_configured_is_todays_launch_exactly` — argv captured at `_run_collection_subprocess` from the REAL `_run_one_city`, grid and walk, is byte-identical with `[hosts]` absent, empty, or 10,000,000 against 10,000 in the window, and differs under the prod budget; killed by letting any host window govern.
   - `test_the_age_wall_projects_against_what_tonights_batch_can_grant` — a 6.5-day checkpoint with ~360 requests to go and 40,000 left on the channel: last night's 2,947 (stamped 20 h ago, gone before a 12 h batch ends) lets it launch capped at 53; the same 2,947 spent tonight (1 h ago) refuses it, as does a 300 budget, and both refusals name `[hosts.mapillary_tiles].rolling_24h_request_budget`; with no batch deadline the ceiling is the momentary remainder and it is refused; killed by the host's full budget as the ceiling, by the momentary remainder as the ceiling, and by not handing the live gate its batch end.
   - `test_the_budget_is_shared_by_both_channels_on_the_host` — the grid's 2,500 leaves the walk 500 whatever the walk's own row says; killed by stamping rows per channel rather than per host.
@@ -559,7 +560,7 @@ Every "killed by" below was run against the committed code, one mutation at a ti
 - `test_budget_drawn_down_by_earlier_fill_cities_declines_a_later_one` — `ended by budget (mapillary)`; killed by dropping the per-channel check.
 - `test_fill_candidates_need_every_member_channel_past_the_floor_and_not_due` — floor, not-due wall, never-collected, quarantine, ONE failure, exclusion, disabled, and the oldest-channel order; killed by ignoring the floor, ordering freshest-first, ignoring failures, and ignoring membership.
 - `test_fill_host_room_is_the_smaller_of_budget_and_ceiling` and `test_the_fill_ceiling_binds_below_the_host_budget`; killed by ignoring the ceiling.
-- `test_makelab1_fills_at_30_days_under_the_measured_mapillary_ceiling`.
+- `test_makelab1_fills_at_30_days_under_its_mapillary_ceiling`.
 - `test_sigterm_mid_city_in_the_fill_stops_the_night` — a SIGTERM during a fill city's gsv stops its mapillary, the fill and the night; killed by not making a fill SIGTERM the night's stop.
 - `test_the_deadline_check_sums_the_channels_needs` and `test_the_fill_ends_at_the_deadline_and_says_so`; killed by dropping the deadline check.
 - `test_the_dry_run_draws_its_ledgers_down_across_fill_cities` and `test_the_dry_run_draws_the_fill_ceiling_down_across_fill_cities`; killed by not subtracting an admitted city's price, and by leaving the preview's own spend out of the host room.
@@ -1078,6 +1079,57 @@ In `tests/test_scheduler.py`, `backup-status` gates on the heartbeat only when `
   the flag reaches the downloader from `cli.py` and the census from `collect.py`, both defaulting on rather than to the metronome, and a jitter of 1 exits 2 at parse time;
   the scheduler parses `[providers.*].jitter` as None-when-absent — never 0, which means "restore the exact cadence" — **warns and falls back to None on an out-of-range or non-numeric field** rather than letting it reach a child as an exit-2 argparse error on every city every night, and hands a valid one to both Mapillary children, a 0 included, while an unset one and a GSV child get no flag;
   and the prod config pin asserts both Mapillary channels resumed at the same jittered rate)
+
+## Standing host holds, persisted refusals and `probe-host` (issue #444)
+
+`tests/test_host_holds.py`, plus the assess-city cases in `tests/test_assess_city.py` and the schema cases in `tests/test_db.py`.
+A hold keeps a host's channels from launching without anything having refused us, so every test below also checks that it is not a refusal: no alert, no breaker membership, exit 0, no `record_attempt`.
+
+- Rest nights (`[hosts.<token>].rest_weekdays`):
+  - `test_rest_weekdays_load_canonical_and_in_weekday_order`, `test_a_rest_only_section_loads_without_a_budget`, `test_an_empty_rest_list_means_no_rest_night`.
+  - `test_an_invalid_rest_list_fails_closed` — six bad spellings, one of them beside a valid budget, are each recorded, logged, load NEITHER key, and refuse `run-due` and `assess-city` before the catalog opens.
+  - `test_makelab1_rests_the_tile_cdn_on_wednesday_and_sunday` — prod's list pinned exactly and read through `_host_holds` (the pass-through), with nothing else resting.
+  - `test_a_rest_night_holds_only_the_hosts_channels_and_is_not_a_failure` — gsv runs, the Mapillary pair launches nothing, `last_attempt_at` and `consecutive_failures` stay untouched, and the `Done:` line says HELD and never "refused".
+  - `test_a_non_rest_night_launches_the_pair` and `test_a_rest_night_with_nothing_due_on_the_host_still_reaches_the_done_line`.
+  - `test_the_limit_catch_up_honours_the_rest_night` — `run-due --provider mapillary --limit 5`.
+  - `test_ignore_host_holds_launches_and_says_so` and `test_the_override_flag_reaches_cmd_run_due`.
+  - `test_the_rest_night_is_read_on_the_utc_snapshot_date` — 00:30 UTC Wednesday (Tuesday evening in Pacific) is a Wednesday rest night.
+  - `test_the_dry_run_shows_the_hold` and `test_status_names_the_rest_weekdays_and_whether_today_is_one`.
+  - `test_a_wholly_held_city_takes_no_slot_live_or_in_the_preview` — at `--limit 1`, the night passes over a city due only on the held pair and collects the next one, and the preview names that same next city instead of spending its one row on the held one (killed by slicing `due[:day_cap]` again).
+  - `test_the_preview_counts_held_pairs_as_holding_the_fill` — a held due pair is unattempted, so the preview's fill section says it holds the fill on both Mapillary channels, as the live rule does (killed by deleting the held branch's `preview_unfinished` increment, the review's surviving M10); `test_a_passed_over_citys_held_pairs_still_hold_the_fill` pins the same for a city the preview passes over whole.
+  - `test_the_fill_declines_a_city_whose_channel_is_on_a_held_host` and `test_the_live_fill_is_handed_the_runs_holds` (the pass-through into `_fill_admission`).
+  - `test_a_hold_never_enters_the_breakers_set`.
+  - `test_a_rest_night_holds_the_mapillary_pair_and_the_answer_is_incomplete` (assess-city): the GSV walk still runs, the summary says HELD and not "refused", and the exit is 1.
+- Persisted refusals (`host_refusals`, schema v22):
+  - `test_a_v21_catalog_gains_host_refusals_and_keeps_its_rows` (`tests/test_db.py`) — the additive rung moves the stamp and pins the column list.
+  - `test_record_host_verdict_fills_requests_before_from_the_24h_ledger` — 23 h back counts, 25 h back and another host's do not; `test_an_unmetered_hosts_verdict_has_no_requests_before` (NULL, never 0); `test_a_verdict_outside_the_pair_is_refused` (the function and the CHECK); `test_newest_host_verdict_is_per_verdict_and_before_is_exclusive`.
+  - `test_a_refusal_the_scheduler_classifies_is_persisted` — exactly one row, the refused child's, stamped at the classification instant with its prior-24 h ledger; the breaker skips that follow add none.
+  - `test_a_busy_host_is_not_a_refusal_and_writes_no_row` (79) and `test_a_failed_refusal_write_never_ends_the_night` (a raising write is logged, the later cities still run, and the `Done:` line and the alert body both say `NOT RECORDED in host_refusals`, since the lost row is a cooldown the next night cannot see, and the probe-host clause says a refusal it meets does arm the cooldown); `test_a_lost_refusal_of_a_host_with_no_cooldown_gets_no_hold_advice` gives a host with no `refusal_cooldown_h` only the plain "not recorded" clause, never the hold-by-hand advice; `test_a_recorded_refusal_says_nothing_about_lost_records` is its control.
+  - `test_an_assess_city_refusal_is_persisted_under_its_own_name` (`tests/test_assess_city.py`).
+  - `test_status_prints_the_last_refusal_and_clearance_per_host`.
+- A THROTTLED child (exit 87), round 2 of the review:
+  - `test_a_throttled_or_refused_pair_stays_due` — after a night lost to 87, and to 75 beside it, the pair's `last_success_at` is still NULL and `get_due_cities` still returns it (killed by recording a success before either branch's `continue`).
+  - `test_a_throttled_checkpoint_near_the_age_wall_is_warned_about` — a 6-day-old Mapillary checkpoint stopped by 87 gets the 83 branch's age-wall WARNING; a 1-day-old one does not.
+- The cross-night refusal cooldown (`[hosts.<token>].refusal_cooldown_h`):
+  - `test_a_refusal_cooldown_loads` (36, 0.5, 168) and `test_an_invalid_refusal_cooldown_fails_closed` (0, −1, 169, a bool, a string, a list).
+  - `test_makelab1_cools_the_tile_cdn_for_36_hours_and_it_reaches_the_gate` — prod's 36 h read through `_host_holds` against a refusal 20 h back, held at the night's start and released one second past 36 h.
+  - `test_a_night_inside_the_cooldown_holds_the_host_and_is_not_a_refusal` — the 10-17 shape: gsv runs, the pair sends nothing, no alert, exit 0, no new `host_refusals` row, no `last_attempt_at`, and "cooling down until" on the `Done:` line and in the log.
+  - `test_a_night_past_the_cooldown_launches` and `test_no_cooldown_configured_is_todays_behaviour` (a refusal an hour old, no key: asked again).
+  - `test_a_clearance_does_not_shorten_the_cooldown` — only the newest REFUSAL counts.
+  - `test_the_cooldown_ends_mid_night_and_the_host_resumes` — 35.5 h at the start: the first city's pair is held, the second's runs once a gsv run has carried the clock past 36 h.
+  - `test_status_says_whether_the_host_is_cooling_down`.
+  - `test_a_refusal_cooldown_holds_an_inquiry_off_the_tile_cdn` (`tests/test_assess_city.py`).
+- `scheduler probe-host` (an injected fetch primitive, `_Fetch`, records every URL; the network guard in conftest backs it up):
+  - `test_probe_host_sends_exactly_one_tile_request_and_records_a_clearance` — ONE request, to exactly the documented z14 tile with the token, a `cleared` row, and one request on the `mapillary` ledger.
+  - `test_a_redirect_is_a_refusal_and_the_token_never_reaches_the_record` (exit 75, the Location redacted).
+  - `test_a_probe_refusal_starts_the_cooldown_a_night_then_honours` — the pass-through from probe-host's row to the next night's gate.
+  - `test_probe_host_classifies_each_answer` — a 200 HTML page and a 301 are refused; a 404 is cleared; 429, 503, 401, 403 and 500 are inconclusive and record nothing; each with exactly one request.
+  - `test_a_throttled_probe_records_nothing_and_says_so` — a 429 or 503 is the collector's backpressure, not a refusal: exit 1, no row, no cooldown armed, and the printed line says "throttled" with the `Retry-After` (or that there was none).
+  - `test_no_response_is_inconclusive_and_not_ledgered`.
+  - `test_probe_host_refuses_while_a_run_due_is_in_flight`, `test_probe_host_refuses_inside_the_cooldown_unless_forced` and `test_probe_host_refuses_while_another_process_holds_the_host_lock` (busy code 79, nothing sent; the lock is released after a probe) — each with no request sent.
+  - `test_probe_host_refuses_an_unknown_host_and_a_missing_token`, `test_probe_host_is_wired_into_the_cli`.
+  - `test_the_production_fetch_never_follows_a_redirect` (`allow_redirects=False` reaches `requests.get`) and `test_the_token_comes_from_the_existing_loader`.
+- `test_the_done_line_names_each_metered_hosts_presence_and_the_gap_before_it` — first launch to last finish on the tile CDN, the gap back to the newest ledger stamp from BEFORE the run (tonight's own stamps are seeded and must be ignored), and neither GSV nor Overpass named; killed by marking the launch after the inline child, by dropping the finish mark, by reading tonight's stamps, and by letting Overpass in.
 
 ## The same-day partner path (issue #215)
 

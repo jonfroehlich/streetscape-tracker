@@ -536,9 +536,9 @@ class HostThrottledError(HostUnavailableError):
     budget stops it on the clock instead, as exit 83, below that limit.) Not a
     :class:`HostBlockedError`: a 429 says "not this fast", where a 302 to
     ``/login`` says "not at all", so it maps to its own exit code
-    (:data:`HOST_THROTTLED_EXIT_CODES`), which the scheduler half of #444
-    (PR #449) treats as inconclusive -- it latches the host for the night,
-    amnestied, but records no refusal. Nor a :class:`SweepIncompleteError`, whose exit 83 promises
+    (:data:`HOST_THROTTLED_EXIT_CODES`) and the scheduler treats it as
+    inconclusive -- it latches the host for the night, amnestied, but records
+    no refusal. Nor a :class:`SweepIncompleteError`, whose exit 83 promises
     the next city's crawl is unaffected; this one is a property of the host,
     which every remaining Mapillary city of the night would walk into.
 
@@ -604,9 +604,7 @@ class HostThrottledError(HostUnavailableError):
 #     night-level breaker; unlike BLOCKED it is not a refusal, so the scheduler
 #     writes no host_refusals row and arms no 36 h cooldown (probe-host reads a
 #     429 as THROTTLED, inconclusive, for the same reason). It is amnestied, as
-#     83 is: the checkpoint is kept and the next night resumes. All of that
-#     scheduler behaviour is #444's scheduler change (PR #449), which this
-#     code's classification must merge with: without it, 87 is a failure. Only the
+#     83 is: the checkpoint is kept and the next night resumes. Only the
 #     Mapillary tile census reads backpressure, so the dict has one entry.
 #
 # 87 continues past 85. 86 is skipped because the GSV capture-history harvester
