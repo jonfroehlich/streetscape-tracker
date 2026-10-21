@@ -90,8 +90,16 @@ class _ScriptedSession:
     tile. Records the kwargs it was BUILT with, and every URL it was asked for.
     """
 
-    def __init__(self, script, **kwargs):
+    def __init__(self, script, overlap=False, storm_from=(), **kwargs):
         self._script = {xy: list(rs) for xy, rs in script.items()}
+        # `overlap` yields once before answering, so requests on several
+        # sockets are in flight together -- without it every response lands
+        # before the next request goes out, and five sockets act as one.
+        self.overlap = overlap
+        # Once any tile in `storm_from` is asked for, EVERY request answers
+        # 503 from then on: a host-wide storm beginning at that tile.
+        self._storm_from = set(storm_from)
+        self._storming = False
         self.kwargs = kwargs
         self.urls: list[str] = []
 
@@ -99,8 +107,11 @@ class _ScriptedSession:
         self.urls.append(url)
         m = _URL_TILE.search(url)
         assert m, url
-        queue = self._script.get((int(m.group(1)), int(m.group(2))))
-        response = queue.pop(0) if queue else ok()
+        tile = (int(m.group(1)), int(m.group(2)))
+        self._storming = self._storming or tile in self._storm_from
+        queue = self._script.get(tile)
+        response = status(503) if self._storming else (queue.pop(0) if queue else ok())
+        overlap = self.overlap
 
         class _Ctx:
             async def __aenter__(self):
@@ -109,6 +120,8 @@ class _ScriptedSession:
                 delay = getattr(response, "delay", 0)
                 if delay:
                     await asyncio.sleep(delay)
+                elif overlap:
+                    await asyncio.sleep(0)
                 return response
 
             async def __aexit__(self, *exc):
@@ -142,12 +155,12 @@ def no_backoff_sleep(monkeypatch):
     return delays
 
 
-def _crawl(monkeypatch, script, **kwargs):
+def _crawl(monkeypatch, script, overlap=False, storm_from=(), **kwargs):
     """Run one census over a scripted session. Returns (result-or-error, session)."""
     sessions = []
 
     def build(**session_kwargs):
-        session = _ScriptedSession(script, **session_kwargs)
+        session = _ScriptedSession(script, overlap=overlap, storm_from=storm_from, **session_kwargs)
         sessions.append(session)
         return session
 
@@ -1146,10 +1159,11 @@ def _seed_resume(cp, n_fresh, recorded):
     return rest[:n_fresh]
 
 
+@pytest.mark.parametrize("overlap", [False, True], ids=["serial", "overlap"])
 @pytest.mark.parametrize("connection_limit", [1, 5])
 @pytest.mark.parametrize("n_fresh", [0, 2])
 def test_a_storm_pauses_a_resume_whose_fresh_tiles_cannot(
-    monkeypatch, tmp_path, limiters, holds, connection_limit, n_fresh
+    monkeypatch, tmp_path, limiters, holds, connection_limit, n_fresh, overlap
 ):
     """Round-5 review of #444: recorded tiles charge no strike, so with fewer
     than three fresh tiles left a host-wide storm could not pause the resume --
@@ -1162,6 +1176,7 @@ def test_a_storm_pauses_a_resume_whose_fresh_tiles_cannot(
     error, session = _crawl(
         monkeypatch,
         {xy: [status(503)] * 10 for xy in _TILES},
+        overlap=overlap,
         connection_limit=connection_limit,
         checkpoint_path=cp,
     )
@@ -1171,19 +1186,51 @@ def test_a_storm_pauses_a_resume_whose_fresh_tiles_cannot(
     assert error.api_requests == len(session.urls)
 
 
+@pytest.mark.parametrize("overlap", [False, True], ids=["serial", "overlap"])
+@pytest.mark.parametrize("connection_limit", [1, 5])
+@pytest.mark.parametrize("n_recorded", [1, 3, 6])
+@pytest.mark.parametrize("n_fresh", [1, 4])
+def test_a_storm_that_begins_at_the_recorded_tail_pauses(
+    monkeypatch, tmp_path, limiters, holds, connection_limit, n_fresh, n_recorded, overlap
+):
+    """Round-6 review: the fresh tiles are SERVED and the storm begins with the
+    first recorded tile. With the probe gated on `served_generation <
+    sent_generation` the first recorded tile -- sent in the generation a fresh
+    tile was served in -- never probed, so three recorded tiles reached two
+    strikes and the night finalized with them as holes. And with requests in
+    flight together, one probe per recorded tile went out as ONE episode. The
+    probe now keeps asking until served or paused."""
+    cp = str(tmp_path / "cp")
+    recorded = _TILES[5 : 5 + n_recorded]
+    _seed_resume(cp, n_fresh, recorded)
+    error, session = _crawl(
+        monkeypatch,
+        {},
+        overlap=overlap,
+        storm_from=recorded,
+        connection_limit=connection_limit,
+        checkpoint_path=cp,
+    )
+    assert type(error) is HostThrottledError, error
+    assert "3 HTTP 429/503 episodes" in str(error)
+    assert error.api_requests == len(session.urls)
+
+
+@pytest.mark.parametrize("overlap", [False, True], ids=["serial", "overlap"])
 @pytest.mark.parametrize("connection_limit", [1, 5])
 def test_recorded_tiles_alone_complete_when_the_host_serves(
-    monkeypatch, tmp_path, limiters, holds, connection_limit
+    monkeypatch, tmp_path, limiters, holds, connection_limit, overlap
 ):
     """The probe's other answer: the host serves the committed tile, so the
     recorded tiles are the ones refusing and the resume completes, each
-    drawing its two requests and at most one probe."""
+    drawing its two requests and at most one probe per refusal."""
     cp = str(tmp_path / "cp")
     recorded = [_TILES[i] for i in (5, 6, 7)]
     _seed_resume(cp, 0, recorded)
     result, session = _crawl(
         monkeypatch,
         {b: [status(503)] * 10 for b in recorded},
+        overlap=overlap,
         connection_limit=connection_limit,
         checkpoint_path=cp,
     )
@@ -1192,8 +1239,9 @@ def test_recorded_tiles_alone_complete_when_the_host_serves(
     asked = [tuple(int(g) for g in _URL_TILE.search(u).groups()) for u in session.urls]
     for b in recorded:
         assert asked.count(b) == dm.TILE_BACKPRESSURE_TILE_TRIES
+    # At most one probe per refusal: each is served, so none loops.
     probes = [t for t in asked if t not in recorded]
-    assert 1 <= len(probes) <= len(recorded)
+    assert 1 <= len(probes) <= len(recorded) * dm.TILE_BACKPRESSURE_TILE_TRIES
     assert result["api_requests"] == len(session.urls)
 
 
@@ -1213,6 +1261,69 @@ def test_a_served_probe_withdraws_the_strikes_before_it(monkeypatch, tmp_path, l
     assert sorted(result["failed_tiles"]) == sorted(fresh + recorded)
     asked = [tuple(int(g) for g in _URL_TILE.search(u).groups()) for u in session.urls]
     assert pool[1] in asked
+
+
+def test_a_refused_probe_is_held_before_anything_else_goes_out(
+    monkeypatch, tmp_path, limiters, holds
+):
+    """Rule 2 holds for a probe too: a probe's 429 holds every request before
+    the next one -- the next probe, and the recorded tile's own retry."""
+    cp = str(tmp_path / "cp")
+    recorded = [_TILES[5]]
+    _seed_resume(cp, 0, recorded)
+    pool = [t for t in _TILES if t not in recorded]
+    script = {recorded[0]: [status(503)] * 10, pool[0]: [status(429)]}
+    result, session = _crawl(monkeypatch, script, connection_limit=1, checkpoint_path=cp)
+    assert not isinstance(result, BaseException), result
+    asked = [tuple(int(g) for g in _URL_TILE.search(u).groups()) for u in session.urls]
+    # R refused (hold), probe 1 refused (hold), probe 2 served, R's retry
+    # refused (hold, given up), probe 3 served.
+    assert asked == [recorded[0], pool[0], pool[1], recorded[0], pool[2]]
+    assert len(holds) == 3
+
+
+def test_no_probe_goes_out_once_the_clock_has_run_out(monkeypatch, tmp_path, limiters, holds):
+    """The probe is gated on the deadline like a fresh tile: a clock that runs
+    out during the recorded tile's hold sends no probe, and the crawl stops
+    on the clock (exit 83)."""
+    import time as _time
+
+    cp = str(tmp_path / "cp")
+    recorded = [_TILES[5]]
+    _seed_resume(cp, 0, recorded)
+    expired = []
+
+    async def hold_then_expire(seconds):
+        holds.append(seconds)
+        expired.append(True)
+
+    monkeypatch.setattr(dm, "_backpressure_sleep", hold_then_expire)
+    monkeypatch.setattr(dm, "crawl_deadline_passed", lambda deadline: bool(expired))
+    error, session = _crawl(
+        monkeypatch,
+        {recorded[0]: [status(503)] * 10},
+        connection_limit=1,
+        checkpoint_path=cp,
+        deadline_monotonic=_time.monotonic() + 10_000,
+    )
+    assert type(error) is SweepIncompleteError, error
+    assert error.stopped_by == "clock"
+    assert len(session.urls) == 1
+
+
+def test_a_302_to_a_probe_is_the_refusal_at_once(monkeypatch, tmp_path, limiters, holds):
+    """A probe redirected to /login answers for the whole city: exit 75, and
+    the recorded tile's own retry never goes out."""
+    cp = str(tmp_path / "cp")
+    recorded = [_TILES[5]]
+    _seed_resume(cp, 0, recorded)
+    pool = [t for t in _TILES if t not in recorded]
+    login = {"Location": "https://www.mapillary.com/login/?next=x%3Faccess_token%3DMLY"}
+    script = {recorded[0]: [status(503)] * 10, pool[0]: [status(302, **login)]}
+    error, session = _crawl(monkeypatch, script, connection_limit=1, checkpoint_path=cp)
+    assert type(error) is HostBlockedError, error
+    asked = [tuple(int(g) for g in _URL_TILE.search(u).groups()) for u in session.urls]
+    assert asked == [recorded[0], pool[0]]
 
 
 def test_a_malformed_stuck_record_costs_nothing_but_the_record(tmp_path):
