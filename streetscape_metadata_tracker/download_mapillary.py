@@ -650,7 +650,14 @@ class TileStatusCounts:
 #    can be a strike, and a strike stops counting once another tile is served
 #    from a later pacer generation unless its own retry was served (rounds 2
 #    and 3 of the review of #444), so neither can several -- except three in a
-#    row in request order, which nothing in one crawl tells from a storm.
+#    row in request order, which nothing in one crawl tells from a storm. The
+#    checkpoint is the evidence from outside the crawl: every tile refused and
+#    not since served is recorded (`TileCheckpoint.stuck`), and a resume asks
+#    for those LAST, charging no strike (round 4). Without it a resume, whose
+#    `todo` has lost the served tiles between them, lined up stuck tiles from
+#    anywhere in a capped night as three in a row, and paused every night.
+#    Left: three stuck tiles that stop a crawl before it has served a single
+#    tile, since a crawl that commits nothing has no checkpoint to record in.
 #
 # Both statuses, because a CDN shedding load answers 503 and one metering a
 # client answers 429; neither has ever been observed from tiles.mapillary.com
@@ -684,7 +691,8 @@ TILE_BACKPRESSURE_MAX_WAIT_S = 900.0
 # retry is served is a CONFIRMED throttle and always counts. A storm serves
 # nothing between its refusals, so it still pauses at its third episode -- and
 # so, by the same token, do three stuck tiles in a row in request order, which
-# no rule that reads one crawl can tell from a storm.
+# no rule that reads one crawl can tell from a storm. The checkpoint's record
+# of them (round 4, rule 6 above) is what lets the NEXT night tell.
 TILE_BACKPRESSURE_PAUSE_AFTER = 3
 # Backpressure responses ONE TILE may draw before it is given up as an ordinary
 # failed tile -- REQUEST_FAILED under MAX_FAILED_TILE_FRACTION (#168), exactly
@@ -1048,6 +1056,17 @@ class TileCheckpoint:
     # Spend of the PREVIOUS invocations only. This process adds its own on top,
     # and the sum is what reaches the catalog row (never the daily ledger).
     api_requests_before: int = 0
+    # Tiles this crawl has seen answer 429/503 and has NOT since been served
+    # (issue #444, rule 6) -- given up as stuck, or still pending when the
+    # crawl stopped. A tile leaves the set once it is served. Advisory, never
+    # part of the commit's integrity: a resume retries them LAST and lets none
+    # of them charge a strike, because a failed tile is never committed -- so
+    # without this record the served tiles that sat between them drop out of
+    # `todo`, the stuck tiles meet at its head, and three of them read as a
+    # storm (exit 87) every night with no progress (round-4 review of #444).
+    # Pending tiles count too: three stuck tiles in a row at five sockets all
+    # strike before any is given up, so the pause records no give-up at all.
+    stuck: set[tuple[int, int]] = field(default_factory=set)
     # Latched by the first failed commit, so the warning is logged once per run
     # and the rest of the fetch runs uncheckpointed rather than retrying a
     # directory that has already proved unwritable.
@@ -1215,6 +1234,7 @@ def load_tile_checkpoint(
         if reason is not None:
             discard(reason)
             return None
+        lattice = set(tiles)
         cp = TileCheckpoint(
             path=path,
             channel=channel,
@@ -1222,6 +1242,15 @@ def load_tile_checkpoint(
             created_at=state["created_at"],
             done=done,
             api_requests_before=int(state["api_requests_total"]),
+            # Absent from a record written before #444's round 4, which reads
+            # as "none known". Filtered rather than validated: it is advice
+            # about request ORDER, so a stale entry costs a strike's worth of
+            # caution at most and must never cost the resume.
+            stuck={
+                (int(x), int(y))
+                for x, y in state.get("stuck_tiles") or []
+                if (int(x), int(y)) in lattice and (int(x), int(y)) not in done
+            },
         )
     except Exception as e:
         # Broad on purpose; see the NEVER RAISES note above. A checkpoint that
@@ -1457,6 +1486,9 @@ def _write_checkpoint_state(
         "variant": cp.variant,
         "tile_count": len(tiles),
         "done_tiles": [[tx, ty, rows] for (tx, ty), rows in done.items()],
+        # A tile served since it was refused is committed by now, and so no
+        # longer suspect: this filter is what drops it from the record.
+        "stuck_tiles": sorted([tx, ty] for tx, ty in cp.stuck if (tx, ty) not in done),
         "census_rows": sum(done.values()),
         "api_requests_total": api_requests_total,
         "created_at": created_at,
@@ -1824,12 +1856,29 @@ async def _fetch_city_images(
         variant=checkpoint_variant,
     )
     done = checkpoint.done if checkpoint else {}
-    todo = [tile for tile in tiles if tile not in done]
+    # Tiles an earlier night saw refused on 429/503 and never served go LAST
+    # and charge no strike (issue #444, round-4 review). Request order only: reassembly walks
+    # `tiles`, so the census is byte-identical whatever order `todo` is in.
+    # Without this a resume -- whose `todo` has lost every served tile -- lines
+    # the stuck tiles up at its head with nothing served between them, which is
+    # a storm as one crawl sees it, and the city stops as 87 every night. Fresh
+    # tiles go first so a REAL storm is still met, and paused on, by tiles with
+    # no such history.
+    prior_stuck = checkpoint.stuck.copy() if checkpoint else set()
+    todo = [tile for tile in tiles if tile not in done and tile not in prior_stuck] + [
+        tile for tile in tiles if tile in prior_stuck
+    ]
     if done and todo:
+        stuck_note = (
+            f"; {len(prior_stuck)} tile(s) an earlier run saw refused on 429/503 and never "
+            f"served are retried last and charge no backpressure strike"
+            if prior_stuck
+            else ""
+        )
         logger.warning(
             f"Resuming {city_name} from the checkpoint at {checkpoint.path}: "
             f"{len(done)}/{len(tiles)} tiles already fetched for "
-            f"{checkpoint.api_requests_before:,} requests; {len(todo)} to go"
+            f"{checkpoint.api_requests_before:,} requests; {len(todo)} to go{stuck_note}"
         )
     elif done and not todo:
         # Recovers the crash-after-fetch-before-catalog case for ~0 requests.
@@ -2282,10 +2331,18 @@ async def _fetch_city_images(
                     # strike older than this request (see `strikes`).
                     on_tile_served((x, y), sent_generation)
                     break
+                if checkpoint is not None:
+                    # Remembered for a resume until it is served -- durable
+                    # with the next commit record, a tile's or `interrupted`'s
+                    # spend (see TileCheckpoint.stuck).
+                    checkpoint.stuck.add((x, y))
                 wait = on_backpressure(
                     slow_down_please,
                     sent_generation,
-                    tile_first=tile_backpressure == 0,
+                    # A tile an earlier night already saw refused and never
+                    # served may refuse on its own, so even its first response
+                    # here says nothing about the host (round-4 review of #444).
+                    tile_first=tile_backpressure == 0 and (x, y) not in prior_stuck,
                     tile=(x, y),
                 )
                 if wait is not None:

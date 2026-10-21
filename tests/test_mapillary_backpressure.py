@@ -16,6 +16,7 @@ so nothing here uses it: a stub has no HTTP status to count.
 """
 
 import asyncio
+import json
 import logging
 import re
 
@@ -1029,17 +1030,148 @@ def test_three_stuck_tiles_in_a_row_cannot_be_told_from_a_storm(
     like from inside one crawl, so the third is a third episode and the crawl
     stops as 87. (Holds release requests in FIFO order, so five sockets do not
     interleave a served tile between them.) Nothing a single night observes
-    tells the two apart; see docs/provider-access.md, rule 6."""
+    tells the two apart -- but the next night does: the tiles that night saw
+    refused and never served are in the checkpoint, so the resume completes
+    (round 4). See
+    docs/provider-access.md, rule 6."""
     bad = [_TILES[i] for i in (10, 11, 12)]
+    cp = str(tmp_path / "cp")
     error, session = _crawl(
         monkeypatch,
         {b: [status(503)] * 50 for b in bad},
         connection_limit=connection_limit,
-        checkpoint_path=str(tmp_path / "cp"),
+        checkpoint_path=cp,
     )
     assert type(error) is HostThrottledError, error
     assert "3 HTTP 429/503 episodes" in str(error)
     assert error.units_done == 10
+    # ...for ONE night. The three refused, unserved tiles are in the checkpoint,
+    # so the resume retries them last and they charge no strike: night 2
+    # completes. (At five sockets none was even given up before the pause.)
+    result, session = _crawl(
+        monkeypatch,
+        {b: [status(503)] * 50 for b in bad},
+        connection_limit=connection_limit,
+        checkpoint_path=cp,
+    )
+    assert not isinstance(result, BaseException), result
+    assert sorted(result["failed_tiles"]) == sorted(bad)
+
+
+@pytest.mark.parametrize("connection_limit", [1, 5])
+def test_a_resume_does_not_line_up_last_nights_stuck_tiles_as_a_storm(
+    monkeypatch, tmp_path, limiters, holds, connection_limit
+):
+    """Round-4 review of #444: a failed tile is never committed, so a resumed
+    crawl's `todo` loses the served tiles that sat BETWEEN last night's stuck
+    tiles. Three stuck tiles anywhere in a capped night's prefix then met at
+    the head of every later night, nothing served between them -- a storm as
+    one crawl sees it -- and each night ended as 87 with no tile committed,
+    latching the host, until the checkpoint aged out and the cycle restarted.
+
+    The given-up tiles are recorded in the checkpoint; a resume retries them
+    LAST, and none of them charges a strike, so night 2 completes the city."""
+    bad = [_TILES[i] for i in (2, 8, 14)]
+    cp = str(tmp_path / "cp")
+
+    def script():
+        return {b: [status(503)] * 50 for b in bad}
+
+    first, _session = _crawl(
+        monkeypatch,
+        script(),
+        connection_limit=connection_limit,
+        checkpoint_path=cp,
+        max_requests=30,
+    )
+    assert type(first) is SweepIncompleteError, first
+    assert 0 < first.units_done < len(_TILES)
+    with open(dm._state_path(cp), encoding="utf-8") as f:
+        recorded = {tuple(t) for t in json.load(f)["stuck_tiles"]}
+    assert recorded == set(bad)
+
+    outcomes, session = _nights_until_complete(monkeypatch, script, cp, connection_limit)
+    assert len(outcomes) == 1, [str(o)[:120] for o in outcomes]
+    result = outcomes[0]
+    assert not isinstance(result, BaseException), result
+    assert sorted(result["failed_tiles"]) == sorted(bad)
+    # Retried last: every fresh tile was asked for before any stuck one.
+    order = [tuple(int(g) for g in _URL_TILE.search(u).groups()) for u in session.urls]
+    first_stuck = min(order.index(b) for b in bad)
+    assert set(order[:first_stuck]).isdisjoint(bad)
+    assert len(set(order[:first_stuck])) == len(_TILES) - first.units_done - len(bad)
+
+
+def test_a_storm_still_pauses_a_resume_on_its_fresh_tiles(monkeypatch, tmp_path, limiters, holds):
+    """The other side of the round-4 rule: forgiving last night's stuck tiles
+    must not blind a resume to a real storm. Fresh tiles go first and still
+    charge strikes, so a storm on every tile pauses at their third episode,
+    before any previously stuck tile is asked for."""
+    bad = [_TILES[i] for i in (2, 8, 14)]
+    cp = str(tmp_path / "cp")
+    first, _ = _crawl(
+        monkeypatch,
+        {b: [status(503)] * 50 for b in bad},
+        connection_limit=1,
+        checkpoint_path=cp,
+        max_requests=30,
+    )
+    assert type(first) is SweepIncompleteError, first
+    error, session = _crawl(
+        monkeypatch,
+        {xy: [status(503)] * 5 for xy in _TILES},
+        connection_limit=1,
+        checkpoint_path=cp,
+    )
+    assert type(error) is HostThrottledError, error
+    assert "3 HTTP 429/503 episodes" in str(error)
+    asked = {tuple(int(g) for g in _URL_TILE.search(u).groups()) for u in session.urls}
+    assert asked.isdisjoint(bad)
+
+
+def test_a_checkpoint_without_a_stuck_record_still_resumes(monkeypatch, tmp_path, limiters, holds):
+    """A commit record written before round 4 has no `stuck_tiles`; it reads
+    as none known, never as an unusable checkpoint (which would discard the
+    night's tiles), and one the checkpoint has since committed is dropped."""
+    cp = str(tmp_path / "cp")
+    first, _ = _crawl(monkeypatch, {}, connection_limit=1, checkpoint_path=cp, max_requests=20)
+    assert type(first) is SweepIncompleteError, first
+    path = dm._state_path(cp)
+    with open(path, encoding="utf-8") as f:
+        state = json.load(f)
+    assert state["stuck_tiles"] == []
+    del state["stuck_tiles"]
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(state, f)
+    loaded = dm.load_tile_checkpoint(cp, bbox=_BBOX, tiles=_TILES)
+    assert loaded is not None and loaded.stuck == set()
+    assert len(loaded.done) == first.units_done
+
+    # A recorded tile the checkpoint has since committed is dropped on load.
+    state["stuck_tiles"] = [list(next(iter(loaded.done)))]
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(state, f)
+    assert dm.load_tile_checkpoint(cp, bbox=_BBOX, tiles=_TILES).stuck == set()
+
+
+def test_a_tile_refused_then_served_is_not_recorded_as_stuck(
+    monkeypatch, tmp_path, limiters, holds
+):
+    """The record is "refused and NOT since served": a throttle the tile's own
+    retry got through is no reason to send that tile last tomorrow, while one
+    still unserved when the crawl stopped is."""
+    cp = str(tmp_path / "cp")
+    served, unserved = _TILES[3], _TILES[15]
+    error, _ = _crawl(
+        monkeypatch,
+        {served: [status(429), ok()], unserved: [status(503)] * 50},
+        connection_limit=1,
+        checkpoint_path=cp,
+        max_requests=20,
+    )
+    assert type(error) is SweepIncompleteError, error
+    with open(dm._state_path(cp), encoding="utf-8") as f:
+        assert [tuple(t) for t in json.load(f)["stuck_tiles"]] == [unserved]
 
 
 def test_a_throttle_whose_retries_succeed_still_pauses_with_tiles_served_between(
