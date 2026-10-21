@@ -2013,6 +2013,15 @@ async def _fetch_city_images(
     # attempts do land in `api_requests` as they happen, so they close the gate
     # on tiles not yet admitted; what they cannot do is un-admit a tile already
     # in flight. That residue is the honest remaining bound, below.
+    #
+    # RELEASED WHEN THE REQUEST IS SENT, not when its answer comes back (round-8
+    # review of #444). From then on the request is in `api_requests`, so a
+    # reservation held to the answer counted every request on the wire twice:
+    # the cap read full until the answer came, then admitted another tile. So
+    # "at the cap" could turn false again -- and a 429 that skipped its hold
+    # because the crawl looked stopped was followed by a request with no
+    # wait. Released at the send, `api_requests + reserved` only ever grows,
+    # and `reserved` is exactly the requests admitted but not yet sent.
     reserved = 0
 
     # Backpressure (issue #444): the strikes this crawl's 429/503 responses
@@ -2124,24 +2133,26 @@ async def _fetch_city_images(
         if strike and standing >= TILE_BACKPRESSURE_PAUSE_AFTER:
             pause_for_backpressure(episodes_detail(standing))
             return None
-        # Already stopping (round-2 review of #444): the cap or the clock has
-        # turned a tile away (`capped`), or will turn this one away at its
-        # next check. When no admitted tile is waiting to send either, nothing
-        # is going out, so a hold would only sleep with the machine-wide tile
-        # lock held, and the stop stays the cap's or the clock's.
-        stopping = (
-            capped
-            or crawl_deadline_passed(deadline_monotonic)
-            or (max_requests is not None and api_requests + reserved >= max_requests)
+        # Already stopping (round-2 review of #444): nothing more will go out
+        # from this crawl, so a hold would only sleep with the machine-wide
+        # tile lock held, and the stop stays the cap's or the clock's. That
+        # is the clock having run out, or the cap spent (`api_requests +
+        # reserved`, which only grows -- see `reserved`) with no admitted tile
+        # still waiting to send. Not `capped`: under round 7's reservations,
+        # held to the answer, a tile could be turned away while the cap only
+        # LOOKED full, and the retry after this 429 then went out unheld
+        # (round-8 review).
+        stopping = crawl_deadline_passed(deadline_monotonic) or (
+            max_requests is not None and api_requests + reserved >= max_requests
         )
         if stopping and reserved == 0:
             return None
-        # Stopping, but a tile already admitted under the cap -- its request
-        # reserved, not yet sent -- WILL still go out: so this is not a stop
-        # with nothing to protect, and it holds like any other (round-7
-        # review of #444; skipping it sent those requests at once after a 429
-        # with no wait). Not turned away instead: those requests are inside
-        # the budget, and a crawl that commits nothing is a counted failure.
+        # Stopping, but a tile already admitted under the cap and not yet sent
+        # WILL still go out: so this is not a stop with nothing to protect, and
+        # it holds like any other (round-7 review; skipping it sent those
+        # requests at once after a 429 with no wait). Not turned away instead:
+        # those requests are inside the budget, and a crawl that commits
+        # nothing is a counted failure.
         if deadline_monotonic is not None and time.monotonic() + wait >= deadline_monotonic:
             # A hold that would outlast the crawl's wall-clock budget is not
             # slept: the scheduler forwards that budget as its SIGKILL timeout
@@ -2249,10 +2260,15 @@ async def _fetch_city_images(
             url = f"{TILE_URL_TEMPLATE.format(z=TILE_ZOOM, x=px, y=py)}?access_token={access_token}"
             generation = pacer.generation
 
+            awaiting_send = True
+
             def on_probe() -> None:
-                nonlocal generation
+                nonlocal generation, reserved, awaiting_send
                 count_request()
                 generation = pacer.generation
+                if awaiting_send:
+                    reserved -= 1
+                    awaiting_send = False
 
             refused: TileBackpressureError | None = None
             reserved += 1
@@ -2270,11 +2286,10 @@ async def _fetch_city_images(
             except (TimeoutError, aiohttp.ClientError):
                 return
             finally:
-                # Released BEFORE the backpressure handling and its hold, as in
-                # fetch_one: the request is in `api_requests` by now, and a
-                # reservation held through a hold would read as one request
-                # too many to every cap check meanwhile (round-6 review).
-                reserved -= 1
+                # Released at the send (`on_probe`), or here if it never went
+                # out; see `reserved`.
+                if awaiting_send:
+                    reserved -= 1
             if refused is None:
                 on_tile_served(key, generation)
                 return
@@ -2291,14 +2306,19 @@ async def _fetch_city_images(
         # the pacer generation its latest attempt was sent under.
         tile_backpressure = 0
         sent_generation = pacer.generation
+        # This admission's request is counted in `reserved` until it goes out.
+        awaiting_send = False
 
         def on_attempt() -> None:
             # One call per HTTP request, from inside _fetch_tile: the ledger's
             # count, plus the status line's retries (any attempt past a tile's
             # first, whichever layer retried it).
-            nonlocal attempts, sent_generation
+            nonlocal attempts, sent_generation, reserved, awaiting_send
             count_request()
             sent_generation = pacer.generation
+            if awaiting_send:
+                reserved -= 1
+                awaiting_send = False
             attempts += 1
             if attempts > 1:
                 statuses.retries += 1
@@ -2382,10 +2402,12 @@ async def _fetch_city_images(
                         stop_reason = SWEEP_STOP_REQUESTS if over_cap else SWEEP_STOP_CLOCK
                     progress_bar.update(1)
                     return records_to_census([])
-                # Reserved BEFORE the await, released after it: there is no
-                # suspension point between the check above and this line, so the
-                # loop cannot interleave another task into the gap.
+                # Reserved BEFORE the await, released when the request is sent
+                # (`on_attempt`): there is no suspension point between the check
+                # above and this line, so the loop cannot interleave another
+                # task into the gap.
                 reserved += 1
+                awaiting_send = True
                 slow_down_please: TileBackpressureError | None = None
                 turned_away = False
                 try:
@@ -2395,8 +2417,7 @@ async def _fetch_city_images(
                     )
                 except TileBackpressureError as e:
                     # Already counted (one request, one status) inside
-                    # _fetch_tile. Handled below, after the reservation is
-                    # released, so a hold never pins a reservation open.
+                    # _fetch_tile, its reservation released at the send.
                     slow_down_please = e
                 except _CrawlPaused:
                     # Waited on the pacer and the crawl paused meanwhile: no
@@ -2422,10 +2443,12 @@ async def _fetch_city_images(
                     # Every exit from the fetch, exception included: a reservation
                     # that leaked would shrink the cap for the rest of the crawl and
                     # eventually close the gate on tiles the budget still covers.
-                    # The requests it stood for are in `api_requests` by now,
-                    # whether the attempt succeeded, failed or exhausted its
-                    # retries, so releasing it double-counts nothing.
-                    reserved -= 1
+                    # A request that went out released it at the send.
+                    if awaiting_send:
+                        # Never sent: turned away on the pacer, or an error
+                        # before the first attempt.
+                        reserved -= 1
+                        awaiting_send = False
                 if turned_away:
                     # The pause check's own outcome: uncommitted, owed to the
                     # resume, and never past the raise before the settle loop.
