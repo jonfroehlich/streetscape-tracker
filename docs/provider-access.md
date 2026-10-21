@@ -887,6 +887,10 @@ Now:
    **A tile's cap reservation is released when its request is SENT, not when the answer comes back** (round-8 review): from the send on the request is in `api_requests`, so a reservation held to the answer counted every request on the wire twice — the cap read full until the answer came, then admitted another tile.
    So "at the cap" could turn false again: a 429 that skipped its hold because the crawl looked stopped was followed by a request with no wait (present since round 2), and round 7's "an admitted tile is waiting" gate, reading the same reservation, slept up to 899 s with nothing left to send.
    Released at the send, `api_requests + reserved` only grows, and `reserved` is exactly the requests admitted but not yet sent.
+   **A stopping crawl ARMS the hold it does not sleep** (round-9 review): a tile already on the wire can still be retried by `@backoff` after a 500/502/504 or a timeout, and that retry holds no reservation, so the skipped hold let it out with no wait.
+   `_BackpressurePacer.arm` owes the hold without sleeping it: the next request to go out sleeps it first, from the moment it was armed, and if nothing goes out nobody sleeps.
+   Past the clock, or when the wait would outlast it, no retry may wait, so the pacer closes instead and an in-flight tile's retry is turned away, uncommitted.
+   A tile refused on its LAST try (`TILE_BACKPRESSURE_TILE_TRIES`) arms its hold too: the hold protects the other tiles, and a stuck LAST tile used to sleep up to 899 s with the tile lock held and nothing left to send.
    It escalates to the backpressure stop only for what says something about the host (the third standing strike, or a `Retry-After` past 900 s); otherwise the stop stays the cap's or the clock's exit 83 (round-2 review of #444).
 4. The pace is **halved once** for the rest of that crawl (`AsyncRateLimiter.slow_down(2)`), on the limiter the crawl builds for itself, so it cannot reach another crawl or another process.
 5. The tile is then retried by re-entering the in-semaphore checks, so the abort, the request cap with its reservation, and the wall-clock deadline gate the retry exactly as they gate a fresh tile.

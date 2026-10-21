@@ -838,6 +838,8 @@ class _BackpressurePacer:
         self._gate = asyncio.Lock()
         self._holds = 0
         self._hold_until = 0.0
+        # An ARMED hold's end (see arm): slept by the next request to go out.
+        self._armed_until = 0.0
         self.slowed = False
         self.closed = False
         # Set by close(); a hold in progress waits on it beside its sleep.
@@ -859,6 +861,14 @@ class _BackpressurePacer:
         while True:
             if self.closed:
                 raise _CrawlPaused()
+            if self._armed_until:
+                # The first request to go out after an armed hold sleeps it,
+                # as an ordinary hold every other request waits behind.
+                remaining = self._armed_until - self._now()
+                self._armed_until = 0.0
+                if remaining > 0:
+                    await self.hold(remaining)
+                continue
             seen = self._holds
             async with self._gate:
                 pass  # waits out any hold in progress
@@ -873,6 +883,21 @@ class _BackpressurePacer:
         # and meets the closed check rather than returning.
         self._holds += 1
         self._closed_event.set()
+
+    def arm(self, seconds: float) -> None:
+        """
+        Owe a hold of ``seconds`` without sleeping it now (round-9 review).
+
+        For a 429/503 that this crawl may send NOTHING after -- the cap spent,
+        or a stuck tile being given up -- where sleeping at once would hold
+        the machine-wide tile lock for up to TILE_BACKPRESSURE_MAX_WAIT_S with
+        nothing to protect. If any request does go out after it (an
+        ``@backoff`` retry of a tile already on the wire, another tile), it
+        waits the hold out first, from the time it was armed; if none does,
+        nobody sleeps. A new generation, like any hold.
+        """
+        self._holds += 1
+        self._armed_until = max(self._armed_until, self._now() + seconds)
 
     async def hold(self, seconds: float) -> None:
         """Keep every request of this crawl from going out for ``seconds``."""
@@ -2143,6 +2168,23 @@ async def _fetch_city_images(
             max_requests is not None and api_requests + reserved >= max_requests
         )
         if stopping and reserved == 0:
+            # No admitted tile is left to send, but a tile already on the wire
+            # can still be retried by `@backoff` after a 5xx or a timeout, and
+            # that retry holds no reservation (round-9 review). So the hold is
+            # ARMED, not skipped: such a retry waits it out, and if nothing
+            # goes out nobody sleeps. Past the clock (or a wait that would
+            # outlast it) no retry may wait, so the pacer closes instead and
+            # an in-flight tile's retry is turned away, uncommitted.
+            if deadline_monotonic is not None and (
+                crawl_deadline_passed(deadline_monotonic)
+                or time.monotonic() + wait >= deadline_monotonic
+            ):
+                if stop_reason is None:
+                    stop_reason = SWEEP_STOP_CLOCK
+                capped = True
+                pacer.close()
+            else:
+                pacer.arm(wait)
             return None
         # Stopping, but a tile already admitted under the cap and not yet sent
         # WILL still go out: so this is not a stop with nothing to protect, and
@@ -2472,8 +2514,16 @@ async def _fetch_city_images(
                     tile_first=tile_backpressure == 0 and (x, y) not in prior_stuck,
                     tile=(x, y),
                 )
+                giving_up = tile_backpressure + 1 >= TILE_BACKPRESSURE_TILE_TRIES
                 if wait is not None:
-                    await pacer.hold(wait)
+                    if giving_up:
+                        # This tile sends nothing more, and the hold is for
+                        # the others: armed, so a stuck LAST tile does not
+                        # sleep up to 899 s holding the tile lock with nothing
+                        # to protect. A probe below sleeps it first.
+                        pacer.arm(wait)
+                    else:
+                        await pacer.hold(wait)
                     if (x, y) in prior_stuck and served_generation <= sent_generation:
                         # Nothing served from a LATER generation than this
                         # recorded tile's request: ask the host instead (see
