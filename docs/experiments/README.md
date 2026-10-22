@@ -77,6 +77,14 @@ Two things generalize.
 **(2) A saturated limiter must be measured, not assumed to deliver its setting**: this one delivered 82–88% once nothing else bound (79–83% in the first, hand-picked reading), and was invisible for as long as something else did.
 The latency scenario that reproduces production's curve is a fit, labelled as one, never a measurement of Google.
 
+### `kartaview-endpoint-move.md`
+
+The 2026-10-22 night's 124 KartaView failures: `kartaview.org` stopped routing `/1.0/list/nearby-photos/` (404) sometime after the 10-15 night, while `api.kartaview.org` and `api.openstreetcam.org` still serve the same photos.
+It PAUSED both KartaView channels rather than moving the host, for two measured reasons.
+Neither `api.` host validates the token (a bogus and a garbage one get the same 200), so the 1,000/h tier the pacer assumes is unverifiable.
+And `totalFilteredItems` now reads `['0']` on every page of a circle that serves 400 distinct photos over two pages, so a sweep that sizes its paging from it would read one page per circle and publish a truncated census with no error.
+Generalizes: when a provider's endpoint moves, re-check the response's SEMANTICS on the new host, not just its status code; a 200 with the familiar keys was the shape of the trap.
+
 ### `kartaview-feasibility.md`
 
 Issue #225 — whether KartaView can be a third provider; it can, as a **census** like Mapillary rather than a GSV-style sample, since its only bulk path is a paginated radius sweep.

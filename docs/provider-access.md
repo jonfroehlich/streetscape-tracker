@@ -591,6 +591,11 @@ Both KartaView channels share one machine-wide `host_lock(HOST_KARTAVIEW)`, so t
 A redirect, an HTML body or a 429 is a `HostBlockedError` at the **first** request (exit 81); 401/403 stays a plain `DownloadError` scoped to the credential.
 Widening the enrolled set is a volume change under the top-of-file rule and is therefore staged in tranches with a stop condition, not switched on catalog-wide (issue #282 and the rollout it gates).
 
+**The endpoint moved without notice, and both channels are PAUSED (2026-10-22).**
+`kartaview.org` stopped routing `/1.0/list/nearby-photos/` (404 text/plain) between the 10-15 and 10-22 nights, and all 124 KartaView attempts on 10-22 failed; no announcement exists, which is the empty room described above doing exactly what it predicted.
+The `api.kartaview.org` and `api.openstreetcam.org` hosts still answer, but they validate no token (so the 1,000/h tier this section's pacing rests on is no longer observable) and report `totalFilteredItems` as 0 (so the sweep would silently read one page per circle).
+The record and the fix it needs are in `docs/experiments/kartaview-endpoint-move.md`; until that fix lands, `kartaview.org` above is the host name the lock carries, not one that serves.
+
 ## Panoramax documents no limit at all, but is the one locked host with a staffed community (surveyed 2026-09-04, issue #316)
 
 Panoramax became a collection channel in [#335](https://github.com/jonfroehlich/streetscape-tracker/issues/335), and this section predates it: it exists because the top-of-file rule is about *before*, and phase 1 of [#316](https://github.com/jonfroehlich/streetscape-tracker/issues/316) put read-only traffic on the host while the answer was still open.
