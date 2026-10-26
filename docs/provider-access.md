@@ -125,7 +125,7 @@ That shape is the argument for the capped-and-resume work in #318 as well as for
 **What this actually spends.** Since #290 the walk reuses the grid run's census for zero requests on a paired night, and the table above shows `mapillary_streets` spending 0 on five of the six nights.
 The *combined* per-IP load has therefore been running at 755–2,260/day (six-night mean ~1,330) against the 3,500 that #241 sanctioned — about 38% of it on the mean and 65% at the 09-03 peak — so on a paired night 3,500 + 0 restores that sanctioned combined ceiling rather than exceeding it.
 **Be honest about the un-paired case**: nothing enforces the pairing, and a split pair can reach **5,250**, which is 1.5x the #241 ceiling and the most this host has been configured for since the 2026-08-22 cut (for ~2 days *after* block 2 it still sat at the old 15,000 + 5,000 = 20,000).
-That is accepted rather than overlooked, on the ground that block 3 (1,938/day, against 26,363 spent clean on 08-14) falsified daily volume and every accumulation window from 1 to 8 days (#286).
+That is accepted rather than overlooked, on the ground that block 3 (1,938/day, against 3,190 and 3,292 spent clean on 08-23 and 08-24) falsified daily volume and every accumulation window from 1 to 8 days (#286).
 It is **not** accepted on the ground that volume is safe — nothing about this host's behaviour is known safe, and the even split #241 chose still matters on exactly the nights that reach 5,250.
 The structurally correct fix is a single per-IP pool both channels draw from, which is a scheduler change rather than a config edit and is deliberately not attempted here; until it exists, the sum above is the number to quote, never the grid channel's 3,500 alone.
 **#385 has since built that pool** (after block 4, below): both channels now also draw from one rolling-24h tile-CDN budget, so the un-paired 5,250 is no longer reachable inside 24 h while it is set at 3,000.
@@ -137,7 +137,7 @@ The same reasoning applies to the next person who wants to move this number: che
 ## SUPERSEDED — the daily budgets encoded a rolling 2–3 day per-IP window (issue #241, superseded by #286)
 
 > **SUPERSEDED by block 3 (2026-08-28); kept in full, not deleted, because the ledger analysis and the staff record below are still the evidence base and because #267 was sized on these bands.**
-> Block 3 arrived at **1,938** combined requests/day while 08-14 had spent **26,363** in one day clean, and **no accumulation window from 1 to 8 days** admits a threshold separating blocked days from clean ones (#286).
+> Block 3 arrived at **1,938** combined requests/day while 08-23 and 08-24 had spent **3,190** and **3,292** clean, and **no accumulation window from 1 to 8 days** admits a threshold separating blocked days from clean ones (#286).
 > So the bands quoted below — 2-day (7,061, 10,766], 3-day (10,284, 12,074] — are **dead**, and the ~10,000-per-48 h reading with them.
 > What survives: the budgets stayed at 1,750 each, no longer as a threshold anyone believes in but as a *conservative floor on our exposure* — and on 2026-09-05 the grid channel's half was re-sized to 3,500 for the 40-city night, which is the section above, not this one; the no-`--limit`-catch-ups rule stayed on the general ground that a multi-night burst is the one shape we know preceded a block, and was LIFTED on 2026-09-09 after #292's eleven clean nights — staged, never at the ceiling, per the read-out at the end of this file; and the **repeat-offender** rival named below is likewise dead, since block 3 did not escalate (≤26.3 h, same as block 2).
 > The live hypothesis is request *shape*, not request *volume* — see the request-jitter section at the end of this file.
@@ -320,6 +320,7 @@ Both figures are upper bounds, and the measured/reported/guessed tiers below mus
   That claim remains untested in both directions: both times we chose silence over the retry experiment, deliberately.
 - **The protocol, proven twice:** disable both Mapillary channels **immediately**, sweep for detached processes, keep true silence, then a **single-request** probe per application daily starting ~24 h after the last refused request.
   An automated version (`probe_mapillary_block.sh` plus a self-disarming systemd user timer, untracked, emails the verdict either way) lives on makelab2 from the second incident.
+  Since #444 the single request is `scheduler probe-host mapillary_tiles`, which sends one request (the script sends two) and records the verdict in `host_refusals`.
   Re-enabling the channels stays a human decision — make it **promptly** on a clean probe, since both incidents' channels sat dark longer than their bans.
   And n=2 with upper bounds only: do not infer a shorter wait works, and do not probe more than once a day.
 
@@ -330,7 +331,10 @@ Both figures are upper bounds, and the measured/reported/guessed tiers below mus
 
 **After three blocks, both levers we control are falsified as the trigger, and the fourth hypothesis is the *shape* of the traffic rather than its amount.**
 Rate: block 2 arrived with the 60/min limiter provably pinned.
-Daily volume: block 3 arrived at **1,938** combined requests/day, while 08-14 had spent **26,363** in one day clean, and no accumulation window from 1 to 8 days separates blocked days from clean ones (issue #286, which retires #241's bands).
+Daily volume: block 3 arrived at **1,938** combined requests/day, while 08-23 and 08-24 had spent **3,190** and **3,292** clean, and no accumulation window from 1 to 8 days separates blocked days from clean ones (issue #286, which retires #241's bands).
+**Correction (2026-10-17, #444):** earlier versions of this file, #286 and the configs cited "08-14 spent 26,363 in one day clean" as the strongest falsifier.
+It was not clean: the ledger's 26,363 (25,297 `mapillary` + 1,066 `mapillary_streets`) fell **inside block 1** (onset 08-12, silence only from ~44 h after onset, in "Recovering from a block" above), so most of it was the detached loop's refused requests.
+The falsification survives without it — on 08-23/08-24 above, and again in September: in served requests over a trailing window (#444, from `runs` and `street_walks` timestamps), clean night ends carried up to **3,481** in 24 h (09-29) and **5,454** in 48 h (09-30), while October's blocks arrived at 1,631–2,287 (24 h) and 3,560–4,020 (48 h).
 What every restart left untouched is that `AsyncRateLimiter`'s token bucket, once saturated, emits tile requests at an **exact `60 / max_per_minute` cadence** — the sleep is computed to the token — over sequential z14 tiles in raster order, from a datacenter IP, with the same UA every time.
 Staff describe the per-IP layer only as a separate system that "can block you at different levels"; if it scores behaviour rather than counting, that regularity is the most machine-like feature we present.
 
@@ -360,7 +364,8 @@ The budgets were left at 1,750 for the restart because a fourth cut has no mecha
 
 **This is a pre-registered test, not a fix**, and the prediction is recorded in #286 before the restart.
 Blocks 2 and 3 each landed **on the 6th active collection night**: 08-13…08-20 and 08-23…08-28 are each a run of six collecting nights ending in the block.
-Two observations, not three — block 1 (08-12) came from a bulk catch-up sustaining ~370 req/min rather than from a six-night restart — so this is an n=2 regularity and the read-out below is only as strong as that.
+**Caveat (2026-10-17, #444):** 08-13 and 08-14 fell inside block 1 (see the correction above), so their traffic was mostly refused requests; counting only nights that were served, block 2 landed on the 4th served night, not the 6th, and the regularity holds for block 3 alone.
+Two observations, not three — block 1 (08-12) came from a bulk catch-up sustaining ~370 req/min rather than from a six-night restart — so this is an n=2 regularity at best (n=1 counting only served nights, per the caveat above) and the read-out below is only as strong as that.
 Those two runs were also 8 calendar days apart, but only because each happened to contain exactly two paused days — so the calendar reading and the active-night reading coincided by accident.
 This restart has no paused days, so the two PREDICTIONS diverge — six active nights lands on 09-04, where carrying the priors' 8-calendar-day block-to-block spacing forward from 08-28 lands on 09-05 — and the active-night rule is the one stated here.
 The restart was planned for Mon 2026-08-31 but the deploy landed on Sat 2026-08-29 afternoon, so the first jittered night is the **08-30 02:13 PDT** timer fire and every date below is one day earlier than #286's original table — shifted here rather than silently left pointing at the pre-deploy plan, because moving a pre-registered date *after* the outcome is known is the thing this whole section exists to avoid.
@@ -380,7 +385,7 @@ All eleven ran clean, and the evidence that carries this is the collect logs: **
 `schedule_state.consecutive_failures` is deliberately NOT quoted as evidence here, and should not be: `db.record_attempt` zeroes it on every success and the column is current state keyed by (city, channel) rather than a per-night record, so an all-zero read today is equally consistent with a blocked night followed by a success.
 Night 6 (09-04) is the night both prior blocks landed on and the night #286 named in advance; it passed, and so did the five after it.
 Eleven active nights is **1.8× the six-active-night interval that preceded blocks 2 and 3**, so the interval that generated the prediction has been cleared with room to spare.
-Be honest about that interval's strength: it is an **n=2** regularity, not n=3 — block 1 (2026-08-12) came from a bulk catch-up sustaining ~370 req/min, not from a six-night restart — and the read-out is only as strong as the rule it cleared.
+Be honest about that interval's strength: it is an **n=2** regularity at best, not n=3 (n=1 if only served nights count — see the caveat above) — block 1 (2026-08-12) came from a bulk catch-up sustaining ~370 req/min, not from a six-night restart — and the read-out is only as strong as the rule it cleared.
 **Grid-channel** spend across the window, per night: 755 / 950 / 1,241 / 1,037 / 1,736 / 1,723 / 862 / 1,343 / 1,593 / 543 / 1,162 requests.
 Those are the `mapillary` column alone, and the quantity the block is keyed on is the **combined** per-IP one: the ledger above pairs 09-03's 1,736 with a 524-request walk for **2,260**, the highest combined night the ledger RECORDS.
 The walk's per-night spend for 09-05…09-09 is not in that ledger, so read the last five figures as a **floor** on the combined load rather than as the load itself — and therefore as a reason not to call 2,260 the window's maximum.
@@ -429,6 +434,48 @@ Like every budget here it is a **soft ceiling**: in-flight retries can overshoot
 Mechanism, ledger and reporting: `docs/scheduler.md`, the rolling-24h section.
 
 Mapillary's own documentation and forum were re-read before this landed (2026-09-29): the API docs still give only the per-app `tiles.mapillary.com` limit of 50,000 per day, and [thread 10644](https://forum.mapillary.com/t/50-000-requests-day-rate-limit-scope/10644) still ends at this project's own 2026-08-28 question, unanswered, so nothing published speaks to the per-IP layer beyond the staff reply above.
+
+## Every-second-night blocks, and the staged response (issue #444, 2026-10-17)
+
+**From 2026-10-10 the tile CDN refused makelab2 every second night, and on 10-17 the block carried over**: the night's first tile was refused about 20 h after the 10-16 onset.
+The diagnosis, the measured tables and the ranked hypotheses are in [#444](https://github.com/jonfroehlich/streetscape-tracker/issues/444); what follows is what changed in code and config, and why.
+The short version of the diagnosis: no volume window from 12 h to 7 d, and no leaky bucket, separates blocked onsets (rolling 24 h at 1,631–2,287) from clean night ends (up to 3,481); what changed on 10-05 is that the fill (#404) made every night a ~2k-request Mapillary night with 6–9 h of presence, back to back, and the blocks began on the sixth such night.
+The best fit, **inferred and not measured**, is a per-IP reputation with slow decay that sustained daily presence feeds (H1); the cheap discriminators are whether the CDN sends 429s before the wall (H2, needs the per-status counts) and whether a request made while blocked extends the block (H3).
+
+**Stage 1 (config, prod):** `[hosts.mapillary_tiles].rolling_24h_request_budget` 3,000 → **1,200**, `[schedule].fill_host_ceilings.mapillary_tiles` 2,260 → **600**, `[providers.mapillary].daily_request_budget` 3,500 → **1,500**.
+The pace stays at 40/min with CV 0.6: slowing it would lengthen presence, the axis that moved most.
+Steady-state need is ~800/day (#385), averaged over the week; **with two rest nights it has to land on five**, so a Mapillary night needs ~800 × 7/5 ≈ **1,120, 93% of the 1,200 pool**, before any cooldown night takes another night away.
+The 90-day cycle therefore fits on paper with almost no headroom: the backlog can grow on any week with a cooldown, and the fill effectively stops on this host.
+**Falsifier for the sizing:** watch the Mapillary due backlog over the three-week Stage 1 window; if it grows week over week, the pool is too small for the rest schedule, independent of whether the blocks stop.
+Watch beside it **the size of the Mapillary-only-due population**: cities due on `mapillary` or `mapillary_streets` but not on `gsv`.
+A rest night still collects the gsv half of a city due on gsv and Mapillary, which leaves its Mapillary half in exactly that population — the STRANDED tier, reached only through the bounded `[schedule].opt_in_cities_per_day` reservation or when the city is next gsv-due, about one cycle (~83 days) later.
+Read it on a Thursday, after the Wednesday rest: `run-due --dry-run` builds the night's slate and logs `N of M cities not due on gsv are inside tonight's ...-city cap`.
+**M is a noisy proxy, not that population**: in code it is every city not due on gsv, so it also counts the gsv-excluded cities (#301) and the cities due only on the KartaView or Panoramax opt-in channels.
+Read its week-over-week trend, not its level; if it grows while those enrolments and exclusions stand still, rest nights are deferring Mapillary by a cycle rather than by a night.
+The dry run does not split M by channel: its per-city rows list each previewed city's due channels, so the Mapillary-only cities inside tonight's cap are the rows naming only `mapillary`/`mapillary_streets`, and the ones past the cap are not shown.
+**Falsifier:** blocks continue at ≤ 1,200/night with two rest nights a week → volume and daily presence are not the inputs. Clean for three weeks → step up at most 25% a week, one knob at a time.
+
+**Rest nights (`rest_weekdays = ["Wed", "Sun"]`):** two nights a week with zero Mapillary presence, on the run's UTC snapshot date, while every other channel runs.
+A Mapillary-only rest, by the Maintainer's choice, so a rested city's Mapillary snapshot lands on a later night than its GSV one; the alternative (rest every channel through the timer) keeps pairing and costs GSV two nights a week.
+A rest night is a standing hold, not a refusal: no alert, no breaker trip, no failure, and the cities stay due.
+**Staying due is not leading the queue**: a city due on gsv and Mapillary still collects gsv on a rest night, so its held Mapillary channels re-enter through the stranded (Mapillary-only-due) tier — the bounded opt-in reservation — not at the head of the next night's queue (see the sizing falsifier above).
+Holds bind scheduler commands only (`run-due`, its `--limit` catch-ups, `assess-city`); a collector run directly (`streetscape_tracker.py` or `streetscape_street_analyzer.collect` with `--provider mapillary`) ignores them, so check `scheduler status` before one.
+A held walk that would have been a 0-request census-cache hit is still held — conservative, and accepted.
+
+**The cross-night refusal cooldown (`refusal_cooldown_h = 36`):** for 36 h after the newest recorded refusal, no channel on the tile CDN launches.
+It exists because the 02:00 nightly re-probed the IP ~20 h into the 10-16 block, and if H3 holds, that request is the most expensive one we make.
+36 h is past every block measured so far (≤ 16.6 h on 10-14/15, > 19.8 h on 10-16/17), and the hold ends mid-night rather than costing the whole night.
+**Falsifier for H3:** if blocks clear in the same time whether or not we probed at ~20 h, probing does not extend them, and the cooldown can shrink.
+
+**Refusals are now persisted** (`host_refusals`, schema v22), with each one's `requests_before` (the host's 24 h ledger total at the refusal), and the `Done:` line names each metered host's hours of presence and the gap since its previous ledgered request — the two quantities #444 had to rebuild by hand for every onset.
+
+**`scheduler probe-host mapillary_tiles` replaces the untracked probe script** in the recovery protocol below: exactly one request, one z14 tile, one token, redirects not followed, the verdict recorded, and refused while a `run-due` is in flight, or on a rest day or inside the cooldown unless `--force` (a rest night is zero presence for the Stage 1 test).
+A clearance it records does not end the cooldown; only the newest refusal is counted.
+Mechanism, posture and tests: `docs/scheduler.md`, the standing-holds section, and `docs/testing.md`.
+
+Not done here, and why: the per-status response counts, the identifying User-Agent and the 429/`Retry-After` backoff (Stages 2 and 4) live in `download_mapillary.py` and `download_common.py`, on a separate branch.
+The forum post and the support email (Stage 5) each need the Maintainer's OK.
+Per this file's opening rule, Mapillary's API docs and forum must be re-read before this is DEPLOYED: it changes how often and how much we ask (every change in the direction of less), and they were not re-read in the session that wrote it.
 
 ## Per-IP hosts and the cross-process host lock (issue #208)
 
@@ -816,3 +863,130 @@ Pacing stays correct regardless, because every attempt, inner retries included, 
 
 If the first nights after deploy show OVER_QUERY_LIMIT rows, a rise in REQUEST_FAILED, or an HTTP 403/429 from the metadata endpoint, lower `[download].max_requests_per_minute` first.
 Do not revert the connector or the pipelining: they change nothing about the rate, only how much of it is reached.
+
+## The tile census now counts what the CDN answers, says who it is, and backs off on 429/503 (issue #444)
+
+**Three changes to how the Mapillary tile census calls `tiles.mapillary.com`, all in `download_mapillary.py`, shared by the grid run and the road walk.**
+None of them changes the pace: the default is still 40/min at jitter CV 0.6 (#292), and nothing here retunes it.
+
+### What Mapillary documents and what its forum says, re-read 2026-10-17
+
+READ THIS FIRST requires this before any change to retry or identity behaviour, so it was done first; the reads went through a web fetcher, never from a host that collects.
+
+- **Documented** ([API documentation](https://www.mapillary.com/developer/api-documentation), rate-limits section): tiles are limited to 50,000 per day per app, "(not per minute)", and exceeding it returns "status code 4xx".
+  The page says **nothing** about HTTP 429, `Retry-After`, a `User-Agent`, or IP-level blocking.
+- **Reported by staff, informally.** [Thread 10644](https://forum.mapillary.com/t/50-000-requests-day-rate-limit-scope/10644) (2026-08-24): an IP-level layer "might block you earlier" on "a sudden spike"; the thread still ends at this project's own 2026-08-28 question, unanswered.
+  [Thread 10574](https://forum.mapillary.com/t/missing-images-and-green-coverage-lines-is-it-just-me/10574) (2026-07-23): "IP blocks are a strong possibility", "the block is 24 hours, as I remember", and "we have multiple levels of rate-limiting".
+  [Thread 8336](https://forum.mapillary.com/t/receiving-html-response-instead-of-json/8336): "Rate limits reset every 24 hours", and a promise to "look into the rate limit errors".
+- **Reported by users only.** [Thread 5821](https://forum.mapillary.com/t/inconsistent-authentication-issues/5821) (2022): the block is per IP, "retrying seemed to extend the block" at 5–10 minute waits, and a 15-minute sleep was found "purely [by] trial and error".
+- **Not found anywhere**: a 429 or a `Retry-After` from the tile CDN, any statement that a `User-Agent` is read, or any thread about a 302 → `/login` from `tiles.mapillary.com` other than our own.
+- **Unknown**: whether the CDN ever sends 429 or 503 before the redirect wall (H2 in #444).
+  Nothing counted it before the status line below, so the answer will come from our own logs, not from Mapillary.
+
+### One status line per crawl
+
+Every HTTP response a crawl receives is tallied by class and logged once, after the fetch, on every way out of it — success, a 302 refusal (exit 75), a pause (exit 83), a backpressure stop (exit 87) — and as an all-zero line for a census reused from the cache.
+Its shape, with illustrative numbers:
+
+```
+mapillary tile statuses: 200=81 204=0 404=1 429=0 4xx=0 5xx=0 3xx=5 other=0 noresp=0 requests=87 retries=1 retry_after=[] city='Carlsbad, CA'
+```
+
+`3xx` is every redirect, in practice the `/login` refusal.
+`4xx` is every 4xx except 404 and 429, which have their own keys.
+`noresp` is requests that got no HTTP status at all (a timeout, a reset), derived as `requests` minus the statuses so the two cannot disagree.
+`retries` is attempts beyond a tile's first, whichever layer retried it.
+`retry_after` lists every `Retry-After` value seen, verbatim, capped at 20 with a `+N more`.
+The response is counted in `_fetch_tile` **before** any branch can raise, so a refusal is in the line rather than missing from it.
+The line is a log contract only: the pause phrases the scheduler parses are unchanged, and the one new exit code is the throttled 87 below.
+Rolling it into the scheduler's `Done:` line is #444's scheduler half.
+
+### An identifying User-Agent
+
+The one session the census opens is built with
+
+```
+StreetscapeTracker/1.0 (+https://github.com/jonfroehlich/streetscape-tracker; sidewalk@cs.uw.edu) aiohttp/<version>
+```
+
+(`download_mapillary.MAPILLARY_USER_AGENT`) in place of aiohttp's stock agent, the one every scraper sends.
+It is the **same string the Panoramax collector sends**, built by one function, `download_common.streetscape_user_agent`, so the two providers cannot drift apart.
+The contact address was chosen by Jon for the Panoramax agent in #405 (commit `8bc6f35`): a shared lab address rather than a personal one.
+The layout is RFC 9110's product token plus a comment, as the Panoramax section above describes.
+Since no Mapillary page says a `User-Agent` is read, **its effect on blocking is unknown**: what it buys is that someone reading Mapillary's logs can write to a person instead of refusing an IP.
+It also makes our traffic trivially identifiable, which is the point.
+
+### Backpressure on 429 and 503
+
+Before #444 a 429 or 503 was an ordinary `ClientResponseError`, which `@backoff` retried up to `TILE_MAX_TRIES` times on a seconds-long exponential, at pace, ignoring `Retry-After` — answering "slow down" by asking again almost at once, on the host where users report that retrying into a block extends it.
+Now:
+
+1. `_fetch_tile` raises `TileBackpressureError`, which is neither an `aiohttp.ClientError` (so `@backoff` does not retry it) nor a `DownloadError` (so #205's whole-city abort does not fire).
+   Other 4xx and 5xx keep the old `@backoff` path.
+2. The crawl's pacer is **held** — no request goes out from any of its sockets — for `max(Retry-After, 60 s)`.
+   Both RFC 9110 forms are read, delay-seconds and HTTP-date; a missing or unreadable header means 60 s, and so does one that cannot be parsed at all (Unicode digits, thousands of digits, a date `datetime` cannot hold) — parsing never raises.
+3. A `Retry-After` longer than **900 s** is not slept on: the crawl stops at once as THROTTLED (rule 7).
+   Retrying before the time the server named would disobey it, and a sleep that long belongs to the next night rather than to this one's host lock.
+   **Nor is a hold that would end past the crawl's wall-clock budget**, but below the strike limit that crawl stops on its **clock** instead — exit 83, as if the budget had run out at that moment, with the pacer closed so the retry never goes out without its wait (round-3 review of #444).
+   One 429 near the end of a long crawl says no more about the host than one anywhere else, which the crawl would have waited out and continued; making it the 87 that skips the host for the rest of the night was out of proportion.
+   A third standing strike is still 87 there, as anywhere.
+   **A crawl already stopping does not hold** — when the request cap (with its reservations) or the clock WOULD turn this tile's retry away, the same test the retry meets next with nothing awaited in between — **unless a tile admitted under the cap has not yet sent its request**: with nothing more going out a hold would only sleep with the tile lock held, but an admitted tile's request does go out, and skipping the hold sent it at once after the 429 (round-7 review). Those requests are inside the budget, so they are held rather than turned away.
+   **A tile's cap reservation is released when its request is SENT, not when the answer comes back** (round-8 review): from the send on the request is in `api_requests`, so a reservation held to the answer counted every request on the wire twice — the cap read full until the answer came, then admitted another tile.
+   So "at the cap" could turn false again: a 429 that skipped its hold because the crawl looked stopped was followed by a request with no wait (present since round 2), and round 7's "an admitted tile is waiting" gate, reading the same reservation, slept up to 899 s with nothing left to send.
+   Released at the send, `api_requests + reserved` only grows, and `reserved` is exactly the requests admitted but not yet sent.
+   **A stopping crawl ARMS the hold it does not sleep** (round-9 review): a tile already on the wire can still be retried by `@backoff` after a 500/502/504 or a timeout, and that retry holds no reservation, so the skipped hold let it out with no wait.
+   `_BackpressurePacer.arm` owes the hold without sleeping it: the next request to go out sleeps it first, from the moment it was armed, and if nothing goes out nobody sleeps.
+   Past the clock, or when the wait would outlast it, no retry may wait, so the pacer closes instead and an in-flight tile's retry is turned away, uncommitted.
+   A tile refused on its LAST try (`TILE_BACKPRESSURE_TILE_TRIES`) arms its hold too: the hold protects the other tiles, and a stuck LAST tile used to sleep up to 899 s with the tile lock held and nothing left to send.
+   It escalates to the backpressure stop only for what says something about the host (the third standing strike, or a `Retry-After` past 900 s); otherwise the stop stays the cap's or the clock's exit 83 (round-2 review of #444).
+4. The pace is **halved once** for the rest of that crawl (`AsyncRateLimiter.slow_down(2)`), on the limiter the crawl builds for itself, so it cannot reach another crawl or another process.
+5. The tile is then retried by re-entering the in-semaphore checks, so the abort, the request cap with its reservation, and the wall-clock deadline gate the retry exactly as they gate a fresh tile.
+   Every HTTP request, the 429 included, is counted once in `api_requests`.
+   **One tile gets at most two backpressure responses** (`TILE_BACKPRESSURE_TILE_TRIES`); after the second, and after its hold, it is given up as an ordinary failed tile, REQUEST_FAILED under #168's tolerance, as when `@backoff` exhausted it before #444.
+   That limit is below the pause on purpose: without it, one tile answering 503 to everything spent all three strikes by itself, the crawl paused, and the next night hit the same tile first, so the city never completed.
+   Several stuck tiles are covered by rule 6.
+6. Strikes are counted in **episodes, not responses**.
+   Each attempt records the pacer's generation when it is sent; a 429/503 answering a request sent before the latest hold began belongs to that hold, so it adds no strike (it may still extend the hold to its own wait).
+   One throttle window that answers several in-flight requests at once is one episode.
+   **Only a tile's first backpressure response can be a strike**: its own retry being refused again says something about that tile, not the host.
+   **Whether a strike still counts is decided by what the CDN did after it.**
+   Each strike is stamped with the pacer generation its request was sent under.
+   If the tile's own retry is later served, the strike is **confirmed** — the CDN asked it to wait, then served it, which is a real throttle — and it always counts.
+   If the tile is still retrying, or was given up as stuck, the strike counts **only while no other tile has been served from a request sent in a later generation**; once one has, the host is serving and this tile is what refuses, so the strike stops counting (for a tile still retrying, until its retry is served and confirms it).
+   The limit is checked when a strike is charged and again when a strike is confirmed, since a confirmation is the only thing that can raise the count.
+   Counted per response, two stuck tiles spent three strikes between them, the crawl paused, and as a failed tile is never committed every resumed night repeated it (round-2 review of #444).
+   Round 2 then withdrew a stuck tile's strike only on a success *after its give-up*, which was too late: give-up takes two holds, and the hold's FIFO gate sends the next stuck tile's first request before any success lands, so three stuck tiles two apart at five sockets paused the city as 87 every night with no progress (round-3 review).
+   A host-wide storm serves nothing between its refusals, so all its strikes stand and the third episode still pauses; so does a throttle whose retries succeed, served tiles between them or not, since each such strike is confirmed.
+   **What one crawl cannot tell apart**: three stuck tiles in a row in request order are refused with nothing served between them, which is exactly a storm as seen from inside one crawl, so that crawl stops as 87 (`test_three_stuck_tiles_in_a_row_cannot_be_told_from_a_storm`).
+   A **resume** makes that layout out of stuck tiles that were never adjacent: a failed tile is never committed, so the served tiles that sat between last night's stuck tiles drop out of `todo` and the stuck tiles meet at its head — three anywhere in a capped night's prefix then stopped every later night as 87 with no tile committed, latching the host, until the checkpoint aged out (round-4 review).
+   The evidence from outside the crawl is therefore **the checkpoint's own record**: every tile a crawl saw answer 429/503 and never served — given up, or still pending when the crawl stopped — is written to `state.json` as `stuck_tiles` (`TileCheckpoint.stuck`), and a resume requests those tiles **last** and lets **none of them charge a strike**.
+   Fresh tiles go first, so a real storm still meets tiles with no such history and pauses at their third episode; the night after an in-a-row 87 completes the city, the three tiles failed under #168's tolerance.
+   Fresh tiles can run out, though, and a storm that meets the recorded tail would then charge nothing: it finalized with its tiles as holes, or failed as a counted failure after holding the host lock for two holds per recorded tile (round-5 review).
+   So **a recorded tile refused with nothing served from a later generation than its request asks the host instead** (`probe_host`): it re-requests committed tiles — the CDN has served each before, so a 429/503 to one is about the host and charges an ordinary strike, held like any other — until one is served, which withdraws the pending strikes, or the crawl stops.
+   It keeps asking (up to three rounds) rather than sending one probe, because probes from recorded tiles in flight together go out in one generation and are one episode; and the gate is `served_generation <= sent_generation`, not `<`, because a fresh tile served in the same generation may have gone out before the storm began (both round-6 review).
+   A storm therefore still pauses at three episodes once it reaches the recorded tail, with requests in flight together or not — including a pause the probe decides while its recorded tile is on its last try, which turns no tile away; the post-gather THROTTLED raise is taken on the pause flag itself, not only on a turned-away tile (round-7 review: that crawl finalized a census under a pause already logged as exit 87); a host that serves completes the city at a cost of at most one served probe per refusal, never committed.
+   **The one case left**: three stuck tiles that stop a crawl before it has served a single tile — nothing is committed, so there is no checkpoint to write the record into, so that city stops as 87 each night; every 87 alerts by city, and `enroll-city --remove` takes it off Mapillary.
+7. The **third episode** in one crawl stops it on the request cap's own path — turned-away tiles uncommitted, the checkpoint kept, raised before the settle loop — as **`HostThrottledError`, exit 87**, the THROTTLED family (`download_common.HOST_THROTTLED_EXIT_CODES`).
+   Every backpressure stop raises it, committed tiles or not; its message carries the phrase "stopped by provider backpressure (HTTP 429/503)", and says "the next run resumes it" only when a tile is committed, "starts from the first tile" otherwise.
+   It replaced exit 83 plus a plain-`DownloadError` arm for the nothing-committed case: that arm counted a `consecutive_failure`, so a few nights of a 429 storm would have quarantined every Mapillary pair (#421), and nothing latched the host, so the next city walked into the same 429s at full pace.
+   The scheduler amnesties 87 and skips both Mapillary channels for the rest of the night, but records no refusal and arms no cooldown (see `docs/scheduler.md`).
+   The stop **closes** the crawl's pacer: no further request goes out, including ones already waiting for their turn, which are turned away uncommitted and uncounted.
+   **It is not a refusal**: a 302 → `/login` is still the `HostBlockedError` (exit 75) it always was, after a 429 too, and wins if both happen in one crawl.
+   A refusal also closes the pacer and cuts short any hold in progress, so no request follows a 302 and the host lock is not held through a hold the crawl will never use.
+
+**Why 900 s.**
+The only cooldown ever reported for a Mapillary tile block is thread 5821's 15-minute sleep, a hint rather than a contract.
+And with the pause at the third episode, a crawl holds in at most two episodes, each lasting the longest wait asked for inside it (at most 900 s), so it holds the machine-wide tile lock for about 30 minutes of sleeping — not exactly, since a same-episode response can extend a hold by up to one request timeout (30 s).
+That is well inside prod's 180-minute per-city timeout floor (`city_timeout_minutes`).
+**A hold that would end past the crawl's wall-clock budget is not slept at all**: the crawl stops at once instead, on its clock (exit 83) below the strike limit (rule 3).
+The scheduler forwards that budget as the child's SIGKILL timeout less a 600 s margin (`_crawl_max_seconds`), so a 900 s hold begun inside the margin would be killed mid-sleep and counted a failure, where stopping is an amnestied exit.
+A halved pace also doubles the remaining wall clock of the crawl it applies to, so a large city answered 429 early can reach its budget; the clock then pauses it as exit 83, which is the intended outcome.
+
+**One known interaction, left as it is.**
+`_fetch_tile` waits on the pacer inside its `@backoff`-decorated body, so a tile that is mid-way through ordinary retries (a 500, a timeout) when a hold begins spends the hold against `@backoff`'s 120 s `max_time`.
+After a hold of 60 s or more it may get fewer than its five tries, and then becomes a failed tile under #168's tolerance a little sooner than it would have.
+Fixing that means moving the pacer out of the retried body, which #198 put there on purpose (one token per HTTP request), so it is noted rather than changed.
+
+Both statuses are covered because a CDN shedding load answers 503 and one metering a client answers 429.
+**Neither has ever been observed from `tiles.mapillary.com`**, so this is built ahead of the evidence, on the cheap side of an unknown.
+If the status line shows zero 429s and zero 503s across the next block, that is itself a finding: it means the 302 wall arrives with no warning, and H2 in #444 is false.

@@ -27,7 +27,7 @@ Legacy pre-2026 undated files are registered as `is_baseline=1` runs by `scripts
 
 ## The catalog
 
-The SQLite catalog `data/streetscape_tracker.db` (`streetscape_metadata_tracker/db.py`, stdlib sqlite3/WAL, no ORM; schema v21, auto-migrated on connect) is the operational source of truth.
+The SQLite catalog `data/streetscape_tracker.db` (`streetscape_metadata_tracker/db.py`, stdlib sqlite3/WAL, no ORM; schema v22, auto-migrated on connect) is the operational source of truth.
 It is **local-only and never rsynced** — it lives in exactly one place, which is why the dated backups in [`catalog-backups.md`](catalog-backups.md) exist.
 
 | Table | Key / uniqueness | Holds |
@@ -39,6 +39,7 @@ It is **local-only and never rsynced** — it lives in exactly one place, which 
 | `api_usage` | PK(usage_date, provider) | Daily request-budget ledger; **additive** (`add_api_usage`); streets channels metered under their own strings (#99) |
 | `host_usage` | index(host, recorded_at) | Timestamped per-HOST spend (#385, v16), one row per `add_api_usage` on a channel in `CHANNEL_METERED_HOST`; read over a rolling 24 h by the `[hosts.*]` budget gate, pruned after 30 days |
 | `schedule_state` | PK(city_id, provider) | Stagger day, last attempt/success, `consecutive_failures` (reset by a success or `reset-failures`), `member` (per-channel membership, #248), `quarantine_alerted_at` (when the night emailed this failure streak, #424, v21) |
+| `host_refusals` | index(host, verdict, recorded_at) | Every verdict this machine has had from a per-IP host (#444, v22): a `refused` row wherever the scheduler classifies a child exit as a host refusal (75/76/81/84) or `probe-host` is refused, a `cleared` row only from `probe-host`; `requests_before` is the host's ledger over the prior 24 h. The cross-night refusal cooldown keys on the newest `refused` row only |
 | `history_harvests` | UNIQUE(city_id, provider, harvest_date) | Out-of-band GSV capture-history harvests (#2; since #442 derived from the per-sample crawl under `experiments/`); its summary JSON is the CSV's sibling (#109) |
 | `street_networks` | UNIQUE(city_id, network_type) | Frozen OSM networks (#103); GraphML lives unpublished under `data/osm_cache/` |
 | `street_walks` | UNIQUE(city_id, provider, network_type, run_date) | Road-walk collection runs (#99) — a second modality with its own unit of observation |
@@ -93,6 +94,9 @@ Two writers clear it, exactly the two that zero `consecutive_failures`: a record
 One writer sets it: `claim_quarantine_alerts`, a compare-and-set `UPDATE ... WHERE quarantine_alerted_at IS NULL` whose rowcount is the decision to email (see [`scheduler.md`](scheduler.md), "The failure quarantine, made visible").
 The step is named by content (`_migrate_add_quarantine_alerted_at_column`) and runs on its v20 → v21 rung **and** on every connect, through `_add_missing_columns` (the generalized `_add_missing_run_columns`, which now takes the table).
 The migration backfills nothing, so the first night after the deploy emails every standing quarantined pair once.
+
+v22 added the `host_refusals` table ([#444](https://github.com/jonfroehlich/streetscape-tracker/issues/444)), purely additive like v2 → v3: no migration function, and the `CREATE TABLE IF NOT EXISTS` builds it on any older catalog.
+It backfills nothing, so every refusal before the deploy is in the logs only, and the first cooldown a v22 night can see is one recorded after it — a probe-host refusal included.
 
 ### Row counts are not grid points (#289)
 

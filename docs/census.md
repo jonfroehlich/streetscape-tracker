@@ -316,6 +316,28 @@ Flip the grid alone and the first night its census pauses leaves a *checkpoint*,
 The WALK was a step further back still: `collect_panoramax_street_samples_async` had no `max_requests` parameter at all, so the flag had nothing to reach even once `_street_collect_cmd` sent it.
 Both halves landed in the commit that added the launch arms, which is what the `False` asked for.
 
+## Backpressure is a third ceiling on the Mapillary tile census, on the cap's own path but with its own exit (issue #444)
+
+**A 429 or 503 from `tiles.mapillary.com` is no longer a per-tile failure for `@backoff` to retry.**
+The crawl holds its pacer for `max(Retry-After, 60 s)`, halves its pace once for the rest of the crawl, and retries the tile; the third backpressure EPISODE in one crawl stops it, and one tile is given up as a failed tile after its second backpressure response.
+The rule, the research behind it and the 900 s ceiling are in [`provider-access.md`](provider-access.md); what belongs here is how it sits in the census contract.
+
+- **The stop takes the request cap's path**: `backpressure_paused` joins `over_cap` and the deadline in the in-semaphore check, so a turned-away tile returns an uncommitted empty frame and the `if capped: raise` before the settle loop is still what keeps it from ever reading as an empty tile.
+  What it raises is its own: `HostThrottledError` (exit 87), committed tiles or not, with the checkpoint kept as for exit 83 — never `SweepIncompleteError`, whose 83 promises the next city is unaffected, and never the cap's plain `DownloadError`, which counts a failure.
+  The `fatal` raise runs before it, so a 302 in the same crawl is still exit 75.
+  A 429 answered after the cap or the clock already stopped the crawl sleeps no hold, and is 87 only on a third standing strike or a `Retry-After` past the ceiling.
+  Its hold is ARMED instead (`_BackpressurePacer.arm`), so an in-flight tile's `@backoff` retry, which holds no reservation, waits it out before it goes out; past the clock, or when the wait would outlast it, the pacer closes and that retry is turned away (round-9 review).
+  A hold that would outlast the deadline stops the crawl on the **clock's** path below the strike limit (`clock_stopped` joins the same check, exit 83), never as 87.
+- **A retried tile re-enters at the top of that check**, so the abort, the cap with its reservation, and the deadline gate it as they gate a fresh tile.
+  The cap's soft-ceiling residue is unchanged — still only `@backoff` retries by tiles already in flight — because a backpressure retry is a fresh admission, never an in-flight retry.
+- **One HTTP request, one count**: the 429 itself is counted inside `_fetch_tile` like any attempt, and the retry is counted when it is sent.
+  A request turned away because the crawl paused while it waited on the pacer (`_CrawlPaused`) was never sent and is never counted.
+- **A stuck tile is a failed tile, never a stalled city**: after `TILE_BACKPRESSURE_TILE_TRIES` (2) backpressure responses the tile settles as an exception, so #168's `MAX_FAILED_TILE_FRACTION` judges it exactly as it judged a tile `@backoff` exhausted.
+  Only its first response can be a strike, and that strike stops counting once another tile is served from a later pacer generation, so several stuck tiles cannot pause the city either — unless three sit in a row in request order, which one crawl cannot tell from a storm (rule 6 in `provider-access.md`, rounds 2 and 3 of the review of #444).
+  The checkpoint records every tile refused and not since served (`stuck_tiles` in `state.json`), and a resume requests them last with no strike, so that 87 lasts one night — and a resume, whose `todo` has lost the served tiles between them, cannot line scattered stuck tiles up into one (round 4); a recorded tile refused with nothing served since re-requests committed tiles until one is served or the crawl pauses, each refusal an ordinary strike, so a storm still pauses (rounds 5 and 6); only three stuck tiles that stop a crawl before it has served a single tile still repeat, with no checkpoint to record them in.
+- **Panoramax is untouched**: there a 429 is a per-IP refusal at the first request (difference 2 in its section below), because with no credential nothing else can be meant.
+- The per-crawl status line (`mapillary tile statuses: …`) is logged by the same function, after the gather, on every way out — see `provider-access.md` for its keys.
+
 ## The census cache — fetch once per (provider, bbox), reuse across channels (issue #290)
 
 **A completed checkpoint is PROMOTED into `census_cache/<provider>/<city_id>_<bbox>` rather than deleted, and every later consumer of that (provider, city, bbox) observation reads it for zero requests.**
