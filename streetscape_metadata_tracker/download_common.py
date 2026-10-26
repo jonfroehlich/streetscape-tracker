@@ -608,8 +608,9 @@ class HostThrottledError(HostUnavailableError):
 #     Mapillary tile census reads backpressure, so the dict has one entry.
 #
 # 87 continues past 85. 86 is skipped because the GSV capture-history harvester
-# (issue #442) exits 86 for its own blocked endpoint; that script never runs
-# under the scheduler, but one number with two meanings in one repo is the
+# (issue #442) exits 86 for its own blocked endpoint (and 88 for its per-host
+# crawl lock, so the next code here is 89); that script never runs under the
+# scheduler, but one number with two meanings in one repo is the
 # plausible-wrong-answer problem 77/78 are skipped for.
 HOST_EXIT_CODES = {
     HOST_MAPILLARY_TILES: 75,

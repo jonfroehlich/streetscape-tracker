@@ -924,12 +924,13 @@ def test_rebuild_from_raw_reproduces_the_crawl_and_keeps_the_last_answer_per_key
 # ── A 200 that is not an answer (review of #446, S3) ───────────────────────
 
 
-@pytest.mark.parametrize("body", [DECOMMISSIONED, CAPTCHA_HTML, "", "not json"])
+@pytest.mark.parametrize("body", [DECOMMISSIONED, "", "not json"])
 def test_a_run_of_unanswered_200s_is_a_refusal_in_disguise(monkeypatch, tmp_path, body):
     # Ten rows, every 200 carrying a body that answers nothing: no key is
     # done, every body is in the raw store, every ledger row says why, and the
     # breaker trips at eight so the run latches -- a 200 of this shape is not
-    # "no imagery here", and a run of them is a block.
+    # "no imagery here", and a run of them is a block. (An HTML page latches
+    # on the FIRST one; its own test below.)
     calls = []
     _patch_fetch(monkeypatch, lambda url: (calls.append(url), (200, body))[1])
     with pytest.raises(dgh.HarvestBlockedError, match="8 consecutive failed requests") as info:
@@ -988,6 +989,250 @@ def test_an_unanswered_key_with_no_answer_at_all_keeps_its_reason_in_a_rebuild(
     assert set(history["edge_id"]) == {"e1"}
 
 
+def test_an_html_page_served_with_a_200_latches_on_the_first_one(monkeypatch, tmp_path):
+    # An anti-abuse interstitial is the endpoint refusing, with a 200 on the
+    # envelope. Counted as one of eight it would let a throttle that serves
+    # one page in a few requests run the whole cap down; the first one ends
+    # the run, with the body in the raw store and the reason in the ledger.
+    calls = []
+
+    def responder(url):
+        calls.append(url)
+        return (200, CAPTCHA_HTML) if len(calls) == 3 else (200, BODY)
+
+    _patch_fetch(monkeypatch, responder)
+    with pytest.raises(dgh.HarvestBlockedError, match="HTML page served with a 200") as info:
+        _run(_worklist(10), tmp_path)
+    assert len(calls) == 3
+    paths = dgh.output_paths(str(tmp_path), "bend", 1)
+    assert dgh.read_done_keys(paths["queries"]) == {("e0", 0), ("e1", 0)}
+    q = _read(paths["queries"])
+    assert q["unanswered"].notna().tolist() == [False, False, True]
+    assert q["unanswered"].iloc[2].startswith("HTML body")
+    latch = json.load(open(tmp_path / dgh.LATCH_FILENAME))
+    assert latch["http_status"] is None and "HTML page" in latch["reason"]
+    assert "unusual traffic" in str(info.value)
+    assert json.loads(gzip.open(paths["raw"], "rt").readlines()[2])["body"] == CAPTCHA_HTML
+    # Latched: the next run sends nothing.
+    calls.clear()
+    with pytest.raises(dgh.HarvestBlockedError, match="latch is in force"):
+        _run(_worklist(10), tmp_path)
+    assert calls == []
+
+
+def test_a_throttle_that_lets_some_requests_through_trips_the_failure_share(monkeypatch, tmp_path):
+    # Every third request unanswered (a non-HTML non-answer, so the page rule
+    # stays out of it): the consecutive rule never sees two failures in a
+    # row, and under it alone the run spends its whole cap. The share rule
+    # reads once the window is full -- 4 of the last 12 at a quarter -- and
+    # the run latches at the 12th request, the keys answered so far done.
+    calls = []
+
+    def responder(url):
+        calls.append(url)
+        return (200, "not json") if len(calls) % 3 == 0 else (200, BODY)
+
+    _patch_fetch(monkeypatch, responder)
+    with pytest.raises(dgh.HarvestBlockedError, match="4 of the last 12 requests failed"):
+        _run(_worklist(40), tmp_path, breaker_limit=8, breaker_window=12, breaker_share=0.25)
+    assert len(calls) == 12
+    paths = dgh.output_paths(str(tmp_path), "bend", 1)
+    assert len(dgh.read_done_keys(paths["queries"])) == 8
+    assert os.path.exists(tmp_path / dgh.LATCH_FILENAME)
+    # At or under the share the run completes: one in five over a window of
+    # 20 is 4 of 20, not above a quarter, and the retry pass answers the rest.
+    second = tmp_path / "second"
+    second.mkdir()
+    calls.clear()
+
+    def one_in_five(url):
+        calls.append(url)
+        # The first pass only, so the retry pass can answer the eight.
+        return (200, "not json") if len(calls) % 5 == 0 and len(calls) <= 40 else (200, BODY)
+
+    _patch_fetch(monkeypatch, one_in_five)
+    result = _run(_worklist(40), second, breaker_limit=8, breaker_window=20, breaker_share=0.25)
+    assert result["answered"] == 40
+    assert not os.path.exists(second / dgh.LATCH_FILENAME)
+
+
+def test_the_breaker_share_rule_reads_only_a_full_window():
+    b = dgh._CircuitBreaker(limit=8, window=4, share=0.25)
+    b.record(ok=False)
+    b.record(ok=False)
+    assert not b.tripped  # 2 of 2 is not a full window
+    b.record(ok=True)
+    b.record(ok=True)
+    assert b.tripped and b.reason == "2 of the last 4 requests failed"
+    for _ in range(4):
+        b.record(ok=True)
+    assert not b.tripped  # the failures have rolled out of the window
+    b.record(ok=False)
+    assert not b.tripped and b.recent_failures == 1  # 1 of 4 is exactly the quarter: not above
+
+
+def test_a_code_5_is_no_images_only_with_its_message():
+    # The retired route answered a code 5 too ("... decommissioned and turned
+    # down."), so the code alone cannot mean "no imagery here": only the
+    # message does, and a code-5 body without it is unanswered, re-queried.
+    answer = dgh.parse_search(json.dumps([[5, "generic", "Search returned no images."]]))
+    assert answer.response_code == 5 and answer.unanswered is None
+    assert answer.panos == () and answer.panos_total == 0
+    for body in (
+        json.dumps([[5, "generic", "something else"]]),
+        json.dumps([[5]]),
+        DECOMMISSIONED,
+    ):
+        result = dgh.parse_search(body)
+        assert result.response_code == 5 and result.unanswered.startswith("response code 5")
+        assert result.refusal is False
+
+
+# ── An out-dir written under another column set (review of #446 round 2, F1) ─
+
+# The pilot's ledger header (commit e2a1396): twelve columns, two fewer
+# mid-row than this crawler's and no `unanswered`.
+PILOT_QUERY_COLUMNS = [
+    "edge_id", "sample_idx", "http_status", "response_code", "panos_total", "panos_dated",
+    "panos_third_party", "anchor_in_history", "current_copyright", "country_code",
+    "street_name", "fetched_at",
+]  # fmt: skip
+
+
+def _pilot_ledger(path, keys=("e0", "e1")):
+    rows = [f"{k},0,200,0,2,2,0,,© 2026 Google,,,2026-10-17T00:00:00+00:00\n" for k in keys]
+    dgh._append_gz(str(path), ",".join(PILOT_QUERY_COLUMNS) + "\n" + "".join(rows))
+
+
+def test_an_out_dir_written_under_another_column_set_is_refused_before_any_request(
+    monkeypatch, tmp_path
+):
+    # Appended under the pilot's header, this crawler's rows land shifted
+    # (`upload_date` under `fetched_at`, `unanswered` under no name), and a
+    # resume reads every unanswered key as done -- 900 rows of the live crawl
+    # on 2026-10-26. The out-dir is refused, with both headers named.
+    paths = dgh.output_paths(str(tmp_path), "bend", 1)
+    _pilot_ledger(paths["queries"])
+    before = open(paths["queries"], "rb").read()
+    calls = []
+    _patch_fetch(monkeypatch, lambda url: (calls.append(url), (200, BODY))[1])
+    with pytest.raises(dgh.OutputShapeError) as info:
+        _run(_worklist(3), tmp_path)
+    message = str(info.value)
+    assert paths["queries"] in message
+    assert ",".join(PILOT_QUERY_COLUMNS) in message and ",".join(dgh.QUERY_COLUMNS) in message
+    assert calls == [] and open(paths["queries"], "rb").read() == before
+    assert not os.path.exists(paths["history"])
+    # The history file is checked the same way: a ledger of this crawler's
+    # shape beside a history file of another is refused too.
+    other = tmp_path / "other"
+    other.mkdir()
+    paths = dgh.output_paths(str(other), "bend", 1)
+    dgh._append_gz(paths["history"], ",".join(dgh.SAMPLE_HISTORY_COLUMNS[:-1]) + "\n")
+    with pytest.raises(dgh.OutputShapeError, match="history"):
+        _run(_worklist(3), other)
+    assert calls == []
+    # And the CLI exits 2 on the same file, dry run included.
+    out = tmp_path / "results"
+    out.mkdir()
+    _pilot_ledger(out / "bend_walk.pass1.queries.csv.gz")
+    code, _ = _cli(monkeypatch, tmp_path, lambda url: (calls.append(url), (200, BODY))[1])
+    assert code == 2 and calls == []
+    code, _ = _cli(monkeypatch, tmp_path, lambda url: (200, BODY), "--dry-run")
+    assert code == 2 and calls == []
+
+
+def test_read_done_keys_refuses_rows_of_another_shape_instead_of_mapping_them(tmp_path):
+    # A pilot ledger resumes as it is (every key in it was answered)...
+    path = tmp_path / "pilot.csv.gz"
+    _pilot_ledger(path)
+    assert dgh.read_done_keys(str(path)) == {("e0", 0), ("e1", 0)}
+    # ...but rows of this crawler's shape appended under it are refused, not
+    # read through the first member's header: under that header the third
+    # row's `unanswered` has no name and the key would count as done.
+    unanswered = dict.fromkeys(dgh.QUERY_COLUMNS, "")
+    unanswered.update(edge_id="e2", sample_idx=0, http_status=200, unanswered="HTML body")
+    dgh._append_gz(str(path), dgh._csv_text([unanswered], dgh.QUERY_COLUMNS, header=False))
+    with pytest.raises(dgh.OutputShapeError, match="15 fields under a 12-field header"):
+        dgh.read_done_keys(str(path))
+    # A short row is refused the same way, and so is a header lacking a
+    # required column.
+    short = tmp_path / "short.csv.gz"
+    dgh._append_gz(str(short), ",".join(dgh.QUERY_COLUMNS) + "\ne0,0,200\n")
+    with pytest.raises(dgh.OutputShapeError, match="3 fields under a 15-field header"):
+        dgh.read_done_keys(str(short))
+    seven = tmp_path / "seven.csv.gz"
+    dgh._append_gz(str(seven), ",".join(dgh.QUERY_COLUMNS[:7]) + "\ne0,0,200,0,2,2,0\n")
+    with pytest.raises(dgh.OutputShapeError, match="lacks anchor_in_history"):
+        dgh.read_done_keys(str(seven))
+    second_header = tmp_path / "two_headers.csv.gz"
+    _pilot_ledger(second_header, keys=("e0",))
+    _pilot_ledger(second_header, keys=("e1",))
+    with pytest.raises(dgh.OutputShapeError, match="second header"):
+        dgh.read_done_keys(str(second_header))
+
+
+def test_load_queries_ledger_reads_every_request_through_the_streaming_reader(
+    monkeypatch, tmp_path
+):
+    count = {"i": 0}
+
+    def responder(url):
+        count["i"] += 1
+        return (200, DECOMMISSIONED) if count["i"] == 2 else (200, BODY)
+
+    _patch_fetch(monkeypatch, responder)
+    paths = _run(_worklist(3), tmp_path)["paths"]
+    ledger = dgh.load_queries_ledger(paths["queries"])
+    assert len(ledger) == 4 and ledger["unanswered"].notna().sum() == 1
+    # A cut final member reads to the cut rather than raising.
+    with open(paths["queries"], "ab") as f:
+        f.write(gzip.compress(b"garbage")[:-7])
+    assert len(dgh.load_queries_ledger(paths["queries"])) == 4
+
+
+# ── One crawl per host (F2) ─────────────────────────────────────────────────
+
+
+def test_one_crawl_per_host_a_second_harvester_is_refused_by_the_lock(monkeypatch, tmp_path):
+    calls = []
+    _patch_fetch(monkeypatch, lambda url: (calls.append(url), (200, BODY))[1])
+    latch_dir = tmp_path / "results"
+    with dgh.crawl_lock(str(latch_dir)):
+        assert os.path.exists(latch_dir / dgh.LOCK_FILENAME)
+        with pytest.raises(dgh.HarvestBusyError, match="one crawl per address") as info:
+            _run(_worklist(3), tmp_path / "results" / "a", latch_dir=str(latch_dir))
+        assert str(latch_dir / dgh.LOCK_FILENAME) in str(info.value)
+        assert calls == []
+        # The CLI exits its own documented code, before any request.
+        code, _ = _cli(monkeypatch, tmp_path, lambda url: (calls.append(url), (200, BODY))[1],
+                       "--latch-dir", str(latch_dir))  # fmt: skip
+        assert code == dgh.HISTORY_BUSY_EXIT_CODE == 88 and calls == []
+    # Released: the same run completes, and releases in turn.
+    result = _run(_worklist(3), tmp_path / "results" / "a", latch_dir=str(latch_dir))
+    assert result["answered"] == 3
+    with dgh.crawl_lock(str(latch_dir)):
+        pass
+
+
+def test_the_lock_is_held_for_the_whole_run_and_released_on_a_latch(monkeypatch, tmp_path):
+    seen = []
+
+    def responder(url):
+        with pytest.raises(dgh.HarvestBusyError):
+            with dgh.crawl_lock(str(tmp_path)):
+                pass
+        seen.append(url)
+        return (429, "no") if len(seen) == 2 else (200, BODY)
+
+    _patch_fetch(monkeypatch, responder)
+    with pytest.raises(dgh.HarvestBlockedError, match="HTTP 429"):
+        _run(_worklist(3), tmp_path)
+    assert len(seen) == 2
+    with dgh.crawl_lock(str(tmp_path)):
+        pass
+
+
 # ── The breaker counts REQUESTS, retries included (S13) ─────────────────────
 
 
@@ -1040,7 +1285,7 @@ class _FakeResponse:
         self.headers = headers or {}
         self._body = body
 
-    async def text(self):
+    async def text(self, **kw):
         return self._body
 
     def raise_for_status(self):
@@ -1138,6 +1383,78 @@ def test_a_429_through_the_real_fetch_seam_sends_no_further_request(monkeypatch,
 
 
 # ── Linear member scan, streaming readers (S4) and the 0-byte header (S5) ──
+
+
+# ── A body the response cannot decode (F6) ──────────────────────────────────
+
+
+class _UndecodableResponse(_FakeResponse):
+    async def text(self, **kw):
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+
+def test_an_undecodable_body_is_a_transport_failure_not_a_crash(monkeypatch, tmp_path):
+    # `resp.text()` raises UnicodeDecodeError (a mis-declared charset) or
+    # LookupError (an unknown one), neither an aiohttp.ClientError: unwrapped,
+    # one such body ended the run with exit 1, no raw line and no latch, and
+    # the restart re-sent the same request. Through the real fetch seam it is
+    # the payload error the driver already retries and the breaker counts.
+    session = _InMemorySession(lambda body: _UndecodableResponse(200))
+    with pytest.raises(aiohttp.ClientPayloadError, match="undecodable body"):
+        _fetch(session)
+
+    class _UnknownCharset(_FakeResponse):
+        async def text(self, **kw):
+            raise LookupError("unknown encoding: x-made-up")
+
+    with pytest.raises(aiohttp.ClientPayloadError, match="x-made-up"):
+        _fetch(_InMemorySession(lambda body: _UnknownCharset(200)))
+    # End to end: eight such bodies trip the breaker and latch; one among
+    # answers is re-queried and its key done.
+    posts = []
+
+    def responder(body):
+        posts.append(body)
+        return _UndecodableResponse(200)
+
+    monkeypatch.setattr(dgh.aiohttp, "ClientSession", lambda **kw: _InMemorySession(responder))
+    with pytest.raises(dgh.HarvestBlockedError, match="8 consecutive failed requests") as info:
+        _run(_worklist(10), tmp_path, fetch_tries=4)
+    assert len(posts) == 8 and "undecodable body" in str(info.value)
+    assert os.path.exists(tmp_path / dgh.LATCH_FILENAME)
+    second = tmp_path / "second"
+    second.mkdir()
+    posts.clear()
+    monkeypatch.setattr(
+        dgh.aiohttp,
+        "ClientSession",
+        lambda **kw: _InMemorySession(
+            lambda body: (
+                _UndecodableResponse(200)
+                if (posts.append(body) or len(posts)) == 2
+                else _FakeResponse(200, BODY)
+            )
+        ),
+    )
+    result = _run(_worklist(3), second)
+    assert result["answered"] == 3 and result["api_requests"] == 4
+
+
+def test_a_refusal_line_in_the_raw_store_yields_no_ledger_row_in_a_rebuild(monkeypatch, tmp_path):
+    # The crawl writes no ledger row for a 429 (it breaks first), so neither
+    # does the rebuild: parsed, the refusal's body would read as an unanswered
+    # row for a key the crawl never recorded.
+    calls = []
+    _patch_fetch(
+        monkeypatch,
+        lambda url: (calls.append(url), (429, "no") if len(calls) == 3 else (200, BODY))[1],
+    )
+    with pytest.raises(dgh.HarvestBlockedError):
+        _run(_worklist(3), tmp_path)
+    paths = dgh.output_paths(str(tmp_path), "bend", 1)
+    history, queries = dgh.rebuild_from_raw(paths["raw"], _worklist(3), 1)
+    assert queries["edge_id"].tolist() == ["e0", "e1"]
+    assert "e2" not in set(history["edge_id"])
 
 
 class _CountingFile:
@@ -1395,6 +1712,10 @@ def test_cli_exit_codes_complete_incomplete_blocked(monkeypatch, tmp_path, capsy
     code, out = _cli(monkeypatch, fresh, lambda url: (calls.append(url), (200, BODY))[1])
     assert code == 86 and calls == []
     assert "cool-down until" in capsys.readouterr().err
+    # The CLI's own check, not only the harvester's: a dry run under the
+    # latch is refused too, before the work list is even read.
+    code, out = _cli(monkeypatch, fresh, lambda url: (200, BODY), "--dry-run")
+    assert code == 86 and "to query" not in capsys.readouterr().out
     code, out = _cli(monkeypatch, fresh, lambda url: (200, BODY), "--clear-latch")
     assert code == 0 and not os.path.exists(fresh / dgh.LATCH_FILENAME)
 
