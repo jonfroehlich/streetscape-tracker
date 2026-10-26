@@ -31,7 +31,10 @@ import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from streetscape_metadata_tracker.download_gsv_history import load_worklist  # noqa: E402
+from streetscape_metadata_tracker.download_gsv_history import (  # noqa: E402
+    load_sample_history,
+    load_worklist,
+)
 
 PCTILES = (10, 25, 50, 75, 90)
 
@@ -41,6 +44,14 @@ def _pct(series: pd.Series) -> dict[str, float]:
 
 
 def summarize_pass(queries: pd.DataFrame, history: pd.DataFrame, worklist_rows: int) -> dict:
+    # A ledger row with `unanswered` set is a 200 that answered nothing (the
+    # key was re-queried); it is a request, never an answer, so it is counted
+    # apart and excluded from every per-answer figure.
+    if "unanswered" in queries.columns:
+        unanswered_rows = int(queries["unanswered"].notna().sum())
+        queries = queries[queries["unanswered"].isna()]
+    else:
+        unanswered_rows = 0
     anchored = queries["anchor_in_history"].notna()
     in_hist = queries["anchor_in_history"].fillna(False).astype(bool)
     official = history[~history["third_party"].astype(bool)]
@@ -50,6 +61,7 @@ def summarize_pass(queries: pd.DataFrame, history: pd.DataFrame, worklist_rows: 
     return {
         "worklist_rows": int(worklist_rows),
         "requests_answered": int(len(queries)),
+        "unanswered_rows": unanswered_rows,
         "http_status": {str(k): int(v) for k, v in queries["http_status"].value_counts().items()},
         "response_code": {
             str(k): int(v) for k, v in queries["response_code"].value_counts(dropna=False).items()
@@ -134,6 +146,13 @@ def _read(path):
     return pd.read_csv(path, dtype={"pano_id": str, "edge_id": str, "anchor_pano_id": str})
 
 
+def _read_history(history_path, queries_path):
+    # Through the crawl's own reader: one answer per key (a crash between the
+    # history and ledger appends duplicates rows on disk), and only keys the
+    # ledger holds as done -- never pd.read_csv on the file.
+    return load_sample_history(history_path, queries_path)
+
+
 def analyze(results_dir: str, worklist_path: str, spot_check_path: str | None) -> dict:
     worklist = load_worklist(worklist_path)
     stem = os.path.basename(worklist_path).removesuffix(".worklist.csv.gz")
@@ -152,7 +171,7 @@ def analyze(results_dir: str, worklist_path: str, spot_check_path: str | None) -
             continue
         queries = _read(q[0])
         history = (
-            _read(h[0])
+            _read_history(h[0], q[0])
             if h
             else pd.DataFrame(columns=["pano_id", "edge_id", "third_party", "capture_date"])
         )
@@ -176,6 +195,7 @@ def analyze(results_dir: str, worklist_path: str, spot_check_path: str | None) -
                 "unknown",
                 "error",
                 "month_match_share_of_answered",
+                "by_year",
                 "seed",
             )
         }

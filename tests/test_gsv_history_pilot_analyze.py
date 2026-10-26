@@ -127,6 +127,53 @@ def test_pass_one_only_has_no_edge_block_and_main_writes_json(tmp_path, capsys):
     )
 
 
+def test_duplicated_and_stranded_history_rows_and_unanswered_queries_are_not_counted(tmp_path):
+    # The crawl appends history rows before the ledger row, so a crash
+    # between the two leaves duplicates on disk (and rows no ledger row
+    # stands for); a 200 that answered nothing leaves a ledger row with
+    # `unanswered` set. The analyzer counts none of them as answers.
+    wl = _worklist(tmp_path)
+    results = tmp_path / "r"
+    results.mkdir()
+    unanswered = _query("e2", 1, 0, None, 1) | {"unanswered": "response code 5: decommissioned"}
+    answered_later = _query("e2", 1, 1, True, 3)
+    _write(
+        results, 1,
+        [_query("e0", 1, 2, True, 0), unanswered, _query("e1", 1, 1, True, 2), answered_later],
+        [
+            # e0's rows twice: the second copy is the resume's, a later harvested_at.
+            _hist("e0", 1, "a", 2011) | {"harvested_at": "2026-10-17T17:00:00+00:00"},
+            _hist("e0", 1, "b", 2019) | {"harvested_at": "2026-10-17T17:00:00+00:00"},
+            _hist("e0", 1, "a", 2011) | {"harvested_at": "2026-10-17T17:05:00+00:00"},
+            _hist("e0", 1, "b", 2019) | {"harvested_at": "2026-10-17T17:05:00+00:00"},
+            _hist("e1", 1, "c", 2014),
+            _hist("e2", 1, "d", 2015),
+            # A key the ledger never recorded (crashed before any ledger row).
+            _hist("e9", 1, "zz", 2000),
+        ],
+    )  # fmt: skip
+    p1 = analyze(str(results), wl, None)["passes"]["1"]
+    assert p1["requests_answered"] == 3 and p1["unanswered_rows"] == 1
+    assert p1["history_rows"] == 4 and p1["distinct_official_panos"] == 4
+    assert p1["capture_year_histogram"] == {"2011": 1, "2014": 1, "2015": 1, "2019": 1}
+    assert p1["zero_history_samples"] == 0  # the unanswered row's 0 is not a zero-history answer
+
+
+def test_the_spot_checks_per_year_split_is_carried(tmp_path):
+    wl = _worklist(tmp_path)
+    results = tmp_path / "r"
+    results.mkdir()
+    _write(results, 1, [_query("e0", 1, 1, True, 0)], [_hist("e0", 1, "a", 2011)])
+    sc = tmp_path / "spot.json"
+    sc.write_text(
+        json.dumps(
+            {"requests": 2, "month_match": 2, "by_year": {"2007": {"n": 2, "month_match": 2}}}
+        )
+    )
+    m = analyze(str(results), wl, str(sc))
+    assert m["spot_check"]["by_year"] == {"2007": {"n": 2, "month_match": 2}}
+
+
 def test_summarize_edges_counts_distinct_panos_not_rows():
     h1 = pd.DataFrame([_hist("e0", 1, "a", 2011), _hist("e0", 1, "a", 2011)])
     h2 = pd.DataFrame([_hist("e0", 0, "a", 2011)])
