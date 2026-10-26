@@ -105,6 +105,7 @@ Its older JSONP shim (`maps/api/js/GeoPhotoService.SingleImageSearch`) was **tur
 Because it is undocumented **there is no guarantee it keeps working**, and it is IP-identified rather than key-metered, which fixes three things about how it runs (#442):
 
 - **Where.** Only from a dedicated address that no lab service shares — never makelab1 or makelab2, whose addresses carry Project Sidewalk and the nightly collection.
+  How it is deployed there — a system unit that survives a reboot, a queue runner that walks the work lists one at a time, and a README — is `deploy/crawler/`, which names no host: the host's identity lives in the lab's private planning notes, and a test refuses it in the repository.
   The crawler is therefore **catalog-free**: it reads nothing but a work list and writes nothing but files, and its outputs come back to the catalog host under gitignored `experiments/`, never `data/`.
 - **How fast.** ONE request in flight, paced by `download_common.AsyncRateLimiter` at a mean of 1/s with jitter 0.6 (the same pacer and coefficient of variation as Mapillary, #292); the pace governs, not sockets.
 - **When to stop, written down in advance.** The FIRST 429 or 403, the first HTML page served with a 200, 8 consecutive failed REQUESTS, or failed requests above a quarter of the last 50, ends the run and writes `blocked.json`, and `scripts/harvest_gsv_history.py` refuses to restart until that latch's 24 h cool-down has passed (`--clear-latch` is the operator's deliberate override).
