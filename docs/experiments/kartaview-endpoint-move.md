@@ -5,7 +5,7 @@ The endpoint had broken by the 2026-10-22 night; the pause was applied by hand o
 They come back with a collector fix, never with a one-line host change, because the host change alone would publish truncated censuses.
 
 Numbers below trace to [`kartaview-endpoint-move_metrics.json`](kartaview-endpoint-move_metrics.json), produced by `scripts/kartaview_endpoint_probe.py --docs-dir docs/experiments` from the Mac on 2026-10-22 at 14:14 UTC.
-The production facts are operator readings from makelab2's catalog and `logs/`, recorded by hand in that file's `production` block with the read-only command behind each figure, since no committed script produces them.
+The production facts are operator readings from makelab2's catalog and `logs/`, recorded by hand in [`kartaview-endpoint-move_production.json`](kartaview-endpoint-move_production.json) with the read-only command behind each figure, since no committed script produces them; the probe never touches that file.
 
 ## What happened in production
 
@@ -15,7 +15,7 @@ The production facts are operator readings from makelab2's catalog and `logs/`, 
   Each spent 6 requests: the calibration ladder from r=1000 to r=100, every rung answered `404 page not found` (text/plain), and the collector raised "gave no usable answer at any radius or any calibration point… this is the endpoint, not the city's geometry".
   That is the designed path for a 404: it is neither backpressure nor a host refusal, so it neither subdivided nor latched the night-level breaker.
   But it is not amnestied either: each failed attempt counts a per-city `consecutive_failures`, and fast failures fill the city cap.
-- That is what the second night cost: 21 of 157 runs succeeded, the 80-city cap filled in 1.60 h on 6-request failures, and the fill phase (the night's early refreshes) was never reached.
+- That is what the second night cost: 21 of 157 runs succeeded, and the 80-city cap was spent in 1.60 h on 6-request failures, leaving about ten hours of the night unused.
 - After the two nights 62 pairs on each channel stand at 2 consecutive failures and 17/16 at 1, against `max_consecutive_failures = 5`.
   Pausing stops that count rising toward quarantine.
 
@@ -51,7 +51,10 @@ That is worse than the honest 404s, and it is why the pause is the right state u
 - A total of 0 (or unparseable) beside a FULL page read as **unknown**, paging on until a short page, under the existing `MAX_PAGES_PER_CELL` cap — the cap's subdivide-or-record-unmeasured branches must still be reachable, or a dense circle pages without bound.
 - Tests pinning the new response shape (`['0']` with a full page).
 - The KartaView host lock's comments, `provider-access.md` and the module docstring naming the new host (the lock key itself is `HOST_KARTAVIEW = "kartaview"`, a lock name rather than a host name).
-- A whole calibration ladder of 404s refused BY NAME as a moved endpoint, the way the Panoramax census refuses a whole lattice of 404s (#407), instead of counting a per-city failure: that is what filled the 80-city cap in 1.6 h on 10-23 and walked every pair toward quarantine, and the next move would do it again.
+- A night-level stop for a moved endpoint.
+  The collector already refuses a whole ladder of 404s by name ("this is the endpoint, not the city's geometry"), but that exit is 1, a counted failure: it stamps `consecutive_failures`, and because the city was attempted it takes a city-cap slot, which is how 10-23 spent the cap in 1.6 h and walked every pair toward quarantine.
+  The Panoramax lattice refusal (#407) is the same shape and counts the same way.
+  What stops both is an amnestied exit family that latches the channel for the night, as a blocked host (75/81) or the #444 throttle (87) does, so the remaining KartaView launches are skipped and a KartaView-only city takes no slot.
 - A decision on pacing given point 2; 960/h has nothing observable behind it now.
 
 ## Replicate

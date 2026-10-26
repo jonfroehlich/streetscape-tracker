@@ -27,7 +27,7 @@ THE TOKEN IS NEVER RECORDED. Rows name the token's KIND (none, real, bogus,
 garbage); the bogus one is zeros of the real token's length, so a length check
 on the server cannot tell them apart. The token travels as a query parameter,
 and urllib3 logs full request URLs at DEBUG, so the ``urllib3`` logger is held
-at INFO whatever ``--log-level`` says.
+at INFO or above whatever ``--log-level`` says.
 
 COST. 12 requests, paced at the ANONYMOUS 100/hour rather than the 1,000 a
 token is documented to buy -- question 2 is whether the token buys anything,

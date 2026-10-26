@@ -989,7 +989,7 @@ The first chained pass is the next night's end; a tranche enabled the afternoon 
 ### Turning an opt-in channel on in production (KartaView, #248; the same shape for every opt-in channel since)
 
 **Where KartaView stands:** `config/scheduler.makelab1.toml` has declared `[providers.kartaview]` since #248 and `[providers.kartaview_streets]` since #258, and both carry `enabled = false` since 2026-10-23 — the endpoint moved and the host that still answers reports no total, so a resume needs the collector fix in `../docs/experiments/kartaview-endpoint-move.md`, never a config flip alone.
-The 853 enrolments survive the pause and cost nothing while it stands.
+The enrolments survive the pause and cost nothing while it stands (`enroll-city --list --channel kartaview` prints them).
 
 The first turn-on was four steps, in this order, and the order matters — enrolment must precede the config block, or the first night after the flip runs the channel over an empty queue and tells you nothing:
 

@@ -1080,7 +1080,7 @@ def test_makelab1_production_config_is_wired():
     # falsified as the trigger, request regularity never was. Pinned so the
     # restart cannot silently ship at the old metronomic 60/min.
     #
-    # Both KartaView channels were PAUSED 2026-10-22: kartaview.org stopped
+    # Both KartaView channels were PAUSED 2026-10-23: kartaview.org stopped
     # routing the nearby-photos endpoint, and the api. hosts that still answer
     # report totalFilteredItems as 0, which would truncate every circle to one
     # page (docs/experiments/kartaview-endpoint-move.md). Pinned off so they
