@@ -58,6 +58,13 @@ Generalizes #226 from dates to floats: a reader must return what is on disk, and
 
 Issue #106 — why production stays on the 20 m grid; below ~10 m you buy redundancy, not information, since official panos sit ~10 m apart.
 
+### `gsv-history-sizing.md`
+
+Issue #442 — how many requests a backfill of the full GSV capture-date history would take, and how fast that history grows, read entirely out of the road walks already on disk (no requests).
+**The query unit decides everything, and the chosen one is every road-walk sample point: 78.1 M requests, ~904 days at 60/min on one address.** Deduplicating by pano barely helps (58.9 M distinct Google panos against 64.1 M Google-anchored samples, an 8.2 % saving) because at 15 m spacing nearly every sample matches its own pano; one query per walk edge midpoint is 8.9 M, 6.6× fewer, and is the opening pass of the same crawl rather than a smaller answer, since a search returns the captures at a point, not along the edge.
+**Pano-id churn is not capture churn**: of the 10.2 % of samples whose matched pano changed between two walks ~62 days apart, 29 % kept the same capture month (a re-issued id or another capture of that month — a class, not a cause, since month precision cannot tell them apart) and 5 % moved to an *older* one, so a walk diff can nominate a sample for a re-query but cannot say what happened there.
+The growth rate, ~1,220 new panos per day per million Google samples, is a single-interval estimate over 7 % of samples and is dominated by a few re-driven cities (per-city new-capture share median 0.07 %, p90 30 %).
+
 ### `gsv-query-radius.md`
 
 Issue #367 — how far from its grid point the pano Google returns actually is, measured over 60 archived GSV files with no API calls.
