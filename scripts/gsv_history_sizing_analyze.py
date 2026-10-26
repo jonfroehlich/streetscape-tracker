@@ -32,6 +32,7 @@ _SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _SCRIPTS_DIR)
 
 from experiment_stats import percentile  # noqa: E402
+from gsv_history_walk_pair_changes import MATCH_FRAC_MIN  # noqa: E402
 
 TOPIC = "gsv-history-sizing"
 RAW_DIR_DEFAULT = "experiments/gsv-history-sizing/out"
@@ -82,6 +83,10 @@ def read_raw(raw_dir: str) -> tuple[dict, dict]:
         ),
         "summary.as_of vs pair_changes.as_of": (summary.get("as_of"), pair_changes.get("as_of")),
         "summary.as_of vs walk_totals.as_of": (summary.get("as_of"), totals.get("as_of")),
+        "summary.walk_totals vs walk_totals.walk_totals": (
+            summary.get("walk_totals"),
+            totals["walk_totals"],
+        ),
     }
     bad = {k: v for k, v in checks.items() if v[0] != v[1]}
     if bad:
@@ -100,7 +105,7 @@ def derive(backfill: dict, change: dict, totals: dict, tables: dict) -> dict:
     """Every share, ratio and duration the writeup quotes, from the blocks and tables."""
     pc = tables["per_city.csv"]
     pcs = tables["pair_changes.csv"]
-    good = pcs[pcs["match_frac"] >= 0.95]
+    good = pcs[pcs["match_frac"] >= MATCH_FRAC_MIN]
     google = backfill["google_samples"]
     samples = backfill["samples"]
     within = 1 - backfill["distinct_google_sum_per_city"] / google

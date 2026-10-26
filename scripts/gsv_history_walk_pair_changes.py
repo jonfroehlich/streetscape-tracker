@@ -25,6 +25,7 @@ import json
 import os
 import sqlite3
 import sys
+import time
 from datetime import date
 from pathlib import Path
 
@@ -76,9 +77,9 @@ def load(path: Path) -> tuple[pd.DataFrame, int]:
     return deduped, int(len(df) - len(deduped))
 
 
-def generated_by(out: Path, *, as_of: str | None = None) -> str:
-    """The command that reproduces ``out``, with the checkout path left as a placeholder."""
-    cmd = f"python {SCRIPT} <repo_dir> {out}"
+def generated_by(repo: Path, out: Path, *, as_of: str | None = None) -> str:
+    """The command that reproduces ``out``, as it was given (run from the checkout, ``.``)."""
+    cmd = f"python {SCRIPT} {repo} {out}"
     if as_of is not None:
         cmd += f" --as-of {as_of}"
     return cmd
@@ -156,7 +157,8 @@ def measure(repo: Path, out: Path, *, as_of: str | None = None) -> dict:
     df["new_frac"] = (df["changed_newer_date"] + df["gained"]) / df["google_both"].clip(lower=1)
     good = df[df["match_frac"] >= MATCH_FRAC_MIN]
     s = {
-        "generated_by": generated_by(out, as_of=as_of),
+        "generated_by": generated_by(repo, out, as_of=as_of),
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "as_of": as_of,
         "pairs": int(len(df)),
         "missing_files": len(missing),
@@ -203,7 +205,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     if args.as_of is not None:
-        date.fromisoformat(args.as_of)
+        # Normalized to YYYY-MM-DD (see size_gsv_history_walks.main).
+        args.as_of = date.fromisoformat(args.as_of).isoformat()
     print(json.dumps(measure(args.repo_dir, args.out_json, as_of=args.as_of), indent=2))
     return 0
 

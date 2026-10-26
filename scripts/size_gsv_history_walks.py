@@ -141,9 +141,11 @@ def catalog_totals(con: sqlite3.Connection, as_of: str | None = None) -> dict:
     return out
 
 
-def generated_by(out: Path, *, as_of: str | None = None, totals_only: bool = False) -> str:
-    """The command that reproduces ``out``, with the checkout path left as a placeholder."""
-    cmd = f"python {SCRIPT} <repo_dir> {out}"
+def generated_by(
+    repo: Path, out: Path, *, as_of: str | None = None, totals_only: bool = False
+) -> str:
+    """The command that reproduces ``out``, as it was given (run from the checkout, ``.``)."""
+    cmd = f"python {SCRIPT} {repo} {out}"
     if as_of is not None:
         cmd += f" --as-of {as_of}"
     if totals_only:
@@ -157,7 +159,7 @@ def measure(repo: Path, out: Path, *, totals_only: bool = False, as_of: str | No
     totals = catalog_totals(con, as_of)
     if totals_only:
         summary = {
-            "generated_by": generated_by(out, as_of=as_of, totals_only=True),
+            "generated_by": generated_by(repo, out, as_of=as_of, totals_only=True),
             "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "as_of": as_of,
             "walk_totals": totals,
@@ -220,7 +222,7 @@ def measure(repo: Path, out: Path, *, totals_only: bool = False, as_of: str | No
     pc = pd.DataFrame(per_city)
     pr = pd.DataFrame([p for p in pairs if p.get("aligned")])
     summary = {
-        "generated_by": generated_by(out, as_of=as_of),
+        "generated_by": generated_by(repo, out, as_of=as_of),
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "as_of": as_of,
         "cities": len(pc),
@@ -285,7 +287,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     if args.as_of is not None:
-        date.fromisoformat(args.as_of)
+        # Normalized to YYYY-MM-DD: the clause compares run_date as TEXT, and the
+        # compact form fromisoformat also accepts ("20261009") sorts after every
+        # dashed date, which would admit every later walk and stamp the record with it.
+        args.as_of = date.fromisoformat(args.as_of).isoformat()
     summary = measure(
         args.repo_dir, args.out_json, totals_only=args.catalog_totals_only, as_of=args.as_of
     )

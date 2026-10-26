@@ -27,6 +27,8 @@ import pandas as pd
 import pytest
 
 from scripts import gsv_history_sizing_analyze as analyze
+from scripts import gsv_history_walk_pair_changes as pair_mod
+from scripts import size_gsv_history_walks as size_mod
 from scripts.gsv_history_walk_pair_changes import measure as measure_pair_changes
 from scripts.size_gsv_history_walks import catalog_totals
 from scripts.size_gsv_history_walks import measure as measure_size
@@ -290,7 +292,7 @@ def test_size_counts_distinct_panos_per_city_and_globally(repo, tmp_path):
     assert s["walk_totals"]["cities"] == 3
     assert (
         s["generated_by"]
-        == f"python scripts/size_gsv_history_walks.py <repo_dir> {tmp_path / 's.json'}"
+        == f"python scripts/size_gsv_history_walks.py {repo} {tmp_path / 's.json'}"
     )
 
 
@@ -335,10 +337,25 @@ def test_size_totals_only_skips_the_csv_scan(repo, tmp_path, monkeypatch):
     s = measure_size(repo, tmp_path / "t.json", totals_only=True, as_of="2026-05-02")
     assert set(s) == {"generated_by", "generated_at", "as_of", "walk_totals"}
     assert s["generated_by"] == (
-        f"python scripts/size_gsv_history_walks.py <repo_dir> {tmp_path / 't.json'}"
+        f"python scripts/size_gsv_history_walks.py {repo} {tmp_path / 't.json'}"
         " --as-of 2026-05-02 --catalog-totals-only"
     )
     assert json.loads((tmp_path / "t.json").read_text())["walk_totals"]["edges_total"] == 8
+
+
+def test_both_mains_normalize_a_compact_as_of_before_the_text_compare(repo, tmp_path, capsys):
+    # date.fromisoformat accepts "20260501", but run_date is compared as TEXT and
+    # "2026-05-02" <= "20260501" is true, so an unnormalized cut admits every later walk.
+    assert size_mod.main([str(repo), str(tmp_path / "s.json"), "--as-of", "20260501"]) == 0
+    s = json.loads((tmp_path / "s.json").read_text())
+    assert s["as_of"] == "2026-05-01" and s["generated_by"].endswith("--as-of 2026-05-01")
+    assert s["google_samples"] == 7 + 3 + 4 and s["pairs_total"] == 0
+    assert pair_mod.main([str(repo), str(tmp_path / "pc.json"), "--as-of", "20260501"]) == 0
+    c = json.loads((tmp_path / "pc.json").read_text())
+    assert c["as_of"] == "2026-05-01" and c["generated_by"].endswith("--as-of 2026-05-01")
+    assert c["pairs"] == 0
+    assert "generated_at" in c
+    capsys.readouterr()
 
 
 # ── The assembler ────────────────────────────────────────────────────────────
@@ -365,7 +382,7 @@ def _generated_by_values(node):
             yield from _generated_by_values(v)
 
 
-def test_analyze_assembles_the_record_and_copies_the_tables(raw_dir, tmp_path):
+def test_analyze_assembles_the_record_and_copies_the_tables(repo, raw_dir, tmp_path):
     docs = tmp_path / "docs"
     rc = analyze.main(
         ["--raw-dir", str(raw_dir), "--docs-dir", str(docs), "--catalog-label", "fixture"]
@@ -382,6 +399,9 @@ def test_analyze_assembles_the_record_and_copies_the_tables(raw_dir, tmp_path):
         assert os.path.exists(os.path.join(PROJECT_ROOT, stamp.split()[1])), stamp
     assert set(record["inputs"]) == {"summary.json", "pair_changes.json", "walk_totals.json"}
     assert record["inputs"]["summary.json"]["as_of"] == "2026-05-02"
+    for name, prov in record["inputs"].items():
+        assert set(prov) == {"generated_by", "generated_at", "as_of"}, name
+        assert prov["generated_by"].split()[2] == str(repo)
     for block in ("backfill", "change_rate", "walk_totals"):
         assert "generated_by" not in record[block] and "generated_at" not in record[block]
     assert "walk_totals" not in record["backfill"]
@@ -439,6 +459,22 @@ def test_analyze_refuses_raw_outputs_that_are_not_one_measurement(raw_dir, tmp_p
         analyze.read_raw(str(raw_dir))
 
 
+def test_analyze_refuses_a_totals_block_measured_as_of_another_date(raw_dir):
+    totals = json.loads((raw_dir / "walk_totals.json").read_text())
+    totals["as_of"] = "2026-05-01"
+    (raw_dir / "walk_totals.json").write_text(json.dumps(totals))
+    with pytest.raises(SystemExit, match="as_of"):
+        analyze.read_raw(str(raw_dir))
+
+
+def test_analyze_refuses_a_totals_block_that_differs_from_the_scan_s_own(raw_dir):
+    totals = json.loads((raw_dir / "walk_totals.json").read_text())
+    totals["walk_totals"]["edges_total"] += 1
+    (raw_dir / "walk_totals.json").write_text(json.dumps(totals))
+    with pytest.raises(SystemExit, match="walk_totals"):
+        analyze.read_raw(str(raw_dir))
+
+
 # ── The committed record ─────────────────────────────────────────────────────
 
 
@@ -457,8 +493,11 @@ def test_committed_generated_by_names_runnable_scripts_at_every_level(metrics):
     for stamp in stamps:
         assert stamp.startswith("python scripts/"), stamp
         assert os.path.exists(os.path.join(PROJECT_ROOT, stamp.split()[1])), stamp
-    # Every block was measured as of the same catalog date.
+    # Every block was measured as of the same catalog date, from the checkout root.
     assert {v["as_of"] for v in metrics["inputs"].values()} == {"2026-10-09"}
+    for name, prov in metrics["inputs"].items():
+        assert set(prov) == {"generated_by", "generated_at", "as_of"}, name
+        assert prov["generated_by"].split()[2] == "."
     # Nothing names the crawler host (the only host named is the catalog's).
     assert "makelab2" in metrics["catalog_label"]
     text = Path(METRICS).read_text(encoding="utf-8")
