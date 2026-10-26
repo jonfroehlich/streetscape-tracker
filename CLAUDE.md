@@ -10,7 +10,7 @@ Streetscape Tracker analyzes street-level imagery coverage and temporal patterns
 Four providers are collectable — Google Street View (GSV, the default), Mapillary (360° panos only), KartaView, and Panoramax.
 Panoramax is the newest and the only credential-free one.
 GSV and Mapillary run nightly over every enabled city **that has not been excluded from the channel** (`enroll-city --channel gsv --remove`, #301).
-KartaView and Panoramax are scheduled too but **opt-in**, collecting only the cities an operator enrolled with `scheduler enroll-city` — KartaView because one whole-catalog pass prices at ~205,000 requests ≈ 215 h at the configured 16/min (#248), Panoramax because 730 of 1,144 enabled cities were MEASURED to hold no Panoramax imagery at all (#316/#335).
+KartaView and Panoramax are scheduled too but **opt-in** (and **both KartaView channels are PAUSED on production since 2026-10-23**: the endpoint moved and the host that still answers reports no total, `docs/experiments/kartaview-endpoint-move.md`), collecting only the cities an operator enrolled with `scheduler enroll-city` — KartaView because one whole-catalog pass prices at ~205,000 requests ≈ 215 h at the configured 16/min (#248), Panoramax because 730 of 1,144 enabled cities were MEASURED to hold no Panoramax imagery at all (#316/#335).
 The tool samples a geographic grid around a city center, queries each provider's metadata API, and produces immutable dated snapshots per (city, provider), run-to-run change summaries (panos added/removed, capture-date changes, coverage deltas), and interactive map visualizations.
 
 ## READ THIS FIRST: provider API access is the single point of failure
@@ -379,6 +379,7 @@ Keep any list a doc enumerates **alphabetical**, so two branches adding an entry
   - `gsv-history-pilot.md`
   - `gsv-query-radius.md`
   - `gsv-throughput.md`
+  - `kartaview-endpoint-move.md`
   - `kartaview-feasibility.md`
   - `kartaview-sweep-cost.md`
   - `kartaview-viewer-deeplink.md`

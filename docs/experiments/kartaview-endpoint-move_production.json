@@ -1,0 +1,99 @@
+{
+ "_about": {
+  "experiment": "kartaview-endpoint-move",
+  "writeup": "docs/experiments/kartaview-endpoint-move.md",
+  "generated_by": "hand-recorded operator readings; no committed script produces them, so each block names the read-only command that read it on makelab2",
+  "read_at_utc": "2026-10-26T12:59:28+00:00",
+  "host": "makelab2 (the catalog host), catalog opened mode=ro",
+  "note": "Re-read in full with the commands as recorded on 2026-10-26 12:59 UTC; the figures matched the earlier reads."
+ },
+ "attempts_by_night": {
+  "command": "for d in 2026-10-15 2026-10-16 2026-10-17 2026-10-18 2026-10-19 2026-10-20 2026-10-21 2026-10-22 2026-10-23; do for ch in kartaview kartaview_streets; do ls logs/collect_*_${ch}_${d}.log | wc -l; done; grep -l 'HTTP 404, text/plain' logs/collect_*_kartaview*_${d}.log | wc -l; done",
+  "note": "One child log per (city, channel, night), opened in append mode, so a same-night retry lands in the same file; the night summaries corroborate the counts (189 - 65 = 124 and 157 - 21 = 136 failed runs). files_with_404 counts logs carrying the collector's 'non-JSON body (HTTP 404, text/plain; charset=utf-8)' line.",
+  "2026-10-15": {
+   "kartaview": 16,
+   "kartaview_streets": 16,
+   "files_with_404": 0
+  },
+  "2026-10-16": {
+   "kartaview": 0,
+   "kartaview_streets": 0,
+   "files_with_404": 0
+  },
+  "2026-10-17": {
+   "kartaview": 0,
+   "kartaview_streets": 0,
+   "files_with_404": 0
+  },
+  "2026-10-18": {
+   "kartaview": 0,
+   "kartaview_streets": 0,
+   "files_with_404": 0
+  },
+  "2026-10-19": {
+   "kartaview": 0,
+   "kartaview_streets": 0,
+   "files_with_404": 0
+  },
+  "2026-10-20": {
+   "kartaview": 0,
+   "kartaview_streets": 0,
+   "files_with_404": 0
+  },
+  "2026-10-21": {
+   "kartaview": 0,
+   "kartaview_streets": 0,
+   "files_with_404": 0
+  },
+  "2026-10-22": {
+   "kartaview": 62,
+   "kartaview_streets": 62,
+   "files_with_404": 124
+  },
+  "2026-10-23": {
+   "kartaview": 68,
+   "kartaview_streets": 68,
+   "files_with_404": 136
+  }
+ },
+ "requests_ledgered": {
+  "command": "sqlite3 'file:data/streetscape_tracker.db?mode=ro' \"select usage_date, provider, requests from api_usage where provider like 'kartaview%' and usage_date in ('2026-10-15','2026-10-22','2026-10-23')\"",
+  "2026-10-15": {
+   "kartaview": 118,
+   "kartaview_streets": 0
+  },
+  "2026-10-22": {
+   "kartaview": 372,
+   "kartaview_streets": 372
+  },
+  "2026-10-23": {
+   "kartaview": 408,
+   "kartaview_streets": 408
+  },
+  "requests_per_failed_attempt": 6
+ },
+ "night_summaries": {
+  "command": "grep -h 'Done: run-due 2026-10-2[23]' logs/streetscape_scheduler.log*",
+  "2026-10-22": "65/189 runs succeeded across 80 cities in 2.09 h; fill not reached (the due slate ended the night); stopped early (city cap reached (80))",
+  "2026-10-23": "21/157 runs succeeded across 80 cities in 1.60 h; fill not reached (the due slate ended the night); stopped early (city cap reached (80))"
+ },
+ "consecutive_failures_after_pause": {
+  "command": "sqlite3 'file:data/streetscape_tracker.db?mode=ro' \"select provider, consecutive_failures, count(*) from schedule_state join cities using(city_id) where cities.enabled=1 and provider like 'kartaview%' group by 1,2\"",
+  "max_consecutive_failures": 5,
+  "kartaview": {
+   "0": 1195,
+   "1": 17,
+   "2": 62
+  },
+  "kartaview_streets": {
+   "0": 1196,
+   "1": 16,
+   "2": 62
+  }
+ },
+ "last_success_at": {
+  "command": "sqlite3 'file:data/streetscape_tracker.db?mode=ro' \"select provider, max(last_success_at) from schedule_state where provider like 'kartaview%' group by 1\"",
+  "kartaview": "2026-10-15T11:42:49+00:00",
+  "kartaview_streets": "2026-10-15T11:42:52+00:00"
+ }
+}

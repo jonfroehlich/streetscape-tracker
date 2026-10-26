@@ -84,6 +84,14 @@ Two things generalize.
 **(2) A saturated limiter must be measured, not assumed to deliver its setting**: this one delivered 82–88% once nothing else bound (79–83% in the first, hand-picked reading), and was invisible for as long as something else did.
 The latency scenario that reproduces production's curve is a fit, labelled as one, never a measurement of Google.
 
+### `kartaview-endpoint-move.md`
+
+The 2026-10-22 night's 124 KartaView failures: `kartaview.org` stopped routing `/1.0/list/nearby-photos/` (404) sometime after the 10-15 night, while `api.kartaview.org` and `api.openstreetcam.org` still serve the same photos.
+It PAUSED both KartaView channels rather than moving the host, for two measured reasons.
+Neither `api.` host validates the token (a bogus and a garbage one get the same 200), so the 1,000/h tier the pacer assumes is unverifiable.
+And `totalFilteredItems` now reads `['0']` on every page of a circle that serves 400 distinct photos over two pages, so a sweep that sizes its paging from it would read one page per circle and publish a truncated census with no error.
+Generalizes: when a provider's endpoint moves, re-check the response's SEMANTICS on the new host, not just its status code; a 200 with the familiar keys was the shape of the trap.
+
 ### `kartaview-feasibility.md`
 
 Issue #225 — whether KartaView can be a third provider; it can, as a **census** like Mapillary rather than a GSV-style sample, since its only bulk path is a paginated radius sweep.
@@ -209,6 +217,7 @@ Answer "should we sample finer / differently?" questions from these before re-ru
 - **Numbers cited in a writeup must be traceable to that committed JSON, and that JSON must be produced by committed code**
   — its `generated_by` names a command the repo can actually run (`grid-density_metrics.json` is written only by `grid_density_analyze.py --area all --docs-dir docs/experiments`, and a test regenerates the summary CSV from it and recomputes every quoted share from its histograms);
   a merge or recomputation that lives in a chat transcript is the same single-copy failure one layer up.
+  The one allowed exception is a reading no committed code CAN produce, such as a count read off the production host's logs or catalog: it goes in its own JSON (never inside a script's output file, which a replicate run would overwrite), whose `_about.generated_by` says it is hand-recorded and whose every block names the read-only command that read it (`kartaview-endpoint-move_production.json`).
   And a number that contradicts vendor documentation gets flagged in the writeup rather than quietly normalized to what the docs say
   — #106's query→pano offsets run past Google's documented 50 m default radius (p99 146 m in Adrian) with no explanation, which is a finding, not an error to round away.
   Same posture as the top-of-file rule on undocumented provider behavior: what we measured outranks what is published, and the disagreement is recorded.

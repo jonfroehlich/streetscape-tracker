@@ -647,6 +647,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     logging.basicConfig(level=args.log_level, format="%(asctime)s %(levelname)s %(message)s")
+    # urllib3 logs the full request URL at DEBUG, access_token included.
+    logging.getLogger("urllib3").setLevel(
+        max(logging.INFO, logging.getLogger("urllib3").getEffectiveLevel())
+    )
 
     if args.targets:
         for name, t in TARGETS.items():
