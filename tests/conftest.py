@@ -479,8 +479,9 @@ def make_history_df(rows, *, harvested_at="2026-04-10T01:03:00+00:00"):
     Build a synthetic `_gsv_history_` harvest DataFrame (issue #2/#109).
 
     Args:
-        rows: list of (pano_id, capture_date_iso, lat, lon); each pano's
-            ``nearest_query_*`` is its own position.
+        rows: list of (pano_id, capture_date_iso, lat, lon[, third_party]);
+            each pano's ``nearest_query_*`` is its own position, and
+            ``third_party`` defaults to False (official imagery).
         harvested_at: the UTC ISO 8601 stamp every row carries.
 
     Returns a raw (string-dated) frame with exactly HISTORY_DTYPES' columns, in
@@ -489,8 +490,9 @@ def make_history_df(rows, *, harvested_at="2026-04-10T01:03:00+00:00"):
     test that depends on which duplicate survives builds its rows that way.
     """
     out = [
-        (pano_id, capture, lat, lon, lat, lon, harvested_at) for pano_id, capture, lat, lon in rows
-    ]
+        (row[0], row[1], row[2], row[3], row[2], row[3], harvested_at, bool(row[4]) if len(row) > 4 else False)
+        for row in rows
+    ]  # fmt: skip
     return pd.DataFrame(out, columns=list(HISTORY_DTYPES))
 
 

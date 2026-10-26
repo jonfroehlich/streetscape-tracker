@@ -84,11 +84,17 @@ from .progress import progress
 
 logger = logging.getLogger(__name__)
 
-# Schema of the per-city `_gsv_history_` artifact — one row per unique official
-# Google pano. Distinct from config.METADATA_DTYPES (a per-grid-point run sample);
+# Schema of the per-city `_gsv_history_` artifact — one row per unique dated
+# pano. Distinct from config.METADATA_DTYPES (a per-grid-point run sample);
 # this is a per-pano historical census, so it gets its own columns. Read by
 # fileutils.load_history_csv_file and summarized by json_summarizer (#109); since
-# #442 it is DERIVED from the per-sample SAMPLE_HISTORY_COLUMNS output below.
+# #442 it is DERIVED from the per-sample SAMPLE_HISTORY_COLUMNS output below,
+# and the importer that derives it MUST carry `third_party`: on the RPC route
+# user photospheres come dated (20 + 179 rows in the pilot), so a present
+# date no longer means official imagery and the summarizer filters on the
+# flag. A harvest written before the column existed came from the retired
+# route, where "dated" was "official" by construction, and reads as all
+# official.
 HISTORY_DTYPES = {
     "pano_id": str,
     "capture_date": str,  # ISO YYYY-MM-DD (day defaults to 01;
@@ -98,6 +104,7 @@ HISTORY_DTYPES = {
     "nearest_query_lat": np.float64,  # grid point whose search first
     "nearest_query_lon": np.float64,  # surfaced this pano
     "harvested_at": str,  # UTC ISO 8601
+    "third_party": bool,  # a user photosphere, never official Google imagery
 }
 
 # The live route (measured 2026-10-17 from the pilot host): the RPC that the

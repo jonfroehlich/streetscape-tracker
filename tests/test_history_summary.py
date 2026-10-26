@@ -145,6 +145,42 @@ def test_summary_dedups_by_pano_id(data_dir):
     assert s["data_file"]["rows"] == 2
 
 
+def test_summary_counts_official_panos_only_and_reads_a_pre_442_harvest_as_official(data_dir):
+    # On the RPC route a user photosphere comes DATED (the pilot: 20 + 179
+    # rows), so "has a date" stopped meaning "official"; the #109 summary
+    # must filter on `third_party`, never on the presence of a date.
+    path = _write_history(
+        data_dir,
+        [
+            ("g2009", "2009-06-01", 44.0, -121.0),
+            ("g2018", "2018-06-01", 44.0, -121.0, False),
+            ("CIHM0ogUSER", "2019-11-01", 44.0, -121.0, True),  # dated, and not official
+            ("CIHM0ogOLD", "2001-01-01", 44.0, -121.0, True),  # never reaches the guard
+        ],
+    )
+    s = _summarize(path)
+    assert s["data_file"]["rows"] == 4
+    assert s["panos"]["unique_panos"] == 2 and s["panos"]["plausibly_dated_panos"] == 2
+    assert s["panos"]["implausible_dates_dropped"] == 0
+    assert s["panos"]["newest_capture_date"] == "2018-06-01"
+    assert s["histogram_of_capture_dates_by_year"] == {"2009": 1, "2018": 1}
+    # A harvest written before the column existed (the retired route, where
+    # a date WAS the official signal) reads as all official.
+    legacy = _history_path(data_dir, city_id="legacy--or")
+    write_city_csv_gz(
+        make_history_df(
+            [("a", "2009-06-01", 44.0, -121.0), ("b", "2012-06-01", 44.0, -121.0)]
+        ).drop(columns=["third_party"]),
+        legacy,
+    )
+    s = strict_load(
+        generate_history_summary_as_json(
+            legacy, load_history_csv_file(legacy), city_id="legacy--or", harvest_date=HARVEST_DATE
+        )
+    )
+    assert s["panos"]["unique_panos"] == 2
+
+
 def test_summary_shape_and_schema(data_dir):
     path = _write_history(
         data_dir,
