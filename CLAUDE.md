@@ -378,6 +378,7 @@ Keep any list a doc enumerates **alphabetical**, so two branches adding an entry
   - `csv-float-parse.md`
   - `grid-density.md`
   - `gsv-history-pilot.md`
+  - `gsv-history-sizing.md`
   - `gsv-query-radius.md`
   - `gsv-throughput.md`
   - `kartaview-endpoint-move.md`
