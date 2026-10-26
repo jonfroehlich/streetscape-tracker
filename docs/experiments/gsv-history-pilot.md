@@ -22,8 +22,8 @@ The backfill will spend months of paced requests against an undocumented source,
 - **What**: the latest Seattle GSV `drive` walk (2026-09-11), first 2,000 edges in sample order; `scripts/build_gsv_history_worklist.py --limit 2000`.
   Pass 1 is each edge's midpoint sample (2,000 rows), pass 2 the rest (21,728).
   99.2 % of the samples carry a current official pano (the *anchor*).
-- **How**: `scripts/harvest_gsv_history.py` at the stopping-rule defaults — one request in flight, 60/min mean with jitter 0.6, stop on the first 429/403 or 8 consecutive failed requests behind a 24 h latch.
-  (The crawl as it ran counted failed rows, not requests, and recorded a 200 whose body was not an answer as "no images"; both were changed after the review of #446, and the committed numbers are unaffected because every one of the 23,728 requests was answered.)
+- **How**: `scripts/harvest_gsv_history.py` at the stopping-rule defaults — one request in flight, 60/min mean with jitter 0.6, stop on the first 429/403, the first HTML page, 8 consecutive failed requests or failures above a quarter of the last 50, behind a 24 h latch.
+  (The crawl as it ran counted failed rows, not requests, recorded a 200 whose body was not an answer as "no images", and had neither the page nor the share rule; all were changed after the review of #446, and the committed numbers are unaffected because every one of the 23,728 requests was answered.)
 - **Check 2**: `scripts/spot_check_gsv_history.py`, 200 distinct official pano ids drawn with seed 442 from pass 1's history, each asked of the documented `pano=` metadata request on the streets key from makelab2, 300/min; spend recorded in the ledger.
 
 ## Finding 1: the route #2 shipped is turned down, and the raw store caught it
