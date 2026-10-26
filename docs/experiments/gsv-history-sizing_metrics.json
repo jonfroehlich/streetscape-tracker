@@ -1,17 +1,23 @@
 {
-  "generated_by": [
-    "python scripts/size_gsv_history_walks.py <repo_dir> out/summary.json",
-    "python scripts/gsv_history_walk_pair_changes.py <repo_dir> out/pair_changes.json",
-    "python scripts/size_gsv_history_walks.py <repo_dir> out/walk_totals.json --catalog-totals-only"
-  ],
-  "measured_on": "makelab2, production catalog and walk files: backfill and change_rate on 2026-10-09, walk_totals on 2026-10-17 (no network requests)",
-  "scripts_as_run_md5": {
-    "size_walk_history.py": "1e8df8e1c2fef43830c140610468a299",
-    "walk_pair_changes.py": "6e55677392ae341ef87ebaad8931f6ab"
+  "generated_by": "python scripts/gsv_history_sizing_analyze.py --raw-dir experiments/gsv-history-sizing/out --docs-dir docs/experiments --catalog-label makelab2-prod",
+  "catalog_label": "makelab2-prod",
+  "inputs": {
+    "summary.json": {
+      "generated_by": "python scripts/size_gsv_history_walks.py <repo_dir> experiments/gsv-history-sizing/out/summary.json --as-of 2026-10-09",
+      "generated_at": "2026-10-26T05:36:00-0700",
+      "as_of": "2026-10-09"
+    },
+    "pair_changes.json": {
+      "generated_by": "python scripts/gsv_history_walk_pair_changes.py <repo_dir> experiments/gsv-history-sizing/out/pair_changes.json --as-of 2026-10-09",
+      "as_of": "2026-10-09"
+    },
+    "walk_totals.json": {
+      "generated_by": "python scripts/size_gsv_history_walks.py <repo_dir> experiments/gsv-history-sizing/out/walk_totals.json --as-of 2026-10-09 --catalog-totals-only",
+      "generated_at": "2026-10-26T05:28:14-0700",
+      "as_of": "2026-10-09"
+    }
   },
   "backfill": {
-    "generated_by": "size_walk_history.py",
-    "generated_at": "2026-10-09T17:47:10-0700",
     "cities": 1274,
     "missing_files": 0,
     "samples": 78141072,
@@ -53,9 +59,10 @@
     "pairs_new_panos_per_day_sum": 1068.0097727816872
   },
   "change_rate": {
-    "generated_by": "walk_pair_changes.py",
     "pairs": 121,
+    "missing_files": 0,
     "pairs_match_ge_95pct": 121,
+    "key_merged_rows": 0,
     "match_frac_pctiles": {
       "0": 1.0,
       "10": 1.0,
@@ -66,22 +73,22 @@
       "50": 62.0,
       "90": 67.0
     },
-    "google_both": 4513196,
-    "changed": 458571,
-    "changed_newer_date": 301502,
-    "changed_same_date": 134701,
-    "changed_older_date": 22365,
+    "google_both": 4513758,
+    "changed": 458687,
+    "changed_newer_date": 301581,
+    "changed_same_date": 134731,
+    "changed_older_date": 22372,
     "gained": 21719,
-    "lost": 4920,
-    "new_capture_distinct_panos": 311970,
+    "lost": 4921,
+    "new_capture_distinct_panos": 311973,
     "new_frac_pctiles": {
       "25": 0.0,
       "50": 0.0007039774727208729,
-      "75": 0.0212495206219712,
-      "90": 0.3033856754786987,
+      "75": 0.02124840941972145,
+      "90": 0.303411725736999,
       "99": 1.0329431547746284
     },
-    "new_capture_panos_per_day_per_1M_google_samples": 1220.4760937303731
+    "new_capture_panos_per_day_per_1M_google_samples": 1220.3371293144753
   },
   "walk_totals": {
     "cities": 1274,
@@ -89,7 +96,7 @@
     "walks_missing_edges_total": 0,
     "length_km": 1169629.955,
     "walks_missing_length_km": 0,
-    "length_km_covered": 940863.091,
+    "length_km_covered": 940510.231,
     "walks_missing_length_km_covered": 0,
     "edges_per_city_pctiles": {
       "10": 48.0,
@@ -97,7 +104,60 @@
       "90": 16276.000000000005,
       "99": 106049.52999999997,
       "100": 357773.0
+    }
+  },
+  "derived": {
+    "present_share_of_samples": 0.8441171116771984,
+    "google_share_of_samples": 0.8208616334313918,
+    "unanchored_samples": 13998064,
+    "unanchored_share_of_google_samples": 0.21823211034942422,
+    "dedup_within_city_share": 0.055705931346406445,
+    "dedup_global_share": 0.08217473991865176,
+    "dedup_global_extra_percentage_points": 2.6468808572245317,
+    "top_decile_cities_share_of_distinct_google": 0.7284853315333623,
+    "google_share_per_city_pctiles": {
+      "10": 0.6486173157342602,
+      "50": 0.9157531580635458,
+      "90": 0.9851268994997718
     },
-    "generated_at": "2026-10-17T08:31:12-0700"
+    "distinct_google_per_walk_edge": 6.581217038480599,
+    "requests_per_unit": {
+      "walk_edge": 8945469,
+      "distinct_google_pano": 58872073,
+      "walk_sample": 78141072
+    },
+    "days_at_requests_per_minute": {
+      "60": {
+        "walk_edge": 103.53552083333334,
+        "distinct_google_pano": 681.3897337962962,
+        "walk_sample": 904.4105555555556
+      },
+      "120": {
+        "walk_edge": 51.76776041666667,
+        "distinct_google_pano": 340.6948668981481,
+        "walk_sample": 452.2052777777778
+      }
+    },
+    "google_both_share_of_google_samples": 0.07037022647893282,
+    "changed_share_of_google_both": 0.1016197589680262,
+    "changed_newer_share": 0.6574875677749751,
+    "changed_same_share": 0.2937318912461003,
+    "changed_older_share": 0.04877400057119561,
+    "changed_undated": 3,
+    "pairs_with_no_new_capture": 47,
+    "top_contributors": [
+      "cleveland--ohio--united-states",
+      "chicago--illinois--united-states",
+      "commerce-city--colorado--united-states",
+      "grant-county--kentucky--united-states",
+      "portland--oregon--united-states"
+    ],
+    "top_contributors_share_of_new_captures": 0.7076317501835094,
+    "new_panos_per_day_scaled_to_all_google_samples": 78276.09424831544,
+    "requests_per_second_if_each_new_pano_requeried": 0.9059733130592065,
+    "requery_candidates": 480406,
+    "requery_candidates_per_new_capture_pano": 1.5398960807505777,
+    "requery_candidates_per_day_scaled_to_all_google_samples": 120537.05074944378,
+    "requests_per_second_if_each_candidate_requeried": 1.395104754044488
   }
 }
