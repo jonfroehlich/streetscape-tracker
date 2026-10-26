@@ -5,6 +5,7 @@ mocked), so there is no network access.
 """
 
 import asyncio
+import contextlib
 import gzip
 import json
 import os
@@ -1231,6 +1232,36 @@ def test_the_lock_is_held_for_the_whole_run_and_released_on_a_latch(monkeypatch,
     assert len(seen) == 2
     with dgh.crawl_lock(str(tmp_path)):
         pass
+
+
+def test_the_latch_is_read_under_the_lock_so_a_refusal_written_by_the_holder_is_seen(
+    monkeypatch, tmp_path
+):
+    # A crawl that trips writes blocked.json while it holds the lock. A second
+    # crawl that read the latch BEFORE taking the lock would see no latch,
+    # wait for the lock, and send after the refusal. So the latch is read
+    # under the lock: here the "other crawl" writes the latch at the moment
+    # this one acquires the lock, and this one must send nothing.
+    real_lock = dgh.crawl_lock
+    calls = []
+
+    @contextlib.contextmanager
+    def lock_then_latch(latch_dir):
+        with real_lock(latch_dir):
+            dgh.write_latch(
+                latch_dir,
+                reason="HTTP 429 from the other crawl",
+                http_status=429,
+                cooldown_hours=24,
+                now=datetime.now(UTC),
+            )
+            yield
+
+    monkeypatch.setattr(dgh, "crawl_lock", lock_then_latch)
+    _patch_fetch(monkeypatch, lambda url: (calls.append(url), (200, BODY))[1])
+    with pytest.raises(dgh.HarvestBlockedError, match="latch is in force"):
+        _run(_worklist(3), tmp_path)
+    assert calls == []
 
 
 # ── The breaker counts REQUESTS, retries included (S13) ─────────────────────

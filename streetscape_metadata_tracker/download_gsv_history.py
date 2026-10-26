@@ -512,7 +512,8 @@ class _CircuitBreaker:
     failed share of the last `window` requests exceeds `share` (a throttle
     that lets one request in a few through never fails `limit` in a row, and
     without the window such a run would spend its whole cap into it: measured
-    375 requests for 46 answers under the consecutive rule alone).
+    375 requests for 46 answers under the consecutive rule alone, in a
+    simulated throttle).
 
     A request fails when its transport fails (a timeout, a connection error,
     a non-200 the driver retries) or when its 200 is not an answer
@@ -1313,13 +1314,16 @@ async def harvest_worklist_async(
     """
     now_func = now_func or (lambda: datetime.now(UTC))
     latch_dir = latch_dir or default_latch_dir(out_dir)
-    latch = latch_active(latch_dir, now=now_func())
-    if latch is not None:
-        raise HarvestBlockedError(
-            f"a block latch is in force ({latch.get('reason')}); cool-down until "
-            f"{latch.get('cooldown_until')} ({_latch_path(latch_dir)})"
-        )
     with crawl_lock(latch_dir):
+        # The latch is read UNDER the lock: a crawl that trips writes
+        # blocked.json while holding it, so a second crawl that read the latch
+        # first and took the lock second would send after the refusal.
+        latch = latch_active(latch_dir, now=now_func())
+        if latch is not None:
+            raise HarvestBlockedError(
+                f"a block latch is in force ({latch.get('reason')}); cool-down until "
+                f"{latch.get('cooldown_until')} ({_latch_path(latch_dir)})"
+            )
         rows = worklist.loc[worklist["pass"] == pass_no].reset_index(drop=True)
         paths = output_paths(out_dir, stem, pass_no)
         Path(out_dir).mkdir(parents=True, exist_ok=True)
