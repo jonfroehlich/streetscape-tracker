@@ -3,17 +3,18 @@
   "catalog_label": "makelab2-prod",
   "inputs": {
     "summary.json": {
-      "generated_by": "python scripts/size_gsv_history_walks.py <repo_dir> experiments/gsv-history-sizing/out/summary.json --as-of 2026-10-09",
-      "generated_at": "2026-10-26T05:36:00-0700",
+      "generated_by": "python scripts/size_gsv_history_walks.py . experiments/gsv-history-sizing/out/summary.json --as-of 2026-10-09",
+      "generated_at": "2026-10-26T06:07:32-0700",
       "as_of": "2026-10-09"
     },
     "pair_changes.json": {
-      "generated_by": "python scripts/gsv_history_walk_pair_changes.py <repo_dir> experiments/gsv-history-sizing/out/pair_changes.json --as-of 2026-10-09",
+      "generated_by": "python scripts/gsv_history_walk_pair_changes.py . experiments/gsv-history-sizing/out/pair_changes.json --as-of 2026-10-09",
+      "generated_at": "2026-10-26T06:00:23-0700",
       "as_of": "2026-10-09"
     },
     "walk_totals.json": {
-      "generated_by": "python scripts/size_gsv_history_walks.py <repo_dir> experiments/gsv-history-sizing/out/walk_totals.json --as-of 2026-10-09 --catalog-totals-only",
-      "generated_at": "2026-10-26T05:28:14-0700",
+      "generated_by": "python scripts/size_gsv_history_walks.py . experiments/gsv-history-sizing/out/walk_totals.json --as-of 2026-10-09 --catalog-totals-only",
+      "generated_at": "2026-10-26T06:00:23-0700",
       "as_of": "2026-10-09"
     }
   },
