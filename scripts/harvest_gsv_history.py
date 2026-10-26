@@ -10,14 +10,18 @@ catalog by a separate import step; the per-city `_gsv_history_` artifact and
 its #109 summary are derived from them there.
 
 Stopping rule (docs/capture-dates.md): ONE request in flight, 60/min mean with
-jitter 0.6; the FIRST 429/403, or 8 consecutive transport failures, ends the
-run and writes blocked.json under --out-dir, after which a restart is refused
-until the cool-down (24 h) has passed. --max-requests ends a run cleanly with
-exit 83 ("resume"), which is how a timer runs daily tranches.
+jitter 0.6; the FIRST 429/403, or 8 consecutive failed REQUESTS (transport
+failures, retries included, and 200s whose body is not an answer), ends the
+run and writes blocked.json under --latch-dir -- by default the PARENT of
+--out-dir, so every work list this host crawls under one results directory
+shares ONE latch, because a refusal is per address, not per work list --
+after which a restart is refused until the cool-down (24 h) has passed.
+--max-requests ends a run cleanly with exit 83 ("resume"), which is how a
+timer runs daily tranches.
 
 Exit codes: 0 pass complete; 83 incomplete, re-run to resume (cap reached, or
 rows still failing); 86 refused by the endpoint, or a latch in force; 2 bad
-arguments.
+arguments, including a work-list file that is missing or not a work list.
 
 Usage:
     python scripts/harvest_gsv_history.py --worklist W.worklist.csv.gz --pass 1 --out-dir results/
@@ -48,6 +52,7 @@ from streetscape_metadata_tracker.download_gsv_history import (  # noqa: E402
     HarvestBlockedError,
     HarvestIncompleteError,
     clear_latch,
+    default_latch_dir,
     harvest_worklist_async,
     latch_active,
     load_worklist,
@@ -75,7 +80,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="stop cleanly after N requests (exit 83)",
     )
-    p.add_argument("--breaker-limit", type=positive_int, default=DEFAULT_BREAKER_LIMIT)
+    p.add_argument(
+        "--breaker-limit",
+        type=positive_int,
+        default=DEFAULT_BREAKER_LIMIT,
+        help="consecutive failed requests that end the run and write the latch",
+    )
+    p.add_argument(
+        "--latch-dir",
+        default=None,
+        help="where blocked.json lives (default: the parent of --out-dir, one latch per host)",
+    )
     p.add_argument("--cooldown-hours", type=float, default=DEFAULT_COOLDOWN_HOURS)
     p.add_argument("--clear-latch", action="store_true", help="remove a latch before starting")
     p.add_argument("--dry-run", action="store_true", help="report what would be queried and exit")
@@ -97,9 +112,10 @@ def main(argv=None) -> int:
         print("--rate-per-minute must be positive", file=sys.stderr)
         return 2
     os.makedirs(args.out_dir, exist_ok=True)
-    if args.clear_latch and clear_latch(args.out_dir):
+    latch_dir = args.latch_dir or default_latch_dir(args.out_dir)
+    if args.clear_latch and clear_latch(latch_dir):
         print("latch cleared")
-    latch = latch_active(args.out_dir)
+    latch = latch_active(latch_dir)
     if latch is not None:
         print(
             f"REFUSED: a block latch is in force ({latch.get('reason')}); "
@@ -109,7 +125,14 @@ def main(argv=None) -> int:
         )
         return HISTORY_BLOCKED_EXIT_CODE
 
-    worklist = load_worklist(args.worklist)
+    if not os.path.isfile(args.worklist):
+        print(f"{args.worklist}: no such work-list file", file=sys.stderr)
+        return 2
+    try:
+        worklist = load_worklist(args.worklist)
+    except ValueError as exc:
+        print(f"{exc}", file=sys.stderr)
+        return 2
     stem = worklist_stem(args.worklist)
     rows = int((worklist["pass"] == args.pass_no).sum())
     done = len(read_done_keys(output_paths(args.out_dir, stem, args.pass_no)["queries"]))
@@ -133,6 +156,7 @@ def main(argv=None) -> int:
                 max_requests=args.max_requests,
                 breaker_limit=args.breaker_limit,
                 cooldown_hours=args.cooldown_hours,
+                latch_dir=latch_dir,
             )
         )
     except HarvestBlockedError as e:
