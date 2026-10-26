@@ -32,6 +32,7 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from streetscape_metadata_tracker.download_gsv_history import (  # noqa: E402
+    load_queries_ledger,
     load_sample_history,
     load_worklist,
 )
@@ -142,14 +143,11 @@ def summarize_edges(h1: pd.DataFrame, h2: pd.DataFrame) -> dict:
     }
 
 
-def _read(path):
-    return pd.read_csv(path, dtype={"pano_id": str, "edge_id": str, "anchor_pano_id": str})
-
-
 def _read_history(history_path, queries_path):
-    # Through the crawl's own reader: one answer per key (a crash between the
+    # Through the crawl's own readers: one answer per key (a crash between the
     # history and ledger appends duplicates rows on disk), and only keys the
-    # ledger holds as done -- never pd.read_csv on the file.
+    # ledger holds as done; the ledger itself is every request, complete
+    # members only -- never pd.read_csv on either file.
     return load_sample_history(history_path, queries_path)
 
 
@@ -169,7 +167,7 @@ def analyze(results_dir: str, worklist_path: str, spot_check_path: str | None) -
         h = glob.glob(os.path.join(results_dir, f"{stem}.pass{pass_no}.history.csv.gz"))
         if not q:
             continue
-        queries = _read(q[0])
+        queries = load_queries_ledger(q[0])
         history = (
             _read_history(h[0], q[0])
             if h

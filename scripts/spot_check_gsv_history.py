@@ -10,7 +10,9 @@ It is the pilot's second check, and the one that keys a Google project, so
 it runs from a host that holds the streets key (makelab2), never from the
 crawler host, which holds no credential on purpose.
 
-Reads one `<stem>.pass<N>.history.csv.gz`, samples `--limit` distinct
+Reads one `<stem>.pass<N>.history.csv.gz` through the crawl's own reader
+(`load_sample_history`: complete gzip members only, one answer per key, and
+only keys the ledger beside it holds as done), samples `--limit` distinct
 official pano ids (third-party ones only with --include-third-party), asks
 the metadata API for each at `--rate-per-minute`, and writes a metrics JSON:
 how many agree on the month, disagree (with examples), echo a different
@@ -56,6 +58,7 @@ from streetscape_metadata_tracker.download_common import (  # noqa: E402
     positive_int,
     redact_credentials,
 )
+from streetscape_metadata_tracker.download_gsv_history import load_sample_history  # noqa: E402
 
 METADATA_URL = "https://maps.googleapis.com/maps/api/streetview/metadata"
 PROVIDER = "gsv_streets"
@@ -186,9 +189,27 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def load_history(history_path: str) -> pd.DataFrame:
+    """
+    The history file as the crawl meant it, never ``pd.read_csv`` on the file.
+
+    A crash between the history append and the ledger append duplicates a
+    key's rows on disk, and a copy taken mid-write ends in a cut member that
+    ``pd.read_csv`` raises on; ``load_sample_history`` applies the crawl's
+    rules instead. The queries ledger beside the history file (same stem) is
+    read when present, so rows no ledger row stands for are left out.
+    """
+    queries_path = history_path.replace(".history.csv.gz", ".queries.csv.gz")
+    if queries_path == history_path or not os.path.exists(queries_path):
+        queries_path = None
+    history = load_sample_history(history_path, queries_path)
+    history["capture_date"] = history["capture_date"].astype(str)
+    return history
+
+
 def main(argv=None, fetch: Fetch | None = None) -> int:
     args = build_parser().parse_args(argv)
-    history = pd.read_csv(args.history, dtype={"pano_id": str, "capture_date": str})
+    history = load_history(args.history)
     sample = sample_ids(
         history, args.limit, args.seed, include_third_party=args.include_third_party
     )

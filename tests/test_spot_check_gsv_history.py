@@ -14,6 +14,7 @@ import pytest
 
 from scripts.spot_check_gsv_history import main, sample_ids, spot_check
 from streetscape_metadata_tracker import db
+from streetscape_metadata_tracker.download_gsv_history import QUERY_COLUMNS
 
 
 def _history(tmp_path):
@@ -27,12 +28,13 @@ def _history(tmp_path):
                 "capture_date": f"20{10 + i % 10}-0{1 + i % 9}-01",
                 "third_party": False,
                 "is_current": i % 5 == 0,
+                "harvested_at": "2026-10-17T17:00:00+00:00",
             }
         )
     rows.append(rows[0] | {"edge_id": "dup"})  # the same pano seen from a second sample
     rows.append(
         {"edge_id": "e9", "sample_idx": 0, "pano_id": "CIHM0ogUSER", "capture_date": "2019-11-01",
-         "third_party": True, "is_current": False}
+         "third_party": True, "is_current": False, "harvested_at": "2026-10-17T17:00:00+00:00"}
     )  # fmt: skip
     path = tmp_path / "x.pass1.history.csv.gz"
     with gzip.open(path, "wt", encoding="utf-8") as f:
@@ -116,6 +118,39 @@ def test_main_writes_metrics_records_spend_and_dry_runs_without_fetching(tmp_pat
         "SELECT SUM(requests) FROM api_usage WHERE provider = 'gsv_streets'"
     ).fetchone()[0]
     assert total == 4
+
+
+def test_the_history_is_read_as_the_crawl_meant_it_never_with_read_csv(tmp_path, capsys):
+    # A crash between the history append and the ledger append leaves a key's
+    # rows twice on disk, and a copy taken mid-write ends in a cut gzip member
+    # that pd.read_csv raises on (EOFError). The spot check reads through
+    # `load_sample_history`: one answer per key, complete members only, and
+    # only keys the ledger beside the file holds as done.
+    path = _history(tmp_path)
+    rows = pd.read_csv(path)
+    again = rows[rows["edge_id"] == "e0"].assign(harvested_at="2026-10-17T18:00:00+00:00")
+    with gzip.open(path, "ab") as f:  # a second member: the resume's copy of e0's rows
+        f.write(again.to_csv(index=False, header=False).encode())
+    with open(path, "ab") as f:  # and a cut final member
+        f.write(gzip.compress(b"e1,0,pNEW,2001-01-01,False,False,2026-10-17T19:00:00+00:00\n")[:-9])
+    assert main(["--history", str(path), "--out", str(tmp_path / "o.json"), "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert (
+        "from 32 history rows" in out
+    )  # 30 + dup + the user pano; e0's second copy replaces its first
+    # With the ledger beside it, a key the ledger does not hold as done is left out.
+    ledger = path.parent / "x.pass1.queries.csv.gz"
+    header = ",".join(QUERY_COLUMNS)
+    done = "\n".join(
+        f"{k},0,200,0,2,2,0,True,c,US,,,,2026-10-17T17:00:00+00:00,"
+        for k in ("e0", "e1", "e2", "e3", "dup")
+    )
+    with gzip.open(ledger, "wt", encoding="utf-8") as f:
+        f.write(header + "\n" + done + "\n")
+    assert main(["--history", str(path), "--out", str(tmp_path / "o.json"), "--dry-run"]) == 0
+    assert (
+        "from 25 history rows" in capsys.readouterr().out
+    )  # e4's 6 rows and e9's user pano dropped
 
 
 def _catalog_with_a_walk(db_path):

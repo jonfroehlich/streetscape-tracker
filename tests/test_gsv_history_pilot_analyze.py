@@ -1,5 +1,6 @@
 """Pins for scripts/gsv_history_pilot_analyze.py (#442): offline, synthetic crawl files."""
 
+import gzip
 import json
 import os
 
@@ -157,6 +158,22 @@ def test_duplicated_and_stranded_history_rows_and_unanswered_queries_are_not_cou
     assert p1["history_rows"] == 4 and p1["distinct_official_panos"] == 4
     assert p1["capture_year_histogram"] == {"2011": 1, "2014": 1, "2015": 1, "2019": 1}
     assert p1["zero_history_samples"] == 0  # the unanswered row's 0 is not a zero-history answer
+
+
+def test_a_ledger_copied_mid_write_reads_to_the_cut(tmp_path):
+    # The analyzer runs on the crawler host while the crawl may be writing:
+    # a cut final member on the ledger is read to the cut, as every other
+    # reader of the crawl's files does, never raised on by pd.read_csv.
+    wl = _worklist(tmp_path)
+    results = tmp_path / "r"
+    results.mkdir()
+    _write(results, 1, [_query("e0", 1, 2, True, 0), _query("e1", 1, 1, True, 2)],
+           [_hist("e0", 1, "a", 2011), _hist("e1", 1, "c", 2014)])  # fmt: skip
+    ledger = output_paths(str(results), STEM, 1)["queries"]
+    with open(ledger, "ab") as f:
+        f.write(gzip.compress(b"e2,1,200,0,2,2,0,True,c,US,,,,2026-10-17T17:09:00+00:00,\n")[:-9])
+    p1 = analyze(str(results), wl, None)["passes"]["1"]
+    assert p1["requests_answered"] == 2
 
 
 def test_the_spot_checks_per_year_split_is_carried(tmp_path):
