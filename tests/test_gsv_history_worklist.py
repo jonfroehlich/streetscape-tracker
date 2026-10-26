@@ -20,6 +20,7 @@ from shapely.geometry import LineString
 
 from scripts.build_gsv_history_worklist import main as build_main
 from streetscape_metadata_tracker import db
+from streetscape_metadata_tracker.analysis import OUT_OF_RADIUS
 from streetscape_metadata_tracker.download_gsv_history import WORKLIST_COLUMNS, load_worklist
 from streetscape_metadata_tracker.naming import network_cache_path
 from streetscape_street_analyzer import download_street_network as dsn
@@ -44,7 +45,11 @@ def _edges(ids=EDGES):
     )
 
 
-def _collected(samples, *, skip=(), third_party=(), empty=(), undated=()):
+# ~30 m north: beyond the walk's 25 m match_dist_m, inside the grid's 50 m.
+FAR_DEG = 0.00027
+
+
+def _collected(samples, *, skip=(), third_party=(), empty=(), undated=(), far=()):
     """A walk CSV frame for the samples: Google OK by default, per-key overrides."""
     rows = []
     for s in samples.itertuples(index=False):
@@ -55,7 +60,7 @@ def _collected(samples, *, skip=(), third_party=(), empty=(), undated=()):
             "query_lat": s.lat,
             "query_lon": s.lon,
             "query_timestamp": "2026-05-01T00:00:00+00:00",
-            "pano_lat": s.lat,
+            "pano_lat": s.lat + (FAR_DEG if key in far else 0.0),
             "pano_lon": s.lon,
             "pano_id": f"p-{s.edge_id}-{s.sample_idx}",
             "capture_date": pd.Timestamp("2023-06-01"),
@@ -130,6 +135,28 @@ def test_anchors_come_from_the_quantized_coordinate_join():
     assert stats["unmatched_samples"] == 1
     assert stats["anchored"] == len(wl) - 3
     assert stats["anchored_share"] == round((len(wl) - 3) / len(wl), 4)
+
+
+def test_a_present_pano_beyond_the_walks_match_distance_is_not_an_anchor():
+    # The walk scores a sample covered only when its pano lies within
+    # match_dist_m (25 m by default); a pano the walk would reject as too far
+    # is not an anchor either, and the row says so with the grid's word for
+    # it. The rule is the WALK's, so at a wider match_dist_m it anchors.
+    edges = _edges()
+    samples = generate_samples(edges, SPACING)
+    coll = _collected(samples, far={("1_2", 2)}, empty={("1_2", 5)})
+    wl, stats = _build(edges, coll)
+    w = wl.set_index(["edge_id", "sample_idx"])
+    assert pd.isna(w.loc[("1_2", 2), "anchor_pano_id"])
+    assert pd.isna(w.loc[("1_2", 2), "anchor_capture_date"])
+    assert w.loc[("1_2", 2), "anchor_status"] == OUT_OF_RADIUS
+    assert w.loc[("1_2", 2), "anchor_copyright"] == GOOGLE  # recorded, as the walk said it
+    assert w.loc[("1_2", 1), "anchor_pano_id"] == "p-1_2-1"  # at 0 m: an anchor
+    assert w.loc[("1_2", 5), "anchor_status"] == "ZERO_RESULTS"  # absent is not far
+    assert stats["anchors_out_of_radius"] == 1 and stats["anchored"] == len(wl) - 2
+    wide, stats_wide = _build(edges, coll, match_dist_m=50.0)
+    assert wide.set_index(["edge_id", "sample_idx"]).loc[("1_2", 2), "anchor_pano_id"] == "p-1_2-2"
+    assert stats_wide["anchors_out_of_radius"] == 0
 
 
 def test_coincident_samples_collapse_to_the_first_edge_and_are_counted():
@@ -229,6 +256,7 @@ def test_script_writes_the_worklist_and_sidecar(catalog, data_dir, tmp_path, cap
     assert wl["anchor_pano_id"].notna().all()
     side = json.load(open(out / "bend_walk.worklist.json"))
     assert side["walk_run_date"] == "2026-05-01" and side["spacing_m"] == SPACING
+    assert side["match_dist_m"] == 25.0 and side["anchors_out_of_radius"] == 0
     assert side["samples"] == n_samples and side["anchored"] == n_samples
     assert "1 of 1 work lists written" in capsys.readouterr().out
 
@@ -240,6 +268,72 @@ def test_script_limit_and_all(catalog, data_dir, tmp_path):
     wl = load_worklist(str(out / "bend_walk.worklist.csv.gz"))
     assert wl["edge_id"].nunique() == 1
     assert json.load(open(out / "bend_walk.worklist.json"))["limit"] == 1
+
+
+def _refreeze(graphml, nodes, edges_spec):
+    g = nx.MultiDiGraph(crs="EPSG:4326")
+    for n, (x, y) in nodes.items():
+        g.add_node(n, x=x, y=y)
+    for u, v, osmid in edges_spec:
+        g.add_edge(u, v, 0, osmid=osmid, highway="residential", length=100.0)
+    ox.save_graphml(g, graphml)
+
+
+def test_script_refuses_a_network_refreshed_since_the_walk(
+    catalog, conn, data_dir, tmp_path, capsys
+):
+    # street_networks is UNIQUE per (city, network type), so a later --refresh
+    # overwrites the GraphML; samples re-derived from it carry keys the walk
+    # never had. The same three checks recompute_streetwalk_stats makes.
+    city_id, graphml, n_samples = catalog
+    out = tmp_path / "w"
+    # (1) A node moved about a metre: the regenerated samples match no
+    # collected location within the tolerance.
+    _refreeze(
+        graphml,
+        {1: (-121.30, 44.05), 2: (-121.30, 44.052), 3: (-121.30, 44.05251)},
+        [(1, 2, 10), (2, 3, 11)],
+    )
+    assert build_main(["--city", city_id, "--data-dir", data_dir, "--out-dir", str(out)]) == 1
+    err = capsys.readouterr().err
+    assert "was not collected on the frozen drive network" in err and "sample key mismatch" in err
+    assert not out.exists()
+    # (2) Renumbered nodes over IDENTICAL geometry: the samples match, the
+    # edge ids do not -- caught only against the coverage artifact.
+    _refreeze(
+        graphml,
+        {10: (-121.30, 44.05), 20: (-121.30, 44.052), 30: (-121.30, 44.0525)},
+        [(10, 20, 10), (20, 30, 11)],
+    )
+    artifact = "bend_walk_coverage.geojson.gz"
+    with gzip.open(os.path.join(data_dir, artifact), "wt", encoding="utf-8") as f:
+        json.dump(
+            {"type": "FeatureCollection", "features": [{"properties": {"edge_id": e}} for e in ("1_2", "2_3")]},
+            f,
+        )  # fmt: skip
+    conn.execute("UPDATE street_walks SET coverage_filename = ?", (artifact,))
+    conn.commit()
+    assert build_main(["--city", city_id, "--data-dir", data_dir, "--out-dir", str(out)]) == 1
+    assert "edge id mismatch" in capsys.readouterr().err and not out.exists()
+    # Without the artifact nothing can see the renumbering; the original
+    # network (the walk's) builds, as a control that the checks are what refused.
+    conn.execute("UPDATE street_walks SET coverage_filename = NULL")
+    conn.commit()
+    _refreeze(
+        graphml,
+        {1: (-121.30, 44.05), 2: (-121.30, 44.052), 3: (-121.30, 44.0525)},
+        [(1, 2, 10), (2, 3, 11)],
+    )
+    assert build_main(["--city", city_id, "--data-dir", data_dir, "--out-dir", str(out)]) == 0
+    assert len(load_worklist(str(out / "bend_walk.worklist.csv.gz"))) == n_samples
+    # (3) The walk's recorded sample count disagrees with what the network yields.
+    conn.execute("UPDATE street_walks SET sample_points = ?", (n_samples + 1,))
+    conn.commit()
+    assert (
+        build_main(["--city", city_id, "--data-dir", data_dir, "--out-dir", str(tmp_path / "x")])
+        == 1
+    )
+    assert "the walk recorded 20: the network was refreshed" in capsys.readouterr().err
 
 
 def test_script_refuses_a_missing_graphml_rather_than_fetching(catalog, data_dir, tmp_path, capsys):
