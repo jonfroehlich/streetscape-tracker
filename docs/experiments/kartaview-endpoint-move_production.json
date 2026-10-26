@@ -3,8 +3,9 @@
   "experiment": "kartaview-endpoint-move",
   "writeup": "docs/experiments/kartaview-endpoint-move.md",
   "generated_by": "hand-recorded operator readings; no committed script produces them, so each block names the read-only command that read it on makelab2",
-  "read_at_utc": "2026-10-26T10:30:00+00:00",
-  "host": "makelab2 (the catalog host), catalog opened mode=ro"
+  "read_at_utc": "2026-10-26T12:59:28+00:00",
+  "host": "makelab2 (the catalog host), catalog opened mode=ro",
+  "note": "Re-read in full with the commands as recorded on 2026-10-26 12:59 UTC; the figures matched the earlier reads."
  },
  "attempts_by_night": {
   "command": "for d in 2026-10-15 2026-10-16 2026-10-17 2026-10-18 2026-10-19 2026-10-20 2026-10-21 2026-10-22 2026-10-23; do for ch in kartaview kartaview_streets; do ls logs/collect_*_${ch}_${d}.log | wc -l; done; grep -l 'HTTP 404, text/plain' logs/collect_*_kartaview*_${d}.log | wc -l; done",

@@ -55,7 +55,7 @@ That is worse than the honest 404s, and it is why the pause is the right state u
   The collector already refuses a whole ladder of 404s by name ("this is the endpoint, not the city's geometry"), but that exit is 1, a counted failure: it stamps `consecutive_failures`, and because the city was attempted it takes a city-cap slot, which is how 10-23 spent the cap in 1.6 h and walked every pair toward quarantine.
   The Panoramax lattice refusal (#407) is the same shape and counts the same way.
   What stops both is an amnestied exit family that latches the channel for the night, so the remaining KartaView launches are skipped and a KartaView-only city takes no slot.
-  The #444 throttle (87) is the one-night shape; a blocked host (75/81) also writes a `host_refusals` row and arms the 36 h cooldown, and the fix should pick between the two on purpose.
+  The #444 throttle (87) is the one-night shape; a blocked host (75/81) also writes a `host_refusals` row, which arms a refusal cooldown only where `[hosts.<host>].refusal_cooldown_h` is set (today only the Mapillary tile CDN, 36 h), and the fix should pick between the two on purpose.
 - A decision on pacing given point 2; 960/h has nothing observable behind it now.
 
 ## Replicate
