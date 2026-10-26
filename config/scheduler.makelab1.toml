@@ -612,8 +612,16 @@ jitter = 0.6
 # 100 req/h, which is not a slower channel, it is no channel.
 #
 # See config/scheduler.toml for the full field docs.
+# PAUSED 2026-10-23: kartaview.org stopped routing /1.0/list/nearby-photos/
+# (HTTP 404 text/plain) somewhere between the 10-15 and 10-22 nights; every
+# KartaView attempt on 10-22 and 10-23 failed, and the second night's fast
+# failures filled the 80-city cap in 1.6 h. The api. hosts still answer, but there
+# totalFilteredItems reads 0, so pointing NEARBY_PHOTOS_URL at them alone would
+# read one page per circle and publish a truncated census. Membership is kept;
+# flip back to true only with the collector fix. Record:
+# docs/experiments/kartaview-endpoint-move.md.
 [providers.kartaview]
-enabled = true
+enabled = false
 daily_request_budget = 10000
 max_requests_per_minute = 16
 
@@ -642,8 +650,16 @@ max_requests_per_minute = 16
 # current concurrency ceiling — re-derived there rather than restated here,
 # since the figure is a property of the host graph and moves when a channel is
 # added.
+# PAUSED 2026-10-23: kartaview.org stopped routing /1.0/list/nearby-photos/
+# (HTTP 404 text/plain) somewhere between the 10-15 and 10-22 nights; every
+# KartaView attempt on 10-22 and 10-23 failed, and the second night's fast
+# failures filled the 80-city cap in 1.6 h. The api. hosts still answer, but there
+# totalFilteredItems reads 0, so pointing NEARBY_PHOTOS_URL at them alone would
+# read one page per circle and publish a truncated census. Membership is kept;
+# flip back to true only with the collector fix. Record:
+# docs/experiments/kartaview-endpoint-move.md.
 [providers.kartaview_streets]
-enabled = true
+enabled = false
 daily_request_budget = 10000
 max_requests_per_minute = 16
 spacing_m = 15

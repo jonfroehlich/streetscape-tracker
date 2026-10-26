@@ -1079,16 +1079,22 @@ def test_makelab1_production_config_is_wired():
     # under test, jittered request gaps — rate and daily volume were both
     # falsified as the trigger, request regularity never was. Pinned so the
     # restart cannot silently ship at the old metronomic 60/min.
+    #
+    # Both KartaView channels were PAUSED 2026-10-23: kartaview.org stopped
+    # routing the nearby-photos endpoint, and the api. hosts that still answer
+    # report totalFilteredItems as 0, which would truncate every circle to one
+    # page (docs/experiments/kartaview-endpoint-move.md). Pinned off so they
+    # come back only with the collector fix, never by a config edit alone.
     assert cfg.enabled_providers() == [
         "gsv",
         "gsv_streets",
         "mapillary",
         "mapillary_streets",
-        "kartaview",
-        "kartaview_streets",
         "panoramax",
         "panoramax_streets",
     ]
+    for channel in ("kartaview", "kartaview_streets"):
+        assert not cfg.providers[channel].enabled, f"{channel} paused 2026-10-23"
     for channel in ("mapillary", "mapillary_streets"):
         pc = cfg.providers[channel]
         assert pc.enabled, f"{channel} resumed under #292"

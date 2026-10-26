@@ -1,0 +1,254 @@
+{
+ "_about": {
+  "experiment": "kartaview-endpoint-move",
+  "writeup": "docs/experiments/kartaview-endpoint-move.md",
+  "generated_by": "scripts/kartaview_endpoint_probe.py --docs-dir docs/experiments",
+  "probed_at_utc": "2026-10-22T14:14:16.476253+00:00",
+  "complete": true,
+  "rate_limit_used_per_hour": 100,
+  "note": "Token values are never recorded, only their kind."
+ },
+ "summary": {
+  "current_host_status": 404,
+  "answering_cases": 7,
+  "distinct_answers_among_answering_cases": 1,
+  "invalid_token_rejected": false,
+  "rate_limit_headers_seen": [],
+  "page_totals_reported": [
+   0,
+   0,
+   0
+  ],
+  "distinct_ids_served_pages_1_2_7": 400,
+  "total_counts_the_circle": false
+ },
+ "host_cases": [
+  {
+   "case": "current host, real token",
+   "url": "https://kartaview.org/1.0/list/nearby-photos/",
+   "token": "real",
+   "radius_m": 500,
+   "page": 1,
+   "ipp": 50,
+   "seconds": 0.9,
+   "http_status": 404,
+   "content_type": "text/plain; charset=utf-8",
+   "rate_limit_headers": [],
+   "body_head": "404 page not found\n"
+  },
+  {
+   "case": "api.kartaview, no token",
+   "url": "https://api.kartaview.org/1.0/list/nearby-photos/",
+   "token": "none",
+   "radius_m": 500,
+   "page": 1,
+   "ipp": 50,
+   "seconds": 1.2,
+   "http_status": 200,
+   "content_type": "application/json",
+   "rate_limit_headers": [],
+   "api_code": 600,
+   "total_raw": [
+    "0"
+   ],
+   "total": 0,
+   "items": 50,
+   "ids_digest": "9e14542ff215"
+  },
+  {
+   "case": "api.kartaview, real token",
+   "url": "https://api.kartaview.org/1.0/list/nearby-photos/",
+   "token": "real",
+   "radius_m": 500,
+   "page": 1,
+   "ipp": 50,
+   "seconds": 0.4,
+   "http_status": 200,
+   "content_type": "application/json",
+   "rate_limit_headers": [],
+   "api_code": 600,
+   "total_raw": [
+    "0"
+   ],
+   "total": 0,
+   "items": 50,
+   "ids_digest": "9e14542ff215"
+  },
+  {
+   "case": "api.kartaview, bogus token",
+   "url": "https://api.kartaview.org/1.0/list/nearby-photos/",
+   "token": "bogus",
+   "radius_m": 500,
+   "page": 1,
+   "ipp": 50,
+   "seconds": 0.4,
+   "http_status": 200,
+   "content_type": "application/json",
+   "rate_limit_headers": [],
+   "api_code": 600,
+   "total_raw": [
+    "0"
+   ],
+   "total": 0,
+   "items": 50,
+   "ids_digest": "9e14542ff215"
+  },
+  {
+   "case": "api.kartaview, garbage token",
+   "url": "https://api.kartaview.org/1.0/list/nearby-photos/",
+   "token": "garbage",
+   "radius_m": 500,
+   "page": 1,
+   "ipp": 50,
+   "seconds": 0.4,
+   "http_status": 200,
+   "content_type": "application/json",
+   "rate_limit_headers": [],
+   "api_code": 600,
+   "total_raw": [
+    "0"
+   ],
+   "total": 0,
+   "items": 50,
+   "ids_digest": "9e14542ff215"
+  },
+  {
+   "case": "api.openstreetcam, no token",
+   "url": "https://api.openstreetcam.org/1.0/list/nearby-photos/",
+   "token": "none",
+   "radius_m": 500,
+   "page": 1,
+   "ipp": 50,
+   "seconds": 1.2,
+   "http_status": 200,
+   "content_type": "application/json",
+   "rate_limit_headers": [],
+   "api_code": 600,
+   "total_raw": [
+    "0"
+   ],
+   "total": 0,
+   "items": 50,
+   "ids_digest": "9e14542ff215"
+  },
+  {
+   "case": "api.openstreetcam, real token",
+   "url": "https://api.openstreetcam.org/1.0/list/nearby-photos/",
+   "token": "real",
+   "radius_m": 500,
+   "page": 1,
+   "ipp": 50,
+   "seconds": 0.4,
+   "http_status": 200,
+   "content_type": "application/json",
+   "rate_limit_headers": [],
+   "api_code": 600,
+   "total_raw": [
+    "0"
+   ],
+   "total": 0,
+   "items": 50,
+   "ids_digest": "9e14542ff215"
+  },
+  {
+   "case": "api.openstreetcam, bogus token",
+   "url": "https://api.openstreetcam.org/1.0/list/nearby-photos/",
+   "token": "bogus",
+   "radius_m": 500,
+   "page": 1,
+   "ipp": 50,
+   "seconds": 0.4,
+   "http_status": 200,
+   "content_type": "application/json",
+   "rate_limit_headers": [],
+   "api_code": 600,
+   "total_raw": [
+    "0"
+   ],
+   "total": 0,
+   "items": 50,
+   "ids_digest": "9e14542ff215"
+  }
+ ],
+ "page_cases": [
+  {
+   "case": "api.kartaview r=400 ipp=200 page 1",
+   "url": "https://api.kartaview.org/1.0/list/nearby-photos/",
+   "token": "real",
+   "radius_m": 400,
+   "page": 1,
+   "ipp": 200,
+   "seconds": 0.7,
+   "http_status": 200,
+   "content_type": "application/json",
+   "rate_limit_headers": [],
+   "api_code": 600,
+   "total_raw": [
+    "0"
+   ],
+   "total": 0,
+   "items": 200,
+   "ids_digest": "789b0ebed729",
+   "ids_already_seen": 0
+  },
+  {
+   "case": "api.kartaview r=400 ipp=200 page 2",
+   "url": "https://api.kartaview.org/1.0/list/nearby-photos/",
+   "token": "real",
+   "radius_m": 400,
+   "page": 2,
+   "ipp": 200,
+   "seconds": 0.7,
+   "http_status": 200,
+   "content_type": "application/json",
+   "rate_limit_headers": [],
+   "api_code": 600,
+   "total_raw": [
+    "0"
+   ],
+   "total": 0,
+   "items": 200,
+   "ids_digest": "fcd1fce56c2d",
+   "ids_already_seen": 0
+  },
+  {
+   "case": "api.kartaview r=400 ipp=200 page 7",
+   "url": "https://api.kartaview.org/1.0/list/nearby-photos/",
+   "token": "real",
+   "radius_m": 400,
+   "page": 7,
+   "ipp": 200,
+   "seconds": 0.2,
+   "http_status": 200,
+   "content_type": "application/json",
+   "rate_limit_headers": [],
+   "api_code": 600,
+   "total_raw": [
+    "0"
+   ],
+   "total": 0,
+   "items": 0,
+   "ids_digest": "e3b0c44298fc",
+   "ids_already_seen": 0
+  },
+  {
+   "case": "api.openstreetcam r=400 ipp=200 page 1",
+   "url": "https://api.openstreetcam.org/1.0/list/nearby-photos/",
+   "token": "real",
+   "radius_m": 400,
+   "page": 1,
+   "ipp": 200,
+   "seconds": 0.7,
+   "http_status": 200,
+   "content_type": "application/json",
+   "rate_limit_headers": [],
+   "api_code": 600,
+   "total_raw": [
+    "0"
+   ],
+   "total": 0,
+   "items": 200,
+   "ids_digest": "789b0ebed729"
+  }
+ ]
+}
