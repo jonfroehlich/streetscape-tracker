@@ -25,11 +25,13 @@ a new host, three questions have to be answered by measurement, not assumed:
 
 THE TOKEN IS NEVER RECORDED. Rows name the token's KIND (none, real, bogus,
 garbage); the bogus one is zeros of the real token's length, so a length check
-on the server cannot tell them apart.
+on the server cannot tell them apart. The token travels as a query parameter,
+and urllib3 logs full request URLs at DEBUG, so the ``urllib3`` logger is held
+at INFO whatever ``--log-level`` says.
 
-COST. 13 requests, paced at the ANONYMOUS 100/hour rather than the 1,000 a
+COST. 12 requests, paced at the ANONYMOUS 100/hour rather than the 1,000 a
 token is documented to buy -- question 2 is whether the token buys anything,
-so this probe does not spend on the assumption it is testing. About 8 minutes.
+so this probe does not spend on the assumption it is testing. About 7 minutes.
 Refuses to run on a makelab* host, as every KartaView probe here does.
 """
 
@@ -163,6 +165,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--log-level", default="INFO")
     args = p.parse_args(argv)
     logging.basicConfig(level=args.log_level, format="%(asctime)s %(levelname)s %(message)s")
+    # urllib3 logs the full request URL at DEBUG, access_token included.
+    logging.getLogger("urllib3").setLevel(
+        max(logging.INFO, logging.getLogger("urllib3").getEffectiveLevel())
+    )
 
     refuse_on_collection_host()
     load_dotenv()

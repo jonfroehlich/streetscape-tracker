@@ -986,20 +986,22 @@ systemctl --user list-timers --all | grep streetscape                          #
 
 The first chained pass is the next night's end; a tranche enabled the afternoon of the deploy needs the manual `--nights 1 --limit 40 --execute` pass.
 
-### Turning the KartaView channel on in production (#248)
+### Turning an opt-in channel on in production (KartaView, #248; the same shape for every opt-in channel since)
 
-The repo default `config/scheduler.toml` declares `[providers.kartaview]`; **production reads `config/scheduler.makelab1.toml`, which deliberately does not**, so deploying the code changes nothing.
-Flipping it is four steps, in this order, and the order matters — enrolment must precede the config block, or the first night after the flip runs the channel over an empty queue and tells you nothing:
+**Where KartaView stands:** `config/scheduler.makelab1.toml` has declared `[providers.kartaview]` since #248 and `[providers.kartaview_streets]` since #258, and both carry `enabled = false` since 2026-10-23 — the endpoint moved and the host that still answers reports no total, so a resume needs the collector fix in `../docs/experiments/kartaview-endpoint-move.md`, never a config flip alone.
+The 853 enrolments survive the pause and cost nothing while it stands.
+
+The first turn-on was four steps, in this order, and the order matters — enrolment must precede the config block, or the first night after the flip runs the channel over an empty queue and tells you nothing:
 
 1. **The token first.** `KARTAVIEW_ACCESS_TOKEN` into the production `.env`. It is required, not optional: anonymous is 100 req/h against 1,000 authenticated, at which a p95 city is hours and Singapore is days — see [`../docs/provider-access.md`](../docs/provider-access.md). Verify with a single hand-run `streetscape_tracker.py --provider kartaview` on one small city before anything is scheduled.
-2. **Enrol the seed cities**, with the channel still absent from the production config. `enroll-city` prints each city's estimate and says `NOTE ... not enabled in this config, so nothing collects it yet`, which is the expected output at this point.
-3. **Add the `[providers.kartaview]` block** to `config/scheduler.makelab1.toml`, copying the repo default's budget and rate. Read that block's comments first: `daily_request_budget` is a pre-flight gate against an *estimate* rather than the child's own ceiling, which since #273 is `min(budget − used, what the child's timeout can pace)` — and since #274 neither budget gate applies to a resumable channel at all, so a metro is capped and resumed rather than skipped permanently.
+2. **Enrol the seed cities**, with the channel still absent from (or disabled in) the production config. `enroll-city` prints each city's estimate and says `NOTE ... not enabled in this config, so nothing collects it yet`, which is the expected output at this point.
+3. **Add the `[providers.kartaview]` block** to `config/scheduler.makelab1.toml` (today: set its `enabled = false` to `true`), copying the repo default's budget and rate. Read that block's comments first: `daily_request_budget` is a pre-flight gate against an *estimate* rather than the child's own ceiling, which since #273 is `min(budget − used, what the child's timeout can pace)` — and since #274 neither budget gate applies to a resumable channel at all, so a metro is capped and resumed rather than skipped permanently.
 4. **Watch one night.** `hoisted=N opt-in-only cities` on the opening line says the reorder took, and the `N of M opt-in-only cities are inside tonight's C-city cap` line beside it says how much of the enrolled set a night actually reaches — `M` divided by the reservation is how many nights a full pass takes, so that is the number to read while widening rather than the enrolled count (#282).
    A `WARNING` that the hoisted count filled the city cap **no longer means the enrolled set is too wide** — since #282 a derived reservation cannot fill the cap. It means `[schedule].opt_in_cities_per_day` was set equal to `max_cities_per_day`, re-creating the unbounded hoist by hand, or that this was a degenerate `--limit 1` run; the fix is that key, not `enroll-city --remove`.
    Check `kartaview budget today` in `status` against what the sweep actually spent — the gap between them is #273 measured.
 
-**The revert is one line**: delete the `[providers.kartaview]` block from `config/scheduler.makelab1.toml` and redeploy.
-Enrolment rows survive that and cost nothing while the channel is unconfigured, so there is no need to un-enrol as part of a rollback.
+**The revert is one line per block**: `enabled = false` on `[providers.kartaview]` and `[providers.kartaview_streets]` in `config/scheduler.makelab1.toml` (that is the 2026-10-23 pause), pinned by `test_makelab1_production_config_is_wired` so a stray edit cannot resume them.
+Enrolment rows survive that and cost nothing while the channel is disabled, so there is no need to un-enrol as part of a rollback; `status` simply stops listing the channel.
 
 **Never deploy mid-batch.** The scheduler launches a fresh `streetscape_tracker.py` per city out of the deployed tree, so an rsync while `run-due` is in flight changes the code the *next* city runs — and a schema migration would be applied by a child while the parent is still executing the previously-loaded module. Check for a live batch first:
 

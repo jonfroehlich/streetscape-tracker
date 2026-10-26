@@ -1094,7 +1094,7 @@ def test_makelab1_production_config_is_wired():
         "panoramax_streets",
     ]
     for channel in ("kartaview", "kartaview_streets"):
-        assert not cfg.providers[channel].enabled, f"{channel} paused 2026-10-22"
+        assert not cfg.providers[channel].enabled, f"{channel} paused 2026-10-23"
     for channel in ("mapillary", "mapillary_streets"):
         pc = cfg.providers[channel]
         assert pc.enabled, f"{channel} resumed under #292"
