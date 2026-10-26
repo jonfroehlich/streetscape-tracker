@@ -10,7 +10,7 @@ The production facts are operator readings from makelab2's catalog and `logs/`, 
 ## What happened in production
 
 - The last successful KartaView sweep was on the 2026-10-15 night: 32 collection attempts, none carrying a 404.
-- No KartaView city was attempted on the nights of 10-16 to 10-21, so the change lies somewhere in that week and cannot be dated more closely.
+- No KartaView city was attempted on the nights of 10-16 to 10-21 (recorded as six zero nights in the production file), so the change lies somewhere in that week and cannot be dated more closely.
 - On the 2026-10-22 night all 124 KartaView attempts failed (62 cities × `kartaview` + `kartaview_streets`), and on the 2026-10-23 night all 136 (68 cities × 2).
   Each spent 6 requests: the calibration ladder from r=1000 to r=100, every rung answered `404 page not found` (text/plain), and the collector raised "gave no usable answer at any radius or any calibration point… this is the endpoint, not the city's geometry".
   That is the designed path for a 404: it is neither backpressure nor a host refusal, so it neither subdivided nor latched the night-level breaker.
@@ -54,7 +54,8 @@ That is worse than the honest 404s, and it is why the pause is the right state u
 - A night-level stop for a moved endpoint.
   The collector already refuses a whole ladder of 404s by name ("this is the endpoint, not the city's geometry"), but that exit is 1, a counted failure: it stamps `consecutive_failures`, and because the city was attempted it takes a city-cap slot, which is how 10-23 spent the cap in 1.6 h and walked every pair toward quarantine.
   The Panoramax lattice refusal (#407) is the same shape and counts the same way.
-  What stops both is an amnestied exit family that latches the channel for the night, as a blocked host (75/81) or the #444 throttle (87) does, so the remaining KartaView launches are skipped and a KartaView-only city takes no slot.
+  What stops both is an amnestied exit family that latches the channel for the night, so the remaining KartaView launches are skipped and a KartaView-only city takes no slot.
+  The #444 throttle (87) is the one-night shape; a blocked host (75/81) also writes a `host_refusals` row and arms the 36 h cooldown, and the fix should pick between the two on purpose.
 - A decision on pacing given point 2; 960/h has nothing observable behind it now.
 
 ## Replicate

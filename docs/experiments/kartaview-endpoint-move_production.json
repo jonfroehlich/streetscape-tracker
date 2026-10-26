@@ -7,10 +7,41 @@
   "host": "makelab2 (the catalog host), catalog opened mode=ro"
  },
  "attempts_by_night": {
-  "command": "for d in 2026-10-15 2026-10-22 2026-10-23; do for ch in kartaview kartaview_streets; do ls logs/collect_*_${ch}_${d}.log | wc -l; done; grep -l 404 logs/collect_*_kartaview*_${d}.log | wc -l; done",
+  "command": "for d in 2026-10-15 2026-10-16 2026-10-17 2026-10-18 2026-10-19 2026-10-20 2026-10-21 2026-10-22 2026-10-23; do for ch in kartaview kartaview_streets; do ls logs/collect_*_${ch}_${d}.log | wc -l; done; grep -l 'HTTP 404, text/plain' logs/collect_*_kartaview*_${d}.log | wc -l; done",
+  "note": "One child log per (city, channel, night), opened in append mode, so a same-night retry lands in the same file; the night summaries corroborate the counts (189 - 65 = 124 and 157 - 21 = 136 failed runs). files_with_404 counts logs carrying the collector's 'non-JSON body (HTTP 404, text/plain; charset=utf-8)' line.",
   "2026-10-15": {
    "kartaview": 16,
    "kartaview_streets": 16,
+   "files_with_404": 0
+  },
+  "2026-10-16": {
+   "kartaview": 0,
+   "kartaview_streets": 0,
+   "files_with_404": 0
+  },
+  "2026-10-17": {
+   "kartaview": 0,
+   "kartaview_streets": 0,
+   "files_with_404": 0
+  },
+  "2026-10-18": {
+   "kartaview": 0,
+   "kartaview_streets": 0,
+   "files_with_404": 0
+  },
+  "2026-10-19": {
+   "kartaview": 0,
+   "kartaview_streets": 0,
+   "files_with_404": 0
+  },
+  "2026-10-20": {
+   "kartaview": 0,
+   "kartaview_streets": 0,
+   "files_with_404": 0
+  },
+  "2026-10-21": {
+   "kartaview": 0,
+   "kartaview_streets": 0,
    "files_with_404": 0
   },
   "2026-10-22": {
@@ -22,8 +53,7 @@
    "kartaview": 68,
    "kartaview_streets": 68,
    "files_with_404": 136
-  },
-  "note": "One child log per (city, channel, night), so a file is one attempt; files_with_404 is the grep count. The night summaries corroborate: 189 - 65 = 124 and 157 - 21 = 136 failed runs."
+  }
  },
  "requests_ledgered": {
   "command": "sqlite3 'file:data/streetscape_tracker.db?mode=ro' \"select usage_date, provider, requests from api_usage where provider like 'kartaview%' and usage_date in ('2026-10-15','2026-10-22','2026-10-23')\"",
