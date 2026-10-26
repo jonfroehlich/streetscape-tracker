@@ -6,6 +6,8 @@ API is stubbed, so no key and no network.
 import gzip
 import json
 import os
+import sqlite3
+from datetime import date
 
 import pandas as pd
 import pytest
@@ -97,7 +99,7 @@ def test_main_writes_metrics_records_spend_and_dry_runs_without_fetching(tmp_pat
     )
     assert calls == [] and not out.exists()
     db_path = os.path.join(data_dir, "streetscape_tracker.db")
-    db.connect(db_path).close()
+    _catalog_with_a_walk(db_path)
     assert (
         main(
             ["--history", str(path), "--out", str(out), "--limit", "4", "--rate-per-minute", "0",
@@ -114,3 +116,64 @@ def test_main_writes_metrics_records_spend_and_dry_runs_without_fetching(tmp_pat
         "SELECT SUM(requests) FROM api_usage WHERE provider = 'gsv_streets'"
     ).fetchone()[0]
     assert total == 4
+
+
+def _catalog_with_a_walk(db_path):
+    """A real catalog that holds one walk (the read-only opener refuses an empty one)."""
+    conn = db.connect(db_path)
+    city_id = db.register_city(
+        conn,
+        city_name="Bend",
+        state_name="Oregon",
+        state_code="OR",
+        country_name="United States",
+        country_code="US",
+        center_lat=44.05,
+        center_lon=-121.31,
+        grid_width_m=40,
+        grid_height_m=40,
+        step_m=20,
+    )
+    db.register_street_walk(
+        conn, city_id=city_id, run_date=date(2026, 5, 1), csv_filename="bend_walk.csv.gz"
+    )
+    conn.commit()
+    conn.close()
+
+
+@pytest.mark.parametrize("version", [db.SCHEMA_VERSION - 1, db.SCHEMA_VERSION + 1])
+def test_a_catalog_at_another_schema_version_is_refused_before_any_request_and_never_migrated(
+    tmp_path, data_dir, version
+):
+    # The 2026-10-17 outage: this script's db.connect migrated the PROD
+    # catalog. The version check now runs before the first request, in
+    # either direction, and the file is untouched; at zero requests nothing
+    # is spent against a catalog the ledger could not reach.
+    path = _history(tmp_path)
+    db_path = os.path.join(data_dir, "streetscape_tracker.db")
+    _catalog_with_a_walk(db_path)
+    raw = sqlite3.connect(db_path)
+    raw.execute(f"PRAGMA user_version = {version}")
+    raw.commit()
+    raw.close()
+    before = open(db_path, "rb").read()
+    calls = []
+
+    def fetch(pano_id):
+        calls.append(pano_id)
+        return 200, {"status": "OK", "pano_id": pano_id, "date": "2000-01"}
+
+    out = tmp_path / "spot.json"
+    argv = ["--history", str(path), "--out", str(out), "--limit", "4", "--rate-per-minute", "0"]
+    assert main(argv + ["--db-path", db_path], fetch=fetch) == 2
+    assert main(argv + ["--db-path", db_path, "--dry-run"], fetch=fetch) == 2
+    assert calls == [] and not out.exists()
+    assert open(db_path, "rb").read() == before
+    raw = sqlite3.connect(db_path)
+    assert raw.execute("PRAGMA user_version").fetchone()[0] == version
+    raw.close()
+    assert not os.path.exists(db_path + "-wal") and not os.path.exists(db_path + "-shm")
+    # A missing catalog is refused the same way; nothing is created.
+    missing = os.path.join(data_dir, "nope.db")
+    assert main(argv + ["--db-path", missing], fetch=fetch) == 2
+    assert calls == [] and not os.path.exists(missing)

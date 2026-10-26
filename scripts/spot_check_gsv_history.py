@@ -17,6 +17,17 @@ how many agree on the month, disagree (with examples), echo a different
 pano id, or are unknown to the documented API (ZERO_RESULTS: a retired
 pano). Spend is recorded in the catalog ledger when --db-path is given.
 
+The catalog is opened BEFORE any request, through the orphan sweep's
+read-only opener, which refuses a schema mismatch in either direction and
+never creates or migrates a file -- db.connect runs init_schema, and on
+2026-10-17 a newer checkout's spot check migrated the PROD catalog that way
+and crashed the next nightly. The one write, the spend row, goes through the
+same validated connection with query_only lifted for it; so a refusal costs
+zero requests, and spend never reaches a catalog this code did not check.
+
+Spends by default (there is nothing to execute but the requests); --dry-run
+samples and reports without one.
+
 Usage:
     python scripts/spot_check_gsv_history.py --history results/X.pass1.history.csv.gz --limit 200 --out spot.json
     python scripts/spot_check_gsv_history.py --history ... --limit 200 --out spot.json --db-path data/streetscape_tracker.db
@@ -36,6 +47,10 @@ import requests
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from scripts.sweep_orphan_diff_details import (  # noqa: E402
+    CatalogRefused,
+    open_catalog_readonly,
+)
 from streetscape_metadata_tracker import config, db  # noqa: E402
 from streetscape_metadata_tracker.download_common import (  # noqa: E402
     positive_int,
@@ -136,6 +151,21 @@ def spot_check(
     }
 
 
+def open_ledger(db_path: str):
+    """
+    The catalog, validated and opened for the ONE write this script makes.
+
+    ``open_catalog_readonly`` is what checks it: the file must exist, be a
+    catalog at exactly this code's schema version, and hold runs or walks;
+    nothing is created or migrated. ``query_only`` is then lifted on that same
+    connection so ``db.add_api_usage`` can insert the spend row (an INSERT
+    into tables the version check proved exist).
+    """
+    conn = open_catalog_readonly(db_path)
+    conn.execute("PRAGMA query_only = OFF")
+    return conn
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -165,6 +195,15 @@ def main(argv=None, fetch: Fetch | None = None) -> int:
     print(
         f"{len(sample)} distinct pano ids sampled from {len(history)} history rows (seed {args.seed})"
     )
+    conn = None
+    if args.db_path:
+        # Before the first request: a catalog this code cannot write without
+        # migrating it is refused here, at a cost of zero requests.
+        try:
+            conn = open_ledger(args.db_path)
+        except CatalogRefused as exc:
+            print(exc, file=sys.stderr)
+            return 2
     if args.dry_run:
         return 0
     if fetch is None:
@@ -175,15 +214,15 @@ def main(argv=None, fetch: Fetch | None = None) -> int:
         load_dotenv(args.env_file or find_dotenv(usecwd=True))
         fetch = _requests_fetch(config.load_config(PROVIDER)["api_key"])
     metrics = spot_check(sample, fetch, rate_per_minute=args.rate_per_minute)
+    if conn is not None:
+        db.add_api_usage(conn, datetime.now(UTC).date(), metrics["requests"], PROVIDER)
+        conn.commit()
+        conn.close()
     metrics["history_file"] = os.path.basename(args.history)
     metrics["seed"] = args.seed
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
-    if args.db_path:
-        conn = db.connect(args.db_path)
-        db.add_api_usage(conn, datetime.now(UTC).date(), metrics["requests"], PROVIDER)
-        conn.commit()
     print(
         f"{metrics['requests']} requests: {metrics['month_match']} month match, "
         f"{metrics['month_mismatch']} mismatch, {metrics['pano_id_differs']} pano id differs, "
