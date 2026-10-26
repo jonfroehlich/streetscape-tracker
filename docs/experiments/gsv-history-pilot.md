@@ -14,7 +14,7 @@ The backfill will spend months of paced requests against an undocumented source,
 1. Does the parser still match the response shape?
 2. Do the harvested months agree with what the documented metadata request reports for the same pano ids?
 3. What comes back at a sample with **no** current official pano: old imagery where none is served now, or nothing?
-4. How much history do the non-midpoint samples add per street segment, i.e. is the backfill one query per edge (8.9 M) or one per sample (59 M)?
+4. How much history do the non-midpoint samples add per street segment, i.e. is the backfill one query per edge (8.9 M) or one per sample (78.1 M, every street-walk sample; 58.9 M is the number of distinct Google panos they reach)?
 
 ## Method
 
@@ -22,24 +22,26 @@ The backfill will spend months of paced requests against an undocumented source,
 - **What**: the latest Seattle GSV `drive` walk (2026-09-11), first 2,000 edges in sample order; `scripts/build_gsv_history_worklist.py --limit 2000`.
   Pass 1 is each edge's midpoint sample (2,000 rows), pass 2 the rest (21,728).
   99.2 % of the samples carry a current official pano (the *anchor*).
-- **How**: `scripts/harvest_gsv_history.py` at the stopping-rule defaults — one request in flight, 60/min mean with jitter 0.6, stop on the first 429/403 or 8 consecutive transport failures behind a 24 h latch.
+- **How**: `scripts/harvest_gsv_history.py` at the stopping-rule defaults — one request in flight, 60/min mean with jitter 0.6, stop on the first 429/403 or 8 consecutive failed requests behind a 24 h latch.
+  (The crawl as it ran counted failed rows, not requests, and recorded a 200 whose body was not an answer as "no images"; both were changed after the review of #446, and the committed numbers are unaffected because every one of the 23,728 requests was answered.)
 - **Check 2**: `scripts/spot_check_gsv_history.py`, 200 distinct official pano ids drawn with seed 442 from pass 1's history, each asked of the documented `pano=` metadata request on the streets key from makelab2, 300/min; spend recorded in the ledger.
 
 ## Finding 1: the route #2 shipped is turned down, and the raw store caught it
 
-The first 100 requests went to the JSONP-style URL the #2 harvester used (`maps/api/js/GeoPhotoService.SingleImageSearch?pb=…&callback=`).
+The pilot's first requests went to the JSONP-style URL the #2 harvester used (`maps/api/js/GeoPhotoService.SingleImageSearch?pb=…&callback=`).
 Every one answered **HTTP 200** with the body
 
 ```
 [[5,"generic","GeoPhotoService.SingleImageSearch is decommissioned and turned down."]]
 ```
 
-The parser found no panos, the queries ledger showed `panos_dated = 0` for all 100, and the raw file held the reason verbatim.
+The parser found no panos, the queries ledger showed `panos_dated = 0` for every one, and the raw file held the reason verbatim.
 That is the case the raw store exists for: a 200 with an empty parse is indistinguishable from "no imagery here" without the body.
-The run was stopped by hand after 100 requests, and those answers are kept beside the results as evidence.
+The run was stopped by hand, and that aborted run's ledger and raw store are kept beside the results on the crawler host, not in the committed metrics (which hold the RPC-route crawl only), so this section quotes no count from it.
+Since the review of #446 the crawler classifies such a body as *unanswered* — the key stays un-done, the reason goes in the ledger, and a run of them trips the breaker — rather than as an answer with no imagery.
 
 The route the Maps JavaScript API itself calls, `POST maps.googleapis.com/$rpc/google.internal.maps.mapsjs.v1.MapsJsInternalService/SingleImageSearch` with an `application/json+protobuf` body, answers.
-Six probes returned full histories (16, 8 and 5 captures back to 2011 at three anchored samples; one back to 2008).
+A handful of hand probes at anchored samples returned full histories reaching back to the late 2000s (the probes were not kept, so no figure from them is quoted; finding 2 is the measurement).
 The request body and response offsets follow [sk-zk/streetlevel](https://github.com/sk-zk/streetlevel) (MIT), the maintained client of that RPC; the crawler was switched to it and pass 1 restarted from zero.
 
 Two things about the new response shape changed the parser:
@@ -74,6 +76,8 @@ The 2010 and 2020 gaps are real absences in what Google serves, not parser holes
 **The 14.6 % of anchors absent from their own history** is the number to carry forward.
 The walk matched its anchor with the documented metadata request at the same point and radius; the RPC's own nearest pano differed at 290 samples, and the anchor was not among the related panos it listed.
 Whether those are the service choosing a different nearest pano for the same 50 m, or histories that genuinely omit a currently served pano, is answerable from the raw bodies (every one is kept) and is left to the pass-2 section.
+One confound is now known: this work list's anchors were taken before the builder applied the walk's own distance rule (a present pano farther than the walk's `match_dist_m`, 25 m, from its sample is not an anchor; added after the review of #446), so part of that share may be anchors the walk itself scores as too far.
+The committed number predates the rule and is not recomputed here — the work list would have to be rebuilt on the catalog host and the ledger's `anchor_in_history` re-derived from the raw bodies.
 
 ## Finding 3: the documented API agrees on every sampled month
 
@@ -87,8 +91,8 @@ Whether those are the service choosing a different nearest pano for the same 50 
 | A different pano id echoed | 0 |
 | Unknown to the documented API (`ZERO_RESULTS`) | 0 |
 
-Every year in the sample matched completely (2007: 13 of 13 … 2025: 25 of 25).
 So the undocumented list and the documented per-pano request describe the same captures, and a harvested month can be quoted with the documented API's confidence.
+(The spot check also splits the result by capture year; the analyzer carries that split into the metrics since the review of #446, but this pilot's committed JSON predates that and holds the totals only, so no per-year figure is quoted.)
 It also means none of the 200 historical panos has been retired from the documented API — the history the RPC lists is still individually addressable.
 
 ## Finding 4: samples with no current official pano still hold history
@@ -135,14 +139,15 @@ Whether two or three well-placed samples per edge close that gap is answerable f
 - **Switch routes and keep raw.** Done in [#446](https://github.com/jonfroehlich/streetscape-tracker/pull/446): the RPC route, `third_party` and `is_current` on every row, and `scripts/reparse_gsv_history_raw.py` so the parsed files are a view of the raw store that any later parser can regenerate for zero requests.
 - **The pace held.** 23,728 requests over 6.6 hours at a measured ~60/min with no non-200 answer; nothing here argues for raising it, and READ THIS FIRST argues against resolving that by experiment.
 - **Unanchored samples stay in the work lists** (finding 4).
-- **The query unit is not settled by this pilot.** The issue's pass-1-then-pass-2 plan still holds as a *sequence* — pass 1 everywhere yields a usable 76 %-of-months dataset early — but the issue's claim that pass 1 "yields segment-level history" is false as stated and is corrected there.
-  Before the backfill starts, measure from pass 2's data how month coverage grows with k evenly spaced samples per edge; that sets whether the catalog-wide cost is nearer 8.9 M (k = 1), a small multiple of it, or the 59 M of every sample.
+- **The query unit is every sample** (decided 2026-10-18, from this pilot): the midpoint alone sees three quarters of a street's capture months, so the backfill queries every street-walk sample — 78.1 M requests, about 2.5 years at 60/min on one address — as a *sequence*: pass 1 (edge midpoints) everywhere first, which yields the usable 76 %-of-months dataset early, then pass 2, with Project Sidewalk deployment cities first.
+  The issue's claim that pass 1 "yields segment-level history" is false as stated and is corrected there.
+  Measuring from pass 2's data how month coverage grows with k evenly spaced samples per edge remains worth doing — it would say how much of pass 2 can be deferred — but it no longer gates the start.
 
 ## Caveats
 
 - One city, 2,000 edges in sample order (so spatially clustered), one day. The capture-year shape and the 76 % month coverage are Seattle's, where streets have been driven ~11 times; a town driven twice will look different.
 - The spot check samples official ids only; third-party ids were not checked against the documented API.
-- Finding 1's 100 requests were spent before anything could be read; a pilot that starts with one request would have cost one.
+- Finding 1's requests on the retired route were spent before anything could be read; a pilot that starts with one request would have cost one, and the crawler now stops on a run of such answers by itself.
 
 ## Replication
 
@@ -152,8 +157,8 @@ python scripts/build_gsv_history_worklist.py --city "Seattle, WA" --limit 2000 -
 # crawler host
 python scripts/harvest_gsv_history.py --worklist W/<stem>.worklist.csv.gz --pass 1 --out-dir R
 python scripts/harvest_gsv_history.py --worklist W/<stem>.worklist.csv.gz --pass 2 --out-dir R
-# catalog host, on a 200-id sample of R/<stem>.pass1.history.csv.gz
-python scripts/spot_check_gsv_history.py --history SAMPLE.csv --limit 200 --seed 442 --out spot.json --db-path data/streetscape_tracker.db
+# catalog host (the script draws the 200-id sample itself; --db-path is checked, never migrated, before the first request)
+python scripts/spot_check_gsv_history.py --history R/<stem>.pass1.history.csv.gz --limit 200 --seed 442 --out spot.json --db-path data/streetscape_tracker.db
 # wherever R is
 python scripts/gsv_history_pilot_analyze.py --results-dir R --worklist W/<stem>.worklist.csv.gz --spot-check spot.json --out docs/experiments/gsv-history-pilot_metrics.json
 ```

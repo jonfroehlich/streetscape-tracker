@@ -101,7 +101,7 @@ Numbers: [`experiments/csv-float-parse.md`](experiments/csv-float-parse.md).
 A normal run records only the *current* capture date per point;
 this harvests the FULL official-Google capture history — every past drive-through and its month — which no documented Google API (free or paid) exposes.
 It comes instead from an **unpublished endpoint** (the `MapsJsInternalService/SingleImageSearch` RPC behind the Maps-JS `getPanorama().time[]` array), queried directly with no API key.
-Its older JSONP shim (`maps/api/js/GeoPhotoService.SingleImageSearch`) was **turned down by 2026-10-17**: the pilot's first 100 requests all got HTTP 200 and the body `GeoPhotoService.SingleImageSearch is decommissioned and turned down.`, which is exactly the shape change the raw store exists for; `download_gsv_history.RPC_URL` records the route that answers (request body and response offsets after sk-zk/streetlevel, MIT).
+Its older JSONP shim (`maps/api/js/GeoPhotoService.SingleImageSearch`) was **turned down by 2026-10-17**: the pilot's first requests all got HTTP 200 and the body `GeoPhotoService.SingleImageSearch is decommissioned and turned down.`, which is exactly the shape change the raw store exists for; `download_gsv_history.RPC_URL` records the route that answers (request body and response offsets after sk-zk/streetlevel, MIT).
 Because it is undocumented **there is no guarantee it keeps working**, and it is IP-identified rather than key-metered, which fixes three things about how it runs (#442):
 
 - **Where.** Only from a dedicated address that no lab service shares — never makelab1 or makelab2, whose addresses carry Project Sidewalk and the nightly collection.

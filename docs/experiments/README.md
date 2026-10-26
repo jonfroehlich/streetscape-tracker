@@ -61,7 +61,7 @@ Issue #106 — why production stays on the 20 m grid; below ~10 m you buy redund
 ### `gsv-history-pilot.md`
 
 Issue #442 — the pilot before the capture-history backfill: 2,000 Seattle edge midpoints at 1 request/s from the dedicated host, plus a 200-id check against the documented metadata request.
-**The endpoint #2 shipped against is turned down**, answering HTTP 200 with a "decommissioned" body for all 100 of the first requests, and the raw store, not the parser, is what said so; the RPC the Maps JavaScript API uses answers in full (7.8 dated captures per sample, 2007–2026, in distinct driving campaigns).
+**The endpoint #2 shipped against is turned down**, answering HTTP 200 with a "decommissioned" body for every one of the first requests, and the raw store, not the parser, is what said so; the RPC the Maps JavaScript API uses answers in full (7.8 dated captures per sample, 2007–2026, in distinct driving campaigns).
 **The documented API agreed on the capture month 200 times out of 200**, so a harvested month carries the documented request's confidence.
 On the new route user photospheres come dated, so "has a date" stopped meaning "official" and every row carries a `third_party` flag instead.
 
