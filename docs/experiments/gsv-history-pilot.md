@@ -18,7 +18,7 @@ The backfill will spend months of paced requests against an undocumented source,
 
 ## Method
 
-- **Where**: one t3.small in us-west-2 with an auto-assigned address no lab service shares, no inbound ports, no credentials; driven over SSM. The catalog host built the work list and ran the spot check.
+- **Where**: a small dedicated host whose address no lab service shares, with no inbound ports and no credentials on it. The catalog host built the work list and ran the spot check.
 - **What**: the latest Seattle GSV `drive` walk (2026-09-11), first 2,000 edges in sample order; `scripts/build_gsv_history_worklist.py --limit 2000`.
   Pass 1 is each edge's midpoint sample (2,000 rows), pass 2 the rest (21,728).
   99.2 % of the samples carry a current official pano (the *anchor*).
