@@ -668,11 +668,14 @@ def generate_history_summary_as_json(
     saw it, and the endpoint's month precision is pinned to the 1st, so a true
     date can only round toward the past.
     ``dated_unique_panos`` itself is not called because it needs a run's
-    ``status`` column, which a harvest has no use for: the harvester keeps
-    only DATED panos, and in this endpoint a present date is the signal of
-    official Google imagery, so the third-party exclusion a run applies by
-    copyright is already true by construction here and is not re-applied
-    (there is no copyright column to apply it with).
+    ``status`` column, which a harvest has no use for. The third-party
+    exclusion a run applies by copyright is applied here on the harvest's
+    ``third_party`` column (HISTORY_DTYPES since #442): on the RPC route user
+    photospheres come DATED, so a present date is no longer the signal of
+    official imagery it was on the retired route, and every statistic below
+    counts official panos only. A harvest without the column predates the
+    column -- the retired route, where "dated" was "official" by
+    construction -- and is read as all official.
     The frame is deduplicated by ``pano_id`` defensively (the harvester
     already does, keeping the first row of its date-sorted output).
     What the mask drops is published as ``implausible_dates_dropped``, never
@@ -705,7 +708,10 @@ def generate_history_summary_as_json(
         logger.info(f"Capture-history summary already exists: {json_path}; returning...")
         return json_path
 
-    dated = df.drop_duplicates(subset=["pano_id"]).copy()
+    official = df
+    if "third_party" in df.columns:
+        official = df[~_as_bool(df["third_party"])]
+    dated = official.drop_duplicates(subset=["pano_id"]).copy()
     if not pd.api.types.is_datetime64_any_dtype(dated["capture_date"]):
         dated["capture_date"] = pd.to_datetime(
             dated["capture_date"], format="ISO8601", errors="coerce"
@@ -756,6 +762,13 @@ def generate_history_summary_as_json(
     _write_json_gz_atomic(json_path, summary)
     logger.info(f"Saved capture-history summary to: {json_path}")
     return json_path
+
+
+def _as_bool(column: pd.Series) -> pd.Series:
+    """A ``third_party`` column as booleans, whether it was read as bool or as text."""
+    if column.dtype == bool:
+        return column
+    return column.astype(str).str.strip().str.lower().isin(("true", "1"))
 
 
 def _replay_change_block(conn, run_id: int) -> dict[str, Any] | None:

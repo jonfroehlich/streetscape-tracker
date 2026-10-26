@@ -1,0 +1,157 @@
+{
+  "generated_by": "scripts/gsv_history_pilot_analyze.py",
+  "generated_at": "2026-10-18T00:03:11+00:00",
+  "worklist": "seattle--washington--united-states_width_17689_height_28145_step_20_streetwalk_sp15_2026-09-11.worklist.csv.gz",
+  "city_id": "seattle--washington--united-states",
+  "passes": {
+    "1": {
+      "worklist_rows": 2000,
+      "requests_answered": 2000,
+      "http_status": {
+        "200": 2000
+      },
+      "response_code": {
+        "0": 1998,
+        "5": 2
+      },
+      "anchored_samples": 1984,
+      "anchor_in_history": 1694,
+      "anchor_in_history_share": 0.8538,
+      "dated_panos_per_sample_mean": 7.758,
+      "dated_panos_per_sample_pctiles": {
+        "10": 3.0,
+        "25": 6.0,
+        "50": 8.0,
+        "75": 10.0,
+        "90": 12.0
+      },
+      "zero_history_samples": 2,
+      "unanchored_samples": 16,
+      "unanchored_samples_with_history": 14,
+      "unanchored_dated_panos_mean": 7.312,
+      "history_rows": 15515,
+      "third_party_rows": 20,
+      "distinct_official_panos": 15490,
+      "official_captures_per_sample_mean": 7.747,
+      "capture_year_histogram": {
+        "2007": 1008,
+        "2008": 1292,
+        "2009": 6,
+        "2011": 1678,
+        "2012": 187,
+        "2013": 30,
+        "2014": 1504,
+        "2015": 858,
+        "2016": 686,
+        "2017": 1013,
+        "2018": 1347,
+        "2019": 1675,
+        "2021": 1318,
+        "2022": 356,
+        "2023": 551,
+        "2024": 376,
+        "2025": 1600,
+        "2026": 10
+      },
+      "first_fetched_at": "2026-10-17T17:21:27.195333+00:00",
+      "last_fetched_at": "2026-10-17T17:54:20.604341+00:00",
+      "elapsed_min": 32.89,
+      "achieved_rate_per_min": 60.81
+    },
+    "2": {
+      "worklist_rows": 21728,
+      "requests_answered": 21728,
+      "http_status": {
+        "200": 21728
+      },
+      "response_code": {
+        "0": 21690,
+        "5": 38
+      },
+      "anchored_samples": 21556,
+      "anchor_in_history": 18584,
+      "anchor_in_history_share": 0.8621,
+      "dated_panos_per_sample_mean": 8.82,
+      "dated_panos_per_sample_pctiles": {
+        "10": 4.0,
+        "25": 6.0,
+        "50": 8.0,
+        "75": 11.0,
+        "90": 15.0
+      },
+      "zero_history_samples": 38,
+      "unanchored_samples": 172,
+      "unanchored_samples_with_history": 135,
+      "unanchored_dated_panos_mean": 7.709,
+      "history_rows": 191644,
+      "third_party_rows": 179,
+      "distinct_official_panos": 181706,
+      "official_captures_per_sample_mean": 8.812,
+      "capture_year_histogram": {
+        "2007": 10444,
+        "2008": 13470,
+        "2009": 25,
+        "2010": 1,
+        "2011": 18911,
+        "2012": 2410,
+        "2013": 1090,
+        "2014": 19339,
+        "2015": 11603,
+        "2016": 8473,
+        "2017": 12275,
+        "2018": 16577,
+        "2019": 18781,
+        "2021": 16090,
+        "2022": 5371,
+        "2023": 10476,
+        "2024": 6235,
+        "2025": 19825,
+        "2026": 69
+      },
+      "first_fetched_at": "2026-10-17T17:55:48.278257+00:00",
+      "last_fetched_at": "2026-10-17T23:59:01.946200+00:00",
+      "elapsed_min": 363.23,
+      "achieved_rate_per_min": 59.82
+    }
+  },
+  "edges": {
+    "months_per_edge_pass1_mean": 7.747,
+    "months_per_edge_both_mean": 11.368,
+    "edges_where_midpoint_sees_every_month": 664,
+    "midpoint_month_coverage_share_pctiles": {
+      "10": 0.3448275862068966,
+      "25": 0.625,
+      "50": 0.8333333333333334,
+      "75": 1.0,
+      "90": 1.0
+    },
+    "midpoint_month_coverage_share_mean": 0.7632,
+    "edges": 2000,
+    "distinct_official_panos_pass1_sum": 15495,
+    "distinct_official_panos_both_sum": 206337,
+    "ratio_both_to_pass1": 13.3164,
+    "edges_where_pass2_added_panos": 1895,
+    "pass2_added_per_edge_pctiles": {
+      "10": 6.0,
+      "25": 19.0,
+      "50": 42.0,
+      "75": 87.0,
+      "90": 202.10000000000014
+    },
+    "distinct_official_panos_global_pass1": 15490,
+    "distinct_official_panos_global_both": 196427
+  },
+  "spot_check": {
+    "requests": 200,
+    "statuses": {
+      "OK": 200
+    },
+    "month_match": 200,
+    "month_mismatch": 0,
+    "pano_id_differs": 0,
+    "unknown": 0,
+    "error": 0,
+    "month_match_share_of_answered": 1.0,
+    "seed": 442
+  }
+}

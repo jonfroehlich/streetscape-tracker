@@ -365,7 +365,7 @@ It is not combinable with `--only` or `--regenerate-json` (exit 2): it returns b
 ## Backfilling the capture-history summaries (issue #109)
 
 #109 gives each GSV capture-history harvest (#2) a sibling summary JSON, which the aggregate points at and `city.html` renders ([`capture-dates.md`](capture-dates.md)).
-`scripts/harvest_gsv_history.py` writes it from now on; a harvest cataloged before the deploy has only its CSV, and the aggregate reads summaries and never builds them, so that city shows no capture-history section until this backfill runs.
+Since #442 the harvest CSV is derived from the crawler's per-sample results by the import step that lands them (a follow-up, which also writes the summary); a harvest cataloged by any other route has only its CSV, and the aggregate reads summaries and never builds them, so that city shows no capture-history section until this backfill runs.
 **The dry run is also how to learn whether production holds any harvest at all** — none may exist, in which case it reports `0 rows` and there is nothing more to do.
 `0 rows` is trustworthy because a wrong path cannot produce it: a `--data-dir` that is not a directory, or a catalog path that does not exist (`--db-path`, default `<data-dir>/streetscape_tracker.db` — e.g. the code checkout's default `./data` holds none), is **refused with exit 2** before anything is opened, rather than letting `db.connect` create an empty catalog and answer `0 rows`.
 

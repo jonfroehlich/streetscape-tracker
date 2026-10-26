@@ -483,7 +483,7 @@ Per this file's opening rule, Mapillary's API docs and forum must be re-read bef
 — Mapillary's tile CDN, `overpass-api.de` and `kartaview.org`
 — and a per-IP limit is a property of the whole machine, so no per-process limiter can honour it alone.
 (Two more are per-IP and knowingly *unlocked*, named in `download_common.py` so the list doesn't read as exhaustive: Nominatim in `geoutils.py`, which runs only when an unknown city is registered and once per `assess-city` invocation (its boundary pre-flight, #215
-— even for an already-registered city), and `download_gsv_history.py`'s undocumented `SingleImageSearch`, which is IP-identified rather than key-metered and already carries its own circuit breaker.
+— even for an already-registered city), and `download_gsv_history.py`'s undocumented `SingleImageSearch`, which is IP-identified rather than key-metered and already carries its own circuit breaker — and since #442 runs ONLY from a dedicated address no lab service shares, never this host.
 Both are out-of-band and low-volume; lock them if either ever runs on a schedule.)
 `streetscape_metadata_tracker/host_lock.py` supplies the missing half: `host_lock(host)` takes a `filelock` on `locks/{host}.lock` for the duration of one fetch, `timeout=0` so a second process **fails fast** (following `download_gsv.py`'s run-level lock) rather than queueing behind a multi-hour run.
 Chokepoints are the two places every such request in the repo passes through: `download_mapillary.fetch_city_images_async` (grid run *and* road walk) and the download branch of `download_street_network.fetch_graph`

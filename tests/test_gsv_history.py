@@ -1,19 +1,22 @@
 """
-Tests for the historical-dates harvester (issue #2). Pure logic + an
-end-to-end sweep served entirely from memory (the unpublished endpoint is
+Tests for the historical-dates harvester (issues #2, #442). Pure logic + a
+work-list crawl served entirely from memory (the unpublished endpoint is
 mocked), so there is no network access.
 """
 
 import asyncio
+import contextlib
+import gzip
 import json
 import os
-import re
 import sys
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 
 import aiohttp
 import pandas as pd
 import pytest
+import yarl
+from multidict import CIMultiDict, CIMultiDictProxy
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -28,75 +31,158 @@ from streetscape_metadata_tracker.naming import (  # noqa: E402
 
 # ── Response-fixture builder ───────────────────────────────────────────────
 #
-# Reproduces the (undocumented) endpoint's deeply-nested shape: a callbackfunc
-# wrapper around data where data[1][5][0] is the "subset", subset[3][0] is the
-# pano list and subset[8] is the date list. Per the endpoint's quirk, the date
-# list covers only the LAST n panos, so undated (user) panos must lead and
-# dated (official Google) panos must trail.
+# Reproduces the live RPC response shape (measured 2026-10-17, offsets after
+# sk-zk/streetlevel): data[0][0] is the response code; msg = data[1];
+# msg[1][1] the current pano's id, msg[6][7] its [year, month],
+# msg[5][0][1][0][2:4] its position; msg[5][0][3][0] every related pano node
+# [[type, id], _, [[_, _, lat, lon]]] (the current pano first), and
+# msg[5][0][8] the history as [index, [year, month], ...] keyed into that list.
 
 
-def _pano_node(pano_id, lat, lon):
-    return [[None, pano_id], None, [[None, None, lat, lon]]]
+def _node(pano_id, lat, lon, kind=2, pose=None):
+    """pose: (elevation, heading, pitch_served, roll) as the service encodes them."""
+    geo = [[None, None, lat, lon]]
+    if pose is not None:
+        elev, heading, pitch_served, roll = pose
+        geo += [[elev, None, 28.1], [heading, pitch_served, roll]]
+    return [[kind, pano_id], None, geo]
 
 
-def _date_node(year, month):
-    return [None, [year, month]]
-
-
-def make_response(undated, dated):
+def make_response(main, historical=(), neighbors=(), code=0, pose=None, extras=None):
     """
-    undated: list of (pano_id, lat, lon) with no capture date (user panos)
-    dated:   list of (pano_id, lat, lon, (year, month)) official Google panos
-    Returns the raw callbackfunc(...) response body as a string.
+    main:       (pano_id, lat, lon, (year, month[, day])) -- the pano served at the location now
+    historical: (pano_id, lat, lon, (year, month[, day])[, type[, pose]]) -- dated panos keyed by index
+    neighbors:  (pano_id, lat, lon) -- undated nodes (links), never history
+    pose:       the current pano's (elevation, heading, pitch_served, roll)
+    extras:     dict with any of country_code, street_name, upload_date, exact_timestamp
+    Returns the raw JSON response body as a string.
     """
-    raw_panos = [_pano_node(p, la, lo) for (p, la, lo) in undated]
-    raw_panos += [_pano_node(p, la, lo) for (p, la, lo, _) in dated]
-    raw_dates = [_date_node(y, m) for (_, _, _, (y, m)) in dated]
-    subset = [None, None, None, [raw_panos], None, None, None, None, raw_dates]
-    data = [None, [None, None, None, None, None, [subset]]]
-    return f"callbackfunc( {json.dumps(data)} )"
+    if code != 0:
+        return json.dumps([[code, "generic", "Search returned no images."]])
+    extras = extras or {}
+    mid, mlat, mlon, mdate = main
+    nodes = [_node(mid, mlat, mlon, pose=pose)]
+    dates = []
+    for h in historical:
+        pid, la, lo, hdate = h[:4]
+        kind = h[4] if len(h) > 4 else 2
+        hpose = h[5] if len(h) > 5 else None
+        dates.append([len(nodes), list(hdate), None, None, None, kind])
+        nodes.append(_node(pid, la, lo, kind, pose=hpose))
+    for pid, la, lo in neighbors:
+        nodes.append(_node(pid, la, lo))
+    # The current pano's own geo node: position, [elevation], [pose], _, country.
+    geo = [[None, None, mlat, mlon], None, None, None, extras.get("country_code")]
+    if pose is not None:
+        geo[1] = [pose[0], None, 28.1]
+        geo[2] = [pose[1], pose[2], pose[3]]
+    subset = [None, geo, None, [nodes], None, None, None, None, dates]
+    if extras.get("street_name"):
+        subset += [None, None, None, [[[[None, None, [extras["street_name"], "en"]]], [12.0]]]]
+    msg = [
+        None,
+        [None, mid],
+        None,
+        None,
+        [[[["© 2026 Google"]]]],
+        [subset],
+        [None] * 7 + [list(mdate), extras.get("upload_date")],
+    ]
+    if extras.get("exact_timestamp"):
+        msg += [None] * 5 + [[extras["exact_timestamp"]]]
+    return json.dumps([[0], msg])
 
 
 # ── Parsing ────────────────────────────────────────────────────────────────
 
+TP_ID = "CIHM0ogKEICAgIDO44iHaw"  # a user photosphere id, as the live endpoint returns them
 
-def test_parse_keeps_only_dated_official_panos():
+
+def test_parse_returns_the_current_pano_and_its_history_with_third_party_flagged():
     text = make_response(
-        undated=[("userA", 45.0, -122.0), ("userB", 45.0, -122.0)],
-        dated=[
+        main=("g2023", 45.31, -122.94, (2023, 6)),
+        historical=[
             ("g2007", 45.31, -122.94, (2007, 10)),
             ("g2012", 45.31, -122.94, (2012, 6)),
-            ("g2023", 45.31, -122.94, (2023, 6)),
+            (TP_ID, 45.31, -122.94, (2019, 11), 10),
+        ],
+        neighbors=[("userA", 45.0, -122.0), ("userB", 45.0, -122.0)],
+    )
+    result = dgh.parse_search(text)
+    assert result.response_code == 0 and result.panos_total == 6
+    panos = result.panos
+    assert [p.pano_id for p in panos] == ["g2023", "g2007", "g2012", TP_ID]
+    assert panos[0].is_current and not any(p.is_current for p in panos[1:])
+    by_id = {p.pano_id: p for p in panos}
+    # month-precision dates standardized to ISO with day defaulting to 01
+    assert by_id["g2023"].capture_date == "2023-06-01"
+    assert by_id["g2007"].capture_date == "2007-10-01"
+    assert by_id["g2012"].capture_date == "2012-06-01"
+    assert by_id["g2007"].lat == pytest.approx(45.31)
+    # A date no longer marks official imagery: the user photosphere is dated
+    # and KEPT, flagged, never silently folded into the official history.
+    assert by_id[TP_ID].third_party and not by_id["g2007"].third_party
+    assert dgh.parse_search_response(text) == list(panos)
+
+
+def test_parse_third_party_falls_back_to_the_id_shape_when_the_type_is_missing():
+    text = make_response(
+        main=("g2023", 45.0, -122.0, (2023, 6)),
+        historical=[
+            (TP_ID, 45.0, -122.0, (2019, 11), None),
+            ("x" * 23, 45.0, -122.0, (2018, 1), None),
         ],
     )
     panos = dgh.parse_search_response(text)
-
-    assert {p.pano_id for p in panos} == {"g2007", "g2012", "g2023"}
-    by_id = {p.pano_id: p for p in panos}
-    # month-precision dates standardized to ISO with day defaulting to 01
-    assert by_id["g2007"].capture_date == "2007-10-01"
-    assert by_id["g2012"].capture_date == "2012-06-01"
-    assert by_id["g2023"].capture_date == "2023-06-01"
-    assert by_id["g2007"].lat == pytest.approx(45.31)
+    assert [p.third_party for p in panos] == [False, True, True]
+    assert dgh.is_third_party_pano_id("TC9HEmnUNHFZac4hT1lccQ") is False
 
 
-def test_parse_no_images_sentinel_returns_empty():
-    text = f"callbackfunc( {json.dumps(dgh._NO_IMAGES_SENTINEL)} )"
-    assert dgh.parse_search_response(text) == []
+def test_parse_no_images_response_code_returns_empty():
+    result = dgh.parse_search(make_response(None, code=5))
+    assert result.response_code == 5 and result.panos == () and result.panos_total == 0
+    assert result.unanswered is None  # an answer: the service looked and found nothing
+
+
+# The bare RPC-form body the retired route answers with, and what an
+# anti-abuse page served with a 200 looks like.
+DECOMMISSIONED = (
+    '[[5,"generic","GeoPhotoService.SingleImageSearch is decommissioned and turned down."]]'
+)
+CAPTCHA_HTML = "<html><body>Our systems have detected unusual traffic.</body></html>"
 
 
 @pytest.mark.parametrize(
-    "text",
+    "text, reason",
     [
-        "",
-        "not javascript at all",
-        "callbackfunc( {not json} )",
-        "callbackfunc( [1,2,3] )",  # right wrapper, wrong shape
+        (DECOMMISSIONED, "response code 5: GeoPhotoService.SingleImageSearch is decommissioned"),
+        ("/**/callbackfunc && callbackfunc( " + DECOMMISSIONED + " )", "non-JSON body"),
+        (CAPTCHA_HTML, "HTML body"),
+        ("", "empty body"),
+        ("not json at all", "non-JSON body"),
+        ("[1,2,3]", "non-JSON body"),  # JSON, but no response code where one belongs
+        (json.dumps([[7, "generic", "something new"]]), "response code 7: something new"),
+        (json.dumps([[0], None]), "response code 0 without a pano message"),
+        (json.dumps([[0], [None, None]]), "response code 0 without a pano message"),
     ],
 )
-def test_parse_malformed_is_swallowed(text):
-    # A shape change in the undocumented endpoint must not raise mid-sweep.
+def test_a_body_that_is_not_an_answer_is_unanswered_never_no_imagery(text, reason):
+    # The pilot's first requests (the retired route, 2026-10-17) all got HTTP
+    # 200 and a code-5 body that is NOT "no images"; an anti-abuse page comes
+    # as a 200 too. Each must come back with a reason, never as an empty
+    # answer, and never raise mid-crawl.
+    result = dgh.parse_search(text)
+    assert result.panos == () and result.panos_total is None
+    assert result.unanswered is not None and result.unanswered.startswith(reason)
+    assert len(result.unanswered) <= dgh.UNANSWERED_REASON_CHARS
     assert dgh.parse_search_response(text) == []
+
+
+def test_build_search_body_asks_for_official_imagery_history_at_the_walk_radius():
+    body = json.loads(dgh.build_search_body(47.6, -122.3))
+    assert body[1] == [[None, None, 47.6, -122.3], 50.0]
+    assert body[2][10] == [[[dgh.PANO_TYPE_OFFICIAL, True, 2]]]
+    assert 6 in body[3][0]  # neighbours + historical toggle
 
 
 # ── Circuit breaker ────────────────────────────────────────────────────────
@@ -299,305 +385,1394 @@ def test_v2_catalog_gains_history_table_on_connect(tmp_path):
     assert hid > 0
 
 
-# ── End-to-end sweep (endpoint mocked) ─────────────────────────────────────
+def test_parse_skips_malformed_date_node_keeps_good_sibling():
+    # A single corrupt date entry must not sink the whole response, nor its
+    # well-formed siblings — one odd row can't abort a crawl.
+    text = make_response(
+        main=("gMAIN", 45.0, -122.0, (2024, 1)),
+        historical=[("gGOOD", 45.0, -122.0, (2015, 6)), ("gBAD", 45.0, -122.0, (2015, 6))],
+    )
+    data = json.loads(text)
+    data[1][5][0][8][1][1] = ["oops"]  # the second history entry's date node
+    panos = dgh.parse_search_response(json.dumps(data))
+    assert [p.pano_id for p in panos] == ["gMAIN", "gGOOD"]
+    assert panos[1].capture_date == "2015-06-01"
+
+
+# ── Work-list crawl (endpoint mocked) ───────────────────────────────────────
+
+
+class _FakeSession:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
 
 
 def _patch_fetch(monkeypatch, responder):
-    """Replace the network fetch with an in-memory responder(url) -> text."""
+    """Replace the unretried fetch seam with responder(url) -> (status, body)."""
 
     async def fake_fetch(session, url, timeout):
-        return responder(url)
+        out = responder(url)
+        if asyncio.iscoroutine(out):
+            out = await out
+        return out
 
     monkeypatch.setattr(dgh, "_fetch_search", fake_fetch)
+    monkeypatch.setattr(dgh.aiohttp, "ClientSession", lambda **kw: _FakeSession())
 
 
-def test_harvest_end_to_end_dedups_across_grid(monkeypatch, tmp_path):
-    # Every grid point's search surfaces the same 3 official panos, so the
-    # census must dedup them to 3 unique rows regardless of grid size.
-    response = make_response(
-        undated=[("user1", 44.05, -121.31)],
-        dated=[
-            ("g2007", 44.05, -121.31, (2007, 10)),
-            ("g2012", 44.05, -121.31, (2012, 6)),
-            ("g2023", 44.05, -121.31, (2023, 6)),
-        ],
-    )
-    _patch_fetch(monkeypatch, lambda url: response)
-
-    out = str(tmp_path / "bend_gsv_history_2026-07-08.csv.gz")
-    result = asyncio.run(
-        dgh.harvest_gsv_history_async(
-            city_name="Bend",
-            center_lat=44.05,
-            center_lon=-121.31,
-            grid_width=40,
-            grid_height=40,
-            step_length=20,
-            output_csv_gz_path=out,
-            jitter_seconds=(0.0, 0.0),
+def _worklist(n=3, *, anchors=None, pass_no=1):
+    """n rows of pass `pass_no`, keyed e0..e{n-1}/0, each at its own coordinate."""
+    anchors = anchors or {}
+    rows = []
+    for i in range(n):
+        rows.append(
+            {
+                "city_id": "bend--oregon--united-states",
+                "walk_csv_filename": "bend_streetwalk.csv.gz",
+                "network_type": "drive",
+                "spacing_m": 15.0,
+                "edge_id": f"e{i}",
+                "sample_idx": 0,
+                "edge_samples": 1,
+                "pass": pass_no,
+                "query_lat": 44.0 + i * 1e-3,
+                "query_lon": -121.0,
+                "anchor_status": "OK" if f"e{i}" in anchors else "ZERO_RESULTS",
+                "anchor_pano_id": anchors.get(f"e{i}"),
+                "anchor_capture_date": "2023-06-01" if f"e{i}" in anchors else None,
+                "anchor_copyright": "© Google" if f"e{i}" in anchors else None,
+            }
         )
-    )
-
-    assert result["grid_points"] == 9  # (2+1)*(2+1)
-    assert result["api_requests"] == 9  # one search per point
-    assert result["unique_panos"] == 3
-    assert result["oldest_capture_date"] == "2007-10-01"
-    assert result["newest_capture_date"] == "2023-06-01"
-
-    df = pd.read_csv(out)
-    assert list(df.columns) == list(dgh.HISTORY_DTYPES.keys())
-    assert len(df) == 3
-    assert set(df["pano_id"]) == {"g2007", "g2012", "g2023"}
-    # checkpoint cleaned up on success
-    assert not os.path.exists(out + ".harvesting")
+    return pd.DataFrame(rows, columns=dgh.WORKLIST_COLUMNS)
 
 
-def test_harvest_writes_empty_file_when_no_history(monkeypatch, tmp_path):
-    empty = f"callbackfunc( {json.dumps(dgh._NO_IMAGES_SENTINEL)} )"
-    _patch_fetch(monkeypatch, lambda url: empty)
-
-    out = str(tmp_path / "nowhere_gsv_history_2026-07-08.csv.gz")
-    result = asyncio.run(
-        dgh.harvest_gsv_history_async(
-            city_name="Nowhere",
-            center_lat=0.0,
-            center_lon=0.0,
-            grid_width=40,
-            grid_height=40,
-            step_length=20,
-            output_csv_gz_path=out,
-            jitter_seconds=(0.0, 0.0),
-        )
-    )
-
-    assert result["unique_panos"] == 0
-    assert result["oldest_capture_date"] is None
-    df = pd.read_csv(out) if os.path.getsize(out) else pd.DataFrame()
-    assert len(df) == 0
+def _lat_of(body):
+    """The query latitude a request body carries (the fake fetch receives the body)."""
+    return float(json.loads(body)[1][0][2])
 
 
-def test_harvest_unions_distinct_panos_across_grid(monkeypatch, tmp_path):
-    # Each grid point surfaces a DIFFERENT pano (keyed off its coordinates), so
-    # the census is the union of all points, not just one point's result.
-    import re as _re
+# The current pano (dated) plus one historical capture, and an undated
+# neighbour the search relates to it: 3 nodes, 2 dated.
+BODY = make_response(
+    main=("g2023", 44.0, -121.0, (2023, 6)),
+    historical=[("g2007", 44.0, -121.0, (2007, 10))],
+    neighbors=[("user1", 44.0, -121.0)],
+)
+
+
+def _run(wl, out_dir, **kw):
+    kw.setdefault("stem", "bend")
+    kw.setdefault("pass_no", 1)
+    kw.setdefault("rate_per_minute", 0)  # pacing off; one test pins the pass-through
+    kw.setdefault("fetch_tries", 1)
+    kw.setdefault("fetch_backoff_factor", 0)
+    # The latch's default home is the out-dir's PARENT (one per host); under
+    # pytest that is the shared basetemp, so tests name it explicitly and one
+    # test pins the default.
+    kw.setdefault("latch_dir", str(out_dir))
+    return asyncio.run(dgh.harvest_worklist_async(wl, str(out_dir), **kw))
+
+
+def _read(path):
+    return pd.read_csv(path, dtype={"edge_id": str, "anchor_pano_id": str, "pano_id": str})
+
+
+def test_results_stay_keyed_to_the_sample_that_found_them(monkeypatch, tmp_path):
+    # Two samples whose searches return the SAME two panos: four history rows,
+    # each carrying its own key, never a dedup to two.
+    _patch_fetch(monkeypatch, lambda url: (200, BODY))
+    wl = _worklist(2, anchors={"e0": "g2023"})
+    result = _run(wl, tmp_path)
+    assert result["answered"] == 2 and result["api_requests"] == 2
+    paths = result["paths"]
+    hist = _read(paths["history"])
+    assert list(hist.columns) == dgh.SAMPLE_HISTORY_COLUMNS
+    assert sorted(zip(hist["edge_id"], hist["pano_id"], strict=True)) == [
+        ("e0", "g2007"),
+        ("e0", "g2023"),
+        ("e1", "g2007"),
+        ("e1", "g2023"),
+    ]
+    assert set(hist["capture_date"]) == {"2007-10-01", "2023-06-01"}
+    assert hist.loc[hist["edge_id"] == "e0", "anchor_pano_id"].unique().tolist() == ["g2023"]
+    q = _read(paths["queries"])
+    assert list(q.columns) == dgh.QUERY_COLUMNS
+    assert q["panos_total"].tolist() == [3, 3] and q["panos_dated"].tolist() == [2, 2]
+
+
+def test_raw_store_holds_every_body_verbatim_and_reparses_to_the_history(monkeypatch, tmp_path):
+    bodies = {}
 
     def responder(url):
-        lat, lon = _re.search(r"!3d([-\d.]+)!4d([-\d.]+)", url).groups()
-        pid = f"g_{lat}_{lon}"
-        return make_response(undated=[], dated=[(pid, float(lat), float(lon), (2018, 5))])
+        body = make_response(main=(f"p{_lat_of(url)}", 44.0, -121.0, (2019, 3)))
+        bodies[url] = body
+        return 200, body
 
     _patch_fetch(monkeypatch, responder)
-
-    out = str(tmp_path / "bend_gsv_history_2026-07-08.csv.gz")
-    result = asyncio.run(
-        dgh.harvest_gsv_history_async(
-            city_name="Bend",
-            center_lat=44.05,
-            center_lon=-121.31,
-            grid_width=40,
-            grid_height=40,
-            step_length=20,
-            output_csv_gz_path=out,
-            jitter_seconds=(0.0, 0.0),
-        )
+    result = _run(_worklist(3), tmp_path)
+    raw = [json.loads(line) for line in gzip.open(result["paths"]["raw"], "rt")]
+    assert len(raw) == 3
+    assert {r["body"] for r in raw} == set(bodies.values())
+    assert all(r["http_status"] == 200 and r["request"] in bodies for r in raw)
+    # Re-parsing the raw copy reproduces the parsed file: the raw store is the
+    # irreplaceable one, so it must be sufficient on its own.
+    reparsed = sorted(
+        (r["edge_id"], p.pano_id, p.capture_date)
+        for r in raw
+        for p in dgh.parse_search_response(r["body"])
+    )
+    hist = _read(result["paths"]["history"])
+    assert reparsed == sorted(
+        zip(hist["edge_id"], hist["pano_id"], hist["capture_date"], strict=True)
     )
 
-    assert result["grid_points"] == 9
-    assert result["unique_panos"] == 9  # every point contributed one
-    assert len(set(pd.read_csv(out)["pano_id"])) == 9
+
+def test_anchor_in_history_is_true_false_or_null(monkeypatch, tmp_path):
+    _patch_fetch(monkeypatch, lambda url: (200, BODY))
+    wl = _worklist(3, anchors={"e0": "g2023", "e1": "gNOT_IN_HISTORY"})
+    result = _run(wl, tmp_path)
+    q = _read(result["paths"]["queries"]).set_index("edge_id")
+    assert q.loc["e0", "anchor_in_history"] == True  # noqa: E712 (CSV round-trip)
+    assert q.loc["e1", "anchor_in_history"] == False  # noqa: E712
+    assert pd.isna(q.loc["e2", "anchor_in_history"])
 
 
-def test_harvest_resume_skips_done_points_and_keeps_earliest_date(monkeypatch, tmp_path):
-    # Pre-seed a checkpoint as if 8 of 9 points were already harvested (with one
-    # pano gOLD@2010), leaving a single point (1, 1) to do. The resume must
-    # query ONLY that point and must keep the earlier checkpoint date for gOLD
-    # even though the live point returns gOLD with a later date.
-    out = str(tmp_path / "bend_gsv_history_2026-07-08.csv.gz")
-    done = [[i, j] for i in (-1, 0, 1) for j in (-1, 0, 1) if (i, j) != (1, 1)]
-    seed = {
-        "done": done,
-        "panos": {
-            "gOLD": {
-                "capture_date": "2010-01-01",
-                "pano_lat": 44.0,
-                "pano_lon": -121.0,
-                "nearest_query_lat": 44.0,
-                "nearest_query_lon": -121.0,
-            }
+def test_resume_skips_answered_keys_and_requeries_a_truncated_tail(monkeypatch, tmp_path):
+    seen = []
+
+    def responder(url):
+        seen.append(_lat_of(url))
+        return 200, BODY
+
+    _patch_fetch(monkeypatch, responder)
+    wl = _worklist(4)
+    # First run answers e0 only (cap), in its own gzip member.
+    with pytest.raises(dgh.HarvestIncompleteError):
+        _run(wl, tmp_path, max_requests=1)
+    paths = dgh.output_paths(str(tmp_path), "bend", 1)
+    assert dgh.read_done_keys(paths["queries"]) == {("e0", 0)}
+    # Second run answers e1, e2 in a second member -- then that member is cut
+    # short, as a crash mid-flush leaves it.
+    with pytest.raises(dgh.HarvestIncompleteError):
+        _run(wl, tmp_path, max_requests=2)
+    assert dgh.read_done_keys(paths["queries"]) == {("e0", 0), ("e1", 0), ("e2", 0)}
+    with open(paths["queries"], "rb") as f:
+        data = f.read()
+    with open(paths["queries"], "wb") as f:
+        f.write(data[:-12])
+    # The cut member is not trusted at all, e1 included: a member is whole or
+    # it is nothing, which is also what the repair before the next append keeps.
+    assert dgh.read_done_keys(paths["queries"]) == {("e0", 0)}
+    seen.clear()
+    result = _run(wl, tmp_path)
+    # e1 and e2 re-queried (their member was cut), e3 queried for the first
+    # time; e0 never again.
+    assert sorted(seen) == sorted(44.0 + i * 1e-3 for i in (1, 2, 3))
+    assert result["answered"] == 3 and result["already_done"] == 1
+    assert dgh.read_done_keys(paths["queries"]) == {("e0", 0), ("e1", 0), ("e2", 0), ("e3", 0)}
+    # The damaged member was cut away before the append, so a PLAIN reader
+    # sees every row too -- nothing is buried behind the damage.
+    assert sorted(pd.read_csv(paths["queries"])["edge_id"]) == ["e0", "e1", "e2", "e3"]
+    # Nothing recorded with holes: every done key has its history rows.
+    hist = _read(paths["history"])
+    assert set(hist["edge_id"]) == {"e0", "e1", "e2", "e3"}
+
+
+def test_repair_gz_tail_keeps_whole_members_and_drops_a_cut_one(tmp_path):
+    path = str(tmp_path / "x.gz")
+    dgh._append_gz(path, "one\n")
+    dgh._append_gz(path, "two\n")
+    whole = os.path.getsize(path)
+    assert dgh.repair_gz_tail(path) == 0 and os.path.getsize(path) == whole
+    dgh._append_gz(path, "three\n")
+    with open(path, "r+b") as f:
+        f.truncate(os.path.getsize(path) - 5)
+    assert dgh.repair_gz_tail(path) > 0
+    assert os.path.getsize(path) == whole
+    assert gzip.open(path, "rt").read() == "one\ntwo\n"
+    assert dgh.repair_gz_tail(str(tmp_path / "absent.gz")) == 0
+
+
+def test_the_ledger_is_written_last(monkeypatch, tmp_path):
+    # A crash between the history append and the ledger append must leave the
+    # key UNRECORDED, never recorded without its rows.
+    order = []
+    real = dgh._append_gz
+
+    def spy(path, text):
+        order.append(os.path.basename(path).split(".")[-3])
+        real(path, text)
+
+    monkeypatch.setattr(dgh, "_append_gz", spy)
+    _patch_fetch(monkeypatch, lambda url: (200, BODY))
+    _run(_worklist(1), tmp_path)
+    assert order == ["raw", "history", "queries"]
+
+
+def test_first_429_stops_the_run_and_writes_the_latch(monkeypatch, tmp_path):
+    calls = []
+
+    def responder(url):
+        calls.append(url)
+        return (429, "slow down") if len(calls) == 2 else (200, BODY)
+
+    _patch_fetch(monkeypatch, responder)
+    now = datetime(2026, 10, 20, 3, 0, tzinfo=UTC)
+    with pytest.raises(dgh.HarvestBlockedError, match="HTTP 429"):
+        _run(_worklist(5), tmp_path, now_func=lambda: now)
+    assert len(calls) == 2, "no request after the refusal"
+    latch = json.load(open(tmp_path / dgh.LATCH_FILENAME))
+    assert latch["http_status"] == 429
+    assert latch["cooldown_until"] == (now + timedelta(hours=24)).isoformat()
+    assert dgh.latch_active(str(tmp_path), now=now) is not None
+    assert dgh.latch_active(str(tmp_path), now=now + timedelta(hours=23)) is not None
+    assert dgh.latch_active(str(tmp_path), now=now + timedelta(hours=25)) is None
+    # The answered row before the refusal is on disk; the refusal's body is in
+    # the raw store too (it is evidence).
+    paths = dgh.output_paths(str(tmp_path), "bend", 1)
+    assert dgh.read_done_keys(paths["queries"]) == {("e0", 0)}
+    raw = [json.loads(line) for line in gzip.open(paths["raw"], "rt")]
+    assert [r["http_status"] for r in raw] == [200, 429]
+
+
+def test_403_is_a_refusal_too(monkeypatch, tmp_path):
+    _patch_fetch(monkeypatch, lambda url: (403, "forbidden"))
+    with pytest.raises(dgh.HarvestBlockedError, match="HTTP 403"):
+        _run(_worklist(2), tmp_path)
+    assert os.path.exists(tmp_path / dgh.LATCH_FILENAME)
+
+
+def test_consecutive_transport_failures_trip_the_breaker_but_a_success_resets_it(
+    monkeypatch, tmp_path
+):
+    def failing(n):
+        count = {"i": 0}
+
+        def responder(url):
+            count["i"] += 1
+            if count["i"] <= n:
+                raise aiohttp.ClientConnectionError("reset")
+            return 200, BODY
+
+        return responder
+
+    _patch_fetch(monkeypatch, failing(8))
+    with pytest.raises(dgh.HarvestBlockedError, match="8 consecutive failed requests"):
+        _run(_worklist(10), tmp_path, breaker_limit=8)
+    latch = json.load(open(tmp_path / dgh.LATCH_FILENAME))
+    assert "ClientConnectionError: reset" in latch["reason"]
+
+    other = tmp_path / "other"
+    _patch_fetch(monkeypatch, failing(7))
+    result = _run(_worklist(10), other, breaker_limit=8)
+    # 7 failures, then every row answers -- the 7 failed rows in the retry pass.
+    assert result["answered"] == 10
+    assert result["api_requests"] == 17
+    assert not os.path.exists(other / dgh.LATCH_FILENAME)
+
+
+def test_request_cap_stops_cleanly_without_a_latch_and_the_next_run_completes(
+    monkeypatch, tmp_path
+):
+    _patch_fetch(monkeypatch, lambda url: (200, BODY))
+    wl = _worklist(5)
+    with pytest.raises(dgh.HarvestIncompleteError) as info:
+        _run(wl, tmp_path, max_requests=3)
+    assert info.value.capped and info.value.remaining == 2 and info.value.api_requests == 3
+    assert not os.path.exists(tmp_path / dgh.LATCH_FILENAME)
+    assert not isinstance(info.value, dgh.HarvestBlockedError)
+    result = _run(wl, tmp_path)
+    assert result["answered"] == 2 and result["already_done"] == 3 and result["api_requests"] == 2
+
+
+def test_rows_still_failing_after_the_retry_pass_leave_the_pass_incomplete(monkeypatch, tmp_path):
+    def responder(url):
+        if _lat_of(url) == 44.0:
+            raise aiohttp.ClientConnectionError("always")
+        return 200, BODY
+
+    _patch_fetch(monkeypatch, responder)
+    with pytest.raises(dgh.HarvestIncompleteError, match="1 rows") as info:
+        _run(_worklist(3), tmp_path, retry_passes=1)
+    assert not info.value.capped and info.value.remaining == 1
+    assert info.value.api_requests == 4  # 3 + one retry of the failing row
+    paths = dgh.output_paths(str(tmp_path), "bend", 1)
+    assert dgh.read_done_keys(paths["queries"]) == {("e1", 0), ("e2", 0)}
+
+
+def test_one_request_in_flight(monkeypatch, tmp_path):
+    in_flight = {"now": 0, "max": 0}
+
+    async def responder(url):
+        in_flight["now"] += 1
+        in_flight["max"] = max(in_flight["max"], in_flight["now"])
+        await asyncio.sleep(0.001)
+        in_flight["now"] -= 1
+        return 200, BODY
+
+    _patch_fetch(monkeypatch, responder)
+    _run(_worklist(6), tmp_path)
+    assert in_flight["max"] == 1
+
+
+def test_every_attempt_waits_for_the_pacer_retries_included(monkeypatch, tmp_path):
+    acquired = {"n": 0, "args": None}
+
+    class CountingLimiter:
+        def __init__(self, max_per_minute, *a, **kw):
+            acquired["args"] = (max_per_minute, kw.get("jitter"))
+
+        async def acquire(self):
+            acquired["n"] += 1
+
+    monkeypatch.setattr(dgh, "AsyncRateLimiter", CountingLimiter)
+    count = {"i": 0}
+
+    def responder(url):
+        count["i"] += 1
+        if count["i"] == 1:
+            raise aiohttp.ClientConnectionError("once")
+        return 200, BODY
+
+    _patch_fetch(monkeypatch, responder)
+    result = _run(_worklist(2), tmp_path, rate_per_minute=60, jitter=0.6, fetch_tries=2)
+    assert acquired["args"] == (60, 0.6)
+    assert acquired["n"] == result["api_requests"] == 3, "the retry took its own slot"
+
+
+def test_only_the_requested_pass_is_queried(monkeypatch, tmp_path):
+    seen = []
+    _patch_fetch(monkeypatch, lambda url: (seen.append(url), (200, BODY))[1])
+    wl = pd.concat([_worklist(2, pass_no=1), _worklist(3, pass_no=2)], ignore_index=True)
+    wl.loc[wl["pass"] == 2, "edge_id"] = ["f0", "f1", "f2"]
+    result = _run(wl, tmp_path, pass_no=2)
+    assert result["rows"] == 3 and len(seen) == 3
+    assert os.path.exists(dgh.output_paths(str(tmp_path), "bend", 2)["queries"])
+    assert not os.path.exists(dgh.output_paths(str(tmp_path), "bend", 1)["queries"])
+
+
+def test_load_worklist_refuses_missing_columns_and_duplicate_keys(tmp_path):
+    wl = _worklist(2)
+    good = tmp_path / "w.worklist.csv.gz"
+    wl.to_csv(good, index=False, compression="gzip")
+    loaded = dgh.load_worklist(str(good))
+    assert loaded["sample_idx"].dtype.kind == "i" and loaded["pass"].dtype.kind == "i"
+    bad = tmp_path / "bad.csv.gz"
+    wl.drop(columns=["anchor_pano_id"]).to_csv(bad, index=False, compression="gzip")
+    with pytest.raises(ValueError, match="anchor_pano_id"):
+        dgh.load_worklist(str(bad))
+    dup = tmp_path / "dup.csv.gz"
+    pd.concat([wl, wl]).to_csv(dup, index=False, compression="gzip")
+    with pytest.raises(ValueError, match="duplicate"):
+        dgh.load_worklist(str(dup))
+
+
+def test_queries_ledger_carries_the_response_code_and_third_party_count(monkeypatch, tmp_path):
+    body = make_response(
+        main=("g2023", 44.0, -121.0, (2023, 6)),
+        historical=[(TP_ID, 44.0, -121.0, (2019, 11), 10)],
+    )
+    _patch_fetch(monkeypatch, lambda url: (200, body))
+    result = _run(_worklist(1), tmp_path)
+    q = _read(result["paths"]["queries"])
+    assert q.loc[0, "response_code"] == 0 and q.loc[0, "panos_total"] == 2
+    assert q.loc[0, "panos_dated"] == 2 and q.loc[0, "panos_third_party"] == 1
+    hist = _read(result["paths"]["history"]).set_index("pano_id")
+    assert bool(hist.loc[TP_ID, "third_party"]) and not bool(hist.loc["g2023", "third_party"])
+    assert bool(hist.loc["g2023", "is_current"]) and not bool(hist.loc[TP_ID, "is_current"])
+
+
+def test_raw_lines_carry_the_request_body_beside_the_response(monkeypatch, tmp_path):
+    _patch_fetch(monkeypatch, lambda url: (200, BODY))
+    result = _run(_worklist(1), tmp_path)
+    raw = [json.loads(line) for line in gzip.open(result["paths"]["raw"], "rt")]
+    assert raw[0]["url"] == dgh.RPC_URL
+    assert json.loads(raw[0]["request"])[1][0][2:4] == [44.0, -121.0]
+
+
+def test_parse_keeps_everything_the_response_carries():
+    text = make_response(
+        main=("g2023", 45.0, -122.0, (2023, 6, 14)),
+        historical=[("g2007", 45.0, -122.0, (2007, 10), 2, (51.5, 180.0, 88.0, 1.5))],
+        pose=(50.4, 0.7, 88.1, 359.3),
+        extras={
+            "country_code": "US",
+            "street_name": "NE 45th St",
+            "upload_date": [2023, 7, 1],
+            "exact_timestamp": "x/1718400000000",
         },
-        "api_requests": 8,
-    }
-    with open(out + ".harvesting", "w", encoding="utf-8") as f:
-        json.dump(seed, f)
+    )
+    r = dgh.parse_search(text)
+    assert (r.copyright, r.country_code, r.street_name) == ("© 2026 Google", "US", "NE 45th St")
+    assert r.upload_date == "[2023, 7, 1]" and r.exact_timestamp == "x/1718400000000"
+    cur, old = r.panos
+    assert cur.capture_day == 14 and old.capture_day is None
+    assert (cur.pano_type, old.pano_type) == (2, 2)
+    assert (cur.elevation_m, cur.heading_deg, cur.roll_deg) == (50.4, 0.7, 359.3)
+    assert cur.pitch_deg == pytest.approx(90 - 88.1)
+    assert (old.elevation_m, old.heading_deg, old.pitch_deg, old.roll_deg) == (
+        51.5,
+        180.0,
+        2.0,
+        1.5,
+    )
+    # Nothing served is required: a bare response parses with every extra None.
+    bare = dgh.parse_search(make_response(main=("g1", 45.0, -122.0, (2020, 1))))
+    assert bare.country_code is None and bare.panos[0].heading_deg is None
+
+
+def test_rebuild_from_raw_reproduces_the_crawl_and_keeps_the_last_answer_per_key(
+    monkeypatch, tmp_path, capsys
+):
+    import scripts.reparse_gsv_history_raw as reparse
 
     calls = {"n": 0}
 
     def responder(url):
         calls["n"] += 1
-        return make_response(
-            undated=[],
-            dated=[
-                ("gOLD", 44.05, -121.31, (2020, 1)),  # later date -> must NOT win
-                ("gNEW", 44.05, -121.31, (2018, 5)),
-            ],
+        lat = _lat_of(url)
+        return 200, make_response(
+            main=(f"p{lat}", 44.0, -121.0, (2019, 3, 15)),
+            historical=[(f"h{lat}", 44.0, -121.0, (2011, 7))],
+            extras={"country_code": "US", "upload_date": [2019, 4, 1], "exact_timestamp": "x/1"},
         )
 
     _patch_fetch(monkeypatch, responder)
+    wl = _worklist(3, anchors={"e0": "p44.0"})
+    with pytest.raises(dgh.HarvestIncompleteError):
+        _run(wl, tmp_path, max_requests=2)  # two members on disk, like a crawl's
+    result = _run(wl, tmp_path)
+    paths = result["paths"]
+    history, queries = dgh.rebuild_from_raw(paths["raw"], wl, 1)
 
-    result = asyncio.run(
-        dgh.harvest_gsv_history_async(
-            city_name="Bend",
-            center_lat=44.05,
-            center_lon=-121.31,
-            grid_width=40,
-            grid_height=40,
-            step_length=20,
-            output_csv_gz_path=out,
-            jitter_seconds=(0.0, 0.0),
-        )
+    def _text(path):
+        return gzip.open(path, "rt", encoding="utf-8", newline="").read()
+
+    # BYTE-identical once decompressed, through the crawl's own writer: a
+    # served capture day the crawl wrote as `15` comes back as `15`, not
+    # `15.0` (the earlier pandas round-trip hid that with check_dtype=False).
+    dgh.write_csv_gz(history, str(tmp_path / "h.csv.gz"), dgh.SAMPLE_HISTORY_COLUMNS)
+    dgh.write_csv_gz(queries, str(tmp_path / "q.csv.gz"), dgh.QUERY_COLUMNS)
+    assert _text(tmp_path / "h.csv.gz") == _text(paths["history"])
+    assert _text(tmp_path / "q.csv.gz") == _text(paths["queries"])
+    assert ",15," in _text(paths["history"]) and "15.0" not in _text(paths["history"])
+    assert (
+        history["pano_id"].str.startswith("h").sum() == 3 and queries["country_code"].eq("US").all()
     )
 
-    assert calls["n"] == 1  # only the one remaining point
-    assert result["api_requests"] == 9  # 8 carried over + 1 new
-    df = pd.read_csv(out).set_index("pano_id")
-    assert set(df.index) == {"gOLD", "gNEW"}
-    assert df.loc["gOLD", "capture_date"] == "2010-01-01"  # earliest kept
-    assert df.loc["gNEW", "capture_date"] == "2018-05-01"
-    assert not os.path.exists(out + ".harvesting")
+    # A key answered twice in the raw store (a re-query after a cut ledger)
+    # keeps its LAST response; a refusal line is not an answer.
+    with gzip.open(paths["raw"], "at") as f:
+        f.write(
+            json.dumps(
+                {"edge_id": "e0", "sample_idx": 0, "query_lat": 44.0, "query_lon": -121.0,
+                 "url": dgh.RPC_URL, "request": "{}", "http_status": 200, "fetched_at": "later",
+                 "body": make_response(main=("pNEW", 44.0, -121.0, (2025, 1)))}
+            ) + "\n"
+        )  # fmt: skip
+        f.write(
+            json.dumps(
+                {"edge_id": "e1", "sample_idx": 0, "query_lat": 44.001, "query_lon": -121.0,
+                 "url": dgh.RPC_URL, "request": "{}", "http_status": 429, "fetched_at": "later",
+                 "body": "slow down"}
+            ) + "\n"
+        )  # fmt: skip
+    history, queries = dgh.rebuild_from_raw(paths["raw"], wl, 1)
+    assert set(history.loc[history["edge_id"] == "e0", "pano_id"]) == {"pNEW"}
+    assert (
+        queries.set_index("edge_id").loc["e1", "http_status"] == 200
+    )  # the refusal did not replace it
+    assert len(queries) == 3
+
+    # The script writes the same two files and refuses to overwrite without --force.
+    wl_path = tmp_path / "bend.worklist.csv.gz"
+    wl.to_csv(wl_path, index=False, compression="gzip")
+    out = tmp_path / "rebuilt"
+    argv = ["--raw", paths["raw"], "--worklist", str(wl_path), "--out-dir", str(out)]
+    assert reparse.main(argv) == 0
+    assert sorted(os.listdir(out)) == ["bend.pass1.history.csv.gz", "bend.pass1.queries.csv.gz"]
+    assert reparse.main(argv) == 1
+    assert reparse.main(argv + ["--force"]) == 0
+    assert (
+        reparse.main(["--raw", "nope.gz", "--worklist", str(wl_path), "--out-dir", str(out)]) == 2
+    )
+    rebuilt_before = _text(out / "bend.pass1.history.csv.gz")
+    assert "pNEW" in rebuilt_before
+
+    # A raw store whose final member a crash cut short (the state SIGKILL
+    # leaves, or a copy taken mid-write) rebuilds from the members before the
+    # cut, and the script says how much it left out.
+    size = os.path.getsize(paths["raw"])
+    with open(paths["raw"], "r+b") as f:
+        f.truncate(size - 20)
+    cut = dgh.raw_store_cut_bytes(paths["raw"])
+    assert cut > 0
+    history, queries = dgh.rebuild_from_raw(paths["raw"], wl, 1)
+    # The cut member held the two hand-appended lines: e0's later answer is
+    # gone with it, and e0 reads as its first answer again.
+    assert len(queries) == 3 and set(history.loc[history["edge_id"] == "e0", "pano_id"]) == {
+        "p44.0",
+        "h44.0",
+    }
+    assert reparse.main(argv + ["--force"]) == 0
+    assert f"({cut} bytes of a cut final raw member left out)" in capsys.readouterr().out
+    assert "pNEW" not in _text(out / "bend.pass1.history.csv.gz")
 
 
-def test_parse_skips_malformed_date_node_keeps_good_sibling():
-    # A single corrupt date entry must not sink the whole response, nor its
-    # well-formed siblings — one odd row can't abort a sweep.
-    good = _pano_node("gGOOD", 45.0, -122.0)
-    bad = _pano_node("gBAD", 45.0, -122.0)
-    raw_dates = [_date_node(2015, 6), [None, ["oops"]]]  # 2nd node malformed
-    subset = [None, None, None, [[good, bad]], None, None, None, None, raw_dates]
-    data = [None, [None, None, None, None, None, [subset]]]
-    panos = dgh.parse_search_response(f"callbackfunc( {json.dumps(data)} )")
-    assert [p.pano_id for p in panos] == ["gGOOD"]
-    assert panos[0].capture_date == "2015-06-01"
+# ── A 200 that is not an answer (review of #446, S3) ───────────────────────
 
 
-def test_harvest_blocks_and_leaves_checkpoint_then_resumes(monkeypatch, tmp_path):
-    out = str(tmp_path / "bend_gsv_history_2026-07-08.csv.gz")
+@pytest.mark.parametrize("body", [DECOMMISSIONED, "", "not json"])
+def test_a_run_of_unanswered_200s_is_a_refusal_in_disguise(monkeypatch, tmp_path, body):
+    # Ten rows, every 200 carrying a body that answers nothing: no key is
+    # done, every body is in the raw store, every ledger row says why, and the
+    # breaker trips at eight so the run latches -- a 200 of this shape is not
+    # "no imagery here", and a run of them is a block. (An HTML page latches
+    # on the FIRST one; its own test below.)
+    calls = []
+    _patch_fetch(monkeypatch, lambda url: (calls.append(url), (200, body))[1])
+    with pytest.raises(dgh.HarvestBlockedError, match="8 consecutive failed requests") as info:
+        _run(_worklist(10), tmp_path, breaker_limit=8)
+    assert len(calls) == 8
+    paths = dgh.output_paths(str(tmp_path), "bend", 1)
+    assert dgh.read_done_keys(paths["queries"]) == set()
+    q = _read(paths["queries"])
+    assert len(q) == 8 and q["unanswered"].notna().all() and (q["http_status"] == 200).all()
+    reason = dgh.parse_search(body).unanswered
+    assert q["unanswered"].unique().tolist() == [reason]
+    assert reason in str(info.value)
+    latch = json.load(open(tmp_path / dgh.LATCH_FILENAME))
+    assert latch["http_status"] is None and reason in latch["reason"]
+    raw = [json.loads(line) for line in gzip.open(paths["raw"], "rt")]
+    assert [r["body"] for r in raw] == [body] * 8
+    assert not os.path.exists(paths["history"])
 
-    # First attempt: every search throttled -> circuit breaker trips.
-    async def always_throttled(session, url, timeout):
-        raise aiohttp.ClientError("simulated 429")
 
-    monkeypatch.setattr(dgh, "_fetch_search", always_throttled)
+def test_one_unanswered_200_is_requeried_and_its_key_is_done_once_answered(monkeypatch, tmp_path):
+    count = {"i": 0}
 
+    def responder(url):
+        count["i"] += 1
+        return (200, DECOMMISSIONED) if count["i"] == 2 else (200, BODY)
+
+    _patch_fetch(monkeypatch, responder)
+    result = _run(_worklist(3), tmp_path)
+    # e1's first answer was not one; the retry pass asked again and it answered.
+    assert result["answered"] == 3 and result["api_requests"] == 4
+    paths = result["paths"]
+    assert dgh.read_done_keys(paths["queries"]) == {("e0", 0), ("e1", 0), ("e2", 0)}
+    q = _read(paths["queries"])
+    assert len(q) == 4 and q["unanswered"].notna().sum() == 1
+    assert q.loc[q["unanswered"].notna(), "edge_id"].tolist() == ["e1"]
+    assert not os.path.exists(tmp_path / dgh.LATCH_FILENAME)
+    # The rebuild reproduces that ledger: the unanswered row stays only where
+    # the key has no answer, so here the answer replaces it.
+    history, queries = dgh.rebuild_from_raw(paths["raw"], _worklist(3), 1)
+    assert len(queries) == 3 and queries["unanswered"].isna().all()
+
+
+def test_an_unanswered_key_with_no_answer_at_all_keeps_its_reason_in_a_rebuild(
+    monkeypatch, tmp_path
+):
+    _patch_fetch(monkeypatch, lambda url: (200, DECOMMISSIONED if _lat_of(url) == 44.0 else BODY))
+    with pytest.raises(dgh.HarvestIncompleteError, match="1 rows"):
+        _run(_worklist(2), tmp_path)
+    paths = dgh.output_paths(str(tmp_path), "bend", 1)
+    history, queries = dgh.rebuild_from_raw(paths["raw"], _worklist(2), 1)
+    q = queries.set_index("edge_id")
+    assert (
+        q.loc["e0", "unanswered"].startswith("response code 5")
+        and q.loc["e1", "unanswered"] is None
+    )
+    assert set(history["edge_id"]) == {"e1"}
+
+
+def test_an_html_page_served_with_a_200_latches_on_the_first_one(monkeypatch, tmp_path):
+    # An anti-abuse interstitial is the endpoint refusing, with a 200 on the
+    # envelope. Counted as one of eight it would let a throttle that serves
+    # one page in a few requests run the whole cap down; the first one ends
+    # the run, with the body in the raw store and the reason in the ledger.
+    calls = []
+
+    def responder(url):
+        calls.append(url)
+        return (200, CAPTCHA_HTML) if len(calls) == 3 else (200, BODY)
+
+    _patch_fetch(monkeypatch, responder)
+    with pytest.raises(dgh.HarvestBlockedError, match="HTML page served with a 200") as info:
+        _run(_worklist(10), tmp_path)
+    assert len(calls) == 3
+    paths = dgh.output_paths(str(tmp_path), "bend", 1)
+    assert dgh.read_done_keys(paths["queries"]) == {("e0", 0), ("e1", 0)}
+    q = _read(paths["queries"])
+    assert q["unanswered"].notna().tolist() == [False, False, True]
+    assert q["unanswered"].iloc[2].startswith("HTML body")
+    latch = json.load(open(tmp_path / dgh.LATCH_FILENAME))
+    assert latch["http_status"] is None and "HTML page" in latch["reason"]
+    assert "unusual traffic" in str(info.value)
+    assert json.loads(gzip.open(paths["raw"], "rt").readlines()[2])["body"] == CAPTCHA_HTML
+    # Latched: the next run sends nothing.
+    calls.clear()
+    with pytest.raises(dgh.HarvestBlockedError, match="latch is in force"):
+        _run(_worklist(10), tmp_path)
+    assert calls == []
+
+
+def test_a_throttle_that_lets_some_requests_through_trips_the_failure_share(monkeypatch, tmp_path):
+    # Every third request unanswered (a non-HTML non-answer, so the page rule
+    # stays out of it): the consecutive rule never sees two failures in a
+    # row, and under it alone the run spends its whole cap. The share rule
+    # reads once the window is full -- 4 of the last 12 at a quarter -- and
+    # the run latches at the 12th request, the keys answered so far done.
+    calls = []
+
+    def responder(url):
+        calls.append(url)
+        return (200, "not json") if len(calls) % 3 == 0 else (200, BODY)
+
+    _patch_fetch(monkeypatch, responder)
+    with pytest.raises(dgh.HarvestBlockedError, match="4 of the last 12 requests failed"):
+        _run(_worklist(40), tmp_path, breaker_limit=8, breaker_window=12, breaker_share=0.25)
+    assert len(calls) == 12
+    paths = dgh.output_paths(str(tmp_path), "bend", 1)
+    assert len(dgh.read_done_keys(paths["queries"])) == 8
+    assert os.path.exists(tmp_path / dgh.LATCH_FILENAME)
+    # At or under the share the run completes: one in five over a window of
+    # 20 is 4 of 20, not above a quarter, and the retry pass answers the rest.
+    second = tmp_path / "second"
+    second.mkdir()
+    calls.clear()
+
+    def one_in_five(url):
+        calls.append(url)
+        # The first pass only, so the retry pass can answer the eight.
+        return (200, "not json") if len(calls) % 5 == 0 and len(calls) <= 40 else (200, BODY)
+
+    _patch_fetch(monkeypatch, one_in_five)
+    result = _run(_worklist(40), second, breaker_limit=8, breaker_window=20, breaker_share=0.25)
+    assert result["answered"] == 40
+    assert not os.path.exists(second / dgh.LATCH_FILENAME)
+
+
+def test_the_breaker_share_rule_reads_only_a_full_window():
+    b = dgh._CircuitBreaker(limit=8, window=4, share=0.25)
+    b.record(ok=False)
+    b.record(ok=False)
+    assert not b.tripped  # 2 of 2 is not a full window
+    b.record(ok=True)
+    b.record(ok=True)
+    assert b.tripped and b.reason == "2 of the last 4 requests failed"
+    for _ in range(4):
+        b.record(ok=True)
+    assert not b.tripped  # the failures have rolled out of the window
+    b.record(ok=False)
+    assert not b.tripped and b.recent_failures == 1  # 1 of 4 is exactly the quarter: not above
+
+
+def test_a_code_5_is_no_images_only_with_its_message():
+    # The retired route answered a code 5 too ("... decommissioned and turned
+    # down."), so the code alone cannot mean "no imagery here": only the
+    # message does, and a code-5 body without it is unanswered, re-queried.
+    answer = dgh.parse_search(json.dumps([[5, "generic", "Search returned no images."]]))
+    assert answer.response_code == 5 and answer.unanswered is None
+    assert answer.panos == () and answer.panos_total == 0
+    for body in (
+        json.dumps([[5, "generic", "something else"]]),
+        json.dumps([[5]]),
+        DECOMMISSIONED,
+    ):
+        result = dgh.parse_search(body)
+        assert result.response_code == 5 and result.unanswered.startswith("response code 5")
+        assert result.refusal is False
+
+
+# ── An out-dir written under another column set (review of #446 round 2, F1) ─
+
+# The pilot's ledger header (commit e2a1396): twelve columns, two fewer
+# mid-row than this crawler's and no `unanswered`.
+PILOT_QUERY_COLUMNS = [
+    "edge_id", "sample_idx", "http_status", "response_code", "panos_total", "panos_dated",
+    "panos_third_party", "anchor_in_history", "current_copyright", "country_code",
+    "street_name", "fetched_at",
+]  # fmt: skip
+
+
+def _pilot_ledger(path, keys=("e0", "e1")):
+    rows = [f"{k},0,200,0,2,2,0,,© 2026 Google,,,2026-10-17T00:00:00+00:00\n" for k in keys]
+    dgh._append_gz(str(path), ",".join(PILOT_QUERY_COLUMNS) + "\n" + "".join(rows))
+
+
+def test_an_out_dir_written_under_another_column_set_is_refused_before_any_request(
+    monkeypatch, tmp_path
+):
+    # Appended under the pilot's header, this crawler's rows land shifted
+    # (`upload_date` under `fetched_at`, `unanswered` under no name), and a
+    # resume reads every unanswered key as done -- 900 rows of the live crawl
+    # on 2026-10-26. The out-dir is refused, with both headers named.
+    paths = dgh.output_paths(str(tmp_path), "bend", 1)
+    _pilot_ledger(paths["queries"])
+    before = open(paths["queries"], "rb").read()
+    calls = []
+    _patch_fetch(monkeypatch, lambda url: (calls.append(url), (200, BODY))[1])
+    with pytest.raises(dgh.OutputShapeError) as info:
+        _run(_worklist(3), tmp_path)
+    message = str(info.value)
+    assert paths["queries"] in message
+    assert ",".join(PILOT_QUERY_COLUMNS) in message and ",".join(dgh.QUERY_COLUMNS) in message
+    assert calls == [] and open(paths["queries"], "rb").read() == before
+    assert not os.path.exists(paths["history"])
+    # The history file is checked the same way: a ledger of this crawler's
+    # shape beside a history file of another is refused too.
+    other = tmp_path / "other"
+    other.mkdir()
+    paths = dgh.output_paths(str(other), "bend", 1)
+    dgh._append_gz(paths["history"], ",".join(dgh.SAMPLE_HISTORY_COLUMNS[:-1]) + "\n")
+    with pytest.raises(dgh.OutputShapeError, match="history"):
+        _run(_worklist(3), other)
+    assert calls == []
+    # And the CLI exits 2 on the same file, dry run included.
+    out = tmp_path / "results"
+    out.mkdir()
+    _pilot_ledger(out / "bend_walk.pass1.queries.csv.gz")
+    code, _ = _cli(monkeypatch, tmp_path, lambda url: (calls.append(url), (200, BODY))[1])
+    assert code == 2 and calls == []
+    code, _ = _cli(monkeypatch, tmp_path, lambda url: (200, BODY), "--dry-run")
+    assert code == 2 and calls == []
+
+
+def test_read_done_keys_refuses_rows_of_another_shape_instead_of_mapping_them(tmp_path):
+    # A pilot ledger resumes as it is (every key in it was answered)...
+    path = tmp_path / "pilot.csv.gz"
+    _pilot_ledger(path)
+    assert dgh.read_done_keys(str(path)) == {("e0", 0), ("e1", 0)}
+    # ...but rows of this crawler's shape appended under it are refused, not
+    # read through the first member's header: under that header the third
+    # row's `unanswered` has no name and the key would count as done.
+    unanswered = dict.fromkeys(dgh.QUERY_COLUMNS, "")
+    unanswered.update(edge_id="e2", sample_idx=0, http_status=200, unanswered="HTML body")
+    dgh._append_gz(str(path), dgh._csv_text([unanswered], dgh.QUERY_COLUMNS, header=False))
+    with pytest.raises(dgh.OutputShapeError, match="15 fields under a 12-field header"):
+        dgh.read_done_keys(str(path))
+    # A short row is refused the same way, and so is a header lacking a
+    # required column.
+    short = tmp_path / "short.csv.gz"
+    dgh._append_gz(str(short), ",".join(dgh.QUERY_COLUMNS) + "\ne0,0,200\n")
+    with pytest.raises(dgh.OutputShapeError, match="3 fields under a 15-field header"):
+        dgh.read_done_keys(str(short))
+    seven = tmp_path / "seven.csv.gz"
+    dgh._append_gz(str(seven), ",".join(dgh.QUERY_COLUMNS[:7]) + "\ne0,0,200,0,2,2,0\n")
+    with pytest.raises(dgh.OutputShapeError, match="lacks anchor_in_history"):
+        dgh.read_done_keys(str(seven))
+    second_header = tmp_path / "two_headers.csv.gz"
+    _pilot_ledger(second_header, keys=("e0",))
+    _pilot_ledger(second_header, keys=("e1",))
+    with pytest.raises(dgh.OutputShapeError, match="second header"):
+        dgh.read_done_keys(str(second_header))
+
+
+def test_load_queries_ledger_reads_every_request_through_the_streaming_reader(
+    monkeypatch, tmp_path
+):
+    count = {"i": 0}
+
+    def responder(url):
+        count["i"] += 1
+        return (200, DECOMMISSIONED) if count["i"] == 2 else (200, BODY)
+
+    _patch_fetch(monkeypatch, responder)
+    paths = _run(_worklist(3), tmp_path)["paths"]
+    ledger = dgh.load_queries_ledger(paths["queries"])
+    assert len(ledger) == 4 and ledger["unanswered"].notna().sum() == 1
+    # A cut final member reads to the cut rather than raising.
+    with open(paths["queries"], "ab") as f:
+        f.write(gzip.compress(b"garbage")[:-7])
+    assert len(dgh.load_queries_ledger(paths["queries"])) == 4
+
+
+# ── One crawl per host (F2) ─────────────────────────────────────────────────
+
+
+def test_one_crawl_per_host_a_second_harvester_is_refused_by_the_lock(monkeypatch, tmp_path):
+    calls = []
+    _patch_fetch(monkeypatch, lambda url: (calls.append(url), (200, BODY))[1])
+    latch_dir = tmp_path / "results"
+    with dgh.crawl_lock(str(latch_dir)):
+        assert os.path.exists(latch_dir / dgh.LOCK_FILENAME)
+        with pytest.raises(dgh.HarvestBusyError, match="one crawl per address") as info:
+            _run(_worklist(3), tmp_path / "results" / "a", latch_dir=str(latch_dir))
+        assert str(latch_dir / dgh.LOCK_FILENAME) in str(info.value)
+        assert calls == []
+        # The CLI exits its own documented code, before any request.
+        code, _ = _cli(monkeypatch, tmp_path, lambda url: (calls.append(url), (200, BODY))[1],
+                       "--latch-dir", str(latch_dir))  # fmt: skip
+        assert code == dgh.HISTORY_BUSY_EXIT_CODE == 88 and calls == []
+    # Released: the same run completes, and releases in turn.
+    result = _run(_worklist(3), tmp_path / "results" / "a", latch_dir=str(latch_dir))
+    assert result["answered"] == 3
+    with dgh.crawl_lock(str(latch_dir)):
+        pass
+
+
+def test_the_lock_is_held_for_the_whole_run_and_released_on_a_latch(monkeypatch, tmp_path):
+    seen = []
+
+    def responder(url):
+        with pytest.raises(dgh.HarvestBusyError):
+            with dgh.crawl_lock(str(tmp_path)):
+                pass
+        seen.append(url)
+        return (429, "no") if len(seen) == 2 else (200, BODY)
+
+    _patch_fetch(monkeypatch, responder)
+    with pytest.raises(dgh.HarvestBlockedError, match="HTTP 429"):
+        _run(_worklist(3), tmp_path)
+    assert len(seen) == 2
+    with dgh.crawl_lock(str(tmp_path)):
+        pass
+
+
+def test_the_latch_is_read_under_the_lock_so_a_refusal_written_by_the_holder_is_seen(
+    monkeypatch, tmp_path
+):
+    # A crawl that trips writes blocked.json while it holds the lock. A second
+    # crawl that read the latch BEFORE taking the lock would see no latch,
+    # wait for the lock, and send after the refusal. So the latch is read
+    # under the lock: here the "other crawl" writes the latch at the moment
+    # this one acquires the lock, and this one must send nothing.
+    real_lock = dgh.crawl_lock
+    calls = []
+
+    @contextlib.contextmanager
+    def lock_then_latch(latch_dir):
+        with real_lock(latch_dir):
+            dgh.write_latch(
+                latch_dir,
+                reason="HTTP 429 from the other crawl",
+                http_status=429,
+                cooldown_hours=24,
+                now=datetime.now(UTC),
+            )
+            yield
+
+    monkeypatch.setattr(dgh, "crawl_lock", lock_then_latch)
+    _patch_fetch(monkeypatch, lambda url: (calls.append(url), (200, BODY))[1])
+    with pytest.raises(dgh.HarvestBlockedError, match="latch is in force"):
+        _run(_worklist(3), tmp_path)
+    assert calls == []
+
+
+# ── The breaker counts REQUESTS, retries included (S13) ─────────────────────
+
+
+@pytest.mark.parametrize("limit", [8, 6, 5])
+def test_the_breaker_counts_requests_not_rows_and_sends_none_once_tripped(
+    monkeypatch, tmp_path, limit
+):
+    # fetch_tries=4: under a per-ROW count eight rows would cost 32 requests
+    # into a dead host before the latch. `limit` failed REQUESTS end it, and
+    # the next is never sent -- also mid-row (6 and 5 are not multiples of 4:
+    # without the check before each attempt the retry wrapper would send the
+    # rest of the row's tries into the dead host).
+    calls = []
+
+    def responder(url):
+        calls.append(url)
+        raise aiohttp.ClientConnectionError("down")
+
+    _patch_fetch(monkeypatch, responder)
+    with pytest.raises(dgh.HarvestBlockedError, match=f"{limit} consecutive failed requests"):
+        _run(_worklist(10), tmp_path, breaker_limit=limit, fetch_tries=4)
+    assert len(calls) == limit
+    assert os.path.exists(tmp_path / dgh.LATCH_FILENAME)
+
+
+def test_a_success_mid_retry_resets_the_request_count(monkeypatch, tmp_path):
+    count = {"i": 0}
+
+    def responder(url):
+        count["i"] += 1
+        if count["i"] in (1, 2, 3, 5, 6, 7, 9, 10, 11):
+            raise aiohttp.ClientConnectionError("flaky")
+        return 200, BODY
+
+    _patch_fetch(monkeypatch, responder)
+    # Three failures then a success, three times over: never 8 in a row.
+    result = _run(_worklist(3), tmp_path, breaker_limit=8, fetch_tries=4)
+    assert result["answered"] == 3 and result["api_requests"] == 12
+    assert not os.path.exists(tmp_path / dgh.LATCH_FILENAME)
+
+
+# ── The real fetch seam (S6): a 429 sends nothing more ─────────────────────
+
+
+class _FakeResponse:
+    """What ``session.post`` yields: status, headers, text(), raise_for_status()."""
+
+    def __init__(self, status, body="", headers=None):
+        self.status = status
+        self.headers = headers or {}
+        self._body = body
+
+    async def text(self, **kw):
+        return self._body
+
+    def raise_for_status(self):
+        if self.status >= 400:
+            info = aiohttp.RequestInfo(
+                url=yarl.URL(dgh.RPC_URL),
+                method="POST",
+                headers=CIMultiDictProxy(CIMultiDict()),
+                real_url=yarl.URL(dgh.RPC_URL),
+            )
+            raise aiohttp.ClientResponseError(
+                request_info=info, history=(), status=self.status, message="error"
+            )
+
+
+class _InMemorySession:
+    """An in-memory aiohttp.ClientSession: ``post`` is an async CM over a responder(body)."""
+
+    def __init__(self, responder):
+        self._responder = responder
+        self.posts = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    def post(self, url, **kwargs):
+        self.posts.append((url, kwargs))
+        response = self._responder(kwargs["data"])
+
+        class _Ctx:
+            async def __aenter__(self):
+                return response
+
+            async def __aexit__(self, *exc):
+                return False
+
+        return _Ctx()
+
+
+def _fetch(session, body="{}"):
+    return asyncio.run(dgh._fetch_search(session, body, aiohttp.ClientTimeout(total=5)))
+
+
+@pytest.mark.parametrize("status", [429, 403])
+def test_fetch_search_returns_a_refusal_unretried_with_its_body(monkeypatch, status):
+    sleeps = []
+    monkeypatch.setattr(dgh.asyncio, "sleep", lambda s: sleeps.append(s) or _noop())
+    session = _InMemorySession(lambda body: _FakeResponse(status, "slow down"))
+    assert _fetch(session) == (status, "slow down")
+    assert len(session.posts) == 1 and sleeps == []
+    assert session.posts[0][0] == dgh.RPC_URL
+    assert session.posts[0][1]["headers"] == {"content-type": dgh.RPC_CONTENT_TYPE}
+
+
+async def _noop():
+    return None
+
+
+def test_fetch_search_sleeps_a_bounded_retry_after_on_503_then_raises(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(dgh.asyncio, "sleep", lambda s: sleeps.append(s) or _noop())
+    for header, expected in (
+        ({"Retry-After": "7"}, [7.0]),
+        ({"Retry-After": "900"}, [30.0]),
+        ({}, []),
+    ):
+        sleeps.clear()
+        session = _InMemorySession(lambda body, h=header: _FakeResponse(503, "busy", h))
+        with pytest.raises(aiohttp.ClientResponseError) as info:
+            _fetch(session)
+        assert info.value.status == 503 and sleeps == expected
+
+
+def test_fetch_search_raises_other_non_200s_and_returns_a_200_body(monkeypatch):
+    with pytest.raises(aiohttp.ClientResponseError) as info:
+        _fetch(_InMemorySession(lambda body: _FakeResponse(500, "oops")))
+    assert info.value.status == 500
+    assert _fetch(_InMemorySession(lambda body: _FakeResponse(200, BODY))) == (200, BODY)
+
+
+def test_a_429_through_the_real_fetch_seam_sends_no_further_request(monkeypatch, tmp_path):
+    # The mutation this pins: dropping the 429/403 short-circuit in
+    # _fetch_search. Then raise_for_status turns the refusal into a retried
+    # ClientResponseError -- fetch_tries attempts into a refusal, then a
+    # "transport failure", then the next row. Here: one request, full stop.
+    session = _InMemorySession(lambda body: _FakeResponse(429, "slow down"))
+    monkeypatch.setattr(dgh.aiohttp, "ClientSession", lambda **kw: session)
+    with pytest.raises(dgh.HarvestBlockedError, match="HTTP 429"):
+        _run(_worklist(5), tmp_path, fetch_tries=4)
+    assert len(session.posts) == 1
+    assert json.load(open(tmp_path / dgh.LATCH_FILENAME))["http_status"] == 429
+
+
+# ── Linear member scan, streaming readers (S4) and the 0-byte header (S5) ──
+
+
+# ── A body the response cannot decode (F6) ──────────────────────────────────
+
+
+class _UndecodableResponse(_FakeResponse):
+    async def text(self, **kw):
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+
+def test_an_undecodable_body_is_a_transport_failure_not_a_crash(monkeypatch, tmp_path):
+    # `resp.text()` raises UnicodeDecodeError (a mis-declared charset) or
+    # LookupError (an unknown one), neither an aiohttp.ClientError: unwrapped,
+    # one such body ended the run with exit 1, no raw line and no latch, and
+    # the restart re-sent the same request. Through the real fetch seam it is
+    # the payload error the driver already retries and the breaker counts.
+    session = _InMemorySession(lambda body: _UndecodableResponse(200))
+    with pytest.raises(aiohttp.ClientPayloadError, match="undecodable body"):
+        _fetch(session)
+
+    class _UnknownCharset(_FakeResponse):
+        async def text(self, **kw):
+            raise LookupError("unknown encoding: x-made-up")
+
+    with pytest.raises(aiohttp.ClientPayloadError, match="x-made-up"):
+        _fetch(_InMemorySession(lambda body: _UnknownCharset(200)))
+    # End to end: eight such bodies trip the breaker and latch; one among
+    # answers is re-queried and its key done.
+    posts = []
+
+    def responder(body):
+        posts.append(body)
+        return _UndecodableResponse(200)
+
+    monkeypatch.setattr(dgh.aiohttp, "ClientSession", lambda **kw: _InMemorySession(responder))
+    with pytest.raises(dgh.HarvestBlockedError, match="8 consecutive failed requests") as info:
+        _run(_worklist(10), tmp_path, fetch_tries=4)
+    assert len(posts) == 8 and "undecodable body" in str(info.value)
+    assert os.path.exists(tmp_path / dgh.LATCH_FILENAME)
+    second = tmp_path / "second"
+    second.mkdir()
+    posts.clear()
+    monkeypatch.setattr(
+        dgh.aiohttp,
+        "ClientSession",
+        lambda **kw: _InMemorySession(
+            lambda body: (
+                _UndecodableResponse(200)
+                if (posts.append(body) or len(posts)) == 2
+                else _FakeResponse(200, BODY)
+            )
+        ),
+    )
+    result = _run(_worklist(3), second)
+    assert result["answered"] == 3 and result["api_requests"] == 4
+
+
+def test_a_refusal_line_in_the_raw_store_yields_no_ledger_row_in_a_rebuild(monkeypatch, tmp_path):
+    # The crawl writes no ledger row for a 429 (it breaks first), so neither
+    # does the rebuild: parsed, the refusal's body would read as an unanswered
+    # row for a key the crawl never recorded.
+    calls = []
+    _patch_fetch(
+        monkeypatch,
+        lambda url: (calls.append(url), (429, "no") if len(calls) == 3 else (200, BODY))[1],
+    )
     with pytest.raises(dgh.HarvestBlockedError):
+        _run(_worklist(3), tmp_path)
+    paths = dgh.output_paths(str(tmp_path), "bend", 1)
+    history, queries = dgh.rebuild_from_raw(paths["raw"], _worklist(3), 1)
+    assert queries["edge_id"].tolist() == ["e0", "e1"]
+    assert "e2" not in set(history["edge_id"])
+
+
+class _CountingFile:
+    """A binary file that records every read size."""
+
+    def __init__(self, path):
+        self._f = open(path, "rb")
+        self.reads = []
+
+    def read(self, n=-1):
+        self.reads.append(n)
+        return self._f.read(n)
+
+    def seek(self, *a):
+        return self._f.seek(*a)
+
+    def fileno(self):
+        return self._f.fileno()
+
+    def close(self):
+        self._f.close()
+
+
+def test_the_member_scan_is_linear_and_never_holds_the_file(monkeypatch, tmp_path):
+    # 300 members of ~8 KB of incompressible text (the raw store's members are
+    # ~40 KB): the quadratic form fed each byte ~150 times over; the scan
+    # hands every byte to a decompressor once, plus at most a piece per
+    # member, and reads in bounded chunks, never the whole file.
+    import random
+
+    rng = random.Random(442)
+    path = str(tmp_path / "many.gz")
+    for i in range(300):
+        noise = "".join(chr(rng.randrange(0x20, 0x7E)) for _ in range(8000))
+        dgh._append_gz(path, f"{i:04d} " + noise + "\n")
+    size = os.path.getsize(path)
+    assert size > 300 * 6000  # ~6.7 KB a member: printable noise compresses a little
+    fed = {"bytes": 0, "objs": 0}
+    real = dgh.zlib.decompressobj
+
+    def counting(*a, **kw):
+        d = real(*a, **kw)
+        fed["objs"] += 1
+
+        class _D:
+            def __getattr__(self, name):
+                return getattr(d, name)
+
+            def decompress(self, data, *rest):
+                fed["bytes"] += len(data)
+                return d.decompress(data, *rest)
+
+        return _D()
+
+    monkeypatch.setattr(dgh.zlib, "decompressobj", counting)
+    f = _CountingFile(path)
+    assert dgh._complete_members_end(f) == size
+    f.close()
+    assert fed["objs"] == 301  # one per member, plus the one that hit EOF
+    assert fed["bytes"] <= size + 300 * dgh._SCAN_PIECE
+    assert max(f.reads) <= dgh._SCAN_CHUNK and all(n > 0 for n in f.reads)
+    # Cut the last member: the scan ends at the member before it, and the
+    # streaming reader yields exactly the complete members' text.
+    with open(path, "r+b") as fh:
+        fh.truncate(size - 100)
+    good, dropped = dgh._scan_gz(path)
+    assert 0 < good < size - 100 and dropped == size - 100 - good
+    with dgh.open_complete_members(path) as (text, cut):
+        lines = text.read().splitlines()
+    assert cut == dropped and len(lines) == 299 and lines[-1].startswith("0298 ")
+
+
+def test_repair_and_resume_read_through_the_streaming_scan(monkeypatch, tmp_path):
+    # repair_gz_tail and read_done_keys must route through the scan (a file
+    # object, never a bytes slice): a spy sees a file object on each call.
+    seen = []
+    real = dgh._complete_members_end
+
+    def spy(fobj):
+        seen.append(type(fobj).__name__)
+        return real(fobj)
+
+    monkeypatch.setattr(dgh, "_complete_members_end", spy)
+    _patch_fetch(monkeypatch, lambda url: (200, BODY))
+    result = _run(_worklist(2), tmp_path)
+    assert dgh.read_done_keys(result["paths"]["queries"]) == {("e0", 0), ("e1", 0)}
+    assert seen and all(name != "bytes" for name in seen)
+
+
+def test_a_crash_in_the_first_flush_leaves_a_0_byte_file_that_gets_its_header_back(
+    monkeypatch, tmp_path
+):
+    # repair_gz_tail cuts a file whose ONLY member was cut to 0 bytes; the
+    # file exists, so "new = not exists" wrote every later row headerless,
+    # DictReader took the first row as the header, no key was ever done, and
+    # the same rows were re-queried on every resume (exit 83 forever).
+    seen = []
+    _patch_fetch(monkeypatch, lambda url: (seen.append(_lat_of(url)), (200, BODY))[1])
+    wl = _worklist(4)
+    with pytest.raises(dgh.HarvestIncompleteError):
+        _run(wl, tmp_path, max_requests=2)
+    paths = dgh.output_paths(str(tmp_path), "bend", 1)
+    for key in ("queries", "history"):
+        with open(paths[key], "r+b") as f:
+            f.truncate(os.path.getsize(paths[key]) // 2)  # mid-first-member
+    seen.clear()
+    result = _run(wl, tmp_path)
+    assert result["answered"] == 4 and sorted(seen) == [44.0 + i * 1e-3 for i in range(4)]
+    assert dgh.read_done_keys(paths["queries"]) == {(f"e{i}", 0) for i in range(4)}
+    q = pd.read_csv(paths["queries"])
+    assert list(q.columns) == dgh.QUERY_COLUMNS and len(q) == 4
+    assert list(_read(paths["history"]).columns) == dgh.SAMPLE_HISTORY_COLUMNS
+    seen.clear()
+    assert _run(wl, tmp_path)["answered"] == 0 and seen == []
+
+
+# ── One latch per host (S9) ─────────────────────────────────────────────────
+
+
+def test_the_latch_defaults_to_the_out_dirs_parent_so_two_work_lists_share_it(
+    monkeypatch, tmp_path
+):
+    results = tmp_path / "results"
+    assert dgh.default_latch_dir(str(results / "city-a")) == str(results)
+    _patch_fetch(monkeypatch, lambda url: (429, "no"))
+    with pytest.raises(dgh.HarvestBlockedError, match="HTTP 429"):
         asyncio.run(
-            dgh.harvest_gsv_history_async(
-                city_name="Bend",
-                center_lat=44.05,
-                center_lon=-121.31,
-                grid_width=40,
-                grid_height=40,
-                step_length=20,
-                output_csv_gz_path=out,
-                jitter_seconds=(0.0, 0.0),
-                circuit_breaker_limit=3,
+            dgh.harvest_worklist_async(
+                _worklist(2), str(results / "city-a"), stem="a", pass_no=1, rate_per_minute=0
             )
         )
-    assert os.path.exists(out + ".harvesting")  # progress preserved
-    assert not os.path.exists(out)  # no output yet
-
-    # Resume: endpoint recovers -> sweep completes, checkpoint removed.
-    response = make_response(undated=[], dated=[("g2020", 44.05, -121.31, (2020, 5))])
-    _patch_fetch(monkeypatch, lambda url: response)
-    result = asyncio.run(
-        dgh.harvest_gsv_history_async(
-            city_name="Bend",
-            center_lat=44.05,
-            center_lon=-121.31,
-            grid_width=40,
-            grid_height=40,
-            step_length=20,
-            output_csv_gz_path=out,
-            jitter_seconds=(0.0, 0.0),
-        )
-    )
-
-    assert result["unique_panos"] == 1
-    assert os.path.exists(out)
-    assert not os.path.exists(out + ".harvesting")
-
-
-# ── Isolated-failure retry / refuse-to-finalize (audit 2026-07-11) ─────────
-
-
-def _point_from_url(url):
-    """Extract the (lat, lon) a search URL queries."""
-    m = re.search(r"!3d([-\d.]+)!4d([-\d.]+)!", url)
-    return float(m.group(1)), float(m.group(2))
-
-
-def test_isolated_failure_is_retried_within_the_run(monkeypatch, tmp_path):
-    """One transient failure (far below the breaker limit) must be re-queried
-    by the in-run retry pass, not silently finalized as a hole."""
-    response = make_response(undated=[], dated=[("g1", 44.05, -121.31, (2020, 1))])
-    state = {"calls": 0, "failed_once": False}
-
-    def responder(url):
-        state["calls"] += 1
-        if not state["failed_once"]:
-            state["failed_once"] = True
-            raise aiohttp.ClientError("transient blip")
-        return response
-
-    _patch_fetch(monkeypatch, responder)
-    out = str(tmp_path / "bend_gsv_history_2026-07-08.csv.gz")
-    result = asyncio.run(
-        dgh.harvest_gsv_history_async(
-            city_name="Bend",
-            center_lat=44.05,
-            center_lon=-121.31,
-            grid_width=40,
-            grid_height=40,
-            step_length=20,
-            output_csv_gz_path=out,
-            jitter_seconds=(0.0, 0.0),
-        )
-    )
-    assert result["unique_panos"] == 1
-    assert state["calls"] == 10  # 9 points + 1 retry of the failed one
-    assert os.path.exists(out)
-    assert not os.path.exists(out + ".harvesting")  # complete → checkpoint gone
-
-
-def test_refuses_to_finalize_harvest_with_holes(monkeypatch, tmp_path):
-    """A point that fails every retry pass (without tripping the breaker)
-    must abort finalization: no final csv.gz, checkpoint kept for resume —
-    previously the sweep 'completed', published the holey harvest, and
-    deleted the checkpoint, permanently losing the failed points."""
-    response = make_response(undated=[], dated=[("g1", 44.05, -121.31, (2020, 1))])
-
-    def responder(url):
-        lat, lon = _point_from_url(url)
-        if abs(lat - 44.05) < 1e-9 and abs(lon - (-121.31)) < 1e-9:
-            raise aiohttp.ClientError("this one point always fails")
-        return response
-
-    _patch_fetch(monkeypatch, responder)
-    out = str(tmp_path / "bend_gsv_history_2026-07-08.csv.gz")
-    with pytest.raises(dgh.HarvestIncompleteError, match="1 grid points"):
+    assert os.path.exists(results / dgh.LATCH_FILENAME)
+    assert not os.path.exists(results / "city-a" / dgh.LATCH_FILENAME)
+    # The next work list on the same host, under the same results dir, is
+    # refused before its first request -- the refusal was the ADDRESS's.
+    calls = []
+    _patch_fetch(monkeypatch, lambda url: (calls.append(url), (200, BODY))[1])
+    with pytest.raises(dgh.HarvestBlockedError, match="latch is in force"):
         asyncio.run(
-            dgh.harvest_gsv_history_async(
-                city_name="Bend",
-                center_lat=44.05,
-                center_lon=-121.31,
-                grid_width=40,
-                grid_height=40,
-                step_length=20,
-                output_csv_gz_path=out,
-                jitter_seconds=(0.0, 0.0),
+            dgh.harvest_worklist_async(
+                _worklist(2), str(results / "city-b"), stem="b", pass_no=1, rate_per_minute=0
             )
         )
-    assert not os.path.exists(out), "must not publish a harvest with holes"
-    assert os.path.exists(out + ".harvesting"), "checkpoint kept for resume"
-    # HarvestIncompleteError extends HarvestBlockedError so existing
-    # operator handling (resume messaging) applies unchanged.
-    assert issubclass(dgh.HarvestIncompleteError, dgh.HarvestBlockedError)
+    assert calls == []
+    # An explicit --latch-dir elsewhere is honoured, and clearing it there works.
+    other = tmp_path / "elsewhere"
+    result = _run(_worklist(1), results / "city-c", latch_dir=str(other))
+    assert result["answered"] == 1 and not os.path.exists(other / dgh.LATCH_FILENAME)
+
+
+def test_a_hand_edited_naive_cooldown_is_read_as_utc(tmp_path):
+    now = datetime(2026, 10, 20, 3, 0, tzinfo=UTC)
+    dgh.write_latch(str(tmp_path), reason="x", http_status=429, cooldown_hours=24, now=now)
+    record = json.load(open(tmp_path / dgh.LATCH_FILENAME))
+    record["cooldown_until"] = "2026-10-21T03:00:00"  # no zone
+    json.dump(record, open(tmp_path / dgh.LATCH_FILENAME, "w"))
+    assert dgh.latch_active(str(tmp_path), now=now + timedelta(hours=23)) is not None
+    assert dgh.latch_active(str(tmp_path), now=now + timedelta(hours=25)) is None
+
+
+# ── Duplicated history rows after a crash between appends (S12) ─────────────
+
+
+def test_history_rows_duplicated_by_a_crash_between_appends_read_as_one_answer(
+    monkeypatch, tmp_path
+):
+    # The ledger is written last, so a crash between the history append and
+    # the ledger append leaves the key un-done and its rows on disk; the
+    # resume appends them again. The file is never rewritten -- the reader
+    # keeps each key's LAST query only, and drops rows no ledger row stands
+    # for -- and equals the rebuild from raw.
+    real = dgh._append_gz
+    state = {"crash": True}
+
+    def crashing(path, text):
+        if state["crash"] and path.endswith(".queries.csv.gz"):
+            state["crash"] = False
+            raise OSError("ENOSPC")
+        real(path, text)
+
+    monkeypatch.setattr(dgh, "_append_gz", crashing)
+    _patch_fetch(monkeypatch, lambda url: (200, BODY))
+    wl = _worklist(3)
+    with pytest.raises(OSError):
+        _run(wl, tmp_path)
+    paths = dgh.output_paths(str(tmp_path), "bend", 1)
+    assert not os.path.exists(paths["queries"]) and os.path.exists(paths["history"])
+    result = _run(wl, tmp_path)
+    assert result["answered"] == 3
+    on_disk = _read(paths["history"])
+    assert len(on_disk) == 12  # 3 rows x 2 panos, twice
+    read = dgh.load_sample_history(paths["history"], paths["queries"])
+    assert len(read) == 6 and not read.duplicated(["edge_id", "sample_idx", "pano_id"]).any()
+    rebuilt, _ = dgh.rebuild_from_raw(paths["raw"], wl, 1)
+    key = ["edge_id", "sample_idx", "pano_id", "harvested_at"]
+    assert sorted(map(tuple, read[key].to_numpy().tolist())) == sorted(
+        map(tuple, rebuilt[key].to_numpy().tolist())
+    )
+    # Rows the ledger does not stand for (a key stranded before any ledger
+    # row) are dropped when the ledger is given; without it, the last-query
+    # rule alone applies.
+    with gzip.open(paths["history"], "at") as f:
+        f.write(dgh._csv_text(
+            dgh.history_rows(wl.iloc[0], dgh.parse_search(BODY), 1, "2027-01-01T00:00:00+00:00"),
+            dgh.SAMPLE_HISTORY_COLUMNS, header=False,
+        ))  # fmt: skip
+    assert len(dgh.load_sample_history(paths["history"])) == 6
+    assert (
+        dgh.load_sample_history(paths["history"])["harvested_at"] == "2027-01-01T00:00:00+00:00"
+    ).sum() == 2
+    assert len(dgh.load_sample_history(paths["history"], paths["queries"])) == 6
+
+
+# ── The CLI ──────────────────────────────────────────────────────────────────
+
+
+def _cli(monkeypatch, tmp_path, responder, *extra):
+    import scripts.harvest_gsv_history as cli
+
+    _patch_fetch(monkeypatch, responder)
+    wl = tmp_path / "bend_walk.worklist.csv.gz"
+    if not wl.exists():
+        _worklist(3).to_csv(wl, index=False, compression="gzip")
+    out = tmp_path / "results"
+    argv = [
+        "--worklist", str(wl), "--pass", "1", "--out-dir", str(out),
+        "--rate-per-minute", "6000", "--jitter", "0",
+        *extra,
+    ]  # fmt: skip
+    return cli.main(argv), out
+
+
+def test_cli_exit_codes_complete_incomplete_blocked(monkeypatch, tmp_path, capsys):
+    code, out = _cli(monkeypatch, tmp_path, lambda url: (200, BODY), "--dry-run")
+    assert code == 0 and "3 to query" in capsys.readouterr().out
+    assert not os.path.exists(out / "bend_walk.pass1.queries.csv.gz")
+
+    code, out = _cli(monkeypatch, tmp_path, lambda url: (200, BODY), "--max-requests", "2")
+    assert code == 83
+    code, out = _cli(monkeypatch, tmp_path, lambda url: (200, BODY))
+    assert code == 0
+    assert dgh.read_done_keys(str(out / "bend_walk.pass1.queries.csv.gz")) == {
+        ("e0", 0),
+        ("e1", 0),
+        ("e2", 0),
+    }
+
+    fresh = tmp_path / "second"
+    fresh.mkdir()
+    code, out = _cli(monkeypatch, fresh, lambda url: (429, "no"))
+    assert code == 86
+    # Latched: refused before any request, until the cool-down passes or the
+    # operator clears it.
+    calls = []
+    code, out = _cli(monkeypatch, fresh, lambda url: (calls.append(url), (200, BODY))[1])
+    assert code == 86 and calls == []
+    assert "cool-down until" in capsys.readouterr().err
+    # The CLI's own check, not only the harvester's: a dry run under the
+    # latch is refused too, before the work list is even read.
+    code, out = _cli(monkeypatch, fresh, lambda url: (200, BODY), "--dry-run")
+    assert code == 86 and "to query" not in capsys.readouterr().out
+    code, out = _cli(monkeypatch, fresh, lambda url: (200, BODY), "--clear-latch")
+    assert code == 0 and not os.path.exists(fresh / dgh.LATCH_FILENAME)
+
+
+def test_cli_exits_2_on_a_missing_or_malformed_worklist(monkeypatch, tmp_path, capsys):
+    import scripts.harvest_gsv_history as cli
+
+    calls = []
+    _patch_fetch(monkeypatch, lambda url: (calls.append(url), (200, BODY))[1])
+    base = ["--pass", "1", "--out-dir", str(tmp_path / "o")]
+    assert cli.main(["--worklist", str(tmp_path / "absent.worklist.csv.gz"), *base]) == 2
+    assert "no such work-list file" in capsys.readouterr().err
+    bad = tmp_path / "bad.worklist.csv.gz"
+    _worklist(1).drop(columns=["anchor_pano_id"]).to_csv(bad, index=False, compression="gzip")
+    assert cli.main(["--worklist", str(bad), *base]) == 2
+    assert "anchor_pano_id" in capsys.readouterr().err
+    assert calls == []
+
+
+def test_cli_refuses_a_bad_jitter_or_cap_with_argparse_exit_2(monkeypatch, tmp_path):
+    import scripts.harvest_gsv_history as cli
+
+    wl = tmp_path / "w.worklist.csv.gz"
+    _worklist(1).to_csv(wl, index=False, compression="gzip")
+    base = ["--worklist", str(wl), "--pass", "1", "--out-dir", str(tmp_path / "o")]
+    for bad in (["--jitter", "1"], ["--max-requests", "0"], ["--pass", "3"]):
+        with pytest.raises(SystemExit) as info:
+            cli.main(base + bad)
+        assert info.value.code == 2
