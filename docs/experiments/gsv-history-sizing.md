@@ -32,7 +32,10 @@ Two measurement scripts and one assembler, catalog and walk CSVs only, no networ
 The first script also counts pair changes, but only for pairs whose two CSVs hold the identical row list in the identical order; 71 of 121 qualify, so its pair figures are a strict subset and the second script's are the ones quoted.
 The first script's per-pano and per-city numbers are the authoritative ones for the backfill.
 
-The 2026-10-09 run keyed the pair join at 5 decimals (~1 m), which merged a handful of genuinely distinct samples per city and measured its "100 % matched" after that merge; the committed record was re-made on 2026-10-26 under the 9-decimal key, with `--as-of 2026-10-09` selecting the same walk files, and the backfill block reproduced byte for byte while the change-rate counts moved in the fourth digit (no quoted rounding changed).
+The 2026-10-09 run keyed the pair join at 5 decimals (~1 m), which merged 656 genuinely distinct samples across 45 of the 121 pairs and measured its "100 % matched" after that merge; the committed record was re-made on 2026-10-26 under the 9-decimal key, with `--as-of 2026-10-09` selecting the same walk files.
+The backfill block and both of its tables reproduced byte for byte.
+The change-rate counts moved by the un-merged rows: anchored-in-both 4,513,196 → 4,513,758, changed 458,571 → 458,687 (newer 301,502 → 301,581, same month 134,701 → 134,731, older 22,365 → 22,372), lost 4,920 → 4,921, new captures 311,970 → 311,973, and the rate 1,220.48 → 1,220.34 per day per million; every percentage quoted below rounds as it did.
+The walk totals are now read as of the same date as the rest: edges and street-km are unchanged, and covered street-km moved 940,863 → 940,510 because the first totals run (2026-10-17) had let eight days of re-walks on unchanged networks into the sum.
 `tests/test_gsv_history_sizing.py` runs all three scripts over a synthetic catalog in which each selection rule has a row that would move a number if the rule were dropped, and recomputes every share quoted below from the committed tables.
 
 ## Backfill size
@@ -107,7 +110,8 @@ Two things make a walk diff a trigger for a re-query rather than a substitute fo
 
 Query every road-walk sample point (78.1 M), from a dedicated address at a paced 60/min, one request in flight: pass 1 is one query per walk edge midpoint everywhere, pass 2 the remaining sample points city by city, Project Sidewalk deployment cities first.
 Keep history current by re-querying every sample whose matched pano changed or that gained imagery between two walks — a walk diff is the trigger, never the answer, since a third of pano changes are not new captures and only the re-query says which.
-The design, pacing and stopping rule are in [#442](https://github.com/jonfroehlich/streetscape-tracker/issues/442).
+**This supersedes the ongoing-design rule [#442](https://github.com/jonfroehlich/streetscape-tracker/issues/442) was written with** — skip same-date re-issues, and re-query once per changed walk edge rather than per sample — because the capture-date comparison above shows a same-month change cannot be recognised as a re-issue before the re-query, and the pilot showed a query answers for a point, not an edge; the issue text still carries the older rule until it is updated.
+The pacing and stopping rule are in [#442](https://github.com/jonfroehlich/streetscape-tracker/issues/442).
 
 ## Replication
 
@@ -120,4 +124,4 @@ python scripts/size_gsv_history_walks.py . experiments/gsv-history-sizing/out/wa
 python scripts/gsv_history_sizing_analyze.py --raw-dir experiments/gsv-history-sizing/out --docs-dir docs/experiments --catalog-label makelab2-prod
 ```
 
-`--as-of` selects the walks dated on or before 2026-10-09, so a catalog that has kept collecting reproduces the record; the assembler refuses raw outputs that disagree about their row counts or `as_of`.
+`--as-of` selects the walks dated on or before 2026-10-09 (a compact `20261009` is normalized first, since the cut is a text compare on `run_date`), so a catalog that has kept collecting reproduces the record; the assembler refuses raw outputs that disagree about their row counts, their `as_of`, or the totals block the scan embeds against the one the totals run wrote.
