@@ -35,7 +35,10 @@
 #   88  another crawl holds the lock
 # RestartSec is long because the only failure that restarts is a crash, and a
 # crash that repeats on the same city would otherwise re-run every few seconds;
-# StartLimit* then stops it after three starts in a day (reset-failed clears).
+# StartLimit* then bounds it to five starts a day. EVERY start counts toward
+# that, the operator's own `systemctl start` after an 83 or a code move
+# included; a start refused as "repeated too quickly" needs `systemctl
+# reset-failed gsv-history-queue@<pass>` first.
 #
 # STOPPING. KillSignal=SIGINT, not the default SIGTERM: the harvester has no
 # signal handler, and SIGTERM ends Python without its `finally`, cutting the
@@ -49,7 +52,7 @@ Documentation=file:///srv/streetscape-tracker/deploy/crawler/README.md
 Wants=network-online.target
 After=network-online.target
 StartLimitIntervalSec=1d
-StartLimitBurst=3
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -78,7 +81,9 @@ MemoryMax=1536M
 # The checkout is read-only under ProtectSystem=strict (Python skips a
 # __pycache__ it cannot write); the only writable tree is the crawler root,
 # where the work lists, every out-dir, the latch, the lock and the queue log
-# live. No home: the harvester holds no credential and reads no catalog.
+# live -- which is also the crawler user's home (ProtectHome hides /home and
+# /root, not /srv), so the libraries the package imports can write their
+# per-user caches. The harvester holds no credential and reads no catalog.
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true

@@ -26,7 +26,8 @@
 #
 # Every work list is checked to exist BEFORE the first request, so a typo on
 # line 30 is found now rather than a week in. The harvester's stdin is
-# /dev/null: a child that read stdin would eat the rest of the queue.
+# /dev/null: a child that read stdin would eat the rest of the queue. A final
+# line with no newline is a work list too (`read` returns false on it).
 #
 # Layout (the two environment variables relocate it for a test or another host):
 #   $CRAWLER_REPO                  the checkout and its .venv  (/srv/streetscape-tracker)
@@ -57,7 +58,7 @@ PYTHON=$REPO/.venv/bin/python
 [ -r "$QUEUE" ] || { echo "$QUEUE: no such queue file" >&2; exit 2; }
 [ -x "$PYTHON" ] || { echo "$PYTHON: no interpreter (is CRAWLER_REPO right?)" >&2; exit 2; }
 MISSING=0
-while IFS= read -r WL; do
+while IFS= read -r WL || [ -n "$WL" ]; do
   [ -z "$WL" ] && continue
   [ -r "$WL" ] || { echo "$WL: no such work list" >&2; MISSING=$((MISSING + 1)); }
 done < "$QUEUE"
@@ -70,7 +71,7 @@ cd "$REPO" || exit 2
 mkdir -p "$RESULTS" || exit 2
 stamp() { date -u +%FT%TZ; }
 INCOMPLETE=0
-while IFS= read -r WL; do
+while IFS= read -r WL || [ -n "$WL" ]; do
   [ -z "$WL" ] && continue
   STEM=$(basename "$WL" .worklist.csv.gz)
   OUT=$RESULTS/$STEM

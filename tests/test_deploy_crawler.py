@@ -172,6 +172,19 @@ def test_the_runner_walks_the_queue_in_order_one_harvester_at_a_time(tmp_path):
     assert "QUEUE DONE pass=1 incomplete=0" in log
 
 
+def test_a_final_queue_line_without_a_newline_is_still_a_work_list(tmp_path):
+    """`read` returns false on an unterminated last line; a runner that stopped
+    there would skip the last city, exit 0 and log a complete queue."""
+    host = Host(tmp_path, ["aaa", "bbb"])
+    host.queue.write_text(host.queue.read_text().rstrip("\n"))
+    r = host.run()
+    assert r.returncode == 0, r.stderr
+    assert host.called_stems() == ["aaa", "bbb"]
+    # The pre-flight sees it too: missing, it refuses the queue.
+    host.worklists["bbb"].unlink()
+    assert host.run().returncode == 2
+
+
 def test_an_incomplete_work_list_is_ridden_past_and_the_queue_ends_83(tmp_path):
     host = Host(tmp_path, ["aaa", "bbb", "ccc"], rcs={"bbb": SWEEP_INCOMPLETE_EXIT_CODE})
     r = host.run()
@@ -324,10 +337,20 @@ def test_the_readme_installs_the_unit_it_ships():
 # Anything that would identify the crawler host: a cloud provider, a region, an
 # instance type or id, a security-group id, a literal address, the remote-shell
 # service used to reach it. The pilot writeup carried several of these until the
-# review of PR #446 scrubbed it; this keeps them out.
+# review of PR #446 scrubbed it; this keeps them out. IPv6 literals are not
+# matched (too many false positives); none has ever been written here.
 HOST_IDENTITY = re.compile(
-    r"\b(aws|ec2|amazon|azure|ssm|elastic ip|us-(east|west)-\d|"
-    r"[a-z]\d[a-z]?\.(nano|micro|small|medium|x?large)|i-[0-9a-f]{8,}|sg-[0-9a-f]{8,})\b"
+    r"\b(aws|ec2|amazon|azure|gce|gcp|hetzner|linode|lightsail|droplet|ssm|elastic ip"
+    # regions: us-west-2, eu-central-1, ap-southeast-2, us-central1, europe-west4
+    r"|(us|eu|ap|sa|ca|me|af|il|europe|asia|australia|northamerica|southamerica)"
+    r"-(east|west|central|north|south|southeast|northeast|southwest|northwest)-?\d"
+    # instance types: t3.small, m5.2xlarge, c6gn.large, e2-micro, n2-standard-4, Standard_D2s
+    r"|[a-z]\d[a-z]*\.(nano|micro|small|medium|\d*x?large|metal)"
+    r"|[a-z]\d[a-z]?-(micro|small|medium|standard|highmem|highcpu)(-\d+)?"
+    r"|standard_[a-z]\d+[a-z]*"
+    # ids and the hostnames a provider derives from an address
+    r"|i-[0-9a-f]{8,}|sg-[0-9a-f]{8,}|ip-\d+-\d+-\d+-\d+)\b"
+    # a literal IPv4 address
     r"|\b\d{1,3}(\.\d{1,3}){3}\b",
     re.IGNORECASE,
 )
@@ -350,17 +373,27 @@ def test_nothing_in_the_crawler_deploy_or_the_harvesters_docs_names_the_host():
     assert offenders == []
 
 
-def test_the_privacy_regex_catches_what_the_review_scrubbed():
+def test_the_privacy_regex_catches_each_kind_of_host_identity():
+    """Synthetic examples of each kind, never the host's own values: this file
+    is public too, and the regex is the rule, not a list of secrets."""
     for leak in (
         "an EC2 instance",
-        "us-west-2",
-        "a t3.small",
-        "via SSM",
-        "i-0abc12345678",
-        "sg-0abc12345678",
-        "54.202.240.80",
         "on AWS",
-        "a t3a.nano box",
+        "a GCE VM",
+        "via SSM",
+        "eu-central-1",
+        "ap-southeast-2",
+        "us-central1",
+        "europe-west4",
+        "an m5.large",
+        "a c6gn.2xlarge box",
+        "an e2-micro",
+        "n2-standard-4",
+        "Standard_D2s",
+        "i-0123456789abcdef0",
+        "sg-0123456789abcdef0",
+        "ip-10-0-0-1",
+        "192.0.2.10",
     ):
         assert HOST_IDENTITY.search(leak), leak
     for fine in (
@@ -369,5 +402,10 @@ def test_the_privacy_regex_catches_what_the_review_scrubbed():
         "v3/api/cities",
         "2026-10-26",
         "a small virtual machine",
+        "the e2e suite",
+        "a t-test",
+        "schema v22",
+        "Python 3.12",
+        "at 60/min, 1,500,869 edges",
     ):
         assert not HOST_IDENTITY.search(fine), fine

@@ -24,8 +24,8 @@ Nothing in `deploy/systemd` applies here: those are the catalog host's user unit
 As root on the host:
 
 ```bash
-useradd --system --create-home --shell /bin/bash crawler
-install -d -o crawler -g crawler /srv/crawler /srv/crawler/worklists /srv/crawler/results
+useradd --system --home-dir /srv/crawler --create-home --shell /bin/bash crawler
+install -d -o crawler -g crawler /srv/crawler/worklists /srv/crawler/results /srv/streetscape-tracker
 sudo -u crawler git clone https://github.com/jonfroehlich/streetscape-tracker.git /srv/streetscape-tracker
 sudo -u crawler python3 -m venv /srv/streetscape-tracker/.venv          # 3.11+
 sudo -u crawler /srv/streetscape-tracker/.venv/bin/pip install -r /srv/streetscape-tracker/requirements.lock
@@ -57,12 +57,18 @@ The runner exits with the harvester's own codes, and the unit restarts on none o
 | 86 | The endpoint refused (429/403, an HTML page, the breaker) and the 24 h latch is in force | Read `blocked.json` and the last `pass1.log`. Wait out the cool-down, then `systemctl start`; the harvester refuses to start while the latch holds. `--clear-latch` is a deliberate operator override, not the default |
 | 88 | Another crawl holds the lock | Two instances enabled at once; disable one |
 | 2 | Our own refusal: argv, a missing or malformed work list, an out-dir written under another column set | Fix the queue or use a fresh out-dir; never append to a pilot-era directory |
-| other | A crash | The unit re-runs the queue after `RestartSec` (every crawl resumes from its ledger), three times a day at most; then `systemctl reset-failed gsv-history-queue@1` after reading the journal |
+| other | A crash | The unit re-runs the queue after `RestartSec` (every crawl resumes from its ledger), under a limit of five starts a day that counts your own `systemctl start`s too; a start refused as "repeated too quickly" needs `systemctl reset-failed gsv-history-queue@1` first, after reading the journal |
 
 **Stopping and moving code.**
 `systemctl stop gsv-history-queue@1` sends SIGINT, so the harvester's final flush writes a complete gzip member; a stop is never a loss.
+The queue log then ends with a `START` line and no `END` for the work list that was running; the next start resumes it.
 To move the checkout, stop the unit, `sudo -u crawler git -C /srv/streetscape-tracker checkout <sha>`, dry-run the current work list by hand as `crawler` (`--dry-run` runs the out-dir shape check and prints how many rows are already answered), then start the unit again.
 A finished work list is skipped on the re-run at the cost of reading its ledger, so a restart from the top of the queue is cheap.
+
+**Taking over a crawl started by hand.**
+A crawl started outside this unit (a `systemd-run` transient unit, a shell) holds the same lock only if it used the same latch dir, so check its out-dir and `--latch-dir` against the layout table first:
+a hand-started crawl under another results root would keep running beside the unit's, two crawls on one address.
+Then stop it with SIGINT (`systemctl kill -s INT <its unit>`, or `kill -INT` the harvester), wait for it to exit, and `systemctl enable --now gsv-history-queue@1`; the queue resumes every work list from its ledger.
 
 **Pass 2.**
 Only after pass 1's queue has ended 0 (or its 83 stragglers are judged done): `systemctl disable --now gsv-history-queue@1`, write `queue-pass2.txt`, then `systemctl enable --now gsv-history-queue@2`.
