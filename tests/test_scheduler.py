@@ -10301,7 +10301,10 @@ def test_an_age_wall_the_per_city_ceiling_binds_names_that_ceiling(conn, tmp_pat
         city_channels=["kartaview"],
     )
     assert plan.skip == _SWEEP_SKIP_AGE_WALL
-    assert "[providers.kartaview].max_city_minutes" in plan.message
+    # The LEVER, not the clock note: the note names the ceiling too whenever it
+    # binds, so a bare substring match passed with the lever arm deleted.
+    assert "raise [providers.kartaview].max_city_minutes" in plan.message
+    assert "derived timeout" not in plan.message
     assert "daily_request_budget" not in plan.message
 
 
