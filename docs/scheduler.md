@@ -371,7 +371,7 @@ Each channel keeps its own limiter and its own daily budget, so no provider is a
 The launch pass computes the set of per-IP hosts the in-flight siblings hold (from `CHANNEL_HOSTS`, never a hardcoded list) and *defers* — leaves pending, silently, reconsidered when a sibling completes — any channel that intersects it.
 So each of Overpass, the Mapillary tile CDN and KartaView sees at most one talker from this process, exactly as before, and the configured `max_requests_per_minute` stays the real figure rather than doubling.
 Every walk shares Overpass with every other walk, and shares its provider's host with its own grid channel, so it always runs after both — which is also the desirable order, since the second street channel of a city then hits the warm GraphML cache instead of racing for the same Overpass fetch.
-With today's **eight** channels the largest host-disjoint set is therefore `gsv` (no per-IP host) + `gsv_streets` (Overpass) + `mapillary` (tile CDN) + `kartaview` (kartaview.org) + `panoramax` (api.panoramax.xyz) = **5 of 8** (#335).
+With today's **eight** channels the largest host-disjoint set is therefore `gsv` (no per-IP host) + `gsv_streets` (Overpass) + `mapillary` (tile CDN) + `kartaview` (api.kartaview.org) + `panoramax` (api.panoramax.xyz) = **5 of 8** (#335).
 `gsv_streets` is the Overpass representative because it is the only Overpass channel with no SECOND host: picking any walk instead gives up that walk's other host and the set drops to 4.
 Re-deriving has now cost three different answers — 4 of 5, then 4 of 6, then 5 of 7 and 5 of 8 — and the instructive one is the last pair: the NUMERATOR did not move, because every walk added brings one more Overpass user and Overpass admits exactly one talker, so a walk can only ever displace the Overpass channel already in the set.
 The figure is a property of the channel SET's host graph, never a constant — derive it again for a ninth rather than quoting this number.
@@ -596,6 +596,13 @@ The scheduler latches the tile CDN for the rest of the run — both Mapillary ch
 It writes no `host_refusals` row and so arms no cooldown, because a 429 is inconclusive, exactly as `probe-host` reads it.
 A walk lost to its own 87 strands like one lost to a refusal, and the alert names it `a throttled host (HTTP 429/503)`.
 The night still alerts and exits nonzero; the subject says `host(s) THROTTLED` and the `Done:` line `THROTTLED (HTTP 429/503, no refusal recorded)`, never "unavailable".
+
+**An ENDPOINT MOVED child (exit 89/90) is not a refusal and writes no row** (#452).
+KartaView exits 89 when every calibration probe answered HTTP 404, or the first six requests of a resume did with nothing answered; Panoramax exits 90 on #407's whole-lattice 404, and on an all-404 resume of at least `ENDPOINT_MOVED_MIN_TILES` tiles (`HostEndpointMovedError`).
+The scheduler reacts as to a throttle — the host is latched for the rest of the run (no `HOST_RECHECKS` entry), the child is amnestied (no `record_attempt`, so no `consecutive_failures`), and no `host_refusals` row or cooldown is written — and one more thing: the branch `continue`s before `attempted += 1`, so a city due only on the moved host **takes no city-cap slot**.
+That is the 2026-10-23 failure it exists for: the KartaView-only cities each spent a slot learning the same 404s, and the 80-city cap was gone in 1.6 h.
+A walk lost to its own 89/90 strands, and the alert names it `a moved endpoint (HTTP 404)`.
+The subject says `host(s) ENDPOINT MOVED`, the `Done:` line `ENDPOINT MOVED (HTTP 404 at every probe, no refusal recorded)`, and the alert paragraph says what to do, because nothing holds the channels tomorrow and the next night re-learns it at six requests per host: set `enabled = false` on their `[providers.*]` blocks, re-run `scripts/kartaview_endpoint_probe.py` from a laptop (never makelab), and read `docs/experiments/kartaview-endpoint-move.md`.
 `scheduler status` prints, per host with a row, the last refusal and how long ago, the last clearance, and the last ledgered request on the host.
 
 **`probe-host HOST` sends exactly one request and records the verdict.**
@@ -861,7 +868,7 @@ the same streak re-reaching a RAISED cap is not emailed again, since only a succ
 and the first night after the v21 deploy emails every standing quarantined pair once, by design, since the migration backfills nothing and a pair quarantined before #423 shipped was never emailed at all.
 
 **The amnestied exit-code families can never reach it.**
-Blocked (75/76/81/84), busy (79/80/82/85), crawl-incomplete (83) and argv-rejected (2) record no `consecutive_failure`, and neither does a child killed by the SIGTERM wind-down (#206), so a host block or a `systemctl stop` never quarantines the city it stopped; `test_an_amnestied_outcome_never_quarantines_a_pair_one_failure_from_the_cap` pins each against a plain failure that does.
+Blocked (75/76/81/84), busy (79/80/82/85), crawl-incomplete (83), throttled (87), endpoint-moved (89/90) and argv-rejected (2) record no `consecutive_failure`, and neither does a child killed by the SIGTERM wind-down (#206), so a host block or a `systemctl stop` never quarantines the city it stopped; `test_an_amnestied_outcome_never_quarantines_a_pair_one_failure_from_the_cap` pins each against a plain failure that does.
 
 **`reset-failures CITY --channel C [--execute]`** is the way out, so the alert's fix is a command rather than SQL against the live catalog.
 It is DRY-RUN until `--execute`, and the preview prints the count, whether the pair is quarantined, and its `last_error`, so the cause is read before it is cleared.

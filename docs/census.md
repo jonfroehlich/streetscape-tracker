@@ -129,7 +129,10 @@ So `download_kartaview.py` tiles the frozen grid's bbox with squares, covers eac
 **`HTTP 400` is BACKPRESSURE here, not a malformed request** (`apiCode` 690 or 408 inside it), which is the opposite of the usual 4xx reading and the easiest thing in this module to get wrong: typed as permanent it would never be retried or subdivided and every dense city would collect nothing.
 **Three measured facts decide the walk, two of them correcting the feasibility study that preceded them.** (1) Pagination is **exhaustive**
 — Seattle r=400 ipp=200 returned pages 1–6 with zero id overlap between any pair, union == `totalFilteredItems`, page 7 empty
-— so a truncated circle is *paged*, not subdivided, and page 1 prices the rest of the circle before we pay for it.
+— so a truncated circle is *paged*, not subdivided, and page 1 used to price the rest of the circle before we paid for it.
+**Since 2026-10-22 it does not (#452):** the host that serves the route, `api.kartaview.org`, reports `totalFilteredItems` as `['0']` on every page (re-measured: pages 1 and 2 of the Seattle circle non-overlapping, page 7 empty, so pagination is still exhaustive).
+A total smaller than the page it arrived with is therefore UNKNOWN (`total_is_usable`), and the circle is paged **blind** until a short page (`page_is_full`), under the same `MAX_PAGES_PER_CELL` whose subdivide and floor-unmeasured branches still bound it — reached *after* paying the cap's pages, since nothing prices them up front any more.
+The cost: a sparse circle (one short page) costs nothing extra, an exactly-full circle one extra empty page, and a subdivided root up to `MAX_PAGES_PER_CELL − 1` more than a counting host cost; `_SWEEP_OVERHEAD_MULTIPLIER` (1.80×) is **not re-measured** for this shape (nothing here makes a live request), and each sweep logs and returns `cells_paged_blind`.
 (2) `apiCode 690` is **flaky**, not a function of (radius, ipp): Horace ND — a bbox holding *no* imagery at all
 — refused r=1000 on 0/6 attempts at ipp=2000 and 0/4 at ipp=200, answered r=250 on 4/4, then answered r=1000 on 2/2 forty-five minutes later.
 So a refusal is retried before it is believed (retrying is **4× cheaper** than subdividing: one request against four, each of which may cascade 1 + 4 + 16 to the floor; 88 cells cleared on retry during the study, for 174 extra requests in total).
@@ -158,19 +161,21 @@ One further date hazard is **not** a KartaView property but a pandas one, and it
 — so the vectorized parser pins `format="ISO8601"` and a test pins the pin.
 **Pacing and the host lock:** KartaView documents 100 req/hour anonymous and 1,000 authenticated (the FAQ is reachable only by scraping `kartaview.org/main.*.js` — the docs are a JS SPA
 — corroborated by Bellingcat), returns **no** `X-RateLimit-*` or `Retry-After` headers at all, and enforced neither figure when measured (130 consecutive requests, zero 429s).
-A client therefore cannot observe its own budget, so we pace to the published number regardless: `DEFAULT_SWEEP_REQUESTS_PER_MINUTE` is 16 (960/hour, under the documented ceiling by construction since the limiter's burst is a single token),
+A client therefore cannot observe its own budget, so we pace to the published number regardless: `DEFAULT_SWEEP_REQUESTS_PER_MINUTE` is **1.5 (90/hour, under the documented ANONYMOUS ceiling)** since #452, because `api.kartaview.org` validates no token and the authenticated tier (16/min, kept as `AUTH_SWEEP_REQUESTS_PER_MINUTE`) is unverifiable — at that pace a Singapore-class sweep (~111 h) cannot finish inside the 7-day checkpoint wall, so the scheduler refuses its resume and records a failure by design,
 the sweep is **serial** (pacing is the bottleneck, the next question depends on the last answer, and fanning out into a server that answers 400 under load is #198's shape), and one `host_lock(HOST_KARTAVIEW)` is held for the whole sweep
 — which for Singapore is hours, so any concurrent KartaView work gets the busy code rather than a queue.
 KartaView is the **third** locked host (`HOST_LABELS` is the registry; there is no separate set) and has its own exit codes
-— **81 blocked / 82 busy**, skipping 77/78 because those are `EX_NOPERM`/`EX_CONFIG` and a plausible-sounding wrong answer to "what does 77 mean?" is worse than an unallocated number.
+— **81 blocked / 82 busy / 89 endpoint moved**, skipping 77/78 because those are `EX_NOPERM`/`EX_CONFIG` and a plausible-sounding wrong answer to "what does 77 mean?" is worse than an unallocated number.
 A redirect, an HTML body or a 429 is a `HostBlockedError` and stops the sweep at the **first** request (#205, exact rather than bounded by a concurrency limit, because the walk is serial);
 **401/403 stays a plain `DownloadError`**, scoped to the credential, per the Mapillary precedent.
 Two conditions that look alike and are not: a city where **no rung answers at any calibration point** is a `DownloadError` and never a host condition (that is a property of the bbox — Horace again
 — and typing it host-wide would let one such city skip every other city's KartaView channel for the night), and it is never recorded as an *empty* city, since a 0-pano census publishes and diffs as "every pano in the city removed".
+A third looks like the first and is the opposite (#452): a ladder where every probe answered **HTTP 404** (`RouteNotFoundError`, typed before the HTML check so an HTML 404 never reads as a refusal) is the ENDPOINT, the same for every city, so it raises `HostEndpointMovedError` and exits 89 — latched for the night, amnestied, no `host_refusals` row.
+A resume skips the ladder, so the sweep applies the same stop at the first `ENDPOINT_NOT_FOUND_STRIKES` (6) requests while nothing has answered; after any answer a 404 is one failed cell under the area guard.
 A sweep that leaves more than `MAX_FAILED_AREA_FRACTION` (2%, measured as **area** because subdivision means cells are not one size) unmeasured refuses to finalize.
 A resume **re-probes carried failed cells before the unvisited roots** (a refusal is time-varying — Horace again), so a cell stays failed only by refusing again;
 each leaves the durable failed set only at the moment it is actually re-swept, so a stop or crash mid-pass keeps the not-yet-re-probed tail failed rather than losing it.
-**"Unmeasured" and "not yet visited" are different facts, and the checkpoint is what separates them (issue #239).** A sweep is hours of paced fetching — Singapore ~9,974 requests ≈ 10.4 h at 16/min
+**"Unmeasured" and "not yet visited" are different facts, and the checkpoint is what separates them (issue #239).** A sweep is hours of paced fetching — Singapore ~9,974 requests ≈ 10.4 h at 16/min, ~111 h at the anonymous 1.5/min
 — and until #239 any interruption discarded every request already paid for: a SIGKILL from `city_timeout_minutes`, a `systemctl stop`, an OOM, a crash in the caller's tail all restarted at cell zero, which is what made a per-city candidacy ceiling (excluding exactly Singapore, the strongest 360° city in the feasibility study) or a `max_batch_hours` bump look necessary.
 `fetch_city_images_async(checkpoint_path=…)` instead commits what it has answered
 — a **directory** of Parquet parts plus a `state.json` **commit record written last**, so a part beyond the record is a torn write, ignored and deleted — and a later process resumes from it.

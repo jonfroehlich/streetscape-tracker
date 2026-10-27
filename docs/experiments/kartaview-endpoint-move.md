@@ -72,3 +72,39 @@ A partial run writes `kartaview-endpoint-move_metrics.partial.json` and never ov
 - One circle, one moment, one IP (the Mac).
   The total reading 0 on every page of a circle known to hold over 1,000 photos is not a sampling question, but whether some other request shape (a different `ipp`, the v2 photo API) still reports a total was not tested.
 - Whether the old host's total had already gone to 0 before it started 404ing is unknowable now; the 10-15 sweeps succeeded, but nothing checked them for truncation.
+
+## Resolution (issue #452, 2026-10-27)
+
+Nothing new was measured for this section; it records what the code does now and what is still open.
+
+**What changed.**
+
+- `NEARBY_PHOTOS_URL` is `https://api.kartaview.org/1.0/list/nearby-photos/` (`api.openstreetcam.org` is the noted fallback).
+- A total smaller than the page it arrived with is UNKNOWN (`total_is_usable`), and the circle is paged blind until a short page (`page_is_full`), under `MAX_PAGES_PER_CELL`; past the cap it subdivides, or at the radius floor records the cell unmeasured.
+  Each sweep logs `N cell(s) paged blind` and returns `cells_paged_blind`.
+- An HTTP 404 is `RouteNotFoundError`, checked before the HTML test.
+  404s at every calibration probe, or at the first `ENDPOINT_NOT_FOUND_STRIKES` (6) requests of a sweep that skipped the ladder with nothing answered, raise `HostEndpointMovedError`: exit **89** for KartaView.
+  Panoramax's whole-lattice 404 (#407) raises it too, as exit **90**, and so does an all-404 resume of at least `ENDPOINT_MOVED_MIN_TILES` (6) tiles.
+- The scheduler treats 89/90 like the #444 throttle: the host is latched for the night, the child is amnestied (no `consecutive_failures`), the branch skips `attempted += 1` so a city due only on that host takes no city-cap slot, and no `host_refusals` row or cooldown is written.
+  The alert names the moved endpoint, the probe script and the pause.
+- The default pace is the anonymous tier, **1.5/min = 90/h**, a float through both CLIs and `ProviderConfig`; both config files pin it.
+  16/min is kept as `AUTH_SWEEP_REQUESTS_PER_MINUTE`.
+
+**Still open.**
+
+- The pace is not decided: 1/min keeps every type an integer at 40% less throughput, and 100/60 hits the documented figure exactly.
+- At 90/h a Singapore-class sweep (~9,974 requests, ~111 h) cannot finish inside the 7-day `CHECKPOINT_MAX_AGE_S`, so the scheduler refuses its resume and records a failure by design; the wall is not raised here.
+- Whether the authenticated tier returns: only a probe showing a bogus token refused would say so.
+- How often to re-probe `kartaview.org` (the probe script, from a laptop); `probe-host` has no KartaView entry.
+- Whether the 10-15 sweeps were already truncated.
+- `_SWEEP_OVERHEAD_MULTIPLIER` (1.80×) is not re-measured for blind paging, which costs one extra page for an exactly-full circle and up to `MAX_PAGES_PER_CELL − 1` more per subdivided root.
+
+**The resume plan (prod steps, in order).**
+
+1. Deploy main to makelab2.
+2. A config PR flipping `enabled = true` on both KartaView blocks of `config/scheduler.makelab1.toml` (`test_makelab1_production_config_is_wired` flips with it).
+3. After night 1: `grep -h "paged blind" logs/collect_*_kartaview_*` and read the `Done:` line.
+4. Compare every re-collected 10-15 city's pano count against its previous run (`runs` rows per city and provider); a collapse over 30% with `cells_paged_blind` > 0 is the truncation signal.
+5. An `ENDPOINT MOVED` alert means `api.kartaview.org` moved too: pause again and re-probe from a laptop.
+
+The 62 pairs at 2 of 5 `consecutive_failures` reset on their first success; no `reset-failures` is needed.
