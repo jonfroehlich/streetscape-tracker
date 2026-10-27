@@ -12866,8 +12866,9 @@ class FillReport:
     def _left_clause(self) -> str:
         """``; left: 9.0 h of the 12 h window, 33 of 80 city slots`` (issue #443).
 
-        Printed on every fill end, so the series is uniform: a ``deadline`` end
-        reads ``0.0 h``, a ``city cap`` end ``0 of 80``.
+        Printed on every fill end but an error, so the series is uniform: a
+        ``deadline`` end reads under ``0.2 h`` (the fill stops launching once
+        ``_MIN_PACED_LAUNCH_S`` or less is left), a ``city cap`` end ``0 of 80``.
         """
         if self.window_left_s is None:
             return ""
@@ -13573,12 +13574,6 @@ def _run_fill(
                     ended = f"budget ({blocker})"
             else:
                 ended = "candidates exhausted"
-        # What the night left on the table (issue #443): read after the fill's
-        # passes, so ``processed`` includes every city the fill advanced.
-        report.window_left_s = max(0.0, batch_deadline - time.monotonic())
-        report.window_h = cfg.max_batch_hours
-        report.slots_left = max(0, max_cities - processed)
-        report.city_cap = max_cities
         report.ended_by = ended
         if walk_prior and report.stop_reason is None:
             tally: Counter[str] = Counter()
@@ -13610,6 +13605,16 @@ def _run_fill(
                 report.early_refreshes += _record_early_refreshes(
                     cfg, conn, touched[cid], today, {walk: prior_success}
                 )
+        # What the night left on the table (issue #443): read LAST, after the
+        # stranded-walk retry pass (which may wait out a breaker re-check), so
+        # the window it spent is not reported as unused and ``processed``
+        # includes every city the fill advanced. The LAST statements of the
+        # ``try``: an error anywhere above leaves them None, so an error end
+        # prints no ``left:`` with no reset needed in the ``except``.
+        report.window_left_s = max(0.0, batch_deadline - time.monotonic())
+        report.window_h = cfg.max_batch_hours
+        report.slots_left = max(0, max_cities - processed)
+        report.city_cap = max_cities
     except Exception:
         logger.exception("Fill phase aborted by an unexpected error")
         report.ended_by = report.stop_reason = _STOP_REASON_FILL_ERROR

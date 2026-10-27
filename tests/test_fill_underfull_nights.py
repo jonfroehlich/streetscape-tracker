@@ -18,6 +18,7 @@ at all. These tests pin, in order:
 """
 
 import os
+import time
 from datetime import UTC, date, datetime, timedelta
 
 import pytest
@@ -2261,7 +2262,11 @@ def test_a_mapillary_excluded_city_is_still_admitted_after_the_tile_cdn_latches(
     night: a city excluded from Mapillary (#301) is admitted on gsv after the
     tile CDN refused fill city ``a``. Killed by refusing every city while any
     host is latched (``if latched:`` in ``_fill_prebudget_refusal``), and by
-    asking the latch of every channel's hosts rather than this channel's."""
+    asking the latch of every channel's hosts rather than this channel's.
+
+    The latch itself is asserted from the night's own ``unavailable`` clause,
+    or the test would pass unchanged with nothing refused at all (killed by
+    dropping ``outcome=_refuse_mapillary()``: review of PR 454, finding 3)."""
     caplog.set_level("INFO")
     a = _city(conn, "Alpha", {"gsv": 70, "mapillary": 70})
     x = _city(conn, "Xcluded", {"gsv": 60})
@@ -2272,6 +2277,7 @@ def test_a_mapillary_excluded_city_is_still_admitted_after_the_tile_cdn_latches(
     assert ran == [(a, "gsv"), (a, "mapillary"), (x, "gsv")]
     assert (x, "gsv") in {(r[0], r[1]) for r in _early_rows(conn)}
     done = _done_line(caplog)
+    assert "Mapillary's tile CDN (tiles.mapillary.com) unavailable" in done
     assert "declined" not in _fill_clause(done)
     # An admission after the latch clears what trails, so nothing declined ENDED it.
     assert "ended by candidates exhausted" in done
@@ -2357,6 +2363,77 @@ def test_the_fill_names_only_the_host_its_declines_asked_about(conn, monkeypatch
         "host refused tonight: Mapillary's tile CDN (tiles.mapillary.com); left:"
     )
     assert "Overpass" not in ended
+
+
+def _overpass_stranded_fill_night(monkeypatch, conn, data_dir, retry):
+    """A fill whose walk strands on Overpass, so the fill's retry pass runs.
+
+    ``retry`` replaces ``_retry_stranded_walks`` for the FILL's call only (the
+    due phase's end-of-night pass keeps the real one).
+    """
+    from streetscape_metadata_tracker.download_common import HOST_EXIT_CODES, HOST_OVERPASS
+
+    providers = {
+        "gsv": ProviderConfig(daily_request_budget=10_000_000),
+        "gsv_streets": ProviderConfig(daily_request_budget=10_000_000),
+        "mapillary": ProviderConfig(daily_request_budget=3_500),
+    }
+    a = _city(conn, "Alpha", {"gsv": 70, "gsv_streets": 70, "mapillary": 70})
+    _freeze_network(data_dir, a)
+    real = sched._retry_stranded_walks
+    called = []
+
+    def fake(*args, fill=False, **kwargs):
+        if not fill:
+            return real(*args, fill=fill, **kwargs)
+        called.append(True)
+        return retry()
+
+    monkeypatch.setattr(sched, "_retry_stranded_walks", fake)
+
+    def outcome(city, provider):
+        if provider == "gsv_streets":
+            return _outcome(HOST_EXIT_CODES[HOST_OVERPASS])
+        return True
+
+    _run_night(
+        monkeypatch, conn, _grid_cfg(providers=providers, data_dir=data_dir), outcome=outcome
+    )
+    assert called, "the fill's stranded-walk retry pass never ran"
+
+
+def test_left_is_read_after_the_fill_stranded_walk_retry_pass(conn, monkeypatch, caplog, data_dir):
+    """The retry pass can wait out a breaker re-check; that time is SPENT, so
+    ``left:`` must be read after it. The fake pass advances the clock 3 h:
+    left reads 9.0 h, not 12.0. Killed by reading the four ``left:`` fields
+    before the retry pass (review of PR 454, finding 2)."""
+    caplog.set_level("INFO")
+    real_monotonic = time.monotonic
+    offset = [0.0]
+    monkeypatch.setattr(sched.time, "monotonic", lambda: real_monotonic() + offset[0])
+
+    def retry():
+        offset[0] += 3 * 3600
+        return None
+
+    _overpass_stranded_fill_night(monkeypatch, conn, data_dir, retry)
+    assert "; left: 9.0 h of the 12 h window, " in _done_line(caplog)
+
+
+def test_an_error_in_the_fill_retry_pass_prints_no_left_clause(conn, monkeypatch, caplog, data_dir):
+    """An error anywhere in the fill, its retry pass included, ends it as
+    ``unexpected error in the fill phase`` with NO ``left:`` -- driven through
+    ``_run_fill``, not a bare ``FillReport``. Killed by reading the four
+    ``left:`` fields before the retry pass (review of PR 454, finding 2)."""
+    caplog.set_level("INFO")
+
+    def retry():
+        raise RuntimeError("boom in the retry pass")
+
+    _overpass_stranded_fill_night(monkeypatch, conn, data_dir, retry)
+    done = _done_line(caplog)
+    assert "ended by unexpected error in the fill phase" in done
+    assert "left:" not in done
 
 
 def test_a_fill_report_the_fill_never_finished_prints_no_left_clause():
