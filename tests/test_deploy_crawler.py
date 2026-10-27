@@ -341,10 +341,10 @@ def test_the_readme_installs_the_unit_it_ships():
 # matched (too many false positives); none has ever been written here.
 HOST_IDENTITY = re.compile(
     r"\b(aws|ec2|amazon|azure|gce|gcp|hetzner|linode|lightsail|droplet|ssm|elastic ip"
-    # regions: us-west-2, eu-central-1, ap-southeast-2, us-central1, europe-west4
+    # regions: eu-central-1, ap-southeast-2, us-central1, europe-west4
     r"|(us|eu|ap|sa|ca|me|af|il|europe|asia|australia|northamerica|southamerica)"
     r"-(east|west|central|north|south|southeast|northeast|southwest|northwest)-?\d"
-    # instance types: t3.small, m5.2xlarge, c6gn.large, e2-micro, n2-standard-4, Standard_D2s
+    # instance types: m5.2xlarge, c6gn.large, e2-micro, n2-standard-4, Standard_D2s
     r"|[a-z]\d[a-z]*\.(nano|micro|small|medium|\d*x?large|metal)"
     r"|[a-z]\d[a-z]?-(micro|small|medium|standard|highmem|highcpu)(-\d+)?"
     r"|standard_[a-z]\d+[a-z]*"
