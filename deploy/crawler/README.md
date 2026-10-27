@@ -68,7 +68,12 @@ A finished work list is skipped on the re-run at the cost of reading its ledger,
 **Taking over a crawl started by hand.**
 A crawl started outside this unit (a `systemd-run` transient unit, a shell) holds the same lock only if it used the same latch dir, so check its out-dir and `--latch-dir` against the layout table first:
 a hand-started crawl under another results root would keep running beside the unit's, two crawls on one address.
-Then stop it with SIGINT (`systemctl kill -s INT <its unit>`, or `kill -INT` the harvester), wait for it to exit, and `systemctl enable --now gsv-history-queue@1`; the queue resumes every work list from its ledger.
+Then stop it with SIGINT (`systemctl kill -s INT <its unit>`, or `kill -INT` the harvester) and wait for it to exit.
+If its layout matched, `systemctl enable --now gsv-history-queue@1`; the queue resumes every work list from its ledger.
+If it did not, bring its files into the layout first, or the unit re-queries every row that crawl answered and ignores a latch it earned:
+copy its `blocked.json`, if there is one, into `/srv/crawler/results/` (the cool-down is the address's, whoever earned it);
+move its three `<stem>.pass<N>.*.gz` files into `/srv/crawler/results/<stem>/` (a fresh directory, never one holding files of another column set);
+then dry-run that work list as `crawler` and check the "already answered" count before enabling the unit.
 
 **Pass 2.**
 Only after pass 1's queue has ended 0 (or its 83 stragglers are judged done): `systemctl disable --now gsv-history-queue@1`, write `queue-pass2.txt`, then `systemctl enable --now gsv-history-queue@2`.
