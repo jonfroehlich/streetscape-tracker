@@ -1175,6 +1175,23 @@ A hold keeps a host's channels from launching without anything having refused us
   - `test_the_production_fetch_never_follows_a_redirect` (`allow_redirects=False` reaches `requests.get`) and `test_the_token_comes_from_the_existing_loader`.
 - `test_the_done_line_names_each_metered_hosts_presence_and_the_gap_before_it` — first launch to last finish on the tile CDN, the gap back to the newest ledger stamp from BEFORE the run (tonight's own stamps are seeded and must be ignored), and neither GSV nor Overpass named; killed by marking the launch after the inline child, by dropping the finish mark, by reading tonight's stamps, and by letting Overpass in.
 
+## The Mapillary night report (issue #444)
+
+`tests/test_mapillary_night_report.py` pins `scripts/mapillary_night_report.py`, the read-only Stage 1 read-out.
+Its log fixtures are copied verbatim from the 2026-10-27 prod pull, including that pull's truncation of the longer `Done:` lines, so the parser is pinned on lines the scheduler actually wrote.
+Every "killed by" below was run: the mutation was applied to the script and the test went red.
+
+- `test_a_done_line_with_deferrals_holds_and_presence_parses_into_one_row` — the 10-16, 10-22 and 10-25 lines: 20 pool deferrals and 1.1 h of presence on 10-22 (with the cut-off gap read as missing, never guessed), the Sunday rest hold with 0 launches, the 10-16 refusal with 2 launches skipped and 3 held; killed by dropping the rolling-pool regex.
+- `test_the_events_before_a_done_line_belong_to_its_night`, `test_a_night_still_in_flight_is_dated_from_its_start_line` — a run's stranded line and fill declines come BEFORE its `Done:` line, so they belong to the night that line closes; 10-26's fill room reads 69 → 5.
+- `test_mapillary_channels_cut_by_a_winddown_or_the_deadline_are_counted_for_375` — a child killed by the stop signal plus a stop-declined line naming both Mapillary channels count 3; the deadline clause counts only the Mapillary channels in it; killed by not counting the killed child.
+- `test_tile_status_lines_sum_per_night_across_child_logs` — the three 10-23 status lines in three child logs sum to 200=251 over 3 crawls, and a gsv child log on the same night is ignored; killed by reading only the first file.
+- `test_a_night_with_no_status_line_reports_na_not_zero` — a Mapillary child log without a status line prints `n/a (0/1)`, and the Stage 1 clock's 429/5xx count stays `None`; killed by defaulting the counts to 0.
+- `test_per_process_requests_never_the_cumulative_total` — a resumed crawl's `runs.api_requests` of 778 is `sweep_total`, and served is the 372 in `api_usage`; killed by taking served from the runs row.
+- `test_the_mapillary_only_due_population_excludes_gsv_due_cities` — 3 Mapillary-only-due and 2 also gsv-due give 3; killed by dropping the gsv exclusion.
+- `test_the_catalog_is_opened_read_only_and_an_older_schema_is_refused`, `test_a_current_catalog_is_read_and_left_byte_identical` — a v21 catalog exits 2 with its `user_version` and bytes unchanged, a current one is read and left byte-identical; killed by opening through `db.connect`, which migrates.
+- `test_it_never_lists_the_data_directory` — `glob`, `os.listdir` and `os.scandir` are spied (and must see something, or the test is vacuous); none is pointed under `data/`.
+- `test_the_stage1_clock_counts_only_design_point_nights` — a night needs ≥ 75% of the pool AND ≥ 2 h of presence; 15 such nights meet the criterion, and one `refused` row un-meets it.
+
 ## The same-day partner path (issue #215)
 
 `tests/test_assess_city.py`: the channel set collected in `enabled_providers()` order and **never** including the GSV grid run;

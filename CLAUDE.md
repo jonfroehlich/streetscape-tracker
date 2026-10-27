@@ -108,7 +108,8 @@ A pair moves together in one transaction, `--no-opt-in` skips it all, an explici
 
 ### One-time and repair scripts (`scripts/`)
 
-Every script in this table is catalog/disk-only (no API calls), dry-run by default, and takes `--execute`, with four exceptions.
+Every script in this table is catalog/disk-only (no API calls), dry-run by default, and takes `--execute`, with five exceptions.
+`mapillary_night_report.py` writes nothing but its optional `--json`, so it has no `--execute`.
 `prefreeze_street_networks.py` queries Overpass on purpose.
 `spot_check_gsv_history.py` makes DOCUMENTED Street View metadata requests on the streets key from the catalog host (never from the credential-free crawler host) and spends by default (`--dry-run` samples only).
 `harvest_gsv_history.py` is the #442 crawler itself, which queries the UNDOCUMENTED endpoint and runs ONLY on the dedicated host.
@@ -117,6 +118,7 @@ Every script in this table is catalog/disk-only (no API calls), dry-run by defau
 
 | Script | Purpose |
 |---|---|
+| `mapillary_night_report.py --config config/scheduler.makelab1.toml --since DATE [--json OUT]` | The #444 Stage 1 read-out, one row per UTC night: served (`api_usage`, per process — never the `runs` row, which holds a census crawl's CUMULATIVE total), runs and walks, the `Done:` line's pool deferrals, holds, refusals and presence, summed child-log tile statuses (`n/a`, never 0, with no status line), the fill's tile-CDN room, #375's deadline and wind-down counts, the Mapillary-only-due population and whether Stage 1's clock has started; on the catalog host, catalog opened read-only and refused at any other schema version, never lists `data/` |
 | `migrate_to_db.py` | One-time migration of legacy undated data files into the catalog |
 | `resize_city.py "City" --width W --height H` | Manually resize one city's frozen grid (escape hatch for what #91's bulk pass can't fix); refuses a city with real runs unless `--force` |
 | `cap_oversized_grids.py [--include-collected]` | Cap every oversized frozen grid at once (#166); including collected cities breaks their diff continuity (no files are deleted) |
