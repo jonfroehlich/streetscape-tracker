@@ -477,6 +477,72 @@ Not done here, and why: the per-status response counts, the identifying User-Age
 The forum post and the support email (Stage 5) each need the Maintainer's OK.
 Per this file's opening rule, Mapillary's API docs and forum must be re-read before this is DEPLOYED: it changes how often and how much we ask (every change in the direction of less), and they were not re-read in the session that wrote it.
 
+## Stage 1 read-out, 2026-10-22..10-27: clean, but not yet at the volume that tests anything (issue #444)
+
+Read from a read-only prod pull of 2026-10-27, taken while that night's `run-due` was still in flight, so 10-27 is partial.
+Served is `api_usage` for both Mapillary channels on the UTC date (the walk row is 0 or absent every night, because paired walks are census-cache hits).
+Tile statuses come from the per-attempt child logs, and the pull caught 4 of about 59 crawls, so that column is a sample, not a night total.
+`host_refusals` has **no rows** since it was deployed on 2026-10-21.
+
+| Night (UTC) | Served | Grid runs / walks | Refusal / hold / throttle | Tile statuses seen | Fill | Ended by | Cities (due / fill), length |
+|---|---|---|---|---|---|---|---|
+| 10-15 | 1,251 | 49 / 29 | clean | not instrumented (pre-deploy) | 29 cities; declined 323 for `mapillary_tiles`; reserved 1,734 | 3,000 rolling cap | 49 (20 / 29), 2.61 h |
+| 10-16 | 1,713 | 16 / 0 | **BLOCK** (302 → login) at 1,631; 2 launches skipped; 3 due held | not instrumented | 0 cities | breaker latch | 20 (20 / 0), 4.25 h |
+| 10-17 | 5 | 0 / 0 | **refused on request 1** (carried over ~20 h); 19 skipped | not instrumented | 0 cities | latch | 14 (14 / 0), 3.81 h |
+| 10-18 | — | — | no `Done:` line (the nightly crashed on an unrelated catalog-version error) | — | — | — | — |
+| 10-19 | 0 | 0 / 0 | both channels disabled (Stage 0) | — | 0 cities | SIGTERM (operator) | 27 (27 / 0), 7.83 h |
+| 10-20 | 0 | 0 / 0 | disabled | — | 35 cities, GSV-only (35 now misaligned) | deadline (12 h) | 50 (15 / 35), 11.64 h |
+| 10-21 | 0 | 0 / 0 | disabled | — | 10 cities, GSV-only | SIGTERM (deploy of `ea02f9d`) | 11 (1 / 10), 8.66 h |
+| 10-22 | **1,200** (= the pool) | 19 / 0 | none; **20 deferred for the rolling pool**; presence 1.1 h, 120 h after the previous request | 1 crawl: 200=155, nothing else | not reached | 80-city cap (124 failed KartaView runs) | 80, 2.09 h |
+| 10-23 | 695 | 15 / 0 | none; 3 deferred for the pool; presence 0.7 h, 23.0 h gap | 3 crawls: 200=251, nothing else | not reached | 80-city cap (136 failed runs, KartaView) | 80, 1.60 h |
+| 10-24 | 372 | 6 (3 resumers) / 0 | none; presence 0.3 h, 23.3 h gap | — | not reached | 80-city cap; only 6 of the 80 were Mapillary-due | 80, 2.38 h |
+| 10-25 (Sun) | 0 | 0 / 0 | rest night held, **0 launches held** (no slate city was Mapillary-due) | — | not reached | 80-city cap | 80, 2.46 h |
+| 10-26 | 221 | 18 / 18 | none; presence 0.5 h, 48.2 h gap | — | 18 cities; fill room on the tile CDN **69 → 5**, ~100 cities declined for it | fill room | 38 (20 / 18), 1.02 h |
+| 10-27 (partial) | 374 so far | 1 / 1 | none at pull time | — | in flight | in flight | in flight |
+
+The 10-24 grid row's `runs.api_requests` sums to 778 against 372 ledgered: for a census crawl that column holds the CUMULATIVE `api_requests_total` (`cli.py`), and the 406 difference is exactly the three crawls that paused at the pool on 10-22/23 (Charleston 155 + 26, Bendigo 163, Cheyenne 62) and finished on 10-24.
+
+**What these nights show:** the IP is not permanently refused, and the 120 h of silence from 10-17 to 10-22 cleared the block as every earlier recovery did.
+The rest night and the cooldown machinery work as specified (10-25 held, `host_refusals` stays empty).
+The four crawls with a status line saw only 200s, with zero 429, 503 or 3xx: weak evidence, at this volume, that the CDN gives no warning before the wall (H2).
+
+**What they do not show: they do not test Stage 1's hypothesis.**
+The five active post-deploy nights served 1,200 / 695 / 372 / 221 / 374, a mean of about 570, against 1,236–2,445 on the blocked-period nights and the ~1,120 per active night the pool was sized for above; presence was 0.3–1.1 h against 2.6–8.8 h.
+Every hypothesis in #444, "nothing changed" included, predicts clean nights at this volume, and 10-22 is the only night at the design point (n = 1, against a block interval that was itself about two nights).
+Named confounders: KartaView's dead endpoint filled the 80-city cap on 10-22/23 with failed runs ([#452](https://github.com/jonfroehlich/streetscape-tracker/issues/452)), so the fill was never reached; 10-24/25 hit the cap with gsv refreshes of cities whose Mapillary half was already caught up; 10-25 was a rest night; 10-26's fill was throttled to 69 requests by the tomorrow-reserve term; 10-27 is partial.
+
+**Why the volume is low: the Mapillary-due work has moved into the stranded tier.**
+A rest night, a pool deferral or a block collects a city's gsv half and leaves its Mapillary half due on `mapillary` and not on `gsv`: kind 2 of the bounded hoist, which shares `[schedule].opt_in_cities_per_day` round-robin with gsv-excluded cities and the 442 Panoramax tranche-2 enrolments, and got 3–4 of its 10 slots a night.
+The gsv-ordered slate then holds few Mapillary-due cities (6 of 80 on 10-24, none on 10-25), and the fill's room on the tile CDN is eaten by a reserve that prices tomorrow's full due list, stranded cities included, although the hoist can reach only a share of them (10-26: room 69, about 980 of the pool idle).
+The size of that population was not in the pull; `scripts/mapillary_night_report.py` prints it ([`operations.md`](operations.md)).
+
+**The informative-volume criterion: Stage 1's three-week clock starts only at the design volume.**
+"Clean for three weeks" at any volume tests nothing, so the clock counts only once the nights reach the level the pool was sized for: at least **15 active nights** on which **at least 4 of every 5 serve ≥ 75% of the pool (≥ 900 of 1,200) with ≥ 2 h of presence**, with **0 `host_refusals` refusals** and **0 429/5xx** in the summed tile statuses.
+The read-out script computes exactly this (`Stage 1 clock` in its summary).
+Until it is met, raising any volume knob is a jump from an unmeasured level.
+
+**The next stage moves volume only inside the unchanged pool:** `opt_in_cities_per_day` 10 → 20 on prod (kind 2 then takes 6 of the 20 on a prod-shaped slate, pinned in `tests/test_scheduler.py`), so the already-due Mapillary backlog drains at the night's own presence window.
+The pool, the fill ceiling, the daily budgets, the rest nights, the cooldown and the 40/min pace are unchanged, and every launch is still gated on the 1,200 pool.
+A daytime `run-due --provider mapillary --limit N` to drain it faster is **not** recommended: it adds a second presence window per day, the shape H1 names.
+Mapillary's API documentation and forum were re-read for this stage on 2026-10-27, through a web fetcher, never from a collecting host: the rate-limits section is unchanged (tiles 50,000 per day per app, "status code 4xx" on excess, nothing on 429, `Retry-After`, `User-Agent` or IP blocking); thread 10644 still ends unanswered at this project's 2026-08-28 question; the forum's latest threads (to 10-27) carry nothing on tile rate limits, IP blocks or login redirects, and the 10-22 "Maps 2.0" announcement does not touch the vector-tile API.
+
+**The staged schedule after that**, each step its own config PR, never applied by an implementer, and taken only once the criterion above holds for the 15 nights since the previous step:
+
+1. pool 1,200 → 1,500 and the fill ceiling 600 → 750 together (one number's two faces), with the daily budgets scaled so the pool stays the binding term;
+2. pool 1,875, fill ceiling 940;
+3. only then the rest schedule (drop Wednesday, keep Sunday), because that tests a different axis (presence days) and must not share a step with volume.
+
+Each step is +25% and one knob at a time.
+**Revert triggers, mechanical:**
+
+- a `refused` row in `host_refusals` → revert the newest step in the next PR (the 36 h cooldown already holds the host meanwhile), and record that level here as the ceiling;
+- any 429 or 5xx in a week's summed tile statuses → hold the step a further 15 nights;
+- the Mapillary-only-due population growing week over week while enrolments stand still → the pool is too small for the rest schedule (the sizing falsifier above), and the next step is step 3 rather than a volume step.
+
+**Open: the 0-walk nights.** 10-22..10-24 ran 40 Mapillary grid runs and **0** walks, while 10-26 paired 18 of 18.
+Either the September walk catch-ups un-paired the walk clocks (a walk due on a different night from its grid pays its own census or waits), or walks were deferred; the pull cannot tell.
+The read-out script answers it on the next read: `walk_clock_unpaired` counts cities whose two Mapillary clocks last succeeded on different dates, and the population block splits grid-due from walk-only-due cities.
+
 ## Per-IP hosts and the cross-process host lock (issue #208)
 
 **Per-IP hosts and the cross-process host lock (issue #208).** Three third parties are **locked** because they meter us by **IP rather than by credential**

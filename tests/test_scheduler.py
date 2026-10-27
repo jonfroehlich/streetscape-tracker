@@ -1231,18 +1231,27 @@ def test_makelab1_production_config_is_wired():
     # per-IP volume must step up in stages, docs/provider-access.md), and both
     # reservations are now SET at 10 rather than derived, since a quarter would
     # move with every step. Pinning the resolved numbers is still the point.
+    #
+    # 2026-10-27 (#444): the opt-in reservation 10 -> 20, config only. The
+    # Mapillary-due work had migrated into kind 2 of the hoist (due on
+    # mapillary, not on gsv) and drained at three or four slots a night; see
+    # test_a_mapillary_only_due_city_gets_at_least_six_hoist_slots_at_prods_reservation
+    # for what the number buys and
+    # test_raising_the_reservation_never_starves_the_plain_queue_at_prods_cap
+    # for what it leaves the plain queue. refresh_slots stays at 10.
     assert cfg.max_cities_per_day == 80
-    assert cfg.opt_in_cities_per_day == 10
-    assert _sched._opt_in_reservation(cfg, cfg.max_cities_per_day) == 10
+    assert cfg.opt_in_cities_per_day == 20
+    assert _sched._opt_in_reservation(cfg, cfg.max_cities_per_day) == 20
     assert cfg.refresh_slots == 10
     assert cfg.effective_refresh_slots(cfg.max_cities_per_day) == 10
-    # The SUM is the number to read: 20 reserved slots lead the night, and the
-    # rest is the plain stalest-first queue until the deadline stops it.
-    # Raising either share without this failing would be raising it blind.
+    # The SUM is the number to read: 30 reserved slots lead the night (20 before
+    # 2026-10-27), and the rest is the plain stalest-first queue until the
+    # deadline stops it. Raising either share without this failing would be
+    # raising it blind.
     assert (
         _sched._opt_in_reservation(cfg, cfg.max_cities_per_day)
         + cfg.effective_refresh_slots(cfg.max_cities_per_day)
-        == 20
+        == 30
     )
     # The inter-city pause (issue #306). Pinned in production, not just at the
     # dataclass default, because this is a knob whose only symptom when wrong is
@@ -4215,6 +4224,142 @@ def test_the_channel_rotation_starts_in_rank_order_on_a_fixed_date(conn, monkeyp
         assert today.toordinal() % 3 == residue
         got = _chosen_labels(conn, monkeypatch, labels, today, _OPT_IN_SLATE, 1)
         assert dict(got) == {leading: 1}, f"ordinal {residue} mod 3"
+
+
+# The prod reservation, sized for the Mapillary-only-due kind (issue #444).
+#
+# Since #444 Stage 1 the Mapillary work that is due migrates OUT of the
+# gsv-ordered slate: a rest night, a pool deferral or a block leaves a city's
+# gsv clock advanced and its Mapillary clock behind, so it is due on mapillary
+# and not on gsv -- kind 2 of the bounded hoist -- and it shares
+# `opt_in_cities_per_day` with gsv-excluded cities (kind 0) and the Panoramax
+# tranche's opt-in enrolments (kind 1). These two tests pin the REASON for the
+# prod number rather than the number: what it buys kind 2, and what it leaves
+# the plain queue.
+_PROD_CHANNELS = [
+    "gsv",
+    "gsv_streets",
+    "mapillary",
+    "mapillary_streets",
+    "panoramax",
+    "panoramax_streets",
+]
+
+
+def _prod_reservation():
+    """``(max_cities, max_opt_in)`` exactly as a nightly run on prod resolves them."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    prod = load_scheduler_config(os.path.join(_PROJECT_ROOT, "config", "scheduler.makelab1.toml"))
+    assert prod.enabled_providers() == _PROD_CHANNELS, "re-derive the slate below"
+    cap = prod.max_cities_per_day
+    return cap, sched._opt_in_reservation(prod, cap)
+
+
+def _mapillary_backlog_slate(conn, *, kind0, kind1, kind2, panoramax_resumers, gsv_due=0):
+    """A prod-shaped stranded population. Returns ``({city_id: label}, live)``.
+
+    kind0: excluded from gsv. kind1: due only on the Panoramax pair (every
+    default channel fresh). kind2: due on the Mapillary pair and not on gsv
+    (both GSV channels fresh) -- the Mapillary-only-due backlog. ``gsv_due``
+    cities are due on everything: the plain queue.
+    """
+    labels = {}
+    for i in range(gsv_due):
+        labels[_register(conn, f"Plain{i:03d}", width=1000, height=1000, step=20)] = "plain"
+    for i in range(kind0):
+        labels[_register(conn, f"Exc{i:03d}", width=1000, height=1000, step=20)] = "kind0"
+    for i in range(kind1):
+        labels[_register(conn, f"Pmx{i:03d}", width=1000, height=1000, step=20)] = "kind1"
+    for i in range(kind2):
+        labels[_register(conn, f"Mly{i:03d}", width=1000, height=1000, step=20)] = "kind2"
+    db.assign_schedule(conn, 90, providers=tuple(_PROD_CHANNELS))
+    for cid, label in labels.items():
+        if label == "kind0":
+            db.set_channel_membership(conn, cid, "gsv", False, cycle_days=90)
+        elif label in ("kind1", "kind2"):
+            fresh = ("gsv", "gsv_streets")
+            if label == "kind1":
+                fresh += ("mapillary", "mapillary_streets")
+                for channel in ("panoramax", "panoramax_streets"):
+                    db.set_channel_membership(conn, cid, channel, True, cycle_days=90)
+            for channel in fresh:
+                db.record_attempt(conn, cid, success=True, provider=channel)
+    live = [cid for cid, label in labels.items() if label == "kind1"][:panoramax_resumers]
+    return labels, live
+
+
+def _mapillary_backlog_cfg(max_opt_in):
+    from streetscape_metadata_tracker.scheduler import ProviderConfig
+
+    cfg = _street_cfg(publish_enabled=False, opt_in_cities_per_day=max_opt_in)
+    for channel in ("panoramax", "panoramax_streets"):
+        cfg.providers[channel] = ProviderConfig(enabled=True, daily_request_budget=8_000)
+    return cfg
+
+
+def test_a_mapillary_only_due_city_gets_at_least_six_hoist_slots_at_prods_reservation(
+    conn, monkeypatch
+):
+    """The Mapillary-only-due kind's share of the prod reservation (issue #444).
+
+    The prod slate of late October 2026, reduced to its shape: 10 gsv-excluded
+    cities, 440 Panoramax-only-due (the tranche-2 enrolments), 60
+    Mapillary-only-due (rest-held, pool-deferred and block-stranded cities), 2
+    live Panoramax checkpoints. At the 10 the nights ran with, the three-kind
+    rotation hands kind 2 three or four slots; the reservation prod reads must
+    give it at least six on each of three consecutive nights, or the backlog
+    drains at the rate that left 10-24's 80-city slate with 6 Mapillary-due
+    cities.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    cap, max_opt_in = _prod_reservation()
+    labels, live = _mapillary_backlog_slate(
+        conn, kind0=10, kind1=440, kind2=60, panoramax_resumers=2
+    )
+    monkeypatch.setattr(
+        sched,
+        "_sweep_checkpoint_progress",
+        lambda cfg, city, channel: {"age_s": 1.0} if city.city_id in live else None,
+    )
+    cfg = _mapillary_backlog_cfg(max_opt_in)
+    for day in range(3):
+        today = date(2026, 10, 27) + timedelta(days=day)
+        slate = sched._collect_due(
+            conn, cfg, today, list(_PROD_CHANNELS), max_opt_in=max_opt_in, max_cities=cap
+        )
+        head_ids = {c.city_id for c in slate.cities[:max_opt_in]}
+        head = Counter(labels[cid] for cid in head_ids)
+        assert set(live) <= head_ids, f"night {today}: a live checkpoint lost its slot"
+        assert head["kind2"] >= 6, f"night {today}: {dict(head)} at max_opt_in={max_opt_in}"
+        assert head["kind0"] and head["kind1"], f"night {today}: {dict(head)}"
+
+
+def test_raising_the_reservation_never_starves_the_plain_queue_at_prods_cap(conn, monkeypatch):
+    """What the raised reservation leaves the plain stalest-first queue (issue #444).
+
+    It is the SUM of the two reservations that bounds how much of a night the
+    plain queue still governs. With 50 gsv-due cities behind a stranded
+    population larger than the reservation, at least 30 of them must still be
+    inside prod's cap -- the backstop the starvation WARNING names, pinned so a
+    reservation raised toward the cap is a red test rather than a quiet night
+    with no gsv collection.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+
+    cap, max_opt_in = _prod_reservation()
+    labels, _live = _mapillary_backlog_slate(
+        conn, kind0=10, kind1=60, kind2=60, panoramax_resumers=0, gsv_due=50
+    )
+    monkeypatch.setattr(sched, "_sweep_checkpoint_progress", lambda cfg, city, channel: None)
+    cfg = _mapillary_backlog_cfg(max_opt_in)
+    slate = sched._collect_due(
+        conn, cfg, date(2026, 10, 27), list(_PROD_CHANNELS), max_opt_in=max_opt_in, max_cities=cap
+    )
+    inside = Counter(labels[c.city_id] for c in slate.cities[:cap])
+    assert inside["plain"] >= 30, f"{dict(inside)} at cap={cap}, max_opt_in={max_opt_in}"
+    assert slate.hoisted == max_opt_in
 
 
 def test_a_city_due_only_on_an_opt_in_channel_is_hoisted_ahead_of_the_gsv_block(conn):
