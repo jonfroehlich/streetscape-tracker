@@ -4236,27 +4236,36 @@ def test_the_channel_rotation_starts_in_rank_order_on_a_fixed_date(conn, monkeyp
 # tranche's opt-in enrolments (kind 1). These two tests pin the REASON for the
 # prod number rather than the number: what it buys kind 2, and what it leaves
 # the plain queue.
-_PROD_CHANNELS = [
+#
+# The channel list is READ from prod, never restated: the KartaView pause
+# (#452) is temporary, and re-enabling it must not be a test-editing event
+# here. What the slate needs is only that gsv is rank 0 (what makes kind 2
+# stranded) and that the Mapillary and Panoramax pairs are enabled (kinds 2
+# and 1); an extra opt-in channel adds an empty sub-queue to kind 1 and does
+# not move kind 2's share, since the rotation is across KINDS.
+_SLATE_NEEDS = {
     "gsv",
     "gsv_streets",
     "mapillary",
     "mapillary_streets",
     "panoramax",
     "panoramax_streets",
-]
+}
 
 
 def _prod_reservation():
-    """``(max_cities, max_opt_in)`` exactly as a nightly run on prod resolves them."""
+    """``(max_cities, max_opt_in, channels)`` exactly as a nightly run on prod resolves them."""
     from streetscape_metadata_tracker import scheduler as sched
 
     prod = load_scheduler_config(os.path.join(_PROJECT_ROOT, "config", "scheduler.makelab1.toml"))
-    assert prod.enabled_providers() == _PROD_CHANNELS, "re-derive the slate below"
+    channels = list(prod.enabled_providers())
+    assert channels[0] == "gsv", "kind 2 is 'not due on rank 0'; re-derive the slate"
+    assert _SLATE_NEEDS <= set(channels), f"re-derive the slate below: {channels}"
     cap = prod.max_cities_per_day
-    return cap, sched._opt_in_reservation(prod, cap)
+    return cap, sched._opt_in_reservation(prod, cap), channels
 
 
-def _mapillary_backlog_slate(conn, *, kind0, kind1, kind2, panoramax_resumers, gsv_due=0):
+def _mapillary_backlog_slate(conn, channels, *, kind0, kind1, kind2, panoramax_resumers, gsv_due=0):
     """A prod-shaped stranded population. Returns ``({city_id: label}, live)``.
 
     kind0: excluded from gsv. kind1: due only on the Panoramax pair (every
@@ -4273,7 +4282,7 @@ def _mapillary_backlog_slate(conn, *, kind0, kind1, kind2, panoramax_resumers, g
         labels[_register(conn, f"Pmx{i:03d}", width=1000, height=1000, step=20)] = "kind1"
     for i in range(kind2):
         labels[_register(conn, f"Mly{i:03d}", width=1000, height=1000, step=20)] = "kind2"
-    db.assign_schedule(conn, 90, providers=tuple(_PROD_CHANNELS))
+    db.assign_schedule(conn, 90, providers=tuple(channels))
     for cid, label in labels.items():
         if label == "kind0":
             db.set_channel_membership(conn, cid, "gsv", False, cycle_days=90)
@@ -4289,12 +4298,13 @@ def _mapillary_backlog_slate(conn, *, kind0, kind1, kind2, panoramax_resumers, g
     return labels, live
 
 
-def _mapillary_backlog_cfg(max_opt_in):
+def _mapillary_backlog_cfg(max_opt_in, channels):
     from streetscape_metadata_tracker.scheduler import ProviderConfig
 
     cfg = _street_cfg(publish_enabled=False, opt_in_cities_per_day=max_opt_in)
-    for channel in ("panoramax", "panoramax_streets"):
-        cfg.providers[channel] = ProviderConfig(enabled=True, daily_request_budget=8_000)
+    for channel in channels:
+        if channel not in cfg.providers:
+            cfg.providers[channel] = ProviderConfig(enabled=True, daily_request_budget=8_000)
     return cfg
 
 
@@ -4304,8 +4314,9 @@ def test_a_mapillary_only_due_city_gets_at_least_six_hoist_slots_at_prods_reserv
     """The Mapillary-only-due kind's share of the prod reservation (issue #444).
 
     The prod slate of late October 2026, reduced to its shape: 10 gsv-excluded
-    cities, 440 Panoramax-only-due (the tranche-2 enrolments), 60
-    Mapillary-only-due (rest-held, pool-deferred and block-stranded cities), 2
+    cities, 440 Panoramax-only-due (the tranche-2 enrolments: 442 on prod), 60
+    Mapillary-only-due (an ASSUMED figure -- the pull did not hold the
+    population, and scripts/mapillary_night_report.py is what measures it), 2
     live Panoramax checkpoints. At the 10 the nights ran with, the three-kind
     rotation hands kind 2 three or four slots; the reservation prod reads must
     give it at least six on each of three consecutive nights, or the backlog
@@ -4314,20 +4325,20 @@ def test_a_mapillary_only_due_city_gets_at_least_six_hoist_slots_at_prods_reserv
     """
     from streetscape_metadata_tracker import scheduler as sched
 
-    cap, max_opt_in = _prod_reservation()
+    cap, max_opt_in, channels = _prod_reservation()
     labels, live = _mapillary_backlog_slate(
-        conn, kind0=10, kind1=440, kind2=60, panoramax_resumers=2
+        conn, channels, kind0=10, kind1=440, kind2=60, panoramax_resumers=2
     )
     monkeypatch.setattr(
         sched,
         "_sweep_checkpoint_progress",
         lambda cfg, city, channel: {"age_s": 1.0} if city.city_id in live else None,
     )
-    cfg = _mapillary_backlog_cfg(max_opt_in)
+    cfg = _mapillary_backlog_cfg(max_opt_in, channels)
     for day in range(3):
         today = date(2026, 10, 27) + timedelta(days=day)
         slate = sched._collect_due(
-            conn, cfg, today, list(_PROD_CHANNELS), max_opt_in=max_opt_in, max_cities=cap
+            conn, cfg, today, list(channels), max_opt_in=max_opt_in, max_cities=cap
         )
         head_ids = {c.city_id for c in slate.cities[:max_opt_in]}
         head = Counter(labels[cid] for cid in head_ids)
@@ -4348,14 +4359,14 @@ def test_raising_the_reservation_never_starves_the_plain_queue_at_prods_cap(conn
     """
     from streetscape_metadata_tracker import scheduler as sched
 
-    cap, max_opt_in = _prod_reservation()
+    cap, max_opt_in, channels = _prod_reservation()
     labels, _live = _mapillary_backlog_slate(
-        conn, kind0=10, kind1=60, kind2=60, panoramax_resumers=0, gsv_due=50
+        conn, channels, kind0=10, kind1=60, kind2=60, panoramax_resumers=0, gsv_due=50
     )
     monkeypatch.setattr(sched, "_sweep_checkpoint_progress", lambda cfg, city, channel: None)
-    cfg = _mapillary_backlog_cfg(max_opt_in)
+    cfg = _mapillary_backlog_cfg(max_opt_in, channels)
     slate = sched._collect_due(
-        conn, cfg, date(2026, 10, 27), list(_PROD_CHANNELS), max_opt_in=max_opt_in, max_cities=cap
+        conn, cfg, date(2026, 10, 27), list(channels), max_opt_in=max_opt_in, max_cities=cap
     )
     inside = Counter(labels[c.city_id] for c in slate.cities[:cap])
     assert inside["plain"] >= 30, f"{dict(inside)} at cap={cap}, max_opt_in={max_opt_in}"

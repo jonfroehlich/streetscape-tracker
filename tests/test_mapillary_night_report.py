@@ -1,9 +1,16 @@
 """scripts/mapillary_night_report.py: the #444 Stage 1 read-out (read-only).
 
-The log fixtures are copied VERBATIM from the read-only prod pull of
-2026-10-27 -- including the pull's truncation of the longer ``Done:`` lines,
-which is why the 10-22 line ends mid-number. A parser that only works on a
-tidied-up line is a parser for a log nobody writes.
+The module-level fixtures (``DONE_*``, ``FILL_ROOM_1026``, ``STATUS_1023``)
+are copied VERBATIM from the read-only prod pull of 2026-10-27 -- including
+the pull's truncation of the longer ``Done:`` lines, which is why the 10-22
+line ends mid-number. A parser that only works on a tidied-up line is a parser
+for a log nobody writes.
+
+The lines built inside individual tests, and ``STRANDED_1026``, are NOT from
+the pull, and each says so: the pull holds no stranded line, no wind-down
+line, no start line and no two-host refusal, so those are written in the
+scheduler's own format (the f-string each names) with values the scheduler
+can actually produce.
 """
 
 import glob
@@ -157,19 +164,131 @@ def test_a_done_line_with_deferrals_holds_and_presence_parses_into_one_row():
     assert all(r.done and not r.filtered for r in runs.values())
 
 
+# NOT from the pull (it holds no stranded line): scheduler._collect_due's
+# f-string, with reached >= promoted as the hoist guarantees (the promoted
+# cities lead the slate, so they are inside the cap by construction).
+STRANDED_1026 = (
+    "2026-10-26 02:01:00,000 - streetscape_scheduler - INFO - 12 of 465 cities not due on "
+    "gsv are inside tonight's 80-city cap ([schedule].opt_in_cities_per_day=10 reserved, "
+    "10 promoted); 453 wait for a later night"
+)
+
+
+def _start(day, due=120, cap=80, filt=""):
+    """A start line in cmd_run_due's format (NOT from the pull, which has none)."""
+    return (
+        f"{day} 02:00:05,000 - streetscape_scheduler - INFO - {due} cities due on {day}{filt}; "
+        f"processing up to {cap} within daily budgets of 1,500 mapillary requests"
+    )
+
+
+def _done(day, cities, filt=""):
+    """A minimal Done: line in cmd_run_due's format (NOT from the pull)."""
+    return (
+        f"{day} 04:00:00,000 - streetscape_scheduler - INFO - Done: run-due {day}{filt}: "
+        f"{cities}/{cities} runs succeeded across {cities} cities in 1.00 h"
+    )
+
+
+class _Cfg:
+    max_cities_per_day = 80
+
+
 def test_the_events_before_a_done_line_belong_to_its_night():
     """The fill's room is quoted only on a decline; first and last, per night."""
-    stranded = (
-        "2026-10-26 02:01:00,000 - streetscape_scheduler - INFO - 7 of 465 cities not due on "
-        "gsv are inside tonight's 80-city cap ([schedule].opt_in_cities_per_day=10 reserved, "
-        "10 promoted); past the first 10, the deadline decides how many run"
-    )
-    runs = report.parse_scheduler_log([DONE_1025, stranded, *FILL_ROOM_1026, DONE_1026])
+    runs = report.parse_scheduler_log([DONE_1025, STRANDED_1026, *FILL_ROOM_1026, DONE_1026])
     night = runs[-1]
     assert night.date == "2026-10-26"
     assert night.fill_rooms == [69, 5]
-    assert (night.stranded_reached, night.stranded_total) == (7, 465)
+    assert (night.stranded_reached, night.stranded_total) == (12, 465)
     assert runs[0].fill_rooms == [] and runs[0].stranded_total is None
+
+
+def test_a_run_that_crashed_after_its_start_line_is_not_folded_into_the_next():
+    """Review finding 4: a second start line closes the first run as crashed.
+
+    Kills: overwriting ``pending.date`` on a start line (the 10-18 run then
+    vanishes and its fill decline is charged to 10-19), and keeping a stranded
+    line logged AFTER the dead run's start with the dead run (that line
+    precedes its OWN run's start, so it is the next run's).
+    """
+    lines = [
+        _start("2026-10-18"),
+        FILL_ROOM_1026[0].replace("2026-10-26", "2026-10-18"),
+        STRANDED_1026.replace("2026-10-26", "2026-10-19"),
+        _start("2026-10-19"),
+        _done("2026-10-19", 27),
+    ]
+    runs = report.parse_scheduler_log(lines)
+    assert [(r.date, r.done, r.crashed) for r in runs] == [
+        ("2026-10-18", False, True),
+        ("2026-10-19", True, False),
+    ]
+    assert runs[0].fill_rooms == [69] and runs[1].fill_rooms == []
+    assert runs[0].stranded_total is None
+    assert (runs[1].stranded_reached, runs[1].stranded_total) == (12, 465)
+    assert report._ended_by(runs[0], _Cfg()).startswith("crashed")
+
+
+def test_the_0200_nightly_wins_over_an_unmarked_hand_run_on_the_same_date(prod):
+    """Review finding 5: a bare ``--limit`` or a second full run is a hand run.
+
+    ``--provider``/``--city`` carry a ``[--...]`` mark; ``--limit`` does not,
+    so it is read off the start line's cap. Kills: taking the LAST unfiltered
+    run of the date (the old ``nightly[-1]``), and dropping the narrowed check
+    (the 3-city ``--limit`` run that comes first then becomes the night).
+    """
+    lines = [
+        # Before 02:00 local, same UTC date: a bare --limit 3 catch-up.
+        _start("2026-10-19", due=120, cap=3),
+        _done("2026-10-19", 3),
+        _start("2026-10-19", due=120, cap=80),
+        _done("2026-10-19", 27),
+        # Later that day, an unfiltered full hand run.
+        _start("2026-10-19", due=93, cap=80),
+        _done("2026-10-19", 5),
+    ]
+    (prod["log_dir"] / "streetscape_scheduler.log").write_text("\n".join(lines) + "\n")
+    night = _night(_run_report(prod), "2026-10-19")
+    assert night["nightly_run"]["cities"] == 27
+    assert night["hand_runs"] == 2
+
+
+def test_a_mapillary_refusal_is_read_when_another_host_refused_the_same_night():
+    """Review finding 3: the verdict follows the LAST label of the run.
+
+    ``_blocked_summary_note`` joins refused hosts with "; " and appends
+    " unavailable" once; Mapillary's label sorts first. Kills: reading one
+    ";"-segment at a time (both two-host lines then miss Mapillary), and
+    dropping the clause-boundary lookbehind (the pool clause's "budget of
+    <Mapillary label>" then joins a KartaView-only refusal).
+    """
+    head = (
+        "2026-10-16 06:30:19,488 - streetscape_scheduler - INFO - Done: run-due 2026-10-16: "
+        "34/34 runs succeeded across 20 cities (20 due, 0 fill) in 4.25 h"
+    )
+    mly = "Mapillary's tile CDN (tiles.mapillary.com)"
+    kv = "the KartaView API (kartaview.org)"
+    ovp = "the Overpass API (overpass-api.de)"
+
+    def parse(rest):
+        (run,) = report.parse_scheduler_log([head + rest])
+        return run
+
+    # Mapillary + KartaView, as the scheduler sorts and joins them.
+    two = parse(f"; {mly}; {kv} unavailable, 2 launch(es) skipped while latched")
+    assert two.refused and not two.throttled and two.skipped_latched == 2
+    # The 2026-08-14 shape: Mapillary + Overpass.
+    assert parse(f"; {mly}; {ovp} unavailable, 4 launch(es) skipped while latched").refused
+    # Mapillary throttled while KartaView refused: the second part follows ", ".
+    mixed = parse(f"; {kv} unavailable, {mly}; {ovp} THROTTLED (HTTP 429/503, no refusal")
+    assert mixed.throttled and not mixed.refused
+    # Only KartaView refused, after a Mapillary pool deferral: not Mapillary's.
+    other = parse(
+        f"; 20 deferred for the rolling-24h budget of {mly}; {kv} unavailable, "
+        "1 launch(es) skipped while latched"
+    )
+    assert not other.refused and other.pool_deferred == 20
 
 
 def test_a_night_still_in_flight_is_dated_from_its_start_line():
@@ -306,21 +425,73 @@ def test_it_never_lists_the_data_directory(prod, monkeypatch):
     assert not [p for p in seen if p.startswith(str(prod["data"]))]
 
 
-def test_the_stage1_clock_counts_only_design_point_nights():
-    """>= 75% of the pool AND >= 2 h of presence, over active nights."""
+_CLEAN = {"200": 155, "429": 0, "5xx": 0, "3xx": 0}
 
-    def night(served, presence_h):
-        return {
-            "served": served,
-            "nightly_run": {"presence_h": presence_h},
-            "tile_statuses": None,
-        }
 
-    nights = [night(1200, 1.1), night(950, 2.5), night(300, 3.0), night(0, None)]
+def _clock_night(served, presence_h, statuses=_CLEAN):
+    return {
+        "served": served,
+        "nightly_run": {"presence_h": presence_h},
+        "tile_statuses": dict(statuses) if statuses else None,
+    }
+
+
+def test_the_stage1_clock_counts_nights_at_the_pool_share_and_reports_presence():
+    """Review finding 1: >= 75% of the pool, presence reported and NOT gated.
+
+    10-22 served the whole pool in 1.1 h, and at 40/min the pool is ~30 min of
+    fetching, so a presence floor kept every full night out. Kills:
+    reinstating any presence floor above 1.1 h (the 1.1 h night stops
+    counting and the 15-night window stops meeting), and dropping the pool
+    share (the 300-request night counts).
+    """
+    nights = [
+        _clock_night(1200, 1.1),
+        _clock_night(950, 2.5),
+        _clock_night(300, 3.0),
+        _clock_night(0, None, None),
+    ]
     clock = report._stage1_clock(nights, 1200, [])
-    assert (clock["active_nights"], clock["design_nights"]) == (3, 1)
-    assert clock["criterion_met"] is False
-    many = [night(1000, 2.5)] * 15
+    assert (clock["active_nights"], clock["design_nights"]) == (3, 2)
+    assert clock["design_presence_h"] == [1.1, 2.5]
+    assert clock["criterion_met"] is False, "3 active nights is under 15"
+    many = [_clock_night(1200, 1.1)] * 15
     assert report._stage1_clock(many, 1200, [])["criterion_met"] is True
     refused = [{"verdict": "refused"}]
     assert report._stage1_clock(many, 1200, refused)["criterion_met"] is False
+    warned = many[:-1] + [_clock_night(1200, 1.1, _CLEAN | {"429": 1})]
+    assert report._stage1_clock(warned, 1200, [])["criterion_met"] is False
+
+
+def test_the_stage1_clock_never_starts_on_missing_tile_status_evidence():
+    """Review finding 2: absence of evidence is UNKNOWN, never a pass.
+
+    Kills: summing over an empty ``seen`` as 0 (15 evidence-free nights then
+    meet the criterion), and judging only the nights that have a status line
+    (14 clean nights plus one with no line would meet it).
+    """
+    blind = [_clock_night(1000, 2.5, None)] * 15
+    clock = report._stage1_clock(blind, 1200, [])
+    assert clock["status_429_5xx"] is None
+    assert clock["nights_without_status"] == 15
+    assert clock["criterion_met"] is False
+
+    partial = [_clock_night(1000, 2.5)] * 14 + [_clock_night(1000, 2.5, None)]
+    clock = report._stage1_clock(partial, 1200, [])
+    assert clock["status_429_5xx"] is None, "one blind night makes the sum unknown"
+    assert clock["status_429_5xx_seen"] == 0
+    assert clock["nights_without_status"] == 1
+    assert clock["criterion_met"] is False
+    # An inactive night needs no evidence: nothing was asked of the CDN.
+    rested = [_clock_night(1000, 2.5)] * 15 + [_clock_night(0, None, None)]
+    assert report._stage1_clock(rested, 1200, [])["criterion_met"] is True
+
+
+def test_the_summary_says_unknown_when_a_night_has_no_status_line(prod):
+    """The rendered clock names the blind nights instead of printing a 0."""
+    db.add_api_usage(prod["conn"], date(2026, 10, 24), 372, "mapillary")
+    prod["conn"].commit()
+    rendered = report.render(_run_report(prod))
+    line = next(x for x in rendered.splitlines() if x.startswith("Stage 1 clock"))
+    assert "429/5xx n/a (UNKNOWN: 1 active night(s) with no status line" in line
+    assert "criterion met: no" in line

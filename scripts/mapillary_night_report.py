@@ -60,10 +60,28 @@ THE STAGE 1 CLOCK
 -----------------
 docs/provider-access.md: Stage 1's three-week test starts only at the design
 volume. ``design_nights`` counts active nights (``served`` > 0) that served at
-least 75% of the ``[hosts.mapillary_tiles]`` rolling pool with at least 2 h of
-presence; the criterion is >= 15 active nights, >= 4 of every 5 of them at the
-design point, 0 ``host_refusals`` refusals and 0 429/5xx in the summed tile
-statuses.
+least 75% of the ``[hosts.mapillary_tiles]`` rolling pool; the criterion is
+>= 15 active nights, >= 4 of every 5 of them at the design point, 0
+``host_refusals`` refusals, and 0 429/5xx in the summed tile statuses OF EVERY
+ACTIVE NIGHT.
+
+Presence is REPORTED per night (and its range over the design nights), never
+gated. A first draft also required >= 2 h of presence, and that clause could
+not be met under the config it was written for: at 40/min through one host
+lock the 1,200 pool is ~30 min of fetching, the one full-pool night (10-22)
+showed 1.1 h, and the 10 -> 20 reservation hoists the Mapillary-due cities to
+the HEAD of the slate, which concentrates presence further. #444's treatment
+(H1) is LESS presence, so a presence floor would also have counted only nights
+that looked like the pre-treatment ones.
+
+Absence of evidence is never a pass: an active night with no tile-status line
+in its child logs is counted in ``nights_without_status``, and while any such
+night is in the window the 429/5xx clause -- and so the criterion -- is
+unknown, not met. Every crawl writes the line (download_mapillary's
+``finally``, and the cache-hit path), so a missing one means pruned or
+mis-pathed child logs. Start ``--since`` at the step's first night: nights
+before the status line was deployed (2026-10-21) have none and keep the clock
+from starting.
 """
 
 from __future__ import annotations
@@ -98,7 +116,6 @@ from streetscape_metadata_tracker.download_mapillary import (  # noqa: E402
 MAPILLARY_CHANNELS = ("mapillary", "mapillary_streets")
 # The Stage 1 "informative volume" criterion (docs/provider-access.md, #444).
 DESIGN_POOL_SHARE = 0.75
-DESIGN_PRESENCE_H = 2.0
 DESIGN_MIN_ACTIVE_NIGHTS = 15
 DESIGN_MIN_SHARE = 0.8  # >= 4 of every 5 active nights
 
@@ -114,8 +131,9 @@ _DONE_RE = re.compile(
     r" in (?P<hours>[\d.]+) h(?P<rest>.*)$"
 )
 _START_RE = re.compile(
-    rf"^{_TS} - .* - INFO - \d+ cities due on (?P<date>{_DATE})"
+    rf"^{_TS} - .* - INFO - (?P<due>\d+) cities due on (?P<date>{_DATE})"
     r"(?P<filter>(?:\s\[--[a-z-]+ [^\]]*\])*);"
+    r"(?: processing up to (?P<day_cap>\d+) )?"
 )
 _POOL_RE = re.compile(rf"(\d+) deferred for the rolling-24h budget of {_LABEL}")
 _PRESENCE_RE = re.compile(
@@ -123,6 +141,14 @@ _PRESENCE_RE = re.compile(
     r"(?:, ([\d.]+) h after its previous ledgered request)?"
 )
 _HELD_RE = re.compile(rf"HELD (?:[^;]*?){_LABEL}: (?P<why>[^;]*?), (?P<n>\d+) launch\(es\) held")
+_ANY_LABEL = "|".join(re.escape(label) for label in sorted(HOST_LABELS.values()))
+# One verdict group of the blocked clause: a run of host labels at a clause
+# boundary ("; " between clauses, ", " between the clause's parts), then its
+# verdict. The boundary keeps the pool clause's "budget of <label>" out of it.
+_HOST_RUN_RE = re.compile(
+    rf"(?:(?<=; )|(?<=, )|^)(?P<labels>(?:{_ANY_LABEL})(?:; (?:{_ANY_LABEL}))*) "
+    r"(?P<verdict>unavailable|THROTTLED|refused this host then recovered on re-check)"
+)
 _SKIPPED_RE = re.compile(r"(\d+) launch\(es\) skipped while latched")
 _DEADLINE_RE = re.compile(r"\d+ channel\(s\) deferred for the deadline \((?P<by>[^)]*)\)")
 _STOPPED_RE = re.compile(r"; stopped early \((?P<why>[^)]*)\)")
@@ -190,6 +216,15 @@ class LogRun:
     stranded_total: int | None = None
     fill_rooms: list[int] = field(default_factory=list)
     winddown_cut: int = 0
+    # From the start line: how many cities were due and how many the run said
+    # it would process. A bare `run-due --limit N` leaves no [--...] mark, so
+    # a cap below both the due count and max_cities_per_day is what tells it
+    # from the nightly (build_report).
+    due_count: int | None = None
+    day_cap: int | None = None
+    # A start line with no Done: line before the NEXT start line: the run
+    # died (the 2026-10-18 shape), it is not in flight.
+    crashed: bool = False
 
 
 def parse_done_rest(run: LogRun, rest: str) -> None:
@@ -202,14 +237,17 @@ def parse_done_rest(run: LogRun, rest: str) -> None:
         run.gap_h = float(m.group(4)) if m.group(4) else None
     if m := _HELD_RE.search(rest):
         run.held, run.held_launches = m.group("why"), int(m.group("n"))
-    for segment in rest.split(";"):
-        if HOST_LABELS[HOST_MAPILLARY_TILES] not in segment:
+    # The blocked clause joins every refused host's label with "; " and names
+    # the verdict ONCE, after the last label (scheduler._blocked_summary_note),
+    # so Mapillary's label -- which sorts first -- is followed by another
+    # host's, not by the verdict, whenever two hosts refused the same night.
+    # Read the whole label run, never one ";"-segment.
+    for m in _HOST_RUN_RE.finditer(rest):
+        if HOST_LABELS[HOST_MAPILLARY_TILES] not in m.group("labels"):
             continue
-        if " THROTTLED" in segment:
+        if m.group("verdict") == "THROTTLED":
             run.throttled = True
-        elif segment.strip().split(",")[0].endswith(" unavailable") or (
-            " then recovered on re-check" in segment
-        ):
+        else:
             run.refused = True
     if m := _SKIPPED_RE.search(rest):
         run.skipped_latched = int(m.group(1))
@@ -247,16 +285,24 @@ def parse_scheduler_log(lines) -> list[LogRun]:
     A run's events (the stranded line, fill declines, wind-down cuts) are logged
     BEFORE its ``Done:`` line -- the stranded line even before its start line --
     so a segment is everything since the previous ``Done:``, and it belongs to
-    the run that ``Done:`` closes. A trailing segment with no ``Done:`` is a run
-    still in flight (or one that crashed): dated from its start line and marked
-    ``done=False``; with no start line either, it is dropped.
+    the run that ``Done:`` closes. A second start line before any ``Done:``
+    means the first run died: it is closed there as ``done=False``,
+    ``crashed=True``, and a stranded line seen after its start (which can only
+    be the NEXT run's, since that line precedes its own start) moves with the
+    next run. A trailing segment with no ``Done:`` is a run still in flight:
+    dated from its start line and marked ``done=False``; with no start line
+    either, it is dropped.
     """
     runs: list[LogRun] = []
     pending = LogRun(date="", filtered=False, done=False)
+    carried: tuple[int, int] | None = None  # a stranded line seen after a start
     for line in lines:
         if m := _STRANDED_RE.match(line):
-            pending.stranded_reached = int(m.group("reached"))
-            pending.stranded_total = int(m.group("total"))
+            reached, total = int(m.group("reached")), int(m.group("total"))
+            if pending.date:
+                carried = (reached, total)
+            else:
+                pending.stranded_reached, pending.stranded_total = reached, total
             continue
         if m := _FILL_ROOM_RE.match(line):
             pending.fill_rooms.append(_int(m.group("room")))
@@ -270,7 +316,16 @@ def parse_scheduler_log(lines) -> list[LogRun]:
             )
             continue
         if m := _START_RE.match(line):
+            if pending.date:
+                pending.crashed = True
+                runs.append(pending)
+                pending = LogRun(date="", filtered=False, done=False)
+                if carried:
+                    pending.stranded_reached, pending.stranded_total = carried
+            carried = None
             pending.date, pending.filtered = m.group("date"), bool(m.group("filter"))
+            pending.due_count = int(m.group("due"))
+            pending.day_cap = int(m.group("day_cap")) if m.group("day_cap") else None
             continue
         if m := _DONE_RE.match(line):
             run = pending
@@ -282,6 +337,10 @@ def parse_scheduler_log(lines) -> list[LogRun]:
             parse_done_rest(run, m.group("rest"))
             runs.append(run)
             pending = LogRun(date="", filtered=False, done=False)
+            if carried:
+                # Logged after this run's start, so it was the next run's.
+                pending.stranded_reached, pending.stranded_total = carried
+                carried = None
     if pending.date:
         runs.append(pending)
     return runs
@@ -431,9 +490,12 @@ def build_report(conn, cfg, *, since: str, until: str, as_of: date, log_dir: str
     dates |= {r.date for r in log_runs if since <= r.date <= until}
     nights = []
     for d in sorted(dates):
-        nightly = [r for r in log_runs if r.date == d and not r.filtered]
-        hand = [r for r in log_runs if r.date == d and r.filtered]
-        run = nightly[-1] if nightly else None
+        on_date = [r for r in log_runs if r.date == d]
+        nightly = [r for r in on_date if not r.filtered and not _narrowed(r, cfg)]
+        # The FIRST full run of the date is the 02:00 nightly; a later
+        # unfiltered one is a hand run, and so is anything narrowed.
+        run = nightly[0] if nightly else None
+        hand = [r for r in on_date if r is not run]
         cat = catalog.get(d, {"served": 0, "served_by": {}, "grid_runs": 0, "sweep_total": 0})
         st = statuses.get(d)
         tiles = st if st and st["crawls"] else None
@@ -476,9 +538,20 @@ def build_report(conn, cfg, *, since: str, until: str, as_of: date, log_dir: str
     }
 
 
+def _narrowed(run: LogRun, cfg) -> bool:
+    """A bare ``--limit N`` run: its start line's cap is below both the due
+    count and ``max_cities_per_day``, which only ``--limit`` does (``--provider``
+    and ``--city`` carry their own ``[--...]`` mark)."""
+    if run.day_cap is None or run.due_count is None:
+        return False
+    return run.day_cap < min(run.due_count, cfg.max_cities_per_day)
+
+
 def _ended_by(run: LogRun | None, cfg) -> str | None:
     if run is None:
         return None
+    if run.crashed:
+        return "crashed (no Done line; a later run started)"
     if not run.done:
         return "in flight (no Done line yet)"
     if run.stopped:
@@ -493,15 +566,18 @@ def _ended_by(run: LogRun | None, cfg) -> str | None:
 def _stage1_clock(nights: list[dict], pool: int | None, refusals: list[dict]) -> dict:
     """Has Stage 1's three-week clock started? (docs/provider-access.md, #444)."""
     active = [n for n in nights if n["served"] > 0]
-    design = [
-        n
-        for n in active
-        if pool
-        and n["served"] >= DESIGN_POOL_SHARE * pool
-        and ((n["nightly_run"] or {}).get("presence_h") or 0) >= DESIGN_PRESENCE_H
+    design = [n for n in active if pool and n["served"] >= DESIGN_POOL_SHARE * pool]
+    presences = [
+        (n["nightly_run"] or {}).get("presence_h")
+        for n in design
+        if (n["nightly_run"] or {}).get("presence_h") is not None
     ]
     seen = [n["tile_statuses"] for n in nights if n["tile_statuses"]]
-    warning = sum(s["429"] + s["5xx"] for s in seen)
+    seen_warning = sum(s["429"] + s["5xx"] for s in seen) if seen else None
+    # An active night with no status line is UNKNOWN, never 0: the sum over
+    # the nights that have one says nothing about the nights that do not.
+    without_status = sum(1 for n in active if not n["tile_statuses"])
+    warning = None if without_status else seen_warning
     refused = sum(1 for r in refusals if r["verdict"] == "refused")
     met = (
         len(active) >= DESIGN_MIN_ACTIVE_NIGHTS
@@ -512,8 +588,11 @@ def _stage1_clock(nights: list[dict], pool: int | None, refusals: list[dict]) ->
     return {
         "active_nights": len(active),
         "design_nights": len(design),
+        "design_presence_h": [min(presences), max(presences)] if presences else None,
+        "nights_without_status": without_status,
         "refusals": refused,
-        "status_429_5xx": warning if seen else None,
+        "status_429_5xx": warning,
+        "status_429_5xx_seen": seen_warning,
         "status_3xx": sum(s["3xx"] for s in seen) if seen else None,
         "criterion_met": met,
     }
@@ -522,6 +601,10 @@ def _stage1_clock(nights: list[dict], pool: int | None, refusals: list[dict]) ->
 def _fmt(value, width: int = 0) -> str:
     text = "n/a" if value is None else f"{value:,}" if isinstance(value, int) else str(value)
     return text.rjust(width) if width else text
+
+
+def _presence_range(span: list[float] | None) -> str:
+    return "n/a" if not span else f"{span[0]:.1f}-{span[1]:.1f} h"
 
 
 def render(report: dict) -> str:
@@ -587,9 +670,16 @@ def render(report: dict) -> str:
         f"are Mapillary-due AND gsv-due; {pop['walk_clock_unpaired']} cities' two Mapillary "
         f"clocks last succeeded on different dates",
         f"Stage 1 clock: {clock['design_nights']} of {clock['active_nights']} active nights at "
-        f"the design point (>= {DESIGN_POOL_SHARE:.0%} of the pool, >= {DESIGN_PRESENCE_H:g} h "
-        f"presence); refusals {clock['refusals']}; 429/5xx {_fmt(clock['status_429_5xx'])}; "
-        f"3xx {_fmt(clock['status_3xx'])}; criterion met: "
+        f"the design point (>= {DESIGN_POOL_SHARE:.0%} of the pool; presence there "
+        f"{_presence_range(clock['design_presence_h'])}, reported, not gated); "
+        f"refusals {clock['refusals']}; 429/5xx {_fmt(clock['status_429_5xx'])}"
+        + (
+            f" (UNKNOWN: {clock['nights_without_status']} active night(s) with no status "
+            f"line; {_fmt(clock['status_429_5xx_seen'])} on the rest)"
+            if clock["nights_without_status"]
+            else ""
+        )
+        + f"; 3xx {_fmt(clock['status_3xx'])}; criterion met: "
         f"{'yes' if clock['criterion_met'] else 'no'}",
         f"#375: Mapillary channels deferred for the deadline "
         f"{report['issue_375']['mapillary_deadline_deferred']}, cut by a wind-down "

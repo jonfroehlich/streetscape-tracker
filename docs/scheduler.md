@@ -567,7 +567,7 @@ The fill declines a city whose channel is on a held host (`_FILL_BLOCKER_HOST_HE
 The cost is at most that reservation's share of two nights a week; teaching the slate about holds would make the hoist's rotation depend on the weekday, so it is noted for the Maintainer rather than changed.
 **Rest-held, pool-deferred and block-stranded cities all re-enter through kind 2 of the hoist**, not at the head of the next night: each collected its gsv half on schedule, so it is due on Mapillary and not on gsv.
 Measured after Stage 1 (#444): the gsv-ordered slate then held almost no Mapillary-due work (6 of 80 cities on 10-24, none on 10-25), and at a reservation of 10 kind 2 got three or four slots a night.
-Prod's reservation is 20 since 2026-10-27, which on a prod-shaped slate (10 gsv-excluded, 440 Panoramax-only-due, 60 Mapillary-only-due, 2 live checkpoints) gives kind 2 six; `scripts/mapillary_night_report.py` prints the population's size and priced total.
+Prod's reservation is 20 since 2026-10-27, which on a prod-shaped test slate (10 gsv-excluded, 440 Panoramax-only-due, an ASSUMED 60 Mapillary-only-due, 2 live checkpoints) gives kind 2 six; `scripts/mapillary_night_report.py` prints the population's size and priced total.
 `assess-city` treats a held channel as an incomplete answer (exit 1), like a refused one, without claiming anything refused us.
 `run-due --ignore-host-holds` lifts both kinds for one invocation, logged at WARNING; the nightly unit never passes it.
 

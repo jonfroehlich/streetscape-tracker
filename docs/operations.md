@@ -154,8 +154,10 @@ How to read it:
   `n/a` means no status line was found, never "no 429s".
 - **room first->last** is the fill's tile-CDN room as its decline lines quote it; `n/a` when no city was declined for it.
 - **stranded** is the hoist's `N of M cities not due on gsv` line, every stranded kind together; the exact Mapillary-only-due figure is the block under the table, as of today (the catalog keeps only each channel's newest clock, so it cannot be read for an earlier night).
-- **Stage 1 clock** counts active nights at the design point (at least 75% of the rolling pool served and at least 2 h of presence) and says whether the criterion in [`provider-access.md`](provider-access.md) is met.
-  Until it is, no volume knob moves.
+- **Stage 1 clock** counts active nights at the design point (at least 75% of the rolling pool served; presence is printed beside it, not gated) and says whether the criterion in [`provider-access.md`](provider-access.md) is met.
+  An active night with no tile-status line makes it `UNKNOWN`, never met, so pass `--since` at the current step's first night.
+  Until it is met, no volume knob moves.
+- **ended by** reads `crashed` for a run whose start line was followed by another run's before any `Done:` line; the first full run of a UTC date is the nightly, and any later one, or a bare `--limit` run, is counted as `[+N hand run(s)]`.
 - **#375** prints how many Mapillary channels the batch deadline deferred and a wind-down cut, the measurement that issue asks for.
 
 ## Answering a partner inquiry the same day: `scheduler assess-city "City, Region"` (issue #215)

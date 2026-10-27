@@ -486,7 +486,7 @@ Tile statuses come from the per-attempt child logs, and the pull caught 4 of abo
 
 | Night (UTC) | Served | Grid runs / walks | Refusal / hold / throttle | Tile statuses seen | Fill | Ended by | Cities (due / fill), length |
 |---|---|---|---|---|---|---|---|
-| 10-15 | 1,251 | 49 / 29 | clean | not instrumented (pre-deploy) | 29 cities; declined 323 for `mapillary_tiles`; reserved 1,734 | 3,000 rolling cap | 49 (20 / 29), 2.61 h |
+| 10-15 | 1,251 | 49 / 29 | clean | not instrumented (pre-deploy) | 29 cities; declined 323 for `mapillary_tiles`; reserved 1,734 | *inferred, not read:* 3,000 rolling cap | 49 (20 / 29), 2.61 h |
 | 10-16 | 1,713 | 16 / 0 | **BLOCK** (302 → login) at 1,631; 2 launches skipped; 3 due held | not instrumented | 0 cities | breaker latch | 20 (20 / 0), 4.25 h |
 | 10-17 | 5 | 0 / 0 | **refused on request 1** (carried over ~20 h); 19 skipped | not instrumented | 0 cities | latch | 14 (14 / 0), 3.81 h |
 | 10-18 | — | — | no `Done:` line (the nightly crashed on an unrelated catalog-version error) | — | — | — | — |
@@ -497,9 +497,10 @@ Tile statuses come from the per-attempt child logs, and the pull caught 4 of abo
 | 10-23 | 695 | 15 / 0 | none; 3 deferred for the pool; presence 0.7 h, 23.0 h gap | 3 crawls: 200=251, nothing else | not reached | 80-city cap (136 failed runs, KartaView) | 80, 1.60 h |
 | 10-24 | 372 | 6 (3 resumers) / 0 | none; presence 0.3 h, 23.3 h gap | — | not reached | 80-city cap; only 6 of the 80 were Mapillary-due | 80, 2.38 h |
 | 10-25 (Sun) | 0 | 0 / 0 | rest night held, **0 launches held** (no slate city was Mapillary-due) | — | not reached | 80-city cap | 80, 2.46 h |
-| 10-26 | 221 | 18 / 18 | none; presence 0.5 h, 48.2 h gap | — | 18 cities; fill room on the tile CDN **69 → 5**, ~100 cities declined for it | fill room | 38 (20 / 18), 1.02 h |
+| 10-26 | 221 | 18 / 18 | none; presence 0.5 h, 48.2 h gap | — | 18 cities; fill room on the tile CDN **69 → 5**, ~100 cities declined for it | *inferred, not read:* fill room | 38 (20 / 18), 1.02 h |
 | 10-27 (partial) | 374 so far | 1 / 1 | none at pull time | — | in flight | in flight | in flight |
 
+Two "Ended by" cells are inferred, not read, because the pull cut both `Done:` lines before their `ended by` clause: 10-26's "fill room" rests on the room falling to 5 and about 100 decline lines in the pull, and 10-15's "3,000 rolling cap" cannot be checked from the pull at all.
 The 10-24 grid row's `runs.api_requests` sums to 778 against 372 ledgered: for a census crawl that column holds the CUMULATIVE `api_requests_total` (`cli.py`), and the 406 difference is exactly the three crawls that paused at the pool on 10-22/23 (Charleston 155 + 26, Bendigo 163, Cheyenne 62) and finished on 10-24.
 
 **What these nights show:** the IP is not permanently refused, and the 120 h of silence from 10-17 to 10-22 cleared the block as every earlier recovery did.
@@ -517,11 +518,18 @@ The gsv-ordered slate then holds few Mapillary-due cities (6 of 80 on 10-24, non
 The size of that population was not in the pull; `scripts/mapillary_night_report.py` prints it ([`operations.md`](operations.md)).
 
 **The informative-volume criterion: Stage 1's three-week clock starts only at the design volume.**
-"Clean for three weeks" at any volume tests nothing, so the clock counts only once the nights reach the level the pool was sized for: at least **15 active nights** on which **at least 4 of every 5 serve ≥ 75% of the pool (≥ 900 of 1,200) with ≥ 2 h of presence**, with **0 `host_refusals` refusals** and **0 429/5xx** in the summed tile statuses.
+"Clean for three weeks" at any volume tests nothing, so the clock counts only once the nights reach the level the pool was sized for: at least **15 active nights** on which **at least 4 of every 5 serve ≥ 75% of the pool (≥ 900 of 1,200)**, with **0 `host_refusals` refusals** and **0 429/5xx** in the summed tile statuses **of every active night**.
 The read-out script computes exactly this (`Stage 1 clock` in its summary).
+**Presence is reported, not gated.**
+A first draft also required ≥ 2 h of presence on each design night, and that clause could not be met under the very config it gated: at 40/min through one host lock the 1,200 pool is about 30 minutes of fetching, the one full-pool night (10-22) showed 1.1 h, and the 10 → 20 reservation below hoists the Mapillary-due cities to the head of the slate, which concentrates presence further.
+It also counted the wrong arm: H1's treatment is *less* daily presence, so a floor set at the pre-treatment level (2.6–8.8 h) admitted only nights that looked untreated.
+The script prints each night's presence and its range over the design nights, so a presence effect stays visible without holding the clock.
+**Missing evidence is unknown, never clean.**
+An active night with no `mapillary tile statuses:` line in its child logs makes the 429/5xx clause, and so the criterion, unknown (the summary says `UNKNOWN: N active night(s) with no status line`).
+Every crawl writes that line, so a missing one means pruned or mis-pathed child logs; run the script with `--since` at a step's first night, since nights before 2026-10-21 predate the line.
 Until it is met, raising any volume knob is a jump from an unmeasured level.
 
-**The next stage moves volume only inside the unchanged pool:** `opt_in_cities_per_day` 10 → 20 on prod (kind 2 then takes 6 of the 20 on a prod-shaped slate, pinned in `tests/test_scheduler.py`), so the already-due Mapillary backlog drains at the night's own presence window.
+**The next stage moves volume only inside the unchanged pool:** `opt_in_cities_per_day` 10 → 20 on prod (kind 2 then takes 6 of the 20 on a prod-shaped test slate whose 60 Mapillary-only-due cities are an assumed figure, pinned in `tests/test_scheduler.py`; kind 1, the Panoramax enrolments, also goes from about 4 to 8, recorded in the Panoramax section below), so the already-due Mapillary backlog drains at the night's own presence window.
 The pool, the fill ceiling, the daily budgets, the rest nights, the cooldown and the 40/min pace are unchanged, and every launch is still gated on the 1,200 pool.
 A daytime `run-due --provider mapillary --limit N` to drain it faster is **not** recommended: it adds a second presence window per day, the shape H1 names.
 Mapillary's API documentation and forum were re-read for this stage on 2026-10-27, through a web fetcher, never from a collecting host: the rate-limits section is unchanged (tiles 50,000 per day per app, "status code 4xx" on excess, nothing on 429, `Retry-After`, `User-Agent` or IP blocking); thread 10644 still ends unanswered at this project's 2026-08-28 question; the forum's latest threads (to 10-27) carry nothing on tile rate limits, IP blocks or login redirects, and the 10-22 "Maps 2.0" announcement does not touch the vector-tile API.
@@ -793,6 +801,10 @@ The fourth column is a DEPLOY fact, not a merge fact, so the repo cannot derive 
   The per-IP sum is 16,000 un-paired, ~5.6 h of the host lock at the 0.8 achieved fraction.
   The weekly growth screen paces from the same block, so it runs twice as fast too.
 - **Enrolment of the 41 screen-positive tracked cities proceeds in tranches only after stage 1 holds.**
+- **The Panoramax pair's share of the night roughly doubled on 2026-10-27, a side effect of #444, not a Panoramax decision.**
+  Prod's `opt_in_cities_per_day` went 10 → 20 to drain the Mapillary-only-due backlog, and the 442 tranche-2 enrolments are kind 1 of the same hoist, so on the prod-shaped test slate kind 1 goes from about 4 hoisted slots a night to 8 (6 plus the 2 live-checkpoint resumers).
+  The 8,000/day per-channel budget still bounds the requests; what moves is the CITY count per night inside this stage's window.
+  Judge the nights from 2026-10-27 on at that city count, and do not read a change in this gate's request totals across that date as a pacing effect.
 - Whole-catalog screening should move to the weekly parquet dump for 0 API requests; that is a separate ticket.
 
 **One host, not twenty-five.** `api.panoramax.xyz` is a meta-catalog that harvests metadata from every registered instance (23 on 2026-09-04), so a collector would query one host regardless of how many instances join — one `host_lock.py` entry, no per-instance fan-out, and no per-instance rate question.
