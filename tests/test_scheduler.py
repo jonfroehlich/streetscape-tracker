@@ -9544,6 +9544,12 @@ def _paused_sweep_outcome():
     )
 
 
+# A per-city ceiling no test night reaches (#452 review): a day, longer than
+# any batch, so a case written about the budget or the deadline clamp keeps
+# testing that term rather than the KartaView pair's 60-minute default.
+_NO_CITY_CEILING_MIN = 24 * 60
+
+
 def _sweep_cfg(**overrides):
     """_street_cfg plus a kartaview channel, bypassing UNWIRED_CHANNELS' refusal
     the same way the timeout cases above do."""
@@ -9672,7 +9678,10 @@ def test_a_sweep_priced_over_the_whole_budget_is_capped_rather_than_skipped_fore
     _enroll_kartaview(conn, cid)
     # A budget far under this city's sweep estimate: the old arm's dead end.
     cfg = _sweep_cfg(publish_enabled=False)
-    cfg.providers["kartaview"] = ProviderConfig(enabled=True, daily_request_budget=400)
+    # Ceiling out of the way (#452 review): the budget is the term under test.
+    cfg.providers["kartaview"] = ProviderConfig(
+        enabled=True, daily_request_budget=400, max_city_minutes=_NO_CITY_CEILING_MIN
+    )
 
     calls = []
     _run_loop_capturing_kwargs(monkeypatch, conn, cfg, calls)
@@ -9842,7 +9851,11 @@ def test_a_timeout_with_room_to_spare_leaves_the_cap_at_the_budget_remainder(con
     # it paces thousands of requests against a 400-request remainder.
     cfg = _sweep_cfg(publish_enabled=False, city_timeout_minutes=600)
     cfg.providers["kartaview"] = ProviderConfig(
-        enabled=True, daily_request_budget=budget, max_requests_per_minute=rate
+        enabled=True,
+        daily_request_budget=budget,
+        max_requests_per_minute=rate,
+        # Ceiling out of the way (#452 review): the budget is the term under test.
+        max_city_minutes=_NO_CITY_CEILING_MIN,
     )
 
     calls = []
@@ -10009,7 +10022,11 @@ def _wall_cfg(budget=100):
     makes the age-wall arm the only thing these cases can be exercising.
     """
     cfg = _sweep_cfg(publish_enabled=False)
-    cfg.providers["kartaview"] = ProviderConfig(enabled=True, daily_request_budget=budget)
+    # The per-city ceiling (#452 review) is set out of the way, so the BUDGET
+    # stays the term these cases exercise; the ceiling has its own tests.
+    cfg.providers["kartaview"] = ProviderConfig(
+        enabled=True, daily_request_budget=budget, max_city_minutes=_NO_CITY_CEILING_MIN
+    )
     return cfg
 
 
@@ -10134,6 +10151,182 @@ def test_a_sweep_with_days_to_spare_launches_exactly_as_before(
         (city.city_id, "kartaview"),
     ).fetchone()
     assert row is None or row["consecutive_failures"] == 0
+
+
+# ── The per-city ceiling on a resumable launch (PR #456 review, #452) ───────
+
+
+def test_a_kartaview_launch_is_held_to_the_per_city_ceiling_not_the_nights_remainder(
+    conn, monkeypatch
+):
+    """
+    THE #452 REVIEW'S MAJOR 2. The city loop is sequential, so a resumable
+    launch sized to the night's remainder holds every later city behind it: at
+    the anonymous 1.5/min a 12 h remainder affords ~540 requests, which the
+    serial sweep spends in ~6 h while every later city's Mapillary and GSV lanes
+    wait. With no `max_city_minutes` configured, the KartaView default (60 min)
+    bounds the TIMEOUT, and the cap and the child's clock stop follow from it.
+
+    Kills: `request_cap = remaining` (20,000 here), the ceiling not applied to
+    the timeout (the cap is then what the 12 h remainder affords), and the
+    clock stop derived from the unceiled timeout.
+    """
+    from streetscape_metadata_tracker import scheduler as sched
+    from streetscape_metadata_tracker.scheduler import (
+        _KARTAVIEW_CITY_CEILING_S,
+        _TIMEOUT_FIXED_SLACK_S,
+        _crawl_max_seconds,
+    )
+
+    cid = _register(conn, "Metro", width=20_000, height=20_000, step=20)
+    _enroll_kartaview(conn, cid)
+    cfg = _sweep_cfg(publish_enabled=False, max_batch_hours=12)
+    assert cfg.providers["kartaview"].max_city_minutes is None, "premise: the default applies"
+    # Premise: without the ceiling, this launch would get far more than an hour.
+    city = db.resolve_city(conn, cid)
+    assert sched.city_timeout_seconds(cfg, city, "kartaview", conn=conn) > 4 * 3600
+
+    calls = []
+    _run_loop_capturing_kwargs(monkeypatch, conn, cfg, calls)
+
+    sweeps = [c for c in calls if c[1] == "kartaview"]
+    assert sweeps, "a ceiling spreads a city over nights; it must never skip it"
+    kwargs = sweeps[0][2]
+    rate, fraction = 1.5, sched._SWEEP_ACHIEVED_RATE_FRACTION
+    expected_cap = int((_KARTAVIEW_CITY_CEILING_S - _TIMEOUT_FIXED_SLACK_S) / 60 * rate * fraction)
+    assert kwargs["timeout_s"] == _KARTAVIEW_CITY_CEILING_S
+    assert kwargs["request_cap"] == expected_cap == 37
+    assert kwargs["max_seconds"] == _crawl_max_seconds(_KARTAVIEW_CITY_CEILING_S) == 3000
+
+
+def test_a_configured_per_city_ceiling_is_honoured_and_reaches_the_walk(conn, monkeypatch):
+    """`[providers.kartaview].max_city_minutes` replaces the default, and the
+    walk channel resolves its default through STREET_CHANNELS like every other
+    pricing value. Kills: the configured value ignored, and a per-CHANNEL
+    default table missing the walk (which would leave kartaview_streets
+    unbounded)."""
+    from streetscape_metadata_tracker.scheduler import (
+        _KARTAVIEW_CITY_CEILING_S,
+        _crawl_city_ceiling_s,
+    )
+
+    assert _crawl_city_ceiling_s("kartaview_streets", None) == _KARTAVIEW_CITY_CEILING_S
+    # Tile censuses keep no default ceiling: Mapillary's lanes are what this protects.
+    assert _crawl_city_ceiling_s("mapillary", None) is None
+    assert _crawl_city_ceiling_s("panoramax", None) is None
+
+    cid = _register(conn, "Metro", width=20_000, height=20_000, step=20)
+    _enroll_kartaview(conn, cid)
+    cfg = _sweep_cfg(publish_enabled=False, max_batch_hours=12)
+    cfg.providers["kartaview"] = ProviderConfig(
+        enabled=True, daily_request_budget=20_000, max_city_minutes=120
+    )
+    calls = []
+    _run_loop_capturing_kwargs(monkeypatch, conn, cfg, calls)
+    kwargs = next(c[2] for c in calls if c[1] == "kartaview")
+    assert kwargs["timeout_s"] == 7200
+    assert kwargs["request_cap"] == int((7200 - 600) / 60 * 1.5 * 0.5)
+
+
+def test_a_per_city_ceiling_under_the_launch_floor_is_raised_rather_than_skipping_every_city():
+    """A ceiling whose cap cannot clear the calibration ladder would not slow
+    KartaView down -- it would floor-skip every city every night. Kills: the
+    `max(..., _crawl_city_ceiling_floor_s)` dropped, and the floor's +1 s (at
+    exactly 3,320 s the float product lands one request short)."""
+    from streetscape_metadata_tracker.scheduler import (
+        _MIN_RADIUS_SWEEP_LAUNCH_REQUESTS,
+        _crawl_city_ceiling_s,
+        _sweep_requests_within_timeout,
+    )
+
+    for minutes in (1, 20, 55):
+        pc = ProviderConfig(max_city_minutes=minutes)
+        ceiling = _crawl_city_ceiling_s("kartaview", pc)
+        assert ceiling == 3321, f"{minutes} min must be raised to the floor"
+        assert (
+            _sweep_requests_within_timeout(ceiling, "kartaview", pc)
+            >= _MIN_RADIUS_SWEEP_LAUNCH_REQUESTS
+        )
+    # At the authenticated pace the floor is far lower, so a small value stands.
+    fast = ProviderConfig(max_city_minutes=20, max_requests_per_minute=16)
+    assert _crawl_city_ceiling_s("kartaview", fast) == 20 * 60
+
+
+def test_a_deadline_clamp_under_the_per_city_ceiling_still_stands(conn):
+    """The ceiling only ever SHORTENS a launch: a timeout the batch deadline
+    already clamped below it is left alone. Kills: `timeout_s = ceiling_s`
+    unconditionally, which would hand a late-night child a timeout past the
+    deadline."""
+    from streetscape_metadata_tracker.scheduler import _sweep_launch_plan
+
+    cid = _register(conn, "Metro", width=20_000, height=20_000, step=20)
+    plan = _sweep_launch_plan(
+        _sweep_cfg(publish_enabled=False),
+        db.resolve_city(conn, cid),
+        "kartaview",
+        conn,
+        est=10_000,
+        remaining=20_000,
+        remaining_s=1800,
+        city_channels=["kartaview"],
+    )
+    assert plan.timeout_s == 1800
+
+
+def test_an_age_wall_the_per_city_ceiling_binds_names_that_ceiling(conn, tmp_path, monkeypatch):
+    """When the per-city ceiling is the clock that walls a checkpoint, the
+    refusal names `max_city_minutes` as the lever, not the batch deadline or
+    the derived timeout. Kills: the ceiling arm dropped from the lever chain."""
+    from streetscape_metadata_tracker.scheduler import _SWEEP_SKIP_AGE_WALL, _sweep_launch_plan
+
+    city = _checkpointed_city(
+        conn,
+        tmp_path,
+        monkeypatch,
+        roots_done=3,
+        root_count=800,
+        days_old=6.5,
+        name="Metro",
+        width=20_000,
+        height=20_000,
+    )
+    plan = _sweep_launch_plan(
+        _sweep_cfg(publish_enabled=False),
+        city,
+        "kartaview",
+        conn,
+        est=10_000,
+        remaining=20_000,
+        remaining_s=None,
+        city_channels=["kartaview"],
+    )
+    assert plan.skip == _SWEEP_SKIP_AGE_WALL
+    assert "[providers.kartaview].max_city_minutes" in plan.message
+    assert "daily_request_budget" not in plan.message
+
+
+def test_max_city_minutes_parses_and_bad_values_fall_back(tmp_path, caplog):
+    """A bad value or a non-resumable channel is named and ignored, never a
+    night-aborting error. Kills: the key not read at load, and the
+    non-resumable guard dropped (a gsv child cut short is SIGKILLed and
+    counted a failure, never paused)."""
+    cfg_path = tmp_path / "s.toml"
+    cfg_path.write_text(
+        "[providers.gsv]\nenabled = true\nmax_city_minutes = 30\n\n"
+        "[providers.kartaview]\nenabled = true\nmax_city_minutes = 90\n\n"
+        '[providers.kartaview_streets]\nenabled = true\nmax_city_minutes = "soon"\n\n'
+        "[providers.mapillary]\nenabled = true\nmax_city_minutes = -5\n"
+    )
+    with caplog.at_level(logging.WARNING):
+        cfg = load_scheduler_config(str(cfg_path))
+    assert cfg.providers["kartaview"].max_city_minutes == 90.0
+    assert cfg.providers["gsv"].max_city_minutes is None
+    assert cfg.providers["kartaview_streets"].max_city_minutes is None
+    assert cfg.providers["mapillary"].max_city_minutes is None
+    text = caplog.text
+    assert "[providers.gsv] max_city_minutes is ignored" in text
+    assert "[providers.kartaview_streets] max_city_minutes='soon'" in text
+    assert "[providers.mapillary] max_city_minutes=-5" in text
 
 
 # ── A paused grid sweep and its paired walk (issues #274, #290) ──────────────

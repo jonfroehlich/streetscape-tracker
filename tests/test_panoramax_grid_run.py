@@ -335,6 +335,10 @@ def test_a_lattice_that_answers_404_EVERYWHERE_is_refused_rather_than_published(
     """
     lat, lon = straddling_city
     tiles = dp.tiles_for_bbox(*dp.grid_bbox(lat, lon, 100, 100, 20))
+    # The fixture's lattice is under the host-typing floor (#452 review), so
+    # the floor is lowered to it; the test below pins the floor itself.
+    assert len(tiles) < dp.ENDPOINT_MOVED_MIN_TILES
+    monkeypatch.setattr(dp, "ENDPOINT_MOVED_MIN_TILES", len(tiles))
     with pytest.raises(DownloadError, match=_MOVED_ENDPOINT) as excinfo:
         _run(monkeypatch, tmp_path, {}, lat, lon, missing=set(tiles))
     # Host-typed since #452, so the child exits 90 (latched, amnestied, no
@@ -719,12 +723,19 @@ def _one_tile_city():
 
 
 def test_a_ONE_TILE_city_that_404s_is_refused_as_a_moved_endpoint(monkeypatch, tmp_path):
-    """No lower bound on the whole-lattice guard: one tile that 404s is a city
-    wholly unmeasured, and the refusal should say why rather than "1/1 tiles
-    failed"."""
+    """No lower bound on the whole-lattice guard's WORDING: one tile that 404s
+    is a city wholly unmeasured, and the refusal should say why rather than
+    "1/1 tiles failed".
+
+    But its TYPE stays the city's own (#452 review): one tile is not evidence
+    of a moved route, and host-typed it would latch Panoramax for every other
+    enrolled city of the night, and again the next night if this city leads the
+    slate. Kills: the whole-lattice guard host-typed with no
+    ENDPOINT_MOVED_MIN_TILES floor."""
     lat, lon, tile = _one_tile_city()
-    with pytest.raises(DownloadError, match=_MOVED_ENDPOINT):
+    with pytest.raises(DownloadError, match=_MOVED_ENDPOINT) as excinfo:
         _run(monkeypatch, tmp_path, {}, lat, lon, missing={tile}, width=40, height=40)
+    assert not isinstance(excinfo.value, HostEndpointMovedError)
 
 
 # ── #407 review: a lone 404 promotes, and its walk reuse stays unmeasured ───

@@ -1377,6 +1377,40 @@ def test_a_total_smaller_than_its_page_is_unusable():
     assert kv.page_is_full(1, 2) is False
     # The server serves at most IPP_MAX, so a 2,000-row page IS full at ipp=8000.
     assert kv.page_is_full(2000, 8000) is True
+    # #452 review: only ipp=200 was ever measured on the blind host, so a page
+    # of 200 is possibly full at production's ipp=2000, and 199 is short of
+    # every page size the server could be applying. Kills:
+    # MEASURED_BLIND_PAGE_SIZE dropped from page_is_full's min.
+    assert kv.page_is_full(kv.MEASURED_BLIND_PAGE_SIZE, kv.IPP_MAX) is True
+    assert kv.page_is_full(kv.MEASURED_BLIND_PAGE_SIZE - 1, kv.IPP_MAX) is False
+
+
+def test_a_server_page_cap_of_200_at_production_ipp_is_paged_not_truncated(monkeypatch):
+    """
+    THE #452 REVIEW'S MAJOR 1. Production asks for ipp=IPP_MAX (2,000), a size
+    Grab documented for the OLD host and nobody measured on api.kartaview.org,
+    which was probed at ipp=200 only. If the new host caps a page at 200, page 1
+    of every dense circle comes back at 200, reads short against 2,000, and the
+    circle publishes truncated with no error and no failed cell. Against the
+    measured 200 it pages on. Kills: page_is_full compared against
+    min(ipp, IPP_MAX) alone.
+    """
+    roots = _roots(1000)
+    first = roots[0]
+    first_key = (round(first.lat, 5), round(first.lon, 5), first.radius_m)
+    cap = kv.MEASURED_BLIND_PAGE_SIZE
+    pages = {1: _ids("a", cap), 2: _ids("b", cap), 3: _ids("c", 37)}
+
+    def responder(call):
+        if call.key == first_key:
+            return pages[call.page], 0
+        return [], 0
+
+    result, calls = _sweep(monkeypatch, responder, radius_m=1000)  # ipp defaults to IPP_MAX
+    assert [c.page for c in calls if c.key == first_key] == [1, 2, 3]
+    assert len(result["census"]) == 2 * cap + 37
+    assert result["cells_paged_deep"] == 1
+    assert result["failed_cells"] == []
 
 
 def test_the_measured_2026_10_22_shape_is_paged_to_a_short_page(monkeypatch):
@@ -1396,17 +1430,23 @@ def test_the_measured_2026_10_22_shape_is_paged_to_a_short_page(monkeypatch):
     assert [c.page for c in calls if c.key == first_key] == [1, 2, 3]
     assert sorted(result["census"]["id"]) == ["a0", "a1", "c0", "c1", "e0"]
     assert result["cells_visited"] == result["cells"] == len(roots), "paged, not subdivided"
+    # The empty roots' total of 0 is honest (total_is_usable(0, 0)), so only
+    # the dense root is blind, and it filled page 1, so it is also deep.
     assert result["cells_paged_blind"] == 1
+    assert result["cells_paged_deep"] == 1
     assert result["failed_cells"] == []
 
 
 def test_an_unknown_total_with_a_short_first_page_costs_one_request(monkeypatch):
     """Kills: blind paging that ignores page fullness, which would double the
-    cost of every sparse city on the moved host."""
+    cost of every sparse city on the moved host; and `cells_paged_deep` counted
+    before the short-page check, which would make it the vacuous signal the
+    #452 review found `cells_paged_blind` to be."""
     result, calls = _sweep(monkeypatch, lambda call: (_ids("a", 1), 0), radius_m=1000, ipp=2)
     assert all(c.page == 1 for c in calls)
     assert len(calls) == len(_roots(1000))
     assert result["cells_paged_blind"] == len(_roots(1000))
+    assert result["cells_paged_deep"] == 0
 
 
 def test_a_usable_total_that_exactly_fills_the_page_is_not_paged_blind(monkeypatch):
@@ -1486,6 +1526,73 @@ def test_a_page_two_backpressure_while_paging_blind_still_subdivides(monkeypatch
     result, calls = _sweep(monkeypatch, responder, radius_m=1000, ipp=2, retries=0)
     assert {c.radius_m for c in calls} == {1000, 500}
     assert result["failed_cells"] == []
+
+
+def test_the_budget_bounds_a_BLIND_descent_inside_its_page_loop(monkeypatch):
+    """
+    The blind twin of test_the_budget_bounds_a_cascade_not_just_the_root_boundary
+    (#452 review, finding 4). Full pages with total 0 never end on their own
+    until MAX_PAGES_PER_CELL, so the page loop has to ask the budget itself:
+    `--kartaview-max-seconds` and the request cap both stop INSIDE this loop on
+    every capped night. Kills: the `if over_budget(): ... return False` block
+    deleted from the blind page loop, which pages one root to the cap (10
+    requests) on a budget of 3.
+    """
+    error, calls = _failed_sweep(
+        monkeypatch, _full_forever(1000), radius_m=1000, ipp=2, max_requests=3
+    )
+    assert len(calls) <= 4, f"budget of 3 spent {len(calls)} requests"
+    assert error.api_requests == len(calls)
+
+
+def test_a_stop_inside_a_BLIND_descent_rolls_that_root_back(monkeypatch, tmp_path):
+    """
+    The checkpointed half of the same stop (#452 review, finding 4). A circle
+    stopped between its blind pages is not exhaustive, so its pages must not be
+    committed against a `roots_done` that excludes it, or the resume re-sweeps
+    the root and carries its early pages twice. Kills: the blind loop's budget
+    check deleted (the stop then lands nowhere near page 2 and the root is
+    paged to MAX_PAGES_PER_CELL), and `unvisited([cell])` dropped from it.
+    """
+    ckpt = tmp_path / "sweep"
+    error, calls = _failed_sweep_ckpt(
+        monkeypatch,
+        _full_forever(1000),
+        ckpt,
+        ipp=2,
+        max_requests=2,
+        checkpoint_request_interval=1,
+    )
+    assert isinstance(error, kv.SweepIncompleteError)
+    assert [c.page for c in calls] == [1, 2], "the stop must land inside the blind page loop"
+    state = _state(ckpt)
+    assert state["roots_done"] == 0, "a half-paged blind root is not a swept root"
+    assert state["census_rows"] == 0, "its pages are rolled back, not committed"
+    assert state["raw_photo_count"] == 0
+
+
+def test_a_backpressure_refusal_COUNTS_AS_AN_ANSWER_against_the_404_strikes(monkeypatch):
+    """
+    PR #456's deviation 3, pinned (#452 review, finding 5). apiCode 690 is a
+    JSON body from the route itself, so a sweep that met one has proved the
+    route is served, and the 404s after it are this city's failed cells -- the
+    area guard's refusal, exit 1 -- never a moved endpoint that latches the
+    channel for every other city. Kills: `note_outcome` counting only `ok*` as
+    an answer.
+    """
+    seen = []
+
+    def responder(call):
+        seen.append(call)
+        if len(seen) == 1:
+            raise kv.BackpressureError("apiCode 690")
+        _not_found(call)
+
+    assert len(_roots(300)) + 3 > kv.ENDPOINT_NOT_FOUND_STRIKES, "premise: enough 404s to strike"
+    error, calls = _failed_sweep(monkeypatch, responder, radius_m=300)
+    assert len(calls) > kv.ENDPOINT_NOT_FOUND_STRIKES, "premise: the 404s reached the strike count"
+    assert not isinstance(error, HostEndpointMovedError)
+    assert "unmeasured" in str(error)
 
 
 # ── A moved endpoint (issue #452) ──────────────────────────────────────────

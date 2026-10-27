@@ -1733,19 +1733,32 @@ def test_the_child_reason_names_a_moved_endpoint(tmp_path, monkeypatch):
     assert "unavailable" not in outcome.reason
 
 
-def test_a_moved_endpoint_latches_without_a_recheck_and_is_never_recovered():
-    from streetscape_metadata_tracker.download_common import HOST_KARTAVIEW
+def test_a_moved_endpoint_latches_and_STAYS_latched_past_its_cooldown():
+    """
+    The latch is held all night because neither moved host has a re-check
+    (`HOST_RECHECKS`), not because the breaker exempts a moved endpoint -- so
+    this asks `blocking()` AFTER the cooldown has elapsed (it is 0 here), which
+    is when a re-check would fire, and twice (#452 review: asserting
+    `rechecks == 0` on a breaker nothing had asked held trivially). Kills: a
+    KartaView or Panoramax entry added to HOST_RECHECKS without deciding what
+    a re-check means for a moved route.
+    """
+    from streetscape_metadata_tracker.download_common import HOST_KARTAVIEW, HOST_PANORAMAX
 
-    breaker = sched.HostBreaker(cooldown_s=0)
-    breaker.endpoint_moved(HOST_KARTAVIEW)
-    assert breaker and breaker.moved_only({HOST_KARTAVIEW})
-    assert not breaker.throttled_only({HOST_KARTAVIEW})
-    assert breaker.blocking({HOST_KARTAVIEW}) == {HOST_KARTAVIEW}
-    assert breaker.rechecks[HOST_KARTAVIEW] == 0
-    assert breaker.recovered == set()
+    for host in (HOST_KARTAVIEW, HOST_PANORAMAX):
+        breaker = sched.HostBreaker(cooldown_s=0)
+        breaker.endpoint_moved(host)
+        assert breaker and breaker.moved_only({host})
+        assert not breaker.throttled_only({host})
+        assert breaker.seconds_until_recheck(host) == 0, "premise: the cooldown has elapsed"
+        for _ in range(2):
+            assert breaker.blocking({host}) == {host}
+        assert breaker.rechecks[host] == 0
+        assert breaker.recovered == set()
+        assert not breaker.can_recheck(host)
     # A refusal on the same night is named as a refusal, not a moved endpoint.
-    breaker.add(HOST_KARTAVIEW)
-    assert not breaker.moved_only({HOST_KARTAVIEW})
+    breaker.add(HOST_PANORAMAX)
+    assert not breaker.moved_only({HOST_PANORAMAX})
 
 
 def test_a_walk_lost_to_a_moved_endpoint_names_the_cause(conn, monkeypatch, tmp_path, caplog):

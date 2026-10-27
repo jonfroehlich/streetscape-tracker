@@ -177,14 +177,15 @@ async def collect_kartaview_street_samples_async(
         census = fetched.pop("census")
         num_flat_images = int((~census_is_pano(census)).sum())
         logger.info(
-            "%s: %d KartaView images (%d panos, %d flat) from %d cells (%d paged blind) "
-            "→ scoring %d sample points",
+            "%s: %d KartaView images (%d panos, %d flat) from %d cells (%d paged blind, "
+            "%d past page 1) → scoring %d sample points",
             city.city_id,
             len(census),
             len(census) - num_flat_images,
             num_flat_images,
             fetched.get("cells_visited") or 0,
             fetched.get("cells_paged_blind") or 0,
+            fetched.get("cells_paged_deep") or 0,
             len(query_points),
         )
 

@@ -1055,7 +1055,7 @@ def is_resumable_channel(name: str) -> bool:
 # channel pair the exception covers: a z15 tile census is checkpointed (#323),
 # so being cut short costs a night rather than the crawl. Within the exception
 # the rule applies again -- kartaview's sweep runs to hours on a metro
-# (Singapore ~9,974 requests at 16/min) where the richest Panoramax city
+# (Singapore ~9,974 requests, ~111 h at the anonymous 1.5/min) where the richest Panoramax city
 # measures ~3,132 tiles, ~104 min at the default 30/min, ~52 min at prod's 60
 # since #405 (all RAW PACE, which is the right basis for comparing two
 # channels' expense; the derived timeouts are longer)
@@ -1171,6 +1171,13 @@ class ProviderConfig:
     # in force; 0 restores an exact cadence. Validated at load by
     # `coerce_jitter`, so an out-of-range config field never reaches a child.
     jitter: float | None = None
+    # Resumable channels only (#452 review): the most wall clock ONE launch of
+    # this channel for ONE city may hold the sequential city loop, in minutes.
+    # None uses the provider's default (`_CrawlPricing.default_city_ceiling_s`:
+    # 60 min for the KartaView pair, none for the tile censuses). Never applied
+    # below what funds the launch floor at this channel's pace -- see
+    # `_crawl_city_ceiling_s` -- so too small a value cannot skip every city.
+    max_city_minutes: float | None = None
     spacing_m: int = 15
     # Which OSM network the road walk covers. 'drive' (motorized public roads)
     # is the scheduled default; 'all_public' additionally walks alleys,
@@ -1957,11 +1964,37 @@ def load_scheduler_config(path: str | None = None) -> SchedulerConfig:
                     f"[0, 1); ignoring it and leaving the collector's own default "
                     f"in force (0 would mean an exact, metronomic cadence)"
                 )
+            # The per-city wall-clock ceiling (#452 review). Same posture as the
+            # two guards above: a bad value is named and dropped back to the
+            # provider's default rather than aborting the night, and a value on a
+            # channel that cannot pause is named and ignored -- a non-resumable
+            # child cut short is SIGKILLed and counted a failure, never paused.
+            raw_ceiling = p.get("max_city_minutes")
+            max_city_minutes = None
+            if raw_ceiling is not None:
+                if (
+                    isinstance(raw_ceiling, bool)
+                    or not isinstance(raw_ceiling, (int, float))
+                    or not raw_ceiling > 0
+                ):
+                    logger.warning(
+                        f"[providers.{name}] max_city_minutes={raw_ceiling!r} is not a positive "
+                        f"number of minutes; ignoring it and using the provider's default"
+                    )
+                elif not CHANNEL_RESUMABLE.get(name, False):
+                    logger.warning(
+                        f"[providers.{name}] max_city_minutes is ignored: {name} cannot "
+                        f"pause and resume, so a launch cut short would be SIGKILLed and "
+                        f"counted a failure rather than spread across nights"
+                    )
+                else:
+                    max_city_minutes = float(raw_ceiling)
             providers[name] = ProviderConfig(
                 enabled=p.get("enabled", True),
                 daily_request_budget=p.get("daily_request_budget", 250_000),
                 max_requests_per_minute=p.get("max_requests_per_minute"),
                 jitter=jitter,
+                max_city_minutes=max_city_minutes,
                 spacing_m=p.get("spacing_m", 15),
                 network_type=network_type,
             )
@@ -2417,10 +2450,20 @@ _TILE_ACHIEVED_RATE_FRACTION = 0.8
 # what binds. The KartaView sweep is deliberately SERIAL (the next question
 # depends on the last answer, and fanning out into a server that answers HTTP 400
 # under load is #198's shape), so its wall-clock per request is
-# max(pacing_interval, latency) with nothing to overlap. At the shipped 16/min
-# the interval is only 3.75 s, and a `nearby-photos` page carries up to 2,000
-# photo records — a far fatter response than a z14 tile — so latency can be the
-# binding term, not the limiter. 0.5 budgets 7.5 s per request at 16/min.
+# max(pacing_interval, latency) with nothing to overlap. At the 16/min this was
+# written against the interval was only 3.75 s, and a `nearby-photos` page
+# carries up to 2,000 photo records — a far fatter response than a z14 tile — so
+# latency could be the binding term, not the limiter. 0.5 budgets 7.5 s per
+# request at 16/min.
+#
+# AT THE ANONYMOUS 1.5/min (#452) THE INTERVAL IS 40 s, so the limiter binds and
+# a child achieves close to the full pace: 0.5 now buys HALF of what the clock
+# could. That is deliberately left as the over-timing direction (a timeout
+# twice the honest wall clock, and a cap half of what the timeout could pace),
+# because the per-city ceiling (`_KARTAVIEW_CITY_CEILING_S`) is what now bounds
+# how long a launch holds the city loop, and a cap priced low only spreads a
+# city over more nights. Re-deriving the fraction per rate is a pricing change
+# for a measured night, not a guess.
 #
 # The error is deliberately asymmetric. Under-timing is the failure this whole
 # derivation exists to prevent: a SIGKILLed child records NO api_usage, so its
@@ -2470,11 +2513,12 @@ _SWEEP_ACHIEVED_RATE_FRACTION = 0.5
 # 83 rather than overspending -- so the overrun this paragraph used to describe
 # is a resumable pause. The cap is the SMALLER of `budget - used` and what the
 # child's own timeout can pace (_sweep_requests_within_timeout), because the
-# neither term dominates: a night's paced wall clock is finite (on prod 16/min
-# over the 12 h batch affords ~11,520 requests) and the budget is 10,000, so
-# which ceiling binds flips with config that moves -- at the 10 h batch this
-# argument was first written against, the clock was the smaller term and the
-# ledger remainder was unreachable outright.
+# neither term dominates: a night's paced wall clock is finite and the budget is
+# 10,000, so which ceiling binds flips with config that moves -- at the 10 h
+# batch this argument was first written against (16/min, ~9,600 paced) the clock
+# was the smaller term, at 12 h and 16/min (~11,520) the budget was, and at the
+# anonymous 1.5/min (#452) the clock is again, by far: a launch is now held to
+# the per-city ceiling, ~37 requests an hour at the default.
 # The number travels as `request_cap`, spelled differently from
 # `daily_budget` on purpose: the street channels' ceiling is the FULL budget
 # because that collector subtracts today's spend itself (see
@@ -2576,6 +2620,40 @@ class _CrawlPricing:
     #: per-provider because the failure each prevents is a different failure.
     launch_floor: int
     floor_buys: str
+    #: The most wall clock one launch may hold the city loop when the channel's
+    #: block sets no ``max_city_minutes``; None for no ceiling. See
+    #: ``_crawl_city_ceiling_s`` (#452 review).
+    default_city_ceiling_s: int | None = None
+
+
+# THE KARTAVIEW PAIR'S PER-CITY WALL-CLOCK CEILING (#452 review, finding 2).
+#
+# The city loop is SEQUENTIAL: lanes split one city's channels, never two
+# cities. A resumable channel is launched capped at what the night affords, and
+# at the anonymous 1.5/min a 12 h remainder affords ~540 requests at the
+# assumed 0.5 achieved fraction -- which the serial sweep, achieving close to
+# the full pace at a 40 s interval, spends in ~6 h. Every later city's GSV and
+# Mapillary lanes sit idle behind it, and the next hoisted KartaView city takes
+# the next ~3 h. At 16/min the same night afforded 5,760 and an enrolled city
+# never needed it (p95 636, ~40 min), so no night ever exercised this shape.
+#
+# The ceiling bounds the TIMEOUT a launch is sized against, so the request cap
+# and the child's own clock stop (`--kartaview-max-seconds`) shrink with it:
+# a city bigger than one ceiling checkpoints, exits 83 (amnestied) and resumes
+# the next night. Nothing is lost but calendar time, which the 7-day
+# CHECKPOINT_MAX_AGE_S wall bounds -- an open decision for Jon in PR #456.
+#
+# 60 minutes is the smallest round value above what funds the radius sweep's
+# launch floor at the anonymous pace: (34 requests / (1.5/min x 0.5)) + the
+# 10-minute fixed slack = ~55.3 min. Below that the cap could not clear the
+# calibration ladder and every city would floor-skip, which is why
+# `_crawl_city_ceiling_s` raises any smaller value to that minimum. HOW LONG A
+# LAUNCH ACTUALLY HOLDS THE LOOP: the cap is priced at 0.5 of the pace, so a
+# child achieving the full pace spends its ~37 requests in ~25 min and pauses;
+# only a child slower than the assumed fraction runs to the ceiling's own
+# clock stop at 50 min. Both KartaView channels share one host lock and run one
+# after the other, so a city due on both can hold the loop up to twice this.
+_KARTAVIEW_CITY_CEILING_S = 60 * 60
 
 
 # Keyed on the PROVIDER behind the channel via STREET_CHANNELS -- the table that
@@ -2594,6 +2672,7 @@ _CRAWL_PRICING: dict[str, Callable[[], _CrawlPricing]] = {
         _SWEEP_ACHIEVED_RATE_FRACTION,
         _MIN_RADIUS_SWEEP_LAUNCH_REQUESTS,
         "clear radius calibration",
+        _KARTAVIEW_CITY_CEILING_S,
     ),
     "mapillary": lambda: _CrawlPricing(
         download_mapillary.DEFAULT_TILE_REQUESTS_PER_MINUTE,
@@ -2625,6 +2704,50 @@ def _crawl_pricing(channel: str) -> _CrawlPricing:
     is the collector's current one. See ``_CRAWL_PRICING``.
     """
     return _CRAWL_PRICING[STREET_CHANNELS.get(channel, channel)]()
+
+
+def _crawl_city_ceiling_s(channel: str, pc: ProviderConfig | None) -> int | None:
+    """
+    The most wall clock one launch of a resumable ``channel`` may hold the city
+    loop, in seconds, or None for no ceiling (#452 review).
+
+    ``[providers.<channel>].max_city_minutes`` when set, the provider's
+    ``default_city_ceiling_s`` otherwise -- and never below
+    :func:`_crawl_city_ceiling_floor_s`, the smallest timeout whose cap clears
+    the launch floor at this channel's pace. A ceiling under that would not
+    slow the channel down, it would floor-skip every city every night.
+
+    Example (KartaView at the anonymous 1.5/min)::
+
+        _crawl_city_ceiling_s("kartaview", None)                         # 3600
+        _crawl_city_ceiling_s("kartaview", ProviderConfig(max_city_minutes=20))
+        # -> 3321, the floor: 600 s slack + 34 requests at 0.75/min
+        _crawl_city_ceiling_s("mapillary", None)                         # None
+    """
+    pricing = _crawl_pricing(channel)
+    configured = pc.max_city_minutes if pc else None
+    ceiling = pricing.default_city_ceiling_s if configured is None else int(configured * 60)
+    if ceiling is None:
+        return None
+    return max(ceiling, _crawl_city_ceiling_floor_s(channel, pc))
+
+
+def _crawl_city_ceiling_floor_s(channel: str, pc: ProviderConfig | None) -> int:
+    """
+    The smallest timeout whose request cap clears ``channel``'s launch floor.
+
+    The inverse of :func:`_sweep_requests_within_timeout` at the launch floor,
+    plus one second so float rounding in that function's ``int()`` cannot land
+    one request short. With pacing disabled no clock bounds the cap, so only
+    the fixed slack and the shortest clamped timeout are owed.
+    """
+    pricing = _crawl_pricing(channel)
+    configured = pc.max_requests_per_minute if pc else None
+    rate = pricing.default_rate if configured is None else configured
+    if rate <= 0:
+        return _TIMEOUT_FIXED_SLACK_S + _MIN_CLAMPED_TIMEOUT_S
+    paced_s = pricing.launch_floor * 60.0 / (rate * pricing.achieved_fraction)
+    return _TIMEOUT_FIXED_SLACK_S + math.ceil(paced_s) + 1
 
 
 # Floor for a deadline-clamped timeout. A city is only started while the batch
@@ -2905,8 +3028,8 @@ def _kartaview_timeout_seconds(
     the achieved rate -- but both terms are unlike the other channels'. The
     count comes from bbox area rather than grid points or tiles, and it spans
     four orders of magnitude across the catalog (median ~16 requests, p95 636,
-    Singapore ~9,974); and the rate is 16/min, low enough that per-request
-    latency competes with the pacing interval, which is why this uses
+    Singapore ~9,974); and the rate is its own (1.5/min, the anonymous tier,
+    since #452), slow and serial, which is why this uses
     ``_SWEEP_ACHIEVED_RATE_FRACTION`` rather than the tile census's figure.
 
     Without this arm the channel fell through ``city_timeout_seconds``'
@@ -3034,8 +3157,10 @@ def _sweep_requests_within_timeout(
     against, 16/min paced ~9,600 requests under a 10,000-request budget, so a
     fresh night's cap was unreachable by arithmetic outright and the arm
     actually taken stayed the kill. At 12 h the same rate paces ~11,520 and the
-    budget is the smaller term instead -- which is why the cap is a ``min`` of
-    the two rather than whichever one is currently smaller. Sizing it to what
+    budget was the smaller term instead; at the anonymous 1.5/min (#452) the
+    clock binds again, and the per-city ceiling shortens it further -- which is
+    why the cap is a ``min`` of the two rather than whichever one is currently
+    smaller. Sizing it to what
     the clock affords is what makes the pause the arm a healthy child takes.
 
     ``_TIMEOUT_HEADROOM`` is deliberately NOT divided out here, and that is the
@@ -3088,8 +3213,8 @@ def city_timeout_seconds(
     every channel scales — the two census PAIRS off tile count and their own
     per-IP rate (see _tile_census_timeout_seconds, which prices Mapillary's z14
     and Panoramax's z15 from one derivation at each provider's own constants),
-    and KartaView off its bbox's swept circle count and its own 16/min pace (see
-    _kartaview_timeout_seconds).
+    and KartaView off its bbox's swept circle count and its own pace (1.5/min
+    since #452; see _kartaview_timeout_seconds).
     The derived value never drops below the configured floor, so small cities
     keep the flat timeout whatever their provider.
 
@@ -3594,8 +3719,9 @@ def _sweep_launch_plan(
     big city actually took was the SIGKILL at the timeout -- no exit code, a
     consecutive_failure, a city-cap slot spent and NO ledger write, because the
     child's add_api_usage calls both need it to return. At the 12 h batch the
-    same rate paces ~11,520, so the budget is now the smaller term and the
-    clock the looser one. Sizing the cap to what BOTH afford makes the
+    same rate paced ~11,520, so the budget became the smaller term; at the
+    anonymous 1.5/min (#452) the clock is the smaller one again, and the
+    per-city ceiling bounds it further (see `_KARTAVIEW_CITY_CEILING_S`). Sizing the cap to what BOTH afford makes the
     deliberate pause the arm a healthy child takes (#273).
 
     THE THREE SKIPS, in the order they are asked, which is the order of how much
@@ -3643,9 +3769,18 @@ def _sweep_launch_plan(
     # enabled without its own [providers.*] block must price, time and cap the
     # same way on every path, and this one also runs under the dry run, which
     # must never raise over a config shape the live path tolerates.
-    affordable = _sweep_requests_within_timeout(
-        timeout_s, channel, (cfg.providers or {}).get(channel)
-    )
+    pc = (cfg.providers or {}).get(channel)
+    # THE PER-CITY CEILING (#452 review): applied to the TIMEOUT, before the
+    # cap and the clock stop are derived from it, so all three shrink together
+    # and a launch holds the sequential city loop at most this long. Sized
+    # against the night's remainder instead, one KartaView city at 1.5/min held
+    # the loop for ~6 h while every later city's Mapillary and GSV lanes waited.
+    # Only ever shortens: a deadline-clamped timeout already under it stands.
+    ceiling_s = _crawl_city_ceiling_s(channel, pc)
+    ceiling_binds = ceiling_s is not None and ceiling_s < timeout_s
+    if ceiling_binds:
+        timeout_s = ceiling_s
+    affordable = _sweep_requests_within_timeout(timeout_s, channel, pc)
     # THE CLOCK TERM GOES TO ZERO AT THE END OF A NIGHT, and that is a new skip
     # rather than a rounding artifact (#318). `_sweep_requests_within_timeout`
     # holds `_TIMEOUT_FIXED_SLACK_S` back for startup and the checkpoint write,
@@ -3666,6 +3801,11 @@ def _sweep_launch_plan(
         )
         + f"{'unpaced' if affordable is None else f'{affordable:,}'} "
         f"inside a {timeout_s // 60:,}-minute timeout"
+        + (
+            f" (the per-city ceiling, [providers.{channel}].max_city_minutes)"
+            if ceiling_binds
+            else ""
+        )
     )
 
     def plan(skip: str | None, message: str, label: str) -> SweepLaunchPlan:
@@ -3763,7 +3903,16 @@ def _sweep_launch_plan(
                 + f"{'unpaced' if affordable is None else f'{affordable:,}'} "
                 f"inside a {timeout_s // 60:,}-minute timeout"
             )
-        if clock_walls:
+        if clock_walls and ceiling_binds:
+            # A third clock (#452 review): the per-city ceiling, which is what
+            # keeps one city from holding the sequential loop for the night.
+            # Raising it trades every later city's lanes for this one's finish.
+            lever = (
+                f"[providers.{channel}].max_city_minutes, the per-city ceiling that held this "
+                f"launch to {timeout_s // 60:,} minutes so later cities' channels are not "
+                f"starved"
+            )
+        elif clock_walls:
             # Two different clocks can be the binding term, with different
             # levers: the batch deadline's clamp (a late launch), or the city's
             # own derived timeout (a big grid on any launch). Tell them apart
@@ -5283,8 +5432,10 @@ def _print_unwired_note(cfg: SchedulerConfig, channel: str) -> None:
 # clears it. The estimate is a FLOOR, not a ceiling -- Yogyakarta ran 3.0x its
 # estimate (#248) -- which is why the bar sits above the measured p95 rather
 # than at it, and why a city over it is enrolled only on an explicit
-# `--enroll-kartaview`: at 16/min one host lock serves both channels, so a
-# city this large is an hour or more of the night's single KartaView lane.
+# `--enroll-kartaview`: one host lock serves both channels, so a city this large
+# is an hour or more of the night's single KartaView lane at the old 16/min, and
+# ~11 h of paced fetching at the anonymous 1.5/min (#452) -- spread over many
+# nights by the per-city ceiling.
 OPT_IN_KARTAVIEW_ENROLL_MAX_REQUESTS = 1_000
 
 # The vocabulary of one channel's enrolment decision. `pending_screen` is the
@@ -8926,7 +9077,8 @@ def _collect_due(
     #     and which one binds moves with the config: at the 10 h batch this was
     #     written against, prod's 16/min paced ~9,600 against a 10,000 budget so
     #     the ledger remainder was unreachable outright; at 12 h the same rate
-    #     paces ~11,520 and the budget is the smaller term instead.
+    #     paced ~11,520 and the budget was the smaller term; at the anonymous
+    #     1.5/min (#452) the clock binds, held to the per-city ceiling.
     #     A pause records no consecutive_failure, so the five-night bound
     #     below does not bind it at all -- what bounds it instead is
     #     CHECKPOINT_MAX_AGE_S, seven days from the checkpoint's FIRST commit,

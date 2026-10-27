@@ -147,8 +147,8 @@ def _parse_provider_list(value: str) -> list[str]:
     and ``test_every_known_provider_reaches_its_own_downloader`` asserts set
     equality against KNOWN_PROVIDERS so the gap cannot open quietly.
 
-    `all` is deliberately never the default — a KartaView sweep is paced at 16
-    requests/minute and serial, so a metro is hours of wall-clock, and nobody
+    `all` is deliberately never the default — a KartaView sweep is paced at 1.5
+    requests/minute (the anonymous tier, #452) and serial, so a metro is hours of wall-clock, and nobody
     should get that by typing nothing.
 
     An empty selection is refused rather than returned. `--provider ""` and

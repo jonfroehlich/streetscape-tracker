@@ -214,6 +214,13 @@ REQUESTS_PER_HOUR_AUTH = 1000
 # every one of its 8 targets.
 IPP_MAX = 2000
 
+# The largest page size MEASURED on api.kartaview.org, the host that pages blind
+# (issue #452): the 2026-10-22 probe asked at ipp=200 and got pages of 200. A
+# blind descent treats a page this large as possibly full (see page_is_full),
+# because whether the new host honours IPP_MAX was never measured, and a smaller
+# server cap read against 2,000 would end every descent after page 1.
+MEASURED_BLIND_PAGE_SIZE = 200
+
 # apiCode values that mean "you asked for too much" rather than "you asked
 # wrongly". Both arrive inside an HTTP 400.
 BACKPRESSURE_API_CODES = frozenset({408, 690})
@@ -321,9 +328,9 @@ MAX_FAILED_AREA_FRACTION = 0.02
 #
 # The commit cadence is measured in REQUESTS, not in root cells, because a root
 # does not cost a fixed amount: one that answers cleanly is a single request
-# (~3.75 s at 16/min), while one that cascades to the radius floor is
-# 1 + 4 + 16 + 64 = 85 cells at up to `retries + 1` attempts each -- ~340
-# requests, ~21 minutes. Flushing per root would therefore have both a WORSE
+# (40 s at the anonymous 1.5/min, #452), while one that cascades to the radius
+# floor is 1 + 4 + 16 + 64 = 85 cells at up to `retries + 1` attempts each --
+# ~340 requests, ~3.8 hours at that pace (~21 minutes at the old 16/min). Flushing per root would therefore have both a WORSE
 # worst case and one part file per ROOT -- 5,130 of them for Singapore, which is
 # its root-cell count and not its request count; the two differ by ~2x and it is
 # the cells that would each get a file.
@@ -523,13 +530,31 @@ def total_is_usable(total: int | None, items_on_page: int) -> bool:
 
 def page_is_full(items_on_page: int, ipp: int) -> bool:
     """
-    Did this page come back at the page size, so the circle may hold more?
+    Could the circle hold more than this page, so a BLIND descent asks again?
 
-    Compared against the page size the SERVER applies -- ``min(ipp, IPP_MAX)``,
-    the same clamp ``_post_nearby`` sends -- so an over-large ``ipp`` cannot
-    make every page look short and end a blind descent after page 1.
+    A page is full at the smallest of three sizes:
+
+    * ``ipp``, what this sweep asks for;
+    * ``IPP_MAX``, the cap ``_post_nearby`` clamps to, so an over-large ``ipp``
+      cannot make every page look short and end a blind descent after page 1;
+    * ``MEASURED_BLIND_PAGE_SIZE`` (200), the only page size ever MEASURED on
+      the host that pages blind (#452 review). ``IPP_MAX`` is Grab's JOSM figure
+      for the OLD host; api.kartaview.org was asked at ``ipp=200`` and nothing
+      larger. Were it to cap a page below 2,000, every page 1 would read short
+      against ``IPP_MAX``, page 2 would never be asked, and every circle over
+      the real cap would publish truncated with no error. Against 200 the stop
+      holds for ANY server cap of 200 or more, which is what was measured.
+
+    The cost, if the host does honour 2,000: one extra request (an empty
+    page 2) for every blind circle holding 200 to 1,999 photos. A known-total
+    circle never consults this function, so a counting host pays nothing.
+
+    Usage:
+        page_is_full(200, 2000)   # True  -- may be a 200-row server cap
+        page_is_full(199, 2000)   # False -- short of every size it could be
+        page_is_full(50, 50)      # True  -- a harness asking for 50
     """
-    return items_on_page >= min(ipp, IPP_MAX)
+    return items_on_page >= min(ipp, IPP_MAX, MEASURED_BLIND_PAGE_SIZE)
 
 
 def pages_for_total(total_filtered_items: int | None, ipp: int = IPP_MAX) -> int:
@@ -1892,7 +1917,7 @@ def load_cached_sweep(
     A COMPLETE sweep another consumer already paid for, or None (issue #290).
 
     This is the one that matters most for KartaView: a sweep is HOURS (Singapore
-    ~10.4 h at the paced 16/min), so a grid run and the #258 road walk of one
+    ~111 h at the anonymous 1.5/min since #452, ~10.4 h at the old 16/min), so a grid run and the #258 road walk of one
     city sweeping the identical frozen bbox on the same night is not a doubled
     cost in the abstract -- it is a second overnight against a host that meters
     by IP.
@@ -2156,7 +2181,8 @@ async def download_kartaview_metadata_async(
             f"Swept {fetched['raw_photo_count']} photo rows "
             f"({num_images} unique: {num_panos} panos, {num_images - num_panos} flat) "
             f"from {fetched['cells_visited']} cells at r={fetched['radius_m']} m "
-            f"({fetched.get('cells_paged_blind', 0)} paged blind)"
+            f"({fetched.get('cells_paged_blind', 0)} paged blind, "
+            f"{fetched.get('cells_paged_deep', 0)} past page 1)"
         )
 
         written = census_core.write_census_grid_run(
@@ -2272,6 +2298,7 @@ def _reuse_cached_sweep(
         "cells_visited": cp.cells_visited,
         # Nothing was paged this process (issue #452): a reuse costs 0 requests.
         "cells_paged_blind": 0,
+        "cells_paged_deep": 0,
         "radius_m": cp.radius_m,
         "raw_photo_count": cp.raw_photo_count,
         "num_images": len(census),
@@ -2442,7 +2469,8 @@ async def _fetch_city_images(
         ``api_requests_total``, ``cells`` (root cells), ``cells_visited`` (roots
         plus every subdivision), ``cells_paged_blind`` (cells THIS PROCESS paged
         to a short page because the host reported no usable total, issue
-        #452), ``radius_m`` (what the sweep tiled at),
+        #452), ``cells_paged_deep`` (those of them that paid a page 2, i.e.
+        whose page 1 came back full), ``radius_m`` (what the sweep tiled at),
         ``raw_photo_count`` (pre-dedupe), ``num_images`` and ``num_panos``
         (post-dedupe totals, summarized here because the caller cannot count
         them without pinning the census -- see below), ``failed_cells`` and
@@ -2704,6 +2732,12 @@ async def _fetch_city_images(
     # #452). THIS process's count, not checkpointed: it describes how tonight's
     # host answered, which is the question the operator asks of it.
     cells_paged_blind = 0
+    # Those of them that paid a page 2 (#452 review). On a host that reports
+    # ['0'] on every page, EVERY visited cell is paged blind, so the count above
+    # says only "the host still does not count". This one says whether any
+    # circle ever filled a page: a city whose pano count collapses while it
+    # stays 0 is what a page cap below MEASURED_BLIND_PAGE_SIZE would look like.
+    cells_paged_deep = 0
     # The moved-endpoint stop for a sweep that skipped the ladder (issue #452).
     # `answered_any` is True once the ROUTE has answered anything this process
     # -- an item list or a backpressure refusal (apiCode 690/408 is a JSON body
@@ -2829,7 +2863,7 @@ async def _fetch_city_images(
                 which are recorded rather than raised. One body shared by the
                 root loop and the retry pass, so the two walks cannot drift.
                 """
-                nonlocal cells_visited, raw_photo_count, cells_paged_blind
+                nonlocal cells_visited, raw_photo_count, cells_paged_blind, cells_paged_deep
                 stack = [subtree_root]
                 while stack:
                     # The guard is checked HERE, and again in the page loop
@@ -2891,6 +2925,7 @@ async def _fetch_city_images(
                         if not page_is_full(len(items), ipp):
                             # One short page exhausts the circle: free.
                             continue
+                        cells_paged_deep += 1
                         page = 2
                         while True:
                             if page > MAX_PAGES_PER_CELL:
@@ -3055,7 +3090,7 @@ async def _fetch_city_images(
                     f"at root {start_index}/{len(roots)}"
                 ),
                 unit="cell",
-                # Paced at ~16 requests/min, so a large city is hours of
+                # Paced at 1.5 requests/min (#452), so a large city is hours of
                 # deliberately slow fetching under the scheduler's redirected
                 # log. A healthy run has to print, or "hung" and "slow" are
                 # indistinguishable after a SIGKILL (issue #157).
@@ -3409,7 +3444,8 @@ async def _fetch_city_images(
         # "paged blind" to confirm the first nights on the moved host.
         logger.info(
             f"{cells_paged_blind} cell(s) paged blind this process: the host reports no "
-            f"usable totalFilteredItems, so each was paged to a short page (issue #452)"
+            f"usable totalFilteredItems, so each was paged to a short page (issue #452); "
+            f"{cells_paged_deep} of them filled page 1 and paid a page 2"
         )
     return {
         "census": census,
@@ -3421,6 +3457,8 @@ async def _fetch_city_images(
         "cells_visited": cells_visited,
         # Cells THIS PROCESS paged blind for want of a usable total (#452).
         "cells_paged_blind": cells_paged_blind,
+        # Those of them that paid a page 2 (#452 review): see its declaration.
+        "cells_paged_deep": cells_paged_deep,
         "radius_m": radius_m,
         "raw_photo_count": raw_photo_count,
         # Summarized HERE, not by the caller, and that is a memory contract

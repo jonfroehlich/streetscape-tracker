@@ -81,14 +81,18 @@ Nothing new was measured for this section; it records what the code does now and
 
 - `NEARBY_PHOTOS_URL` is `https://api.kartaview.org/1.0/list/nearby-photos/` (`api.openstreetcam.org` is the noted fallback).
 - A total smaller than the page it arrived with is UNKNOWN (`total_is_usable`), and the circle is paged blind until a short page (`page_is_full`), under `MAX_PAGES_PER_CELL`; past the cap it subdivides, or at the radius floor records the cell unmeasured.
-  Each sweep logs `N cell(s) paged blind` and returns `cells_paged_blind`.
+  A blind page is FULL at `min(ipp, IPP_MAX, MEASURED_BLIND_PAGE_SIZE)`, the last being **200, the only page size measured on this host** (the 2026-10-22 probe asked at `ipp=200`); `IPP_MAX` (2,000) is Grab's figure for the old host and was never measured here (#452 review).
+  So the stop condition holds for any server page cap of 200 or more, at the cost of one extra request (an empty page 2) for a blind circle of 200–1,999 photos if the host does honour 2,000.
+  Each sweep logs `N cell(s) paged blind`, of which `M` paid a page 2, and returns `cells_paged_blind` and `cells_paged_deep`.
 - An HTTP 404 is `RouteNotFoundError`, checked before the HTML test.
   404s at every calibration probe, or at the first `ENDPOINT_NOT_FOUND_STRIKES` (6) requests of a sweep that skipped the ladder with nothing answered, raise `HostEndpointMovedError`: exit **89** for KartaView.
-  Panoramax's whole-lattice 404 (#407) raises it too, as exit **90**, and so does an all-404 resume of at least `ENDPOINT_MOVED_MIN_TILES` (6) tiles.
+  Panoramax's whole-lattice 404 (#407) raises it too, as exit **90**, and so does an all-404 resume; both only at `ENDPOINT_MOVED_MIN_TILES` (6) tiles or more, so a one- or two-tile city stays its own refusal (#452 review).
 - The scheduler treats 89/90 like the #444 throttle: the host is latched for the night, the child is amnestied (no `consecutive_failures`), the branch skips `attempted += 1` so a city due only on that host takes no city-cap slot, and no `host_refusals` row or cooldown is written.
   The alert names the moved endpoint, the probe script and the pause.
 - The default pace is the anonymous tier, **1.5/min = 90/h**, a float through both CLIs and `ProviderConfig`; both config files pin it.
   16/min is kept as `AUTH_SWEEP_REQUESTS_PER_MINUTE`.
+- Each KartaView launch is held to a per-city wall-clock ceiling, `[providers.kartaview*].max_city_minutes`, default **60** (#452 review), because the city loop is sequential and a launch sized to the night's remainder held every later city's Mapillary and GSV lanes for ~6 h at this pace.
+  The cap that follows is ~37 requests a launch (priced at the 0.5 achieved fraction), which a child at the full 40 s interval spends in ~25 min before pausing with exit 83.
 
 **Still open.**
 
@@ -97,14 +101,16 @@ Nothing new was measured for this section; it records what the code does now and
 - Whether the authenticated tier returns: only a probe showing a bogus token refused would say so.
 - How often to re-probe `kartaview.org` (the probe script, from a laptop); `probe-host` has no KartaView entry.
 - Whether the 10-15 sweeps were already truncated.
+- **Whether `api.kartaview.org` honours `ipp=2000`, and pages by its own page size.** The blind stop no longer depends on the first (see above), but if the host capped a page below 2,000 while offsetting page 2 by the 2,000 asked for, rows between the two would be skipped. A two-request laptop probe at `ipp=2000` against the Seattle circle (page 1 carries 2,000 items, page 2 is non-empty and disjoint) closes both; it was not run here, since no live request was allowed.
 - `_SWEEP_OVERHEAD_MULTIPLIER` (1.80×) is not re-measured for blind paging, which costs one extra page for an exactly-full circle and up to `MAX_PAGES_PER_CELL − 1` more per subdivided root.
 
 **The resume plan (prod steps, in order).**
 
 1. Deploy main to makelab2.
 2. A config PR flipping `enabled = true` on both KartaView blocks of `config/scheduler.makelab1.toml` (`test_makelab1_production_config_is_wired` flips with it).
-3. After night 1: `grep -h "paged blind" logs/collect_*_kartaview_*` and read the `Done:` line.
-4. Compare every re-collected 10-15 city's pano count against its previous run (`runs` rows per city and provider); a collapse over 30% with `cells_paged_blind` > 0 is the truncation signal.
-5. An `ENDPOINT MOVED` alert means `api.kartaview.org` moved too: pause again and re-probe from a laptop.
+3. Before the flip, read `scheduler status` for the enrolled KartaView cities and price the first night's shape: at most `opt_in_cities_per_day` hoisted KartaView cities, each holding the city loop for at most one `max_city_minutes` per channel (two for a city due on both), so 10 cities at the default bound KartaView to ~10–20 h of loop time in the worst case and ~4–8 h if each child spends its ~37-request cap at the full pace. That worst case is a whole night, which is why the ceiling's value is an open decision rather than settled here.
+4. After night 1: `grep -h "paged blind" logs/collect_*_kartaview_*` and read the `Done:` line.
+5. Compare every re-collected 10-15 city's pano count against its previous run (`runs` rows per city and provider). On this host every visited cell is paged blind, so `cells_paged_blind` > 0 says nothing (#452 review); the signal is `cells_paged_deep`. A collapse over 30% in a city whose `cells_paged_deep` is 0 means no circle ever filled a page, which is what a page cap below 200 would look like.
+6. An `ENDPOINT MOVED` alert means `api.kartaview.org` moved too: pause again and re-probe from a laptop.
 
 The 62 pairs at 2 of 5 `consecutive_failures` reset on their first success; no `reset-failures` is needed.
