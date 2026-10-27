@@ -457,6 +457,37 @@ def test_a_sweep_that_stops_at_its_cap_exits_83_rather_than_failing(tmp_path, mo
     assert spent == 500
 
 
+def test_a_moved_endpoint_walk_exits_89_and_still_ledgers_its_spend(tmp_path, monkeypatch):
+    """Issue #452: a walk whose sweep met only 404s exits 89 -- the scheduler's
+    latched, amnestied, no-refusal family -- and its probes still reach the
+    ledger. Kills: the walk mapping it to 81 (a refusal row) or 1 (a counted
+    failure), or dropping the spend on the host-error path."""
+    from streetscape_metadata_tracker.download_common import (
+        HOST_ENDPOINT_MOVED_EXIT_CODES,
+        HOST_KARTAVIEW,
+        HostEndpointMovedError,
+    )
+
+    error = HostEndpointMovedError("404 at every calibration probe", HOST_KARTAVIEW)
+    error.api_requests = 6
+    error.api_requests_total = 6
+    data_dir, _ = _setup(tmp_path, monkeypatch, [_image("kv1", 44.05, -121.30)], raises=error)
+    assert collect.run_collect(_args(data_dir)) == HOST_ENDPOINT_MOVED_EXIT_CODES[HOST_KARTAVIEW]
+    assert not os.path.exists(_walk_csv(data_dir))
+    conn = db.connect(db.get_default_db_path(data_dir))
+    spent = db.get_api_usage(conn, date.fromisoformat(RUN_DATE), provider="kartaview_streets")
+    conn.close()
+    assert spent == 6
+
+
+def test_the_walks_rate_flag_takes_a_fraction(tmp_path, monkeypatch):
+    """The scheduler forwards the anonymous pace as "1.5" (#452). Kills: the
+    walk's flag left `type=int`, which exits 2 -- ARGV REJECTED."""
+    data_dir, calls = _setup(tmp_path, monkeypatch, [_image("kv1", 44.05, -121.30)])
+    assert collect.run_collect(_args(data_dir, **{"kartaview-max-requests-per-minute": 1.5})) == 0
+    assert calls["max_requests_per_minute"] == 1.5
+
+
 @pytest.mark.parametrize("stopped_by", ["clock", "requests"])
 def test_the_walks_pause_line_names_the_ceiling_the_scheduler_reads_back(
     tmp_path, monkeypatch, caplog, stopped_by

@@ -26,7 +26,9 @@ from streetscape_metadata_tracker import download_panoramax as dp
 from streetscape_metadata_tracker.checkpointing import CensusCache, load_census_cache_marker
 from streetscape_metadata_tracker.config import PANORAMAX_METADATA_DTYPES
 from streetscape_metadata_tracker.download_common import (
+    HOST_PANORAMAX,
     DownloadError,
+    HostEndpointMovedError,
     HostUnavailableError,
     SweepIncompleteError,
     tile_frac_to_lonlat,
@@ -333,8 +335,13 @@ def test_a_lattice_that_answers_404_EVERYWHERE_is_refused_rather_than_published(
     """
     lat, lon = straddling_city
     tiles = dp.tiles_for_bbox(*dp.grid_bbox(lat, lon, 100, 100, 20))
-    with pytest.raises(DownloadError, match=_MOVED_ENDPOINT):
+    with pytest.raises(DownloadError, match=_MOVED_ENDPOINT) as excinfo:
         _run(monkeypatch, tmp_path, {}, lat, lon, missing=set(tiles))
+    # Host-typed since #452, so the child exits 90 (latched, amnestied, no
+    # refusal row) rather than 1 (a counted failure for every Panoramax city).
+    # Kills: the guard left on a plain DownloadError.
+    assert isinstance(excinfo.value, HostEndpointMovedError)
+    assert excinfo.value.host == HOST_PANORAMAX
 
 
 def test_a_404_LATTICE_is_still_refused_on_the_NIGHT_AFTER_it_checkpointed(
@@ -424,6 +431,8 @@ def test_one_404_at_the_default_tolerance_is_refused_as_failed_tiles_not_as_a_mo
     with pytest.raises(DownloadError, match="tiles failed") as excinfo:
         _run(monkeypatch, tmp_path, {}, lat, lon, missing={tiles[0]})
     assert "has moved or been renamed — refusing" not in str(excinfo.value)
+    # Other tiles answered, so the route is served: this city's refusal (#452).
+    assert not isinstance(excinfo.value, HostEndpointMovedError)
 
 
 def test_a_lattice_of_204s_is_an_EMPTY_CITY_and_publishes_rather_than_refusing(
@@ -648,6 +657,30 @@ def test_a_resume_of_404s_OVER_the_tolerance_is_refused_as_failed_tiles_naming_t
     message = str(excinfo.value)
     assert "Every failed tile answered HTTP 404" in message
     assert not re.search(_MOVED_ENDPOINT, message)
+    # Two tiles are under ENDPOINT_MOVED_MIN_TILES, so this stays the city's
+    # own refusal rather than latching Panoramax for the night (#452).
+    assert len(bad) < dp.ENDPOINT_MOVED_MIN_TILES
+    assert not isinstance(excinfo.value, HostEndpointMovedError)
+
+
+def test_a_resume_of_ENOUGH_404s_with_nothing_answering_is_a_moved_endpoint(
+    monkeypatch, tmp_path, straddling_city
+):
+    """The same resume once the tiles asked tonight reach the floor, every one
+    a 404 and none answering: the route, not the city, so exit 90 (#452). The
+    floor is lowered to the fixture's two tiles. Kills: the tolerance branch
+    left on a plain DownloadError for an all-404 resume."""
+    lat, lon = straddling_city
+    tiles = dp.tiles_for_bbox(*dp.grid_bbox(lat, lon, 100, 100, 20))
+    bad = set(tiles[:2])
+    checkpoint = dict(checkpoint_path=str(tmp_path / "crawl"), checkpoint_channel="panoramax")
+    _night(monkeypatch, tmp_path, lat, lon, missing=bad, tolerance=0.99, **checkpoint)
+
+    monkeypatch.setattr(dp, "ENDPOINT_MOVED_MIN_TILES", len(bad))
+    with pytest.raises(DownloadError, match="probably moved") as excinfo:
+        _night(monkeypatch, tmp_path, lat, lon, missing=bad, tolerance=0.02, **checkpoint)
+    assert isinstance(excinfo.value, HostEndpointMovedError)
+    assert excinfo.value.host == HOST_PANORAMAX
 
 
 def test_a_CACHE_HANDBACK_of_the_crawls_own_404s_is_priced_by_the_tolerance_not_refused(

@@ -86,6 +86,7 @@ from .download_common import (
     ARGV_REJECTED_EXIT_CODE,
     CHANNEL_METERED_HOST,
     HOST_BY_BUSY_EXIT_CODE,
+    HOST_BY_ENDPOINT_MOVED_EXIT_CODE,
     HOST_BY_EXIT_CODE,
     HOST_BY_THROTTLED_EXIT_CODE,
     HOST_KARTAVIEW,
@@ -186,7 +187,7 @@ def is_street_channel(name: str) -> bool:
 #     gsv          (no per-IP host, always free)
 #   + gsv_streets  (Overpass)
 #   + mapillary    (tiles.mapillary.com)
-#   + kartaview    (kartaview.org)
+#   + kartaview    (api.kartaview.org)
 #   + panoramax    (api.panoramax.xyz)
 #   = 5, of 8 channels.
 #
@@ -216,7 +217,7 @@ CHANNEL_HOSTS: dict[str, tuple[str, ...]] = {
     # open.
     "kartaview": (HOST_KARTAVIEW,),
     # The walk needs BOTH: it starts at the city's OSM street network and then
-    # sweeps kartaview.org for the census it joins against. Overpass is not
+    # sweeps api.kartaview.org for the census it joins against. Overpass is not
     # hypothetical here even though a re-walk reads a cached GraphML — a FIRST
     # walk of a city always goes to the network, the same reason gsv_streets
     # declares it.
@@ -252,7 +253,9 @@ CHANNEL_HOSTS: dict[str, tuple[str, ...]] = {
 # for it (HOST_RECHECKS): one request, on a cooldown, capped per night. A host
 # with no entry keeps the original all-night latch -- that is the deliberate
 # answer for Mapillary and KartaView, not an omission, and the table is the
-# place to say so if that ever changes.
+# place to say so if that ever changes. A MOVED ENDPOINT (exit 89/90, issue
+# #452) latches all night on every host for the same reason: no in-night
+# probe can make a removed route come back.
 #
 # The cooldown is measured from the trip, or from the last re-check that
 # still said "not serving". 45 min sits inside the ~1 h both Overpass
@@ -454,7 +457,8 @@ class HostBreaker(set):
 
     A ``set`` of the hosts that refused or THROTTLED this machine at any point
     tonight (a throttle is exit 87, issue #444; ``throttled_hosts`` says which
-    were throttles alone) -- that membership is MONOTONE, so ``bool(breaker)``
+    were throttles alone), or whose endpoint MOVED (exit 89/90, issue #452;
+    ``moved_hosts``) -- that membership is MONOTONE, so ``bool(breaker)``
     still means "a third party refused or throttled us tonight" for the alert
     and the exit status, and a plain
     ``==`` against a set of host names keeps working. What is new is
@@ -549,6 +553,11 @@ class HostBreaker(set):
         # arms tomorrow's cooldown, a throttle records nothing.
         self.refused_hosts: set[str] = set()
         self.throttled_hosts: set[str] = set()
+        # ...or a MOVED ENDPOINT (exit 89/90, issue #452): the route answered
+        # HTTP 404 everywhere it was asked. Latched like a throttle, recorded
+        # nowhere, and worded apart because the operator's move differs again:
+        # nothing clears it by waiting, so pause the channels and re-probe.
+        self.moved_hosts: set[str] = set()
         self.trips: Counter[str] = Counter()
         self.rechecks: Counter[str] = Counter()
         self.recoveries: Counter[str] = Counter()
@@ -590,13 +599,21 @@ class HostBreaker(set):
         # (city_id, walk) pairs stranded by a THROTTLED host (exit 87, issue
         # #444), so the alert names the cause as a throttle, not a refusal.
         self.throttled_stranded: set[tuple[str, str]] = set()
+        # (city_id, walk) pairs stranded by a MOVED ENDPOINT (exit 89/90,
+        # issue #452), so the alert names the cause as a moved route.
+        self.moved_stranded: set[tuple[str, str]] = set()
         self._next_recheck_at: dict[str, float] = {}
 
-    def add(self, host: str, *, throttled: bool = False) -> None:
-        """Record that ``host`` refused (or throttled) this machine; latch its channels."""
+    def add(self, host: str, *, throttled: bool = False, moved: bool = False) -> None:
+        """Record that ``host`` refused, throttled or lost its route; latch its channels."""
         super().add(host)
         self.latched.add(host)
-        (self.throttled_hosts if throttled else self.refused_hosts).add(host)
+        if moved:
+            self.moved_hosts.add(host)
+        elif throttled:
+            self.throttled_hosts.add(host)
+        else:
+            self.refused_hosts.add(host)
         self.trips[host] += 1
         self._next_recheck_at[host] = self._clock() + self.cooldown_s
 
@@ -616,6 +633,22 @@ class HostBreaker(set):
         """True when every host in ``hosts`` latched by throttle alone, never a refusal."""
         hosts = set(hosts)
         return bool(hosts) and hosts <= self.throttled_hosts - self.refused_hosts
+
+    def endpoint_moved(self, host: str) -> None:
+        """Latch ``host`` for a MOVED ENDPOINT (exit 89/90, issue #452), not a refusal.
+
+        Same latch as :meth:`add` -- every remaining city would spend its own
+        probes learning the same 404s -- but the caller writes no
+        ``host_refusals`` row and the alert says "ENDPOINT MOVED". Neither
+        KartaView nor Panoramax has a ``HOST_RECHECKS`` entry, so the latch
+        holds for the rest of the run.
+        """
+        self.add(host, moved=True)
+
+    def moved_only(self, hosts) -> bool:
+        """True when every host in ``hosts`` latched by a moved endpoint alone, never a refusal."""
+        hosts = set(hosts)
+        return bool(hosts) and hosts <= self.moved_hosts - self.refused_hosts
 
     def _refuse(self, *args, **kwargs):
         """Every other ``set`` mutator, and ``copy``, is refused (issue #341).
@@ -699,12 +732,15 @@ class HostBreaker(set):
         argv_rejected: bool = False,
         deadline: bool = False,
         throttled: bool = False,
+        endpoint_moved: bool = False,
     ) -> None:
         self.stranded.setdefault(city_id, []).append(provider)
         if argv_rejected:
             self.argv_stranded.add((city_id, provider))
         if throttled:
             self.throttled_stranded.add((city_id, provider))
+        if endpoint_moved:
+            self.moved_stranded.add((city_id, provider))
         if deadline:
             self.deadline_stranded.add((city_id, provider))
         if busy_host is not None:
@@ -832,7 +868,7 @@ def _walk_network_is_frozen(cfg: "SchedulerConfig", city: db.CityRow, provider: 
     frozen 'drive' network says nothing about an 'all_public' walk.
 
     Only ever relaxes the Overpass entry: the other host a walk may need (the
-    Mapillary tile CDN, kartaview.org) is asked for the census regardless.
+    Mapillary tile CDN, api.kartaview.org) is asked for the census regardless.
     """
     if not is_street_channel(provider):
         return False
@@ -1125,7 +1161,9 @@ class ProviderConfig:
     # Street channels only: client-side pacing for the isolated streets key
     # (0/None → fall back to [download].max_requests_per_minute) and the
     # on-street sample spacing the road walk collects at.
-    max_requests_per_minute: int | None = None
+    # A float since issue #452: KartaView's anonymous tier is 1.5/min (90/h),
+    # which is not a whole number per minute. Forwarded as str(rate).
+    max_requests_per_minute: float | None = None
     # Tile-census channels only (the Mapillary pair, and the Panoramax pair
     # since #335): the exponential share of each tile-request gap (issue #292) —
     # also the resulting coefficient of variation, and 1 minus it is the gap's
@@ -2528,7 +2566,7 @@ class _CrawlPricing:
     """
 
     #: Pace assumed when the channel's [providers.*] block sets none.
-    default_rate: int
+    default_rate: float
     #: What fraction of that pace the child actually achieves. The tile censuses
     #: sit near 1 because the limiter is a hard ceiling their fetch tracks
     #: closely; the serial radius sweep sits at 0.5 because latency, not the
@@ -7665,7 +7703,9 @@ def cmd_assess_city(
             "`regenerate-aggregate --publish` when you mean to."
         )
     blocked_note = (
-        f", {_host_names(blocked_hosts)} refused or throttled this host" if blocked_hosts else ""
+        f", {_host_names(blocked_hosts)} refused, throttled or moved this host"
+        if blocked_hosts
+        else ""
     )
     busy_note = f", {_host_names(busy_hosts)} busy locally" if busy_hosts else ""
     summary = (
@@ -8157,8 +8197,15 @@ def _run_collection_subprocess(
         blocked = HOST_BY_EXIT_CODE.get(exit_code)
         busy = HOST_BY_BUSY_EXIT_CODE.get(exit_code)
         throttled = HOST_BY_THROTTLED_EXIT_CODE.get(exit_code)
+        moved = HOST_BY_ENDPOINT_MOVED_EXIT_CODE.get(exit_code)
         if blocked:
             why = f"exited {exit_code} ({HOST_LABELS[blocked]} unavailable to this host)"
+        elif moved:
+            # Issue #452: the route answered HTTP 404 everywhere it was asked.
+            why = (
+                f"exited {exit_code} ({HOST_LABELS[moved]}: its endpoint MOVED -- the route "
+                f"answered HTTP 404 at every probe; not a refusal and not the city's fault)"
+            )
         elif throttled:
             # Issue #444: the CDN asked for a slower pace (HTTP 429/503) often
             # enough that the crawl stopped. Not a refusal; checkpoint kept.
@@ -8366,7 +8413,7 @@ def _run_one_city(
         # channel: the timeout is DERIVED from the configured rate (#238), so a
         # child left on its own default would be timed against a number it never
         # honoured. Omitting the flag when unset is still correct -- the CLI
-        # default is the same conservative 16/min this derivation assumes.
+        # default is the same pace this derivation assumes (1.5/min since #452).
         rate = ((cfg.providers or {}).get(provider) or ProviderConfig()).max_requests_per_minute
         if rate is not None:
             cmd += ["--kartaview-max-requests-per-minute", str(rate)]
@@ -10646,6 +10693,8 @@ def _run_city_channels(
     # ...and those lost to a THROTTLED host (exit 87; issue #444), named so in
     # the alert.
     lost_to_throttle: set[str] = set()
+    # ...and those lost to a MOVED ENDPOINT (exit 89/90; issue #452), likewise.
+    lost_to_moved: set[str] = set()
     # The standing holds, decided ONCE for this city (issue #444): a cooldown
     # read per launch could lift between the grid run and its walk, and the
     # walk would then run alone and pay a full census instead of the paired
@@ -10864,18 +10913,24 @@ def _run_city_channels(
                             blocked_hosts.skipped_launches += 1
                             lost_to_host.append(provider)
                             throttled_skip = blocked_hosts.throttled_only(unavailable)
+                            moved_skip = blocked_hosts.moved_only(unavailable)
                             if throttled_skip:
                                 # Defensive: a breaker-skipped walk never strands,
                                 # since its grid sibling is on the same latched host
                                 # and was skipped too. Kept so the stranded wording
                                 # agrees with this line's if a sibling ever lands.
                                 lost_to_throttle.add(provider)
+                            if moved_skip:
+                                # The same defensive record for a moved endpoint.
+                                lost_to_moved.add(provider)
                             logger.info(
                                 f"{city.city_id} [{provider}]: skipping — "
                                 f"{_host_names(unavailable)} "
                                 + (
                                     "already throttled this host tonight (HTTP 429/503)."
                                     if throttled_skip
+                                    else "moved its endpoint tonight (HTTP 404 at every probe)."
+                                    if moved_skip
                                     else "already refused this host."
                                 )
                             )
@@ -11405,6 +11460,39 @@ def _run_city_channels(
                         )
                         continue
 
+                    moved_host = HOST_BY_ENDPOINT_MOVED_EXIT_CODE.get(exit_code)
+                    if moved_host is not None:
+                        # The route answered HTTP 404 everywhere it was asked
+                        # (issue #452: KartaView's calibration ladder or a
+                        # resume's first strikes, Panoramax's whole lattice).
+                        # The throttle branch's reaction, for the same reasons:
+                        #   * AMNESTIED -- no record_attempt, so no
+                        #     consecutive_failures, and the `continue` comes
+                        #     BEFORE `attempted += 1`, so a city due only on
+                        #     this host takes no city-cap slot. 2026-10-23 is
+                        #     the failure this prevents: every KartaView-only
+                        #     city spent its slot learning the same 404s, and
+                        #     the 80-city cap was gone in 1.6 h.
+                        #   * LATCHED -- every remaining city would pay its
+                        #     own probes to learn it again; no HOST_RECHECKS
+                        #     entry, so it holds all night.
+                        #   * NO host_refusals ROW -- a 404 is not a refusal
+                        #     of this IP, and a cooldown would only delay the
+                        #     operator's real move: pause the channels and
+                        #     re-probe from a laptop. Nothing holds them
+                        #     tomorrow, so the alert says so.
+                        blocked_hosts.endpoint_moved(moved_host)
+                        lost_to_host.append(provider)
+                        lost_to_moved.add(provider)
+                        logger.error(
+                            f"{city.city_id} [{provider}]: {HOST_LABELS[moved_host]}'s "
+                            f"endpoint MOVED (HTTP 404 at every probe) — skipping its "
+                            f"remaining channels tonight. No refusal recorded, not counted as "
+                            f"a failure for this city, and it takes no city-cap slot; pause the "
+                            f"channels and re-probe from a laptop (issue #452). ({reason})"
+                        )
+                        continue
+
                     if exit_code == ARGV_REJECTED_EXIT_CODE:
                         # Our own CLI refused the argv this process built (issue
                         # #359). The city did nothing and nothing was spent, so it
@@ -11594,10 +11682,11 @@ def _run_city_channels(
                 busy_host=lost_to_busy.get(provider),
                 argv_rejected=provider in lost_to_argv,
                 throttled=provider in lost_to_throttle,
+                endpoint_moved=provider in lost_to_moved,
             )
             logger.warning(
                 f"{city.city_id} [{provider}]: STRANDED — its {sibling} grid run succeeded "
-                f"tonight but a refused, throttled or busy host, or an argv our own CLI "
+                f"tonight but a refused, throttled, moved or busy host, or an argv our own CLI "
                 f"rejected, cost it this walk, so the city leaves the "
                 f"night un-paired and is not due on {sibling} again for "
                 f"~{cfg.cycle_days - cfg.grace_days} days (issue #341)."
@@ -12918,7 +13007,7 @@ def _fill_prebudget_refusal(
             return FillVerdict(
                 False,
                 _FILL_BLOCKER_HOST_REFUSED,
-                f"{_host_names(refused)} refused or throttled this host tonight ({channel})",
+                f"{_host_names(refused)} refused, throttled or moved its endpoint tonight ({channel})",
             )
     return None
 
@@ -13739,13 +13828,20 @@ def _blocked_summary_note(breaker: HostBreaker) -> str:
     # THROTTLED: it recorded no refusal, so "unavailable" would send the
     # operator looking for a cooldown that does not exist.
     throttled = {h for h in breaker.latched if breaker.throttled_only({h})}
-    refused = breaker.latched - throttled
+    # ...and one latched by a moved endpoint alone (exit 89/90, issue #452).
+    moved = {h for h in breaker.latched if breaker.moved_only({h})}
+    refused = breaker.latched - throttled - moved
     if refused:
         parts.append("; ".join(sorted(HOST_LABELS.get(h, h) for h in refused)) + " unavailable")
     if throttled:
         parts.append(
             "; ".join(sorted(HOST_LABELS.get(h, h) for h in throttled))
             + " THROTTLED (HTTP 429/503, no refusal recorded)"
+        )
+    if moved:
+        parts.append(
+            "; ".join(sorted(HOST_LABELS.get(h, h) for h in moved))
+            + " ENDPOINT MOVED (HTTP 404 at every probe, no refusal recorded)"
         )
     if breaker.recovered:
         parts.append(
@@ -13799,10 +13895,24 @@ def _blocked_alert_note(breaker: HostBreaker, cooldown_hosts: Collection[str] = 
     if not breaker:
         return ""
     throttled = {h for h in breaker if breaker.throttled_only({h})}
-    refused = set(breaker) - throttled
+    moved = {h for h in breaker if breaker.moved_only({h})}
+    refused = set(breaker) - throttled - moved
     note = ""
-    if throttled:
+    if moved:
+        moved_codes = "/".join(
+            str(code) for code, h in sorted(HOST_BY_ENDPOINT_MOVED_EXIT_CODE.items()) if h in moved
+        )
         note += (
+            f"{_host_names(moved)}'s endpoint MOVED: the route answered HTTP 404 everywhere "
+            f"it was asked (exit {moved_codes}, issue #452). Not a refusal: no host_refusals "
+            f"row, no cooldown, and nothing holds the channels tomorrow -- the next night "
+            f"spends its probes per host to re-learn it. Pause the channels (enabled = false "
+            f"on their [providers.*] blocks), re-run scripts/kartaview_endpoint_probe.py from "
+            f"a laptop (never makelab), and read docs/experiments/kartaview-endpoint-move.md. "
+            f"No city was marked failed and none took a city-cap slot."
+        )
+    if throttled:
+        note += (" " if note else "") + (
             f"{_host_names(throttled)} THROTTLED this host: it answered HTTP 429/503 often "
             f"enough that a crawl stopped itself (exit 87, issue #444). Not a refusal: no "
             f"host_refusals row was written and no cooldown is armed, so the throttle "
@@ -13814,11 +13924,12 @@ def _blocked_alert_note(breaker: HostBreaker, cooldown_hosts: Collection[str] = 
     if not refused:
         return note
     note += (" " if note else "") + "This host's IP was refused by " + _host_names(refused) + "."
-    if breaker.latched - throttled:
+    if breaker.latched - throttled - moved:
+        still = breaker.latched - throttled - moved
         note += (
-            f" Still refusing at the end of the night: {_host_names(breaker.latched - throttled)} "
+            f" Still refusing at the end of the night: {_host_names(still)} "
             f"— its channels were skipped from the first refusal on, apart from re-checks "
-            f"({', '.join(f'{breaker.rechecks[h]} for {HOST_LABELS.get(h, h)}' for h in sorted(breaker.latched - throttled))} "
+            f"({', '.join(f'{breaker.rechecks[h]} for {HOST_LABELS.get(h, h)}' for h in sorted(still))} "
             f"of {breaker.max_rechecks} allowed per night, {breaker.cooldown_s / 60:g} min apart; "
             f"a host with no re-check stays latched all night by design, see HOST_RECHECKS)."
         )
@@ -13939,6 +14050,8 @@ def _stranded_alert_note(cfg: SchedulerConfig, breaker: HostBreaker, today: date
             return f"{channel}: the batch deadline"
         if (cid, channel) in breaker.throttled_stranded:
             return f"{channel}: a throttled host (HTTP 429/503)"
+        if (cid, channel) in breaker.moved_stranded:
+            return f"{channel}: a moved endpoint (HTTP 404)"
         return channel
 
     lines = [
@@ -13953,7 +14066,7 @@ def _stranded_alert_note(cfg: SchedulerConfig, breaker: HostBreaker, today: date
     ]
     return (
         f"{len(stranded)} city(ies) came out of the night with a grid run but NO road "
-        f"walk, because a refused, throttled or locally busy host, an argv our own CLI rejected "
+        f"walk, because a refused, throttled, moved or locally busy host, an argv our own CLI rejected "
         f"(issue #359), or the batch deadline (issue #373) cost them the walk while the grid "
         f"sibling succeeded. The end-of-night retry (issue #380) could not walk the "
         f"host-stranded ones either, and never retries a walk marked `the batch deadline`, "
@@ -14472,11 +14585,16 @@ def _finish_batch(
         if plan_error:
             parts.append("DRIVING-PLAN FETCH FAILED")
         throttled_latched = {h for h in blocked_hosts.latched if blocked_hosts.throttled_only({h})}
-        if blocked_hosts.latched - throttled_latched:
-            parts.append(f"{len(blocked_hosts.latched - throttled_latched)} host(s) UNAVAILABLE")
+        moved_latched = {h for h in blocked_hosts.latched if blocked_hosts.moved_only({h})}
+        refused_latched = blocked_hosts.latched - throttled_latched - moved_latched
+        if refused_latched:
+            parts.append(f"{len(refused_latched)} host(s) UNAVAILABLE")
         if throttled_latched:
             # Issue #444: named apart, because there is nothing to wait out.
             parts.append(f"{len(throttled_latched)} host(s) THROTTLED")
+        if moved_latched:
+            # Issue #452: named apart, because waiting will not fix it.
+            parts.append(f"{len(moved_latched)} host(s) ENDPOINT MOVED")
         if blocked_hosts.recovered:
             # Recovered is still a refusal that cost the night launches (and
             # possibly stranded cities), so it is named rather than folded

@@ -512,8 +512,13 @@ def test_a_metro_sweep_outgrows_the_flat_timeout(conn):
     That is worse than a plain failure twice over: a killed child records NO
     api_usage, so every request it already spent vanishes from the daily
     ledger, and it burns one of the five consecutive_failures that nothing but
-    a success resets."""
+    a success resets.
+
+    Pinned at AUTH_SWEEP_REQUESTS_PER_MINUTE, the pace the premise was measured
+    at; the default is the anonymous 1.5/min since #452, which the second half
+    checks the derivation still covers."""
     from streetscape_metadata_tracker.download_kartaview import (
+        AUTH_SWEEP_REQUESTS_PER_MINUTE,
         DEFAULT_SWEEP_REQUESTS_PER_MINUTE,
     )
     from streetscape_metadata_tracker.scheduler import city_timeout_seconds
@@ -529,14 +534,20 @@ def test_a_metro_sweep_outgrows_the_flat_timeout(conn):
         api_requests=9_974,
     )
     floor = 180 * 60
-    derived = city_timeout_seconds(_kv_cfg(), city, "kartaview", conn=conn)
+    derived = city_timeout_seconds(
+        _kv_cfg(rate=AUTH_SWEEP_REQUESTS_PER_MINUTE), city, "kartaview", conn=conn
+    )
 
     assert derived > floor, "a ~10 h sweep must not be squeezed into the flat floor"
     # Pin both walls rather than the number: it must cover the sweep's own
     # paced wall-clock, and the premise must be re-measured if the pace moves.
-    paced_seconds = 9_974 / DEFAULT_SWEEP_REQUESTS_PER_MINUTE * 60
+    paced_seconds = 9_974 / AUTH_SWEEP_REQUESTS_PER_MINUTE * 60
     assert paced_seconds / 3600 < 11, "re-measure this test's premise, not just the constant"
     assert derived > paced_seconds
+    # At the default anonymous pace (#452) the same city is ~111 h of pacing,
+    # and the derivation must still cover it rather than fall back to a floor.
+    default_derived = city_timeout_seconds(_kv_cfg(), city, "kartaview", conn=conn)
+    assert default_derived > 9_974 / DEFAULT_SWEEP_REQUESTS_PER_MINUTE * 60
 
 
 def test_the_sweep_child_is_timed_with_the_catalog_handle_not_without_it(
@@ -1083,8 +1094,10 @@ def test_makelab1_production_config_is_wired():
     # Both KartaView channels were PAUSED 2026-10-23: kartaview.org stopped
     # routing the nearby-photos endpoint, and the api. hosts that still answer
     # report totalFilteredItems as 0, which would truncate every circle to one
-    # page (docs/experiments/kartaview-endpoint-move.md). Pinned off so they
-    # come back only with the collector fix, never by a config edit alone.
+    # page (docs/experiments/kartaview-endpoint-move.md). The collector fix
+    # landed with #452 (api.kartaview.org, blind paging, exit 89); the channels
+    # stay pinned off until the deliberate config PR that resumes them, which
+    # flips this assertion with it.
     assert cfg.enabled_providers() == [
         "gsv",
         "gsv_streets",
@@ -1127,7 +1140,9 @@ def test_makelab1_production_config_is_wired():
     assert cfg.providers["kartaview"].daily_request_budget == 10_000
     # Load-bearing beyond pacing: _kartaview_timeout_seconds derives every sweep's
     # per-city timeout from this rate, so lowering it shortens those timeouts too.
-    assert cfg.providers["kartaview"].max_requests_per_minute == 16
+    # 1.5/min = 90/h, under the documented ANONYMOUS ceiling, since #452: the
+    # authenticated tier is unverifiable on the host the route moved to.
+    assert cfg.providers["kartaview"].max_requests_per_minute == 1.5
     # The KartaView ROAD WALK (#258), turned on 2026-08-31 as the sixth channel
     # and the second opt-in one. Same figures as the grid channel above and for
     # the same reason: one sweep of one bbox priced one way, so a walk that
@@ -1137,7 +1152,7 @@ def test_makelab1_production_config_is_wired():
     # what stops the derived timeout being measured against a rate the sweep
     # never used.
     assert cfg.providers["kartaview_streets"].daily_request_budget == 10_000
-    assert cfg.providers["kartaview_streets"].max_requests_per_minute == 16
+    assert cfg.providers["kartaview_streets"].max_requests_per_minute == 1.5
     # Walks the same sample points on the same network as the other two street
     # channels, or the three providers would not share a streets.html row.
     assert cfg.providers["kartaview_streets"].spacing_m == 15
@@ -13276,7 +13291,7 @@ def test_a_busy_host_strands_a_city_exactly_like_a_refusal(conn, monkeypatch, ca
     assert "UNAVAILABLE" not in subject, "a busy lock is not the provider refusing us"
     assert f"{alpha} (gsv_streets)" in body
     assert beta not in body.split("came out of the night")[1]
-    assert "refused, throttled or locally busy host" in body
+    assert "refused, throttled, moved or locally busy host" in body
 
 
 # ---------------------------------------------------------------------------
@@ -14995,7 +15010,10 @@ def test_the_kartaview_walk_is_priced_at_enrolment_too(conn, monkeypatch, tmp_pa
     out = capsys.readouterr().out
     assert "requests at 1.80x overhead" in out, "the sweep's vocabulary, not a lattice's"
     assert "GEOMETRY estimate" in out, "and the r=1000 caveat, since this reads that sweep"
-    assert "paced at 16/min" in out
+    # The anonymous pace since #452, read from the constant the note prices with.
+    from streetscape_metadata_tracker.download_kartaview import DEFAULT_SWEEP_REQUESTS_PER_MINUTE
+
+    assert f"paced at {DEFAULT_SWEEP_REQUESTS_PER_MINUTE}/min" in out
     # And the pairing line, naming its own grid sibling rather than Panoramax's.
     assert "kartaview is NOT a member" in out
 
@@ -15894,13 +15912,18 @@ def test_the_timeout_is_the_clamped_floored_estimate_on_every_arm(conn, remainin
 # Hard-coded so a later refactor cannot move a child's timeout silently -- the
 # equality test above would stay green if the estimate and the timeout moved
 # TOGETHER.
+#
+# The kartaview row is the one deliberate move: #452 changed the DEFAULT pace
+# from 16/min to the anonymous 1.5/min, and this fixture runs every channel at
+# its default, so the same pre-#373 formula now reads 2,450,400 (it read 230,268
+# at 16/min). The formula did not change; its input did.
 _PRE_373_TIMEOUTS = [
     ("Bend", 1000, "gsv", None, 10_800),
     ("Giant", 150_000, "gsv", None, 422_587),
     ("Giant", 150_000, "gsv", 7200, 7200),
     ("Giant", 150_000, "gsv", 1, 300),
     ("Giant", 150_000, "gsv_streets", None, 84_412),
-    ("Giant", 150_000, "kartaview", None, 230_268),
+    ("Giant", 150_000, "kartaview", None, 2_450_400),
     ("Giant", 150_000, "mapillary", None, 14_628),
     ("Giant", 150_000, "panoramax", None, 110_895),
 ]

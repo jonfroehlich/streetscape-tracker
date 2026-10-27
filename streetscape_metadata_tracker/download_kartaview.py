@@ -39,9 +39,14 @@ retry budget:
 
   1. ``/1.0/list/nearby-photos/`` pagination is EXHAUSTIVE (Seattle r=400
      ipp=200: pages 1-6, zero id overlap between any pair, union ==
-     ``totalFilteredItems``, page 7 empty). A truncated circle is therefore
-     PAGED, not subdivided -- and page 1 reports the circle's total, so it
-     prices the rest of the circle before we pay for it.
+     ``totalFilteredItems``, page 7 empty; re-measured on api.kartaview.org
+     2026-10-22: pages 1 and 2 of the Seattle circle non-overlapping, page 7
+     empty). A truncated circle is therefore PAGED, not subdivided. Page 1 USED
+     to report the circle's total, pricing the rest of the circle up front; on
+     the host that serves the route since 2026-10-22 the total reads ``['0']``
+     on every page (issue #452), so a total smaller than the page it arrived
+     with is treated as UNKNOWN and the circle is paged BLIND to a short page,
+     under :data:`MAX_PAGES_PER_CELL` (:func:`total_is_usable`).
   2. ``apiCode 690`` is FLAKY, not a function of (radius, ipp). Horace ND -- a
      bbox holding NO imagery at all -- refused r=1000 on 0/6 attempts at
      ipp=2000 and 0/4 at ipp=200, answered r=250 on 4/4, and then answered
@@ -65,7 +70,10 @@ for it.
 
 PACING. KartaView documents 100 requests/hour anonymous and 1,000 authenticated
 (the FAQ is reachable only by scraping ``kartaview.org/main.*.js`` -- the docs are
-a JS SPA -- and is corroborated by Bellingcat's toolkit entry), returns NO
+a JS SPA -- and is corroborated by Bellingcat's toolkit entry). The authenticated
+tier has been UNVERIFIABLE since 2026-10-22: no host that serves the route
+validates the token (issue #452), so the default pace is under the anonymous
+tier (:data:`DEFAULT_SWEEP_REQUESTS_PER_MINUTE`, 90/h). The API returns NO
 ``X-RateLimit-*`` or ``Retry-After`` headers of any kind, and did not enforce
 either figure when measured (130 consecutive requests, zero 429s). A client
 therefore cannot observe its own budget, which is exactly CLAUDE.md's corollary:
@@ -77,7 +85,8 @@ since the limiter is the bottleneck and the walk is adaptive (what to ask next
 depends on the last answer).
 
 CHECKPOINTING (issue #239). A sweep is HOURS at that pace -- Singapore is
-~9,974 requests, i.e. ~10.4 h -- so an interruption that discarded it would be
+~9,974 requests, i.e. ~10.4 h at the authenticated 16/min and ~111 h at the
+anonymous 1.5/min -- so an interruption that discarded it would be
 the most expensive failure in the repo. ``fetch_city_images_async`` therefore
 takes a ``checkpoint_path`` and commits what it has answered as it goes, so a
 SIGKILL, a ``systemctl stop``, an OOM or a crash in the caller's tail means
@@ -91,7 +100,8 @@ on the day it completes. See the checkpoint section below -- the file format,
 the fetch-order contract, the commit cadence and the age bound are all
 constraints rather than choices.
 
-The whole sweep also takes the machine-wide :data:`HOST_KARTAVIEW` lock, because
+The whole sweep also takes the machine-wide :data:`HOST_KARTAVIEW` lock (the
+API host is ``api.kartaview.org`` since 2026-10-22), because
 the documented limit is per API key but nothing tells us the enforced one is:
 both of this project's prior per-IP bans (Mapillary tiles #198, Overpass #209)
 were on limits no document described, and a per-IP limit is a property of the
@@ -168,6 +178,7 @@ from .download_common import (
     AsyncRateLimiter,
     DownloadError,
     HostBlockedError,
+    HostEndpointMovedError,
     SweepIncompleteError,
     crawl_budget_seconds,
     crawl_deadline_passed,
@@ -180,7 +191,12 @@ from .progress import progress
 logger = logging.getLogger(__name__)
 
 # The only reliable spatial endpoint (see the module docstring). Radius mode.
-NEARBY_PHOTOS_URL = "https://kartaview.org/1.0/list/nearby-photos/"
+# MOVED 2026-10-22: kartaview.org's /1.0/ routes began answering a text/plain
+# "404 page not found", and api.kartaview.org serves the same photos (measured
+# in docs/experiments/kartaview-endpoint-move.md, issue #452). api.openstreetcam.org
+# answered identically and is the fallback if this one moves again. If it does,
+# the calibration ladder exits 89 (ENDPOINT MOVED) rather than failing per city.
+NEARBY_PHOTOS_URL = "https://api.kartaview.org/1.0/list/nearby-photos/"
 
 # Documented hourly ceilings. The token is what makes a scheduled channel
 # possible at all: at 100/hour the p95 city is 3.8 hours and Singapore is 73.
@@ -225,25 +241,53 @@ RADIUS_FLOOR_M = 100
 # Deep paging is untested past page 7 (fact 1 was measured to there), so a cell
 # that would need more than this is subdivided instead -- four shallower circles
 # for the price of one wasted page-1.
+#
+# It bounds TWO descents since issue #452. With a usable total the sweep knows
+# the page count up front and subdivides BEFORE paying page 2. With an unknown
+# total (the host has reported ['0'] on every page since 2026-10-22) nothing
+# prices the circle, so the blind descent pays this many pages and only THEN
+# subdivides, or records the cell unmeasured at the radius floor. That is the
+# price of a host that no longer counts: up to MAX_PAGES_PER_CELL - 1 requests
+# more per subdivided root than a counting host cost.
 MAX_PAGES_PER_CELL = 10
 
 # A refusal is retried before it is believed (fact 2). Generous rather than
 # minimal, because a retry costs one request and a subdivision costs four.
 DEFAULT_BACKPRESSURE_RETRIES = 3
 
+# 404s, with nothing answered, before the sweep calls the ROUTE gone (issue
+# #452). The calibration ladder pays exactly one request per rung when every
+# probe 404s (a 404 is a definite answer, so it is never retried, and the
+# per-rung early break skips the rung's other probes) -- len(RADIUS_LADDER_M)
+# = 6, the very 6 requests each 2026-10-22/23 attempt spent -- so a resumed
+# sweep, which skips the ladder, is held to the same count.
+ENDPOINT_NOT_FOUND_STRIKES = len(RADIUS_LADDER_M)
+
 # Probes per rung during calibration. A rung is accepted only if EVERY probe on
 # it answers, since one lucky point would set a radius the rest of the city then
 # rediscovers the hard way -- which is the cost calibration exists to avoid.
 DEFAULT_CALIBRATION_PROBES = 2
 
-# Pacing, in the per-minute units AsyncRateLimiter speaks. 16/min is 960/hour,
-# just under the documented authenticated ceiling, and the limiter's burst
-# capacity is ~1 second's worth, so no hour can exceed it by more than a single
-# request. Deliberately expressed as a rate rather than an hourly budget: the
-# enforcement window is undocumented, so spreading the requests evenly is the
-# conservative reading of an hourly figure (a burst of 1,000 followed by 59
-# minutes of silence satisfies the same published number).
-DEFAULT_SWEEP_REQUESTS_PER_MINUTE = 16
+# Pacing, in the per-minute units AsyncRateLimiter speaks. Deliberately expressed
+# as a rate rather than an hourly budget: the enforcement window is undocumented,
+# so spreading the requests evenly is the conservative reading of an hourly
+# figure (a burst of 1,000 followed by 59 minutes of silence satisfies the same
+# published number), and the limiter's burst capacity is ~1 request, so no hour
+# can exceed the rate by more than a single request.
+#
+# 16/min is 960/hour, just under the documented AUTHENTICATED ceiling. It was
+# the default until issue #452 and is kept NAMED because the checkpoint age
+# wall and the timeout derivations were sized at it; it comes back only when a
+# host validates the token again (a probe that shows a bogus token refused is
+# the evidence).
+AUTH_SWEEP_REQUESTS_PER_MINUTE = 16
+# 1.5/min is 90/hour, under the documented ANONYMOUS ceiling (100/h) -- the only
+# tier anything observable supports since 2026-10-22, when the route moved to a
+# host that validates no token. A half-integer on purpose, so the scheduler's
+# integer inverse is exact (int(60 * 1.5 * 0.5) == 45 requests per paced hour).
+# NOT DECIDED: the pace is Jon's call (1/min keeps every type an int at 40% less
+# throughput; 100/60 hits the documented figure exactly).
+DEFAULT_SWEEP_REQUESTS_PER_MINUTE = 1.5
 
 # Fraction of the bbox that may end up unmeasured before the sweep refuses to
 # finalize. AREA rather than a cell count, because subdivision means cells are
@@ -458,6 +502,34 @@ def can_subdivide(cell: Cell) -> bool:
     has ever tested.
     """
     return subdivide(cell)[0].radius_m >= RADIUS_FLOOR_M
+
+
+def total_is_usable(total: int | None, items_on_page: int) -> bool:
+    """
+    A total the sweep may size paging from: parsed, and not smaller than its page.
+
+    MEASURED 2026-10-22 on api.kartaview.org (issue #452): ``['0']`` on a page
+    of 200, on every page of a circle holding more than 1,000 photos. A count
+    that undercounts the page it arrived with cannot be trusted to count the
+    pages it did not, so the sweep pages such a circle BLIND, to a short page.
+
+    Usage:
+        total_is_usable(737, 200)  # True -- size paging from it
+        total_is_usable(0, 200)    # False -- the 2026-10-22 shape
+        total_is_usable(0, 0)      # True -- an empty circle, honestly counted
+    """
+    return total is not None and total >= items_on_page
+
+
+def page_is_full(items_on_page: int, ipp: int) -> bool:
+    """
+    Did this page come back at the page size, so the circle may hold more?
+
+    Compared against the page size the SERVER applies -- ``min(ipp, IPP_MAX)``,
+    the same clamp ``_post_nearby`` sends -- so an over-large ``ipp`` cannot
+    make every page look short and end a blind descent after page 1.
+    """
+    return items_on_page >= min(ipp, IPP_MAX)
 
 
 def pages_for_total(total_filtered_items: int | None, ipp: int = IPP_MAX) -> int:
@@ -962,6 +1034,33 @@ class ResponseError(DownloadError):
     """
 
 
+class RouteNotFoundError(ResponseError):
+    """
+    HTTP 404: the nearby-photos route is not served on this host (issue #452).
+
+    A ResponseError -- a definite answer, never retried -- typed apart so the
+    sweep can tell "this route is gone" from "this one query broke". One 404 is
+    a failed cell like any other definite error; 404s at every calibration
+    probe, or at the first :data:`ENDPOINT_NOT_FOUND_STRIKES` requests of a
+    resumed sweep with nothing answered, are a MOVED ENDPOINT and raise
+    :class:`~.download_common.HostEndpointMovedError` (exit 89).
+
+    Body-independent on purpose: the measured body was a text/plain
+    ``404 page not found``, and an HTML 404 must not read as a host refusal.
+    """
+
+
+def endpoint_moved_message(where: str) -> str:
+    """The operator-facing text of a moved endpoint, naming where it was learned."""
+    return (
+        f"KartaView answered HTTP 404 at every {where} ({NEARBY_PHOTOS_URL}): the "
+        f"nearby-photos route is not served on this host -- the endpoint has moved, as it "
+        f"did on 2026-10-22 (docs/experiments/kartaview-endpoint-move.md). Not this "
+        f"city's geometry and not a refusal of this IP; pause both KartaView channels and "
+        f"re-run scripts/kartaview_endpoint_probe.py from a laptop, never a makelab host."
+    )
+
+
 class CredentialRejectedError(ResponseError):
     """
     The server rejected the token itself: HTTP 401/403.
@@ -1009,6 +1108,7 @@ async def _post_nearby(
 
     Raises:
         BackpressureError: the query was too heavy; retry, then subdivide.
+        RouteNotFoundError: HTTP 404, the route is not served on this host.
         HostBlockedError: the service is refusing this HOST -- a redirect to a
             login page, an HTML error page, or a 429. All three are properties
             of the machine rather than of this circle, so the caller stops.
@@ -1033,10 +1133,10 @@ async def _post_nearby(
             content_type = resp.headers.get("Content-Type", "")
             # 401/403 is decided FIRST, before the content-type test below, and
             # the order is the whole point (the Mapillary precedent checks it
-            # first for the same reason). kartaview.org serves a JS single-page
-            # app from the very host this API lives on, so the natural shape of
-            # a rejected or expired token is an HTML login page -- and so is a
-            # load balancer's 502/503. Reading content-type first typed both as
+            # first for the same reason). The SPA host kartaview.org (where this
+            # API lived until 2026-10-22) and a load balancer can both answer
+            # HTML, so the natural shape of a rejected or expired token is an
+            # HTML login page -- and so is a load balancer's 502/503. Reading content-type first typed both as
             # a host refusal, which routes into #208's night-level breaker:
             # every remaining KartaView city skipped for the night, no failure
             # recorded, and an unconditional "host UNAVAILABLE" alert sending
@@ -1066,6 +1166,16 @@ async def _post_nearby(
             if resp.status >= 500:
                 raise TransportError(
                     f"KartaView server error (HTTP {resp.status}, {content_type or '?'})"
+                )
+            # 404 BEFORE the content-type test, for the same reason as 401/403:
+            # an HTML 404 page read as a host refusal would trip the night-level
+            # breaker and write a host_refusals row for a route that simply is
+            # not served here (issue #452). The 2026-10-22 move answered a
+            # text/plain "404 page not found" from every /1.0/ route.
+            if resp.status == 404:
+                raise RouteNotFoundError(
+                    f"HTTP 404 ({content_type or '?'}) from {NEARBY_PHOTOS_URL}: "
+                    f"the nearby-photos route is not served here"
                 )
             if "text/html" in content_type.lower():
                 raise HostBlockedError(
@@ -1249,6 +1359,11 @@ async def calibrate_radius(
             returns ``(what ran out, remedy)`` for that message, so a clock
             stop names the clock rather than a request budget that was never
             reached; None keeps the request-budget wording.
+        HostEndpointMovedError: every probe answered HTTP 404 (issue #452):
+            the route is not served on this host, which is the ENDPOINT and
+            not the city, and is the same for every remaining city tonight.
+            Checked before the ResponseError arm below, which it would
+            otherwise be.
         ResponseError: the server gave a definite, unusable non-credential
             answer at every probe (an unparseable body, an HTTP error that is
             neither backpressure nor transport). Surfaced as itself rather
@@ -1259,6 +1374,7 @@ async def calibrate_radius(
     """
     points = calibration_points(bbox, probes_per_rung)
     saw_only_broken = True
+    saw_only_not_found = True
     for radius in RADIUS_LADDER_M:
         answered = 0
         for lat, lon in points:
@@ -1287,8 +1403,10 @@ async def calibrate_radius(
                 retries=retries,
                 timeout=timeout,
             )
-            if outcome != "broken":
+            if outcome not in ("broken", "not_found"):
                 saw_only_broken = False
+            if outcome != "not_found":
+                saw_only_not_found = False
             if not outcome.startswith("ok"):
                 # The rung needs every probe, so it is already lost.
                 break
@@ -1296,6 +1414,12 @@ async def calibrate_radius(
         logger.info(f"  calibrate r={radius} m: {answered}/{len(points)} answered")
         if answered == len(points):
             return radius
+    if saw_only_not_found:
+        # Every probe a 404: the route is gone from this host, as it went from
+        # kartaview.org on 2026-10-22 (issue #452). Host-typed, so the child
+        # exits 89 and the scheduler latches the channel for the night instead
+        # of letting every remaining city spend its own ladder learning this.
+        raise HostEndpointMovedError(endpoint_moved_message("calibration probe"), HOST_KARTAVIEW)
     if saw_only_broken:
         # A rejected credential never reaches this: CredentialRejectedError
         # propagates from the first probe. What lands here is the endpoint
@@ -1323,7 +1447,11 @@ async def _probe_cell(
     """
     One page of one cell. Returns ``(items, total, outcome)``.
 
-    ``outcome`` is ``ok`` / ``ok_after_retry`` / ``refused`` / ``broken``.
+    ``outcome`` is ``ok`` / ``ok_after_retry`` / ``refused`` / ``broken`` /
+    ``not_found``. ``not_found`` is an HTTP 404 (:class:`RouteNotFoundError`,
+    issue #452): handled like ``broken`` -- recorded, never retried, never
+    subdivided -- and kept apart only so the caller can count 404s and
+    recognise a moved endpoint.
 
     RETRYING IS FOUR TIMES CHEAPER THAN SUBDIVIDING, which is why the retry
     budget is generous and why this is a function rather than a loop inline. A
@@ -1378,6 +1506,9 @@ async def _probe_cell(
             # finally-commit keeps the spend, and the message sends the
             # operator to the .env rather than to the city.
             raise
+        except RouteNotFoundError as e:
+            logger.warning(f"r={cell.radius_m} m @ {cell.lat:.4f},{cell.lon:.4f}: {e}")
+            return [], None, "not_found"
         except ResponseError as e:
             logger.warning(
                 f"r={cell.radius_m} m @ {cell.lat:.4f},{cell.lon:.4f}: neither backpressure "
@@ -1940,7 +2071,7 @@ async def download_kartaview_metadata_async(
     access_token: str,
     output_csv_gz_path: str,
     request_timeout: float = DEFAULT_REQUEST_TIMEOUT_S,
-    max_requests_per_minute: int = DEFAULT_SWEEP_REQUESTS_PER_MINUTE,
+    max_requests_per_minute: float = DEFAULT_SWEEP_REQUESTS_PER_MINUTE,
     max_requests: int | None = None,
     deadline_monotonic: float | None = None,
     radius_m: int | None = None,
@@ -2024,7 +2155,8 @@ async def download_kartaview_metadata_async(
         logger.info(
             f"Swept {fetched['raw_photo_count']} photo rows "
             f"({num_images} unique: {num_panos} panos, {num_images - num_panos} flat) "
-            f"from {fetched['cells_visited']} cells at r={fetched['radius_m']} m"
+            f"from {fetched['cells_visited']} cells at r={fetched['radius_m']} m "
+            f"({fetched.get('cells_paged_blind', 0)} paged blind)"
         )
 
         written = census_core.write_census_grid_run(
@@ -2138,6 +2270,8 @@ def _reuse_cached_sweep(
         "census": census,
         "cells": cp.roots_done,
         "cells_visited": cp.cells_visited,
+        # Nothing was paged this process (issue #452): a reuse costs 0 requests.
+        "cells_paged_blind": 0,
         "radius_m": cp.radius_m,
         "raw_photo_count": cp.raw_photo_count,
         "num_images": len(census),
@@ -2157,7 +2291,7 @@ async def fetch_city_images_async(
     ipp: int = IPP_MAX,
     radius_m: int | None = None,
     request_timeout: float = DEFAULT_REQUEST_TIMEOUT_S,
-    max_requests_per_minute: int = DEFAULT_SWEEP_REQUESTS_PER_MINUTE,
+    max_requests_per_minute: float = DEFAULT_SWEEP_REQUESTS_PER_MINUTE,
     max_requests: int | None = None,
     deadline_monotonic: float | None = None,
     retries: int = DEFAULT_BACKPRESSURE_RETRIES,
@@ -2218,7 +2352,7 @@ async def _fetch_city_images(
     ipp: int = IPP_MAX,
     radius_m: int | None = None,
     request_timeout: float = DEFAULT_REQUEST_TIMEOUT_S,
-    max_requests_per_minute: int = DEFAULT_SWEEP_REQUESTS_PER_MINUTE,
+    max_requests_per_minute: float = DEFAULT_SWEEP_REQUESTS_PER_MINUTE,
     max_requests: int | None = None,
     deadline_monotonic: float | None = None,
     retries: int = DEFAULT_BACKPRESSURE_RETRIES,
@@ -2306,7 +2440,9 @@ async def _fetch_city_images(
     Returns:
         Dict with ``census`` (the deduped columnar census), ``api_requests``,
         ``api_requests_total``, ``cells`` (root cells), ``cells_visited`` (roots
-        plus every subdivision), ``radius_m`` (what the sweep tiled at),
+        plus every subdivision), ``cells_paged_blind`` (cells THIS PROCESS paged
+        to a short page because the host reported no usable total, issue
+        #452), ``radius_m`` (what the sweep tiled at),
         ``raw_photo_count`` (pre-dedupe), ``num_images`` and ``num_panos``
         (post-dedupe totals, summarized here because the caller cannot count
         them without pinning the census -- see below), ``failed_cells`` and
@@ -2344,6 +2480,11 @@ async def _fetch_city_images(
             ``api_requests`` so the caller can still record what it spent.
         HostBlockedError: KartaView is refusing this host. Raised at the FIRST
             refusal rather than after the whole bbox has been paid for (#205).
+        HostEndpointMovedError: the nearby-photos route answered HTTP 404 at
+            every calibration probe, or at the first
+            :data:`ENDPOINT_NOT_FOUND_STRIKES` requests of a sweep that skipped
+            the ladder with nothing answered (issue #452). Exit 89; carries
+            the spend like every DownloadError.
     """
     if deadline_monotonic is not None and checkpoint_path is None:
         # Refused before a request, like the tile censuses' guard (issue #344).
@@ -2559,6 +2700,17 @@ async def _fetch_city_images(
     failed_cells: list[Cell] = []
     raw_photo_count = resumed.raw_photo_count if resumed else 0
     cells_visited = resumed.cells_visited if resumed else 0
+    # Cells whose page 1 carried no usable total and were paged blind (issue
+    # #452). THIS process's count, not checkpointed: it describes how tonight's
+    # host answered, which is the question the operator asks of it.
+    cells_paged_blind = 0
+    # The moved-endpoint stop for a sweep that skipped the ladder (issue #452).
+    # `answered_any` is True once the ROUTE has answered anything this process
+    # -- an item list or a backpressure refusal (apiCode 690/408 is a JSON body
+    # from the route itself, so it proves the route is served). A successful
+    # calibration has answered, so it starts True after one.
+    answered_any = False
+    not_found_count = 0
     prior_requests = resumed.api_requests_total if resumed else 0
     start_index = resumed.roots_done if resumed else 0
     roots_done = start_index
@@ -2601,6 +2753,8 @@ async def _fetch_city_images(
                     budget_exhausted=over_budget,
                     describe_budget_stop=lambda: (budget_ran_out(), budget_remedy()),
                 )
+                # A rung answered at every probe, so the route is served.
+                answered_any = radius_m is not None
             if radius_m is None:
                 # NOT a host condition, deliberately. A host block shows up as a
                 # redirect, an HTML page or a 429 and is typed where it happens;
@@ -2634,6 +2788,36 @@ async def _fetch_city_images(
                 f"covering bbox {tuple(round(v, 4) for v in bbox)}"
             )
 
+            def note_outcome(outcome: str) -> None:
+                """
+                Stop a sweep that meets only 404s before anything answers (#452).
+
+                The calibration ladder catches a moved route on a fresh sweep;
+                a RESUMED sweep pins its radius and skips the ladder, so without
+                this it would walk the whole lattice of 404s to the area guard
+                -- a lattice-sized spend, exit 1, and a counted failure, for
+                every enrolled city of the night. Counted only while nothing has
+                answered in this process: after an answer, a 404 is one failed
+                cell, bounded by MAX_FAILED_AREA_FRACTION like any other, and a
+                route removed mid-sweep is caught by the next night's resume
+                from its first request.
+                """
+                nonlocal answered_any, not_found_count
+                if outcome.startswith("ok") or outcome == "refused":
+                    answered_any = True
+                    return
+                if outcome != "not_found" or answered_any:
+                    return
+                not_found_count += 1
+                if not_found_count >= ENDPOINT_NOT_FOUND_STRIKES:
+                    raise HostEndpointMovedError(
+                        endpoint_moved_message(
+                            f"one of the first {not_found_count} requests of a sweep that "
+                            f"skipped the calibration ladder"
+                        ),
+                        HOST_KARTAVIEW,
+                    )
+
             async def _sweep_subtree(subtree_root: Cell) -> bool:
                 """
                 Sweep one cell depth-first, descending wherever it refuses.
@@ -2645,7 +2829,7 @@ async def _fetch_city_images(
                 which are recorded rather than raised. One body shared by the
                 root loop and the retry pass, so the two walks cannot drift.
                 """
-                nonlocal cells_visited, raw_photo_count
+                nonlocal cells_visited, raw_photo_count, cells_paged_blind
                 stack = [subtree_root]
                 while stack:
                     # The guard is checked HERE, and again in the page loop
@@ -2675,7 +2859,8 @@ async def _fetch_city_images(
                         retries=retries,
                         timeout=timeout,
                     )
-                    if outcome == "broken":
+                    note_outcome(outcome)
+                    if outcome in ("broken", "not_found"):
                         failed_cells.append(cell)
                         continue
                     if outcome == "refused":
@@ -2693,6 +2878,72 @@ async def _fetch_city_images(
                     # dicts are freed before the next is decoded rather than
                     # the whole city's surviving to the end (#157).
                     frames.append(records_to_census(decode_photo_items(items)))
+
+                    if not total_is_usable(total, len(items)):
+                        # UNKNOWN TOTAL (issue #452): the host has answered
+                        # ['0'] on every page since 2026-10-22, so a total
+                        # smaller than its own page sizes nothing. Page BLIND
+                        # until a short page, under the same cap, with the
+                        # same refused/broken arms as the known-total loop.
+                        # A host-only repoint without this branch reads one
+                        # page per circle and publishes truncated censuses.
+                        cells_paged_blind += 1
+                        if not page_is_full(len(items), ipp):
+                            # One short page exhausts the circle: free.
+                            continue
+                        page = 2
+                        while True:
+                            if page > MAX_PAGES_PER_CELL:
+                                # The known-total cap's two outcomes, reached
+                                # AFTER paying the cap's pages, since nothing
+                                # prices them up front any more. The paged
+                                # rows are kept; the children's overlap is
+                                # deduped by id.
+                                if can_subdivide(cell):
+                                    stack.extend(subdivide(cell))
+                                else:
+                                    logger.warning(
+                                        f"r={cell.radius_m} m @ {cell.lat:.4f},{cell.lon:.4f} "
+                                        f"needs more than {MAX_PAGES_PER_CELL} pages at the "
+                                        f"radius floor and cannot be split; recording it as "
+                                        f"unmeasured"
+                                    )
+                                    failed_cells.append(cell)
+                                break
+                            if over_budget():
+                                unvisited([cell])
+                                unvisited(stack)
+                                return False
+                            items, _, outcome = await _probe_cell(
+                                session,
+                                limiter,
+                                count_request,
+                                cell,
+                                page=page,
+                                ipp=ipp,
+                                access_token=access_token,
+                                retries=retries,
+                                timeout=timeout,
+                            )
+                            note_outcome(outcome)
+                            if outcome == "refused":
+                                # Backpressure, and only backpressure,
+                                # subdivides (as in the known-total loop).
+                                if can_subdivide(cell):
+                                    stack.extend(subdivide(cell))
+                                else:
+                                    failed_cells.append(cell)
+                                break
+                            if outcome in ("broken", "not_found"):
+                                # Never fans out (as in the known-total loop).
+                                failed_cells.append(cell)
+                                break
+                            raw_photo_count += len(items)
+                            frames.append(records_to_census(decode_photo_items(items)))
+                            if not page_is_full(len(items), ipp):
+                                break
+                            page += 1
+                        continue
 
                     pages = pages_for_total(total, ipp)
                     if pages > MAX_PAGES_PER_CELL:
@@ -2737,6 +2988,7 @@ async def _fetch_city_images(
                             retries=retries,
                             timeout=timeout,
                         )
+                        note_outcome(outcome)
                         if outcome == "refused":
                             # Backpressure, and ONLY backpressure, may
                             # subdivide: a partially paged circle is not
@@ -2747,7 +2999,7 @@ async def _fetch_city_images(
                             else:
                                 failed_cells.append(cell)
                             break
-                        if outcome == "broken":
+                        if outcome in ("broken", "not_found"):
                             # A transport fault or a definite unusable
                             # answer is NOT backpressure, so it must not
                             # fan out -- asking the server for four
@@ -3152,6 +3404,13 @@ async def _fetch_city_images(
         f"{raw_photo_count} photo rows, {len(census)} unique, {api_requests} requests"
         + (f" this process, {prior_requests + api_requests} in total" if prior_requests else "")
     )
+    if cells_paged_blind:
+        # Once per sweep, not per cell (issue #452). The resume plan greps for
+        # "paged blind" to confirm the first nights on the moved host.
+        logger.info(
+            f"{cells_paged_blind} cell(s) paged blind this process: the host reports no "
+            f"usable totalFilteredItems, so each was paged to a short page (issue #452)"
+        )
     return {
         "census": census,
         # THIS process's spend, for the additive daily ledger; see the Returns
@@ -3160,6 +3419,8 @@ async def _fetch_city_images(
         "api_requests_total": prior_requests + api_requests,
         "cells": len(roots),
         "cells_visited": cells_visited,
+        # Cells THIS PROCESS paged blind for want of a usable total (#452).
+        "cells_paged_blind": cells_paged_blind,
         "radius_m": radius_m,
         "raw_photo_count": raw_photo_count,
         # Summarized HERE, not by the caller, and that is a memory contract

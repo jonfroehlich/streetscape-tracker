@@ -1522,3 +1522,253 @@ def test_the_throttled_line_says_who_resumes_the_checkpoint(
     assert wording in lines[0]
     other = "NOT due" if not fill else "stays due"
     assert other not in lines[0]
+
+
+# ── an ENDPOINT MOVED child (exit 89/90, issue #452) ──────────────────────
+#
+# A route that answered HTTP 404 everywhere it was asked. The throttle's
+# reaction (latch, amnesty, no refusal row) with its own wording, and -- the
+# 2026-10-23 failure this exists for -- no city-cap slot for a city due only on
+# the moved host: that night the KartaView-only cities spent the 80-city cap in
+# 1.6 h learning the same 404s.
+
+MOVED_KV = 89
+MOVED_PNX = 90
+KARTAVIEW_PAIR = ("kartaview", "kartaview_streets")
+PANORAMAX_PAIR = ("panoramax", "panoramax_streets")
+
+
+def _opt_in_cfg(tmp_path, pair):
+    """gsv + one opt-in provider pair, loaded THROUGH the loader."""
+    rate = "max_requests_per_minute = 1.5\n" if pair == KARTAVIEW_PAIR else ""
+    path = tmp_path / "moved.toml"
+    path.write_text(
+        "[providers.gsv]\nenabled = true\ndaily_request_budget = 10000000\n\n"
+        + "".join(
+            f"[providers.{p}]\nenabled = true\ndaily_request_budget = 100000\n{rate}\n"
+            for p in pair
+        )
+        + f'[paths]\ndata_dir = "{tmp_path / "data"}"\nlog_dir = "{tmp_path / "logs"}"\n'
+        f'backup_dir = "{tmp_path / "backups"}"\n'
+    )
+    return load_scheduler_config(str(path))
+
+
+def _enrol(conn, cfg, city_id, pair):
+    for channel in pair:
+        db.set_channel_membership(conn, city_id, channel, True, cycle_days=cfg.cycle_days)
+
+
+def _opt_in_failures(conn, pair):
+    return {
+        (r["city_id"], r["provider"]): r["consecutive_failures"]
+        for r in conn.execute(
+            "SELECT city_id, provider, consecutive_failures FROM schedule_state "
+            f"WHERE provider IN ({', '.join('?' for _ in pair)})",
+            pair,
+        )
+    }
+
+
+def _moved_night(monkeypatch, conn, cfg, *, failing, exit_code, today=THURSDAY, **kwargs):
+    """A night whose ``failing`` children all exit ``exit_code``; the rest succeed."""
+    launches = []
+
+    def fake(cfg_, city, today_, provider="gsv", **kw):
+        launches.append((city.city_id, provider))
+        if provider in failing:
+            return sched.CollectionOutcome(False, f"exited {exit_code} (stub)", exit_code=exit_code)
+        return True
+
+    monkeypatch.setattr(sched, "_run_one_city", fake)
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+    monkeypatch.setattr(sched.time, "sleep", lambda s: None)
+    monkeypatch.setattr(sched, "generate_aggregate_v2", lambda c, d: None)
+    monkeypatch.setattr(sched, "generate_streetwalk_manifest", lambda c, d: {})
+    monkeypatch.setattr(sched, "_publish", lambda cfg, summary, **kw: 0)
+    alerts = kwargs.pop("alerts", None)
+    monkeypatch.setattr(
+        sched, "send_alert", lambda *a, **k: alerts.append(a) if alerts is not None else None
+    )
+    return sched.cmd_run_due(cfg, today=today, **kwargs), launches
+
+
+def test_the_endpoint_moved_codes_are_the_collectors():
+    from streetscape_metadata_tracker.download_common import (
+        HOST_ENDPOINT_MOVED_EXIT_CODES,
+        HOST_KARTAVIEW,
+        HOST_PANORAMAX,
+    )
+
+    assert HOST_ENDPOINT_MOVED_EXIT_CODES == {HOST_KARTAVIEW: MOVED_KV, HOST_PANORAMAX: MOVED_PNX}
+
+
+def test_an_endpoint_moved_child_latches_the_host_and_writes_no_refusal(
+    conn, monkeypatch, tmp_path, caplog
+):
+    """89 latches KartaView for the night -- one launch, then both channels
+    skipped for every later city -- writes NO host_refusals row, records no
+    failure and no attempt, and still alerts and exits nonzero, naming the
+    probe script and the pause. Kills: the branch missing (a generic failure:
+    counted, unlatched, worded "unavailable")."""
+    cfg = _opt_in_cfg(tmp_path, KARTAVIEW_PAIR)
+    cfg.alerts.enabled = True
+    cities = [_register(conn, "Bend"), _register(conn, "Corvallis")]
+    for cid in cities:
+        _enrol(conn, cfg, cid, KARTAVIEW_PAIR)
+    alerts = []
+    with caplog.at_level(logging.INFO, logger="streetscape_scheduler"):
+        rc, launches = _moved_night(
+            monkeypatch, conn, cfg, failing=KARTAVIEW_PAIR, exit_code=MOVED_KV, alerts=alerts
+        )
+
+    assert rc != 0
+    providers = [p for _c, p in launches]
+    assert providers.count("kartaview") == 1
+    assert "kartaview_streets" not in providers
+    assert providers.count("gsv") == 2
+    assert _refusal_rows(conn) == []
+    assert set(_opt_in_failures(conn, KARTAVIEW_PAIR).values()) <= {0}
+    attempted = conn.execute(
+        "SELECT COUNT(*) FROM schedule_state WHERE provider IN ('kartaview', 'kartaview_streets') "
+        "AND last_attempt_at IS NOT NULL"
+    ).fetchone()[0]
+    assert attempted == 0, "an amnestied launch must not stamp last_attempt_at"
+    done = _done_line(caplog)
+    assert "ENDPOINT MOVED" in done
+    assert "unavailable" not in done and "THROTTLED" not in done
+    assert len(alerts) == 1
+    _cfg_arg, subject, body = alerts[0]
+    assert "1 host(s) ENDPOINT MOVED" in subject
+    assert "UNAVAILABLE" not in subject
+    assert "kartaview_endpoint_probe.py" in body
+    assert "enabled = false" in body
+    assert "was refused by" not in body
+
+
+@pytest.mark.parametrize("exit_code", [MOVED_KV, 1], ids=["moved-89", "control-exit-1"])
+def test_a_kartaview_only_city_lost_to_a_moved_endpoint_takes_no_cap_slot(
+    conn, monkeypatch, tmp_path, exit_code
+):
+    """At --limit 1, a city due ONLY on KartaView whose child exits 89 must not
+    spend the night's one slot: the next city's gsv run still launches. The
+    exit-1 control shows the harness does spend the slot on a counted failure.
+    Kills: `attempted += 1` reached before the `continue` -- the exact
+    2026-10-23 failure."""
+    cfg = _opt_in_cfg(tmp_path, KARTAVIEW_PAIR)
+    a = _register(conn, "Albany")
+    b = _register(conn, "Bend")
+    db.record_attempt(conn, a, success=True, provider="gsv")
+    db.set_channel_membership(conn, a, "kartaview", True, cycle_days=cfg.cycle_days)
+    db.set_channel_membership(conn, b, "kartaview", False, cycle_days=cfg.cycle_days)
+    rc, launches = _moved_night(
+        monkeypatch, conn, cfg, failing=("kartaview",), exit_code=exit_code, limit=1
+    )
+    assert (a, "kartaview") in launches
+    assert ((b, "gsv") in launches) is (exit_code == MOVED_KV), launches
+
+
+@pytest.mark.parametrize("exit_code,counted", [(MOVED_KV, False), (1, True)])
+def test_an_endpoint_moved_night_quarantines_nothing_however_often_it_repeats(
+    conn, monkeypatch, tmp_path, exit_code, counted
+):
+    """Amnestied: nights of a moved route must never quarantine a KartaView
+    pair (#421). The exit-1 control proves the harness records a real failure.
+    Kills: a record_attempt(success=False) before the branch's `continue`."""
+    cfg = _opt_in_cfg(tmp_path, KARTAVIEW_PAIR)
+    a = _register(conn, "Bend")
+    _enrol(conn, cfg, a, ("kartaview",))
+    nights = 3
+    for day in range(nights):
+        _moved_night(
+            monkeypatch,
+            conn,
+            cfg,
+            failing=("kartaview",),
+            exit_code=exit_code,
+            today=THURSDAY + timedelta(days=day),
+        )
+    assert _opt_in_failures(conn, KARTAVIEW_PAIR).get((a, "kartaview"), 0) == (
+        nights if counted else 0
+    )
+
+
+def test_an_endpoint_moved_pair_stays_due(conn, monkeypatch, tmp_path):
+    """The other half of the amnesty: the pair stays DUE, so it is asked again
+    once the route is fixed. Kills: a record_attempt(success=True) before the
+    branch's `continue`."""
+    cfg = _opt_in_cfg(tmp_path, KARTAVIEW_PAIR)
+    a = _register(conn, "Bend")
+    _enrol(conn, cfg, a, ("kartaview",))
+    _moved_night(monkeypatch, conn, cfg, failing=("kartaview",), exit_code=MOVED_KV)
+    row = conn.execute(
+        "SELECT last_success_at FROM schedule_state WHERE city_id = ? AND provider = 'kartaview'",
+        (a,),
+    ).fetchone()
+    assert row is None or row["last_success_at"] is None
+    due = db.get_due_cities(
+        conn,
+        today=THURSDAY + timedelta(days=1),
+        cycle_days=cfg.cycle_days,
+        grace_days=cfg.grace_days,
+        max_consecutive_failures=cfg.max_consecutive_failures,
+        default_membership=sched.CHANNEL_DEFAULT_MEMBERSHIP["kartaview"],
+        provider="kartaview",
+    )
+    assert a in [c.city_id for c in due]
+
+
+def test_the_child_reason_names_a_moved_endpoint(tmp_path, monkeypatch):
+    """`_run_collection_subprocess` turns 89 into words, never "unavailable"."""
+    cfg = _opt_in_cfg(tmp_path, KARTAVIEW_PAIR)
+
+    class _Done:
+        returncode = MOVED_KV
+
+    monkeypatch.setattr(sched.subprocess, "run", lambda *a, **k: _Done())
+    row = type("C", (), {"city_id": "bend--oregon--united-states"})()
+    outcome = sched._run_collection_subprocess(cfg, ["true"], 60, row, "kartaview", THURSDAY)
+    assert outcome.exit_code == MOVED_KV and not outcome
+    assert "MOVED" in outcome.reason
+    assert "unavailable" not in outcome.reason
+
+
+def test_a_moved_endpoint_latches_without_a_recheck_and_is_never_recovered():
+    from streetscape_metadata_tracker.download_common import HOST_KARTAVIEW
+
+    breaker = sched.HostBreaker(cooldown_s=0)
+    breaker.endpoint_moved(HOST_KARTAVIEW)
+    assert breaker and breaker.moved_only({HOST_KARTAVIEW})
+    assert not breaker.throttled_only({HOST_KARTAVIEW})
+    assert breaker.blocking({HOST_KARTAVIEW}) == {HOST_KARTAVIEW}
+    assert breaker.rechecks[HOST_KARTAVIEW] == 0
+    assert breaker.recovered == set()
+    # A refusal on the same night is named as a refusal, not a moved endpoint.
+    breaker.add(HOST_KARTAVIEW)
+    assert not breaker.moved_only({HOST_KARTAVIEW})
+
+
+def test_a_walk_lost_to_a_moved_endpoint_names_the_cause(conn, monkeypatch, tmp_path, caplog):
+    """The Panoramax grid run lands, its walk exits 90 (#407's whole-lattice
+    404, host-typed by #452): stranded, the cause named as a moved route, and
+    no refusal row."""
+    cfg = _opt_in_cfg(tmp_path, PANORAMAX_PAIR)
+    cfg.alerts.enabled = True
+    a = _register(conn, "Bend")
+    _enrol(conn, cfg, a, PANORAMAX_PAIR)
+    alerts = []
+    with caplog.at_level(logging.INFO, logger="streetscape_scheduler"):
+        rc, launches = _moved_night(
+            monkeypatch,
+            conn,
+            cfg,
+            failing=("panoramax_streets",),
+            exit_code=MOVED_PNX,
+            alerts=alerts,
+        )
+    assert rc != 0
+    assert launches.count((a, "panoramax_streets")) == 1
+    assert "1 city(ies) STRANDED un-walked" in _done_line(caplog)
+    _cfg_arg, _subject, body = alerts[0]
+    assert f"{a} (panoramax_streets: a moved endpoint (HTTP 404))" in body
+    assert _refusal_rows(conn) == []

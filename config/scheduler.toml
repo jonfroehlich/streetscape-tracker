@@ -489,11 +489,16 @@ enabled = true
 # alerts and the five-night backstop applies. An enrolled metro therefore needs
 # a budget that finishes it inside a week, not merely one that starts it.
 daily_request_budget = 10000
-# DEFAULT_SWEEP_REQUESTS_PER_MINUTE — 960/h, under the documented 1,000/h
-# authenticated ceiling. Load-bearing beyond pacing: _kartaview_timeout_seconds
-# derives the per-city timeout from this rate, so lowering it here without
-# re-reading that function silently shortens every sweep's timeout too.
-max_requests_per_minute = 16
+# DEFAULT_SWEEP_REQUESTS_PER_MINUTE — 1.5/min = 90/h, under the documented
+# 100/h ANONYMOUS ceiling (issue #452). The authenticated 1,000/h tier (16/min
+# was the pace until then) is unverifiable since 2026-10-22: the API moved to
+# api.kartaview.org, which validates no token. At this pace a 12 h night paces
+# at most ~1,080 requests, so the clock term, not this budget, binds; a
+# Singapore-class sweep (~9,974 requests) takes ~111 h, past the 7-day
+# checkpoint wall. Load-bearing beyond pacing: _kartaview_timeout_seconds
+# derives the per-city timeout from this rate, so changing it here without
+# re-reading that function silently moves every sweep's timeout too.
+max_requests_per_minute = 1.5
 
 # KartaView road walk (issue #258) — the SECOND opt-in channel, and the same
 # arithmetic as the block above: declaring it enrols nobody, because a
@@ -538,8 +543,9 @@ daily_request_budget = 10000
 # divides the sweep estimate by this rate, and _street_collect_cmd passes it to
 # the child as --kartaview-max-requests-per-minute so the two cannot disagree.
 # Not additive with [providers.kartaview]'s: one host lock, so the two channels
-# never talk to kartaview.org at the same moment.
-max_requests_per_minute = 16
+# never talk to api.kartaview.org at the same moment. The anonymous tier's pace,
+# as above (issue #452).
+max_requests_per_minute = 1.5
 # Match the other street channels so they all walk the same sample points and
 # land on one comparable streets.html row.
 spacing_m = 15

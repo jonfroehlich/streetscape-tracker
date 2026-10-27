@@ -110,7 +110,7 @@ async def collect_kartaview_street_samples_async(
     output_csv_gz_path: str,
     match_dist_m: float,
     request_timeout: float = 30,
-    max_requests_per_minute: int = DEFAULT_SWEEP_REQUESTS_PER_MINUTE,
+    max_requests_per_minute: float = DEFAULT_SWEEP_REQUESTS_PER_MINUTE,
     max_requests: int | None = None,
     deadline_monotonic: float | None = None,
     checkpoint_path: str | None = None,
@@ -177,12 +177,14 @@ async def collect_kartaview_street_samples_async(
         census = fetched.pop("census")
         num_flat_images = int((~census_is_pano(census)).sum())
         logger.info(
-            "%s: %d KartaView images (%d panos, %d flat) from %d cells → scoring %d sample points",
+            "%s: %d KartaView images (%d panos, %d flat) from %d cells (%d paged blind) "
+            "→ scoring %d sample points",
             city.city_id,
             len(census),
             len(census) - num_flat_images,
             num_flat_images,
             fetched.get("cells_visited") or 0,
+            fetched.get("cells_paged_blind") or 0,
             len(query_points),
         )
 

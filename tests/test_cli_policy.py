@@ -684,6 +684,67 @@ def test_a_throttled_host_exits_with_the_throttled_code(monkeypatch, catalog):
     assert rc == HOST_THROTTLED_EXIT_CODES[HOST_MAPILLARY_TILES] == 87
 
 
+@pytest.mark.parametrize(
+    ("provider", "downloader", "host"),
+    [
+        ("kartaview", "download_kartaview_metadata_async", "kartaview"),
+        ("panoramax", "download_panoramax_metadata_async", "panoramax"),
+    ],
+)
+def test_a_moved_endpoint_exits_with_the_endpoint_moved_code(
+    monkeypatch, catalog, provider, downloader, host
+):
+    """Issue #452: a route that answered 404 everywhere is neither a refusal
+    (81/84, which writes a host_refusals row) nor a plain failure (1, which
+    counts toward quarantine). The grid CLI hands it over as its own number,
+    and still ledgers the requests the probes spent. Kills: the exception
+    caught as a plain DownloadError, or host_exit_code's branch missing."""
+    from streetscape_metadata_tracker.download_common import (
+        HOST_ENDPOINT_MOVED_EXIT_CODES,
+        HostEndpointMovedError,
+    )
+
+    conn, city_id, data_dir = catalog
+    kartaview_configs(monkeypatch)
+    error = HostEndpointMovedError("404 at every probe", host=host)
+    error.api_requests = 6
+
+    async def stub(**kwargs):
+        raise error
+
+    monkeypatch.setattr(cli, downloader, stub)
+    rc = run_cli(monkeypatch, city_id, data_dir, provider=provider)
+    assert rc == HOST_ENDPOINT_MOVED_EXIT_CODES[host]
+    assert rc in (89, 90)
+    assert db.get_api_usage(conn, RUN_DATE, provider=provider) == 6
+
+
+def test_the_kartaview_rate_flag_takes_a_fraction(monkeypatch, catalog):
+    """The scheduler forwards the anonymous pace as "1.5" (#452). Kills: the
+    flag left `type=int`, where argparse exits 2 -- which the scheduler
+    classifies as ARGV REJECTED, never collecting the channel at all."""
+    _, city_id, data_dir = catalog
+    kartaview_configs(monkeypatch)
+    calls = []
+    inner = kartaview_stub()
+
+    async def capture(**kwargs):
+        calls.append(kwargs)
+        return await inner(**kwargs)
+
+    monkeypatch.setattr(cli, "download_kartaview_metadata_async", capture)
+    rc = run_cli(
+        monkeypatch,
+        city_id,
+        data_dir,
+        "--kartaview-max-requests-per-minute",
+        "1.5",
+        provider="kartaview",
+    )
+    assert rc == 0
+    assert calls[0]["max_requests_per_minute"] == 1.5
+
+
 def test_a_mixed_failure_exits_1_rather_than_a_host_code(monkeypatch, catalog):
     """
     Mapillary blocked AND GSV genuinely broken. Reporting the host code would

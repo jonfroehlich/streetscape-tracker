@@ -3,7 +3,7 @@ The KartaView census collector (issue #225).
 
 Every request is served from memory: the sweep tests substitute
 ``_post_nearby``, and the request-layer tests substitute the aiohttp session.
-Nothing here touches kartaview.org -- a test suite that probed a third party
+Nothing here touches api.kartaview.org -- a test suite that probed a third party
 from every dev machine and CI job is the shape of the two per-IP bans this
 project already has.
 
@@ -46,6 +46,7 @@ from streetscape_metadata_tracker.download_common import (
     DownloadError,
     HostBlockedError,
     HostBusyError,
+    HostEndpointMovedError,
     host_exit_code,
 )
 from streetscape_metadata_tracker.download_mapillary import grid_bbox
@@ -1091,8 +1092,8 @@ def test_the_estimate_agrees_with_the_plan_across_the_seam():
 @pytest.mark.parametrize("status", [401, 403])
 def test_a_rejected_credential_serving_html_is_still_only_the_credential(status):
     """
-    THE realistic shape: kartaview.org is a JS single-page app on this very
-    host, so a rejected or expired token comes back as an HTML login page. The
+    THE realistic shape: the SPA host kartaview.org (this API's host until 2026-10-22)
+    serves HTML, so a rejected or expired token comes back as an HTML login page. The
     content-type test used to run first and typed that as a host refusal, which
     trips #208's night-level breaker -- every remaining KartaView city skipped,
     no failure recorded, and an alert sending the operator after a ban that
@@ -1219,8 +1220,14 @@ def test_the_default_pace_stays_under_the_documented_hourly_ceiling():
     KartaView returns no X-RateLimit-* or Retry-After headers at all, so a
     client cannot observe its own budget and this is the only check there is.
     Raising the constant to 20/min (1,200/h) broke nothing before this test.
+
+    Since #452 the DEFAULT is held to the ANONYMOUS ceiling: no host that serves
+    the route validates the token, so the authenticated tier is unverifiable.
+    The retired authenticated pace keeps its own pin. Kills: the default put
+    back at 16/min without a probe showing the token honoured.
     """
-    assert kv.DEFAULT_SWEEP_REQUESTS_PER_MINUTE * 60 <= kv.REQUESTS_PER_HOUR_AUTH
+    assert kv.DEFAULT_SWEEP_REQUESTS_PER_MINUTE * 60 <= kv.REQUESTS_PER_HOUR_ANON
+    assert kv.AUTH_SWEEP_REQUESTS_PER_MINUTE * 60 <= kv.REQUESTS_PER_HOUR_AUTH
 
 
 def test_the_request_carries_the_token_and_the_full_page_size():
@@ -1236,6 +1243,34 @@ def test_the_request_carries_the_token_and_the_full_page_size():
     )
     assert session.calls[0]["params"] == {"access_token": "secret-token"}
     assert session.calls[0]["data"]["ipp"] == kv.IPP_MAX == 2000
+
+
+def test_the_request_goes_to_the_api_host():
+    """kartaview.org's /1.0/ routes answer 404 since 2026-10-22, and
+    api.kartaview.org serves the same photos (#452). Kills: the URL not
+    repointed, or its path mistyped."""
+    (_, _), session, _ = _post(
+        _FakeResponse(body={"currentPageItems": [], "totalFilteredItems": 0}),
+    )
+    assert session.calls[0]["url"] == "https://api.kartaview.org/1.0/list/nearby-photos/"
+
+
+@pytest.mark.parametrize(
+    "content_type, text",
+    [("text/plain; charset=utf-8", "404 page not found"), ("text/html", "<html>404</html>")],
+    ids=["measured-text-plain", "html"],
+)
+def test_an_http_404_is_a_route_not_found_error(content_type, text):
+    """A 404 is the ROUTE, typed apart from a host refusal (#452). The measured
+    body was text/plain; an HTML 404 must not reach the content-type check and
+    trip the night-level breaker with a refusal row. Kills: the 404 check placed
+    after the HTML check, or a 404 left as a generic ResponseError."""
+    error = _post_error(
+        _FakeResponse(status=404, headers={"Content-Type": content_type}, text=text)
+    )
+    assert isinstance(error, kv.RouteNotFoundError)
+    assert isinstance(error, kv.ResponseError)
+    assert not isinstance(error, HostBlockedError)
 
 
 # ── The runaway guard, which did not guard ─────────────────────────────────
@@ -1312,6 +1347,205 @@ def test_a_page_two_backpressure_refusal_still_subdivides(monkeypatch):
 
     _failed_sweep(monkeypatch, responder, radius_m=500, retries=0)
     # The point is only that children WERE asked; the sweep still refuses.
+
+
+# ── Unknown totals (issue #452) ────────────────────────────────────────────
+#
+# api.kartaview.org reports totalFilteredItems as ['0'] on every page of a
+# circle holding more than 1,000 photos (measured 2026-10-22). Every test here
+# asserts the REQUEST list, not only the census: a sweep that reads one page per
+# circle produces a plausible census, and only the calls show what it skipped.
+
+
+def _ids(prefix, n):
+    return [_item(id=f"{prefix}{i}") for i in range(n)]
+
+
+def _roots(radius_m):
+    return kv.cells_for_bbox(*BBOX, radius_m * math.sqrt(2))
+
+
+def test_a_total_smaller_than_its_page_is_unusable():
+    """Kills: `>` for `>=`, a dropped None arm, and the server cap ignored."""
+    assert kv.total_is_usable(0, 200) is False
+    assert kv.total_is_usable(0, 0) is True
+    assert kv.total_is_usable(None, 5) is False
+    assert kv.total_is_usable(3, 2) is True
+    assert kv.total_is_usable(2, 2) is True
+    assert kv.total_is_usable(1, 2) is False
+    assert kv.page_is_full(2, 2) is True
+    assert kv.page_is_full(1, 2) is False
+    # The server serves at most IPP_MAX, so a 2,000-row page IS full at ipp=8000.
+    assert kv.page_is_full(2000, 8000) is True
+
+
+def test_the_measured_2026_10_22_shape_is_paged_to_a_short_page(monkeypatch):
+    """THE HOST-ONLY MUTANT KILLER. A repoint without the paging change reads
+    page 1 of each circle and publishes a truncated census with no error."""
+    roots = _roots(1000)
+    first = roots[0]
+    first_key = (round(first.lat, 5), round(first.lon, 5), first.radius_m)
+    pages = {1: _ids("a", 2), 2: _ids("c", 2), 3: _ids("e", 1)}
+
+    def responder(call):
+        if call.key == first_key:
+            return pages[call.page], 0
+        return [], 0
+
+    result, calls = _sweep(monkeypatch, responder, radius_m=1000, ipp=2)
+    assert [c.page for c in calls if c.key == first_key] == [1, 2, 3]
+    assert sorted(result["census"]["id"]) == ["a0", "a1", "c0", "c1", "e0"]
+    assert result["cells_visited"] == result["cells"] == len(roots), "paged, not subdivided"
+    assert result["cells_paged_blind"] == 1
+    assert result["failed_cells"] == []
+
+
+def test_an_unknown_total_with_a_short_first_page_costs_one_request(monkeypatch):
+    """Kills: blind paging that ignores page fullness, which would double the
+    cost of every sparse city on the moved host."""
+    result, calls = _sweep(monkeypatch, lambda call: (_ids("a", 1), 0), radius_m=1000, ipp=2)
+    assert all(c.page == 1 for c in calls)
+    assert len(calls) == len(_roots(1000))
+    assert result["cells_paged_blind"] == len(_roots(1000))
+
+
+def test_a_usable_total_that_exactly_fills_the_page_is_not_paged_blind(monkeypatch):
+    """Kills: total_is_usable ignored, i.e. page 2 sent to every exactly-full
+    circle on a host that still counts."""
+    result, calls = _sweep(monkeypatch, lambda call: (_ids("a", 2), 2), radius_m=1000, ipp=2)
+    assert all(c.page == 1 for c in calls)
+    assert result["cells_paged_blind"] == 0
+
+
+def _full_forever(radius_m):
+    """Full pages with total 0 at ``radius_m`` forever; empty everywhere else."""
+
+    def responder(call):
+        if call.radius_m == radius_m:
+            return _ids(f"{call.key}-{call.page}-", 2), 0
+        return [], 0
+
+    return responder
+
+
+def test_a_blind_paged_circle_meets_the_page_cap_and_subdivides(monkeypatch):
+    """The blind descent pays MAX_PAGES_PER_CELL pages and THEN subdivides,
+    keeping the rows it paged. Kills: no cap in the blind branch (which a
+    generous request budget would otherwise let run on)."""
+    roots = _roots(1000)
+    result, calls = _sweep(
+        monkeypatch, _full_forever(1000), radius_m=1000, ipp=2, max_requests=10_000
+    )
+    for root in roots:
+        key = (round(root.lat, 5), round(root.lon, 5), 1000)
+        assert [c.page for c in calls if c.key == key] == list(range(1, kv.MAX_PAGES_PER_CELL + 1))
+    assert {c.radius_m for c in calls} == {1000, 500}
+    assert result["cells_visited"] == result["cells"] * 5, "each root plus its four children"
+    assert result["raw_photo_count"] == len(roots) * kv.MAX_PAGES_PER_CELL * 2
+    assert result["failed_cells"] == []
+
+
+def test_a_blind_paged_circle_at_the_floor_is_unmeasured_not_unbounded(monkeypatch):
+    """The blind twin of the known-total floor test: at the radius floor there
+    is nothing to split into, so the cell is recorded unmeasured after the cap's
+    pages. Kills: a floor fall-through that pages forever."""
+    error, calls = _failed_sweep(
+        monkeypatch, _full_forever(kv.RADIUS_FLOOR_M), radius_m=kv.RADIUS_FLOOR_M, ipp=2
+    )
+    roots = _roots(kv.RADIUS_FLOOR_M)
+    assert len(calls) == len(roots) * kv.MAX_PAGES_PER_CELL
+    assert {c.radius_m for c in calls} == {kv.RADIUS_FLOOR_M}
+    assert "unmeasured" in str(error)
+
+
+def test_a_page_two_fault_while_paging_blind_does_not_fan_out(monkeypatch):
+    """Kills: the blind branch's `broken` arm copied from `refused`."""
+
+    def responder(call):
+        if call.page == 1:
+            return _ids("a", 2), 0
+        raise kv.TransportError("connection reset")
+
+    error, calls = _failed_sweep(monkeypatch, responder, radius_m=1000, ipp=2, retries=0)
+    assert {c.radius_m for c in calls} == {1000}, "no subdivision may have happened"
+    assert len(calls) == 2 * len(_roots(1000))
+    assert "unmeasured" in str(error)
+
+
+def test_a_page_two_backpressure_while_paging_blind_still_subdivides(monkeypatch):
+    """Kills: the blind branch's `refused` arm recording a failed cell instead
+    of re-covering the area as four smaller circles."""
+
+    def responder(call):
+        if call.radius_m == 500:
+            return [], 0
+        if call.page == 1:
+            return _ids("a", 2), 0
+        raise kv.BackpressureError("apiCode 690")
+
+    result, calls = _sweep(monkeypatch, responder, radius_m=1000, ipp=2, retries=0)
+    assert {c.radius_m for c in calls} == {1000, 500}
+    assert result["failed_cells"] == []
+
+
+# ── A moved endpoint (issue #452) ──────────────────────────────────────────
+
+
+def _not_found(_call):
+    raise kv.RouteNotFoundError("HTTP 404 (text/plain): the route is not served here")
+
+
+def test_a_404_at_every_calibration_probe_is_a_moved_endpoint(monkeypatch):
+    """Kills: the ladder typed as the old ResponseError (exit 1, a counted
+    failure for every enrolled city), or a ladder that keeps probing a rung it
+    has already lost (one request per rung is the whole cost)."""
+    error, calls = _failed_sweep(monkeypatch, _not_found, radius_m=None, calibration_probes=2)
+    assert isinstance(error, HostEndpointMovedError)
+    assert error.host == HOST_KARTAVIEW
+    assert error.api_requests == len(calls) == len(kv.RADIUS_LADDER_M)
+    assert kv.NEARBY_PHOTOS_URL in str(error)
+    assert "moved" in str(error)
+
+
+def test_a_404_at_one_probe_among_answers_is_not_a_moved_endpoint(monkeypatch):
+    """Kills: raising on the first 404 rather than on a ladder of them."""
+
+    def responder(call):
+        if call.radius_m == 1000:
+            _not_found(call)
+        return [], 0
+
+    result, calls = _sweep(monkeypatch, responder, radius_m=None, calibration_probes=2)
+    assert result["radius_m"] == 500
+    assert result["failed_cells"] == []
+
+
+def test_a_resumed_sweep_meeting_only_404s_stops_after_the_strike_count(monkeypatch):
+    """A sweep that skips the ladder (a resume pins its radius) must not walk a
+    whole lattice of 404s to the area guard. Kills: a plain DownloadError after
+    a lattice-sized spend."""
+    assert len(_roots(300)) > kv.ENDPOINT_NOT_FOUND_STRIKES, "premise: room to over-spend"
+    error, calls = _failed_sweep(monkeypatch, _not_found, radius_m=300)
+    assert isinstance(error, HostEndpointMovedError)
+    assert len(calls) == error.api_requests == kv.ENDPOINT_NOT_FOUND_STRIKES
+    assert "skipped the calibration ladder" in str(error)
+
+
+def test_a_404_after_an_answer_is_a_failed_cell_not_a_moved_endpoint(monkeypatch):
+    """Once anything answered, a 404 is one failed cell bounded by the area
+    guard. Kills: strikes counted after an answer."""
+    seen = []
+
+    def responder(call):
+        seen.append(call)
+        if len(seen) == 1:
+            return [], 0
+        _not_found(call)
+
+    error, calls = _failed_sweep(monkeypatch, responder, radius_m=300)
+    assert not isinstance(error, HostEndpointMovedError)
+    assert len(calls) == len(_roots(300)), "every later cell asked once, recorded failed"
+    assert "unmeasured" in str(error)
 
 
 def test_a_page_size_above_the_server_cap_does_not_silently_truncate(monkeypatch):
@@ -1826,15 +2060,28 @@ def test_the_checkpoint_age_limit_is_sized_between_a_long_sweep_and_the_cadence(
     """
     The constant is a measurement sandwich, so pin both walls rather than the
     number. Below: Singapore, the catalog's worst city, is ~9,974 requests at
-    DEFAULT_SWEEP_REQUESTS_PER_MINUTE -- a legitimate multi-night sweep must fit
-    with room to spare. Above: `min_days_since_last_run` is 80, so the guard has
-    to be well under that or it would start catching ordinary re-collections
-    instead of stale ones.
+    AUTH_SWEEP_REQUESTS_PER_MINUTE (the pace the wall was sized at, and the
+    default until #452) -- a legitimate multi-night sweep must fit with room to
+    spare. Above: `min_days_since_last_run` is 80, so the guard has to be well
+    under that or it would start catching ordinary re-collections instead of
+    stale ones.
     """
-    singapore_hours = 9_974 / kv.DEFAULT_SWEEP_REQUESTS_PER_MINUTE / 60
+    singapore_hours = 9_974 / kv.AUTH_SWEEP_REQUESTS_PER_MINUTE / 60
     assert singapore_hours < 11, "re-measure this test's premise, not just the constant"
     assert kv.CHECKPOINT_MAX_AGE_S > 3 * singapore_hours * 3600
     assert kv.CHECKPOINT_MAX_AGE_S < 80 * 24 * 3600 / 4
+
+
+def test_the_anonymous_pace_does_not_fit_a_metro_inside_the_checkpoint_wall():
+    """The caveat docs/census.md and docs/provider-access.md carry since #452:
+    at the anonymous pace a Singapore-class sweep (~111 h of pacing, ~3x that
+    in wall clock across nights) cannot finish inside the 7-day wall, so the
+    scheduler refuses its resume and records a failure by design. Kills:
+    silently changing the wall or the default without touching those docs."""
+    paced_s = 9_974 / kv.DEFAULT_SWEEP_REQUESTS_PER_MINUTE * 60
+    assert paced_s * 3 > kv.CHECKPOINT_MAX_AGE_S, (
+        "the gap closed: delete the metro caveat in docs/census.md and docs/provider-access.md"
+    )
 
 
 def test_the_progress_bar_resumes_at_the_committed_root_count(monkeypatch, tmp_path):

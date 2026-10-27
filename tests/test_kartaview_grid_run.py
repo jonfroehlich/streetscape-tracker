@@ -15,7 +15,7 @@ without failing anything else:
   * the checkpoint SURVIVES the wrapper — its path is handed back for the CLI
     to discard only after register_run commits (PR #251 review).
 
-The sweep is stubbed out entirely -- no request reaches kartaview.org, which is
+The sweep is stubbed out entirely -- no request reaches api.kartaview.org, which is
 the suite-wide rule for a project that already owns two per-IP bans.
 """
 

@@ -606,24 +606,30 @@ jitter = 0.6
 # records a failure rather than re-sweeping from zero every week (#274).
 #
 # max_requests_per_minute is load-bearing beyond pacing: _kartaview_timeout_seconds
-# derives every sweep's per-city timeout from this rate, so lowering it here
-# silently shortens those timeouts too. 16/min = 960/h, under the 1,000/h
-# authenticated ceiling. Requires KARTAVIEW_ACCESS_TOKEN in .env — anonymous is
-# 100 req/h, which is not a slower channel, it is no channel.
+# derives every sweep's per-city timeout from this rate, so changing it here
+# silently moves those timeouts too. 1.5/min = 90/h, under the documented 100/h
+# ANONYMOUS ceiling (issue #452): the authenticated 1,000/h tier (16/min until
+# then) is unverifiable since 2026-10-22, because api.kartaview.org validates no
+# token. KARTAVIEW_ACCESS_TOKEN is still required in .env and still sent. At this
+# pace a 12 h night paces at most ~1,080 KartaView requests, and a Singapore-class
+# sweep (~111 h) cannot finish inside the 7-day checkpoint wall.
 #
 # See config/scheduler.toml for the full field docs.
 # PAUSED 2026-10-23: kartaview.org stopped routing /1.0/list/nearby-photos/
 # (HTTP 404 text/plain) somewhere between the 10-15 and 10-22 nights; every
 # KartaView attempt on 10-22 and 10-23 failed, and the second night's fast
-# failures filled the 80-city cap in 1.6 h. The api. hosts still answer, but there
-# totalFilteredItems reads 0, so pointing NEARBY_PHOTOS_URL at them alone would
-# read one page per circle and publish a truncated census. Membership is kept;
-# flip back to true only with the collector fix. Record:
+# failures filled the 80-city cap in 1.6 h. Record:
 # docs/experiments/kartaview-endpoint-move.md.
+# REPOINTED (issue #452): the collector now sweeps api.kartaview.org, pages
+# blind to a short page when the host reports no usable total, and exits 89
+# (amnestied, night-latching) if the route 404s again. Still PAUSED: flipping
+# `enabled = true` is a deliberate prod step (see the resume plan in
+# docs/experiments/kartaview-endpoint-move.md); the pace is the anonymous tier
+# until the token is verifiable. Membership is kept.
 [providers.kartaview]
 enabled = false
 daily_request_budget = 10000
-max_requests_per_minute = 16
+max_requests_per_minute = 1.5
 
 # KartaView road walk (issue #258) — the SECOND opt-in channel, enrolled
 # SEPARATELY from the grid one above: `scheduler enroll-city CITY --channel
@@ -650,18 +656,14 @@ max_requests_per_minute = 16
 # current concurrency ceiling — re-derived there rather than restated here,
 # since the figure is a property of the host graph and moves when a channel is
 # added.
-# PAUSED 2026-10-23: kartaview.org stopped routing /1.0/list/nearby-photos/
-# (HTTP 404 text/plain) somewhere between the 10-15 and 10-22 nights; every
-# KartaView attempt on 10-22 and 10-23 failed, and the second night's fast
-# failures filled the 80-city cap in 1.6 h. The api. hosts still answer, but there
-# totalFilteredItems reads 0, so pointing NEARBY_PHOTOS_URL at them alone would
-# read one page per circle and publish a truncated census. Membership is kept;
-# flip back to true only with the collector fix. Record:
-# docs/experiments/kartaview-endpoint-move.md.
+# PAUSED 2026-10-23 and REPOINTED (issue #452), exactly as [providers.kartaview]
+# above: flipping `enabled = true` is a deliberate prod step (the resume plan is
+# in docs/experiments/kartaview-endpoint-move.md), and the pace is the anonymous
+# tier until the token is verifiable. Membership is kept.
 [providers.kartaview_streets]
 enabled = false
 daily_request_budget = 10000
-max_requests_per_minute = 16
+max_requests_per_minute = 1.5
 spacing_m = 15
 network_type = "drive"
 
@@ -680,7 +682,7 @@ network_type = "drive"
 # THE CONCURRENCY CEILING, RE-DERIVED over the eight-channel host graph rather
 # than carried forward from the line this block replaced: the largest
 # host-disjoint set is gsv (no per-IP host) + gsv_streets (Overpass) + mapillary
-# (tile CDN) + kartaview (kartaview.org) + panoramax (api.panoramax.xyz) = 5,
+# (tile CDN) + kartaview (api.kartaview.org) + panoramax (api.panoramax.xyz) = 5,
 # so 5 of 8. The numerator did not move and the denominator did: every walk
 # added since #258 brings one more Overpass user, and Overpass admits exactly
 # one talker. gsv_streets is the representative because it is the only Overpass
