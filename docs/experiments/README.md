@@ -98,6 +98,7 @@ It PAUSED both KartaView channels rather than moving the host, for two measured 
 Neither `api.` host validates the token (a bogus and a garbage one get the same 200), so the 1,000/h tier the pacer assumes is unverifiable.
 And `totalFilteredItems` now reads `['0']` on every page of a circle that serves 400 distinct photos over two pages, so a sweep that sizes its paging from it would read one page per circle and publish a truncated census with no error.
 Generalizes: when a provider's endpoint moves, re-check the response's SEMANTICS on the new host, not just its status code; a 200 with the familiar keys was the shape of the trap.
+Its Resolution section records the fix (#452: the new host, blind paging, the 89/90 ENDPOINT MOVED family, the anonymous pace) and the resume plan; nothing new was measured for it.
 
 ### `kartaview-feasibility.md`
 

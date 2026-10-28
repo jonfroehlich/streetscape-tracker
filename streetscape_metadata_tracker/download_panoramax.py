@@ -108,6 +108,7 @@ from .download_common import (
     AsyncRateLimiter,
     DownloadError,
     HostBlockedError,
+    HostEndpointMovedError,
     SweepIncompleteError,
     crawl_budget_seconds,
     crawl_ceiling_needs_checkpoint,
@@ -457,6 +458,16 @@ def build_empty_rows(query_lat, query_lon, query_timestamp: str, status) -> pd.D
 # bounds the size of the unknown region in an immutable snapshot, it does not
 # count requests.
 MAX_FAILED_TILE_FRACTION = 0.02
+
+# Distinct tiles that must ALL answer 404, with nothing else answering, before a
+# refusal is typed as a moved endpoint (exit 90, issue #452) rather than this
+# city's own failure. Applied to BOTH branches that can say so: a resume, which
+# asks only for what is left and can be two tiles that are this city's alone,
+# and the whole-lattice guard, whose one- or two-tile city is no stronger
+# evidence of a moved route and would latch the channel for every other city of
+# the night (#452 review). Six mirrors KartaView's ENDPOINT_NOT_FOUND_STRIKES:
+# the same "no answer, six distinct asks" evidence.
+ENDPOINT_MOVED_MIN_TILES = 6
 
 # PUBLIC for the same reason Mapillary's is (#318): one tile's worst-case
 # attempt is what a request cap has to be able to fund before launching is worth
@@ -1758,8 +1769,9 @@ async def _fetch_city_images(
     # instead priced by the tolerance, which says "endpoint" itself when every
     # failure it counts was a 404.
     #
-    # No lower bound on the lattice: a one-tile city that 404s is wholly
-    # unmeasured either way, and naming the cause is the better refusal.
+    # No lower bound on the WORDING: a one-tile city that 404s is wholly
+    # unmeasured either way, and naming the cause is the better refusal. The
+    # TYPE has one (#452 review): see the host-typing paragraph below.
     #
     # A CAPPED NIGHT NEVER REACHES THIS, and that is a real gap rather than a
     # consequence worth restating as a feature. The cap raises
@@ -1773,13 +1785,31 @@ async def _fetch_city_images(
     # in the part they got to, so the trade stands -- but a Panoramax channel
     # wired to launch capped (#316 phase 2) wants an endpoint probe at the START
     # of a capped run, not this one at the end.
+    #
+    # HOST-TYPED since issue #452 (HostEndpointMovedError, exit 90): a moved
+    # route is the same for every remaining Panoramax city of the night, so the
+    # scheduler latches the host, amnesties the city and writes no refusal --
+    # where a plain DownloadError exited 1 and counted a failure per city.
+    #
+    # HOST-TYPED ONLY AT ENDPOINT_MOVED_MIN_TILES OR MORE, the same floor the
+    # resume branch below applies (#452 review). Host-typed, a one- or two-tile
+    # lattice of 404s latches the whole Panoramax channel for the night, and
+    # the same small city can lead the slate and do it again the next night --
+    # one city's evidence costing every enrolled city its night. Below the
+    # floor the refusal keeps the moved-endpoint wording on a plain
+    # DownloadError, exactly as before #452: a counted failure for that city.
     if tiles and missing_tiles == len(tiles):
-        error = DownloadError(
+        message = (
             f"Every one of the {len(tiles)} Panoramax tiles requested for {city_name} "
             f"answered HTTP 404. An empty tile answers 204, never 404, so "
             f"this means the tile endpoint ({TILE_URL_TEMPLATE}) has moved or been "
             f"renamed — refusing to finalize a snapshot claiming the city holds no "
             f"imagery."
+        )
+        error = (
+            HostEndpointMovedError(message, HOST_PANORAMAX)
+            if len(tiles) >= ENDPOINT_MOVED_MIN_TILES
+            else DownloadError(message)
         )
         raise interrupted(error)
 
@@ -1800,10 +1830,24 @@ async def _fetch_city_images(
                 if missing_tiles == len(failed_tiles)
                 else ""
             )
-            error = DownloadError(
+            message = (
                 f"Panoramax tile download failed: {detail} "
                 f"({failed_fraction:.1%} > {MAX_FAILED_TILE_FRACTION:.0%} tolerated); "
                 f"refusing to finalize an incomplete snapshot.{cause}"
+            )
+            # HOST-TYPED ONLY ON EVIDENCE OF A ROUTE (issue #452): every tile
+            # asked THIS invocation answered 404, and there were at least
+            # ENDPOINT_MOVED_MIN_TILES of them. Without the floor, the
+            # two-persistent-404 resume described above the whole-lattice guard
+            # would latch Panoramax for the rest of every night until its
+            # checkpoint aged out -- one small city costing every other
+            # Panoramax city its night. Short of the floor it stays the city's
+            # own refusal, as before.
+            moved = (
+                bool(cause) and missing_tiles == len(todo) and len(todo) >= ENDPOINT_MOVED_MIN_TILES
+            )
+            error = (
+                HostEndpointMovedError(message, HOST_PANORAMAX) if moved else DownloadError(message)
             )
             raise interrupted(error) from first_error
         logger.warning(f"Continuing with {detail}; affected grid points marked REQUEST_FAILED")

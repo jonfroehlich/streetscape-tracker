@@ -1155,15 +1155,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--kartaview-max-requests-per-minute",
-        type=int,
+        # A float since issue #452, so the scheduler's "1.5" is not ARGV
+        # REJECTED (exit 2).
+        type=float,
         default=DEFAULT_SWEEP_REQUESTS_PER_MINUTE,
         help=(
-            "Client-side pacing cap for KartaView sweep requests "
-            f"(default: {DEFAULT_SWEEP_REQUESTS_PER_MINUTE}); <= 0 disables "
+            "Client-side pacing cap for KartaView sweep requests; fractions "
+            f"allowed (default: {DEFAULT_SWEEP_REQUESTS_PER_MINUTE:g}, i.e. "
+            f"{DEFAULT_SWEEP_REQUESTS_PER_MINUTE * 60:g}/hour); <= 0 disables "
             "pacing. Its own flag rather than the Mapillary one because "
-            "kartaview.org is a separate per-IP-metered host, shared with no "
-            "other channel -- and because the authenticated ceiling is "
-            "1,000/h, which this default sits under (issue #258)"
+            "api.kartaview.org is a separate per-IP-metered host, shared with no "
+            "other channel (issue #258). The default sits under the documented "
+            "anonymous ceiling of 100/hour: the authenticated tier is "
+            "unverifiable since 2026-10-22, when the API moved to a host that "
+            "validates no token (issue #452)"
         ),
     )
     parser.add_argument(

@@ -359,6 +359,57 @@ def test_the_throttled_family_collides_with_no_other_exit_code():
     assert not set(HOST_THROTTLED_EXIT_CODES.values()) & others
 
 
+def test_the_endpoint_moved_family_collides_with_no_other_exit_code():
+    """Issue #452's ENDPOINT MOVED family (89/90) is read by the scheduler as
+    its own reaction -- latch the host, amnestied, no refusal recorded, worded
+    as a moved route -- so it shares a number with no other family, with 83,
+    argparse's 2, or the #442 harvester's 86 and 88. Kills: a number reused
+    from the harvester or from the throttle family."""
+    from streetscape_metadata_tracker.download_common import (
+        ARGV_REJECTED_EXIT_CODE,
+        HOST_BY_ENDPOINT_MOVED_EXIT_CODE,
+        HOST_ENDPOINT_MOVED_EXIT_CODES,
+        HOST_KARTAVIEW,
+        HOST_PANORAMAX,
+        HOST_THROTTLED_EXIT_CODES,
+        SWEEP_INCOMPLETE_EXIT_CODE,
+    )
+
+    assert HOST_ENDPOINT_MOVED_EXIT_CODES == {HOST_KARTAVIEW: 89, HOST_PANORAMAX: 90}
+    assert HOST_BY_ENDPOINT_MOVED_EXIT_CODE == {89: HOST_KARTAVIEW, 90: HOST_PANORAMAX}
+    assert set(HOST_ENDPOINT_MOVED_EXIT_CODES) <= set(HOST_LABELS)
+    others = (
+        set(HOST_EXIT_CODES.values())
+        | set(HOST_BUSY_EXIT_CODES.values())
+        | set(HOST_THROTTLED_EXIT_CODES.values())
+        | {SWEEP_INCOMPLETE_EXIT_CODE, ARGV_REJECTED_EXIT_CODE, 0, 1, 86, 88}
+    )
+    assert not set(HOST_ENDPOINT_MOVED_EXIT_CODES.values()) & others
+
+
+def test_host_exit_code_maps_a_moved_endpoint():
+    """Kills: the missing isinstance branch, which falls through to 81 -- and
+    the scheduler then writes a host_refusals row for a route that is simply
+    not served (#452)."""
+    from streetscape_metadata_tracker.download_common import (
+        HOST_ENDPOINT_MOVED_EXIT_CODES,
+        HOST_KARTAVIEW,
+        HOST_PANORAMAX,
+        HostEndpointMovedError,
+    )
+
+    assert host_exit_code(HostEndpointMovedError("x", HOST_KARTAVIEW)) == 89
+    assert (
+        host_exit_code(HostEndpointMovedError("x", HOST_KARTAVIEW))
+        != (HOST_EXIT_CODES[HOST_KARTAVIEW])
+    )
+    assert (
+        host_exit_code(HostEndpointMovedError("x", HOST_PANORAMAX))
+        == HOST_ENDPOINT_MOVED_EXIT_CODES[HOST_PANORAMAX]
+        == 90
+    )
+
+
 def test_the_exit_code_distinguishes_a_busy_lock_from_a_refusal():
     """
     The two conditions have opposite lifetimes. A refusal is durable and trips

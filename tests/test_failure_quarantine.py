@@ -50,7 +50,9 @@ from streetscape_metadata_tracker.alerting import AlertConfig
 from streetscape_metadata_tracker.download_common import (
     ARGV_REJECTED_EXIT_CODE,
     HOST_BUSY_EXIT_CODES,
+    HOST_ENDPOINT_MOVED_EXIT_CODES,
     HOST_EXIT_CODES,
+    HOST_KARTAVIEW,
     HOST_MAPILLARY_TILES,
     SWEEP_INCOMPLETE_EXIT_CODE,
 )
@@ -791,6 +793,14 @@ def _killed_by_the_stop():
         pytest.param(
             CollectionOutcome(False, "argv", exit_code=ARGV_REJECTED_EXIT_CODE),
             id="argv-rejected",
+        ),
+        # Issue #452. The code is KartaView's, read on a Mapillary pair: the
+        # amnesty is keyed on the exit family, not on which channel exited.
+        pytest.param(
+            CollectionOutcome(
+                False, "moved", exit_code=HOST_ENDPOINT_MOVED_EXIT_CODES[HOST_KARTAVIEW]
+            ),
+            id="endpoint-moved",
         ),
         # The #206 wind-down: the child fails BECAUSE the stop's SIGTERM reached
         # its cgroup, so the stop is credited rather than the city. A callable,

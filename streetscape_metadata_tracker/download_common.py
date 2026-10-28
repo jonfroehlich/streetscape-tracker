@@ -76,6 +76,10 @@ HOST_OVERPASS = "overpass"
 # published says the ENFORCED limit is the documented one. Both of this
 # project's prior bans were on limits no document described, which is why this
 # is locked on the documented-per-key reading rather than exempted by it.
+# The API host is api.kartaview.org since 2026-10-22, when kartaview.org's
+# /1.0/ routes began answering 404 (issue #452,
+# docs/experiments/kartaview-endpoint-move.md). The lock KEY "kartaview" is a
+# lock name, not a hostname, and is unchanged.
 HOST_KARTAVIEW = "kartaview"
 # Panoramax publishes NO rate limit anywhere found -- not in the API docs, not
 # in the OpenAPI spec, and no X-RateLimit-*/Retry-After header comes back -- so
@@ -89,7 +93,7 @@ HOST_PANORAMAX = "panoramax"
 HOST_LABELS = {
     HOST_MAPILLARY_TILES: "Mapillary's tile CDN (tiles.mapillary.com)",
     HOST_OVERPASS: "the Overpass API (overpass-api.de)",
-    HOST_KARTAVIEW: "the KartaView API (kartaview.org)",
+    HOST_KARTAVIEW: "the KartaView API (api.kartaview.org)",
     HOST_PANORAMAX: "the Panoramax meta-catalog (api.panoramax.xyz)",
 }
 
@@ -564,6 +568,26 @@ class HostThrottledError(HostUnavailableError):
         self.unit_count = unit_count
 
 
+class HostEndpointMovedError(HostUnavailableError):
+    """
+    The route this collector depends on answered HTTP 404 everywhere it was asked (#452).
+
+    Not a refusal of this IP (no ``host_refusals`` row, no cooldown), not the
+    city's geometry, and not backpressure. Like a throttle it latches the host
+    for the night: every remaining city would spend its calibration ladder
+    learning the same thing -- 2026-10-23 spent the 80-city cap in 1.6 h that
+    way. Amnestied: no ``consecutive_failure``, no city-cap slot. Nothing
+    resumes it tomorrow by itself: the next night re-learns it at
+    ``ENDPOINT_NOT_FOUND_STRIKES`` requests per host (KartaView) or one
+    lattice of 404s (Panoramax), so the operator's move is to pause the
+    channels and re-probe from a laptop (``scripts/kartaview_endpoint_probe.py``).
+
+    Raised by KartaView's calibration ladder and resumed sweep, and by the
+    Panoramax tile census's whole-lattice-404 guard (#407). Maps to its own
+    exit family, :data:`HOST_ENDPOINT_MOVED_EXIT_CODES`.
+    """
+
+
 # Exit codes a collection child uses to tell the scheduler *which* host is
 # unavailable, and in WHICH of the two senses. The message never crosses the
 # process boundary — the scheduler only sees `subprocess.run(...).returncode` —
@@ -609,9 +633,20 @@ class HostThrottledError(HostUnavailableError):
 #
 # 87 continues past 85. 86 is skipped because the GSV capture-history harvester
 # (issue #442) exits 86 for its own blocked endpoint (and 88 for its per-host
-# crawl lock, so the next code here is 89); that script never runs under the
-# scheduler, but one number with two meanings in one repo is the
-# plausible-wrong-answer problem 77/78 are skipped for.
+# crawl lock); that script never runs under the scheduler, but one number with
+# two meanings in one repo is the plausible-wrong-answer problem 77/78 are
+# skipped for.
+#
+#   ENDPOINT MOVED (issue #452) -- the route the collector depends on answered
+#     HTTP 404 everywhere it was asked (KartaView's whole calibration ladder,
+#     Panoramax's whole tile lattice). A fourth family because it matches none
+#     of the others: like THROTTLED it latches the host for the night and is
+#     amnestied (no consecutive_failure, no city-cap slot) and writes no
+#     host_refusals row; unlike THROTTLED nothing clears it by waiting, so the
+#     alert tells the operator to pause the channels and re-probe from a
+#     laptop. 89/90 continue past the harvester's 88, so the next code here is
+#     91. Mapillary's tile CDN and Overpass get no entry: a Mapillary tile 404
+#     is a CLEARED answer (docs/scheduler.md), not a route signal.
 HOST_EXIT_CODES = {
     HOST_MAPILLARY_TILES: 75,
     HOST_OVERPASS: 76,
@@ -627,9 +662,16 @@ HOST_BUSY_EXIT_CODES = {
 HOST_THROTTLED_EXIT_CODES = {
     HOST_MAPILLARY_TILES: 87,
 }
+HOST_ENDPOINT_MOVED_EXIT_CODES = {
+    HOST_KARTAVIEW: 89,
+    HOST_PANORAMAX: 90,
+}
 HOST_BY_EXIT_CODE = {code: host for host, code in HOST_EXIT_CODES.items()}
 HOST_BY_BUSY_EXIT_CODE = {code: host for host, code in HOST_BUSY_EXIT_CODES.items()}
 HOST_BY_THROTTLED_EXIT_CODE = {code: host for host, code in HOST_THROTTLED_EXIT_CODES.items()}
+HOST_BY_ENDPOINT_MOVED_EXIT_CODE = {
+    code: host for host, code in HOST_ENDPOINT_MOVED_EXIT_CODES.items()
+}
 
 # A collection stopped part-way and CHECKPOINTED what it had (issue #239). Not a
 # host condition in either sense above: the third party answered every question
@@ -912,7 +954,7 @@ def host_exit_code(error: HostUnavailableError) -> int:
     """
     The exit code a collection child should return for ``error``.
 
-    The single place the busy/blocked/throttled distinction becomes a number, so the three
+    The single place the busy/blocked/throttled/moved distinction becomes a number, so the three
     child entry points (``cli.py``, ``collect.py``, ``analyze.py``) cannot drift
     from each other or from the scheduler's reverse maps.
     """
@@ -920,6 +962,11 @@ def host_exit_code(error: HostUnavailableError) -> int:
         return HOST_BUSY_EXIT_CODES[error.host]
     if isinstance(error, HostThrottledError):
         return HOST_THROTTLED_EXIT_CODES[error.host]
+    if isinstance(error, HostEndpointMovedError):
+        # BEFORE the blocked fallthrough: falling to 81/84 would have the
+        # scheduler write a host_refusals row for a route that simply is not
+        # served (issue #452).
+        return HOST_ENDPOINT_MOVED_EXIT_CODES[error.host]
     return HOST_EXIT_CODES[error.host]
 
 
@@ -1020,7 +1067,7 @@ class AsyncRateLimiter:
 
     def __init__(
         self,
-        max_per_minute: int,
+        max_per_minute: float,
         time_func: Callable[[], float] | None = None,
         *,
         jitter: float = 0.0,

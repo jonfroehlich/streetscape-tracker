@@ -1595,6 +1595,7 @@ def test_assess_city_inherits_the_lane_scheduler_from_the_config_knob(conn, monk
         deferred_host_budget=Counter(),
         rejected_argv=_sched.ArgvRejections(),
         deadline_deferred=Counter(),
+        ceiling_skipped=Counter(),
         batch_deadline=None,
         stop_requested=None,
         record_failures=False,

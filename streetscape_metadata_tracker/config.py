@@ -295,11 +295,13 @@ def load_config(provider: str = "gsv") -> dict[str, Any]:
         if not config["access_token"]:
             raise ValueError(
                 "KARTAVIEW_ACCESS_TOKEN not found in environment variables.\n\n"
-                "KartaView serves anonymous clients at 100 requests/hour and "
-                "authenticated ones at 1,000 (issue #225). The token is required "
-                "rather than optional because the anonymous rate is not a slower "
-                "channel, it is no channel: a p95 city is ~636 requests (6.4 hours) "
-                "and Singapore ~9,974 (100 hours), against a nightly batch.\n\n"
+                "KartaView documents 100 requests/hour for anonymous clients and "
+                "1,000 for authenticated ones (issue #225). Since 2026-10-22 no "
+                "host that serves the API validates the token (issue #452), so "
+                "the collector paces under the ANONYMOUS tier by default (90/hour) "
+                "and the authenticated tier is unverifiable. The token is still "
+                "required and still sent, so a restored tier is used as soon as "
+                "the pace is raised back.\n\n"
                 "Add it to the .env file in your project root:\n"
                 "  KARTAVIEW_ACCESS_TOKEN=YOUR_TOKEN\n\n"
                 "Sign in at https://kartaview.org with Google or Facebook and read "

@@ -147,8 +147,8 @@ def _parse_provider_list(value: str) -> list[str]:
     and ``test_every_known_provider_reaches_its_own_downloader`` asserts set
     equality against KNOWN_PROVIDERS so the gap cannot open quietly.
 
-    `all` is deliberately never the default — a KartaView sweep is paced at 16
-    requests/minute and serial, so a metro is hours of wall-clock, and nobody
+    `all` is deliberately never the default — a KartaView sweep is paced at 1.5
+    requests/minute (the anonymous tier, #452) and serial, so a metro is hours of wall-clock, and nobody
     should get that by typing nothing.
 
     An empty selection is refused rather than returned. `--provider ""` and
@@ -439,19 +439,25 @@ def parse_args():
 
     concurrency_group.add_argument(
         "--kartaview-max-requests-per-minute",
-        type=int,
+        # A float since issue #452: the anonymous tier (100/h) is not a whole
+        # number per minute, and an int parser would exit 2 on the scheduler's
+        # "1.5" -- which the scheduler classifies as ARGV REJECTED.
+        type=float,
         default=DEFAULT_SWEEP_REQUESTS_PER_MINUTE,
         help=f"""Client-side cap on KartaView sweep requests per minute
-             (kartaview provider only). A third separate flag rather than a
-             shared one because all three limits are a different KIND: the GSV
-             cap above is a project quota, Mapillary's is an undocumented
-             per-IP tile limit, and this one paces to KartaView's PUBLISHED
-             1,000/hour authenticated ceiling — which is necessary because the
-             API returns no X-RateLimit-* or Retry-After headers at all, so a
-             client cannot observe its own budget and has to assume the
+             (kartaview provider only); fractions allowed. A third separate
+             flag rather than a shared one because all three limits are a
+             different KIND: the GSV cap above is a project quota, Mapillary's
+             is an undocumented per-IP tile limit, and this one paces to
+             KartaView's PUBLISHED hourly ceiling — which is necessary because
+             the API returns no X-RateLimit-* or Retry-After headers at all, so
+             a client cannot observe its own budget and has to assume the
              documented number is real. Default
-             {DEFAULT_SWEEP_REQUESTS_PER_MINUTE} ({DEFAULT_SWEEP_REQUESTS_PER_MINUTE * 60}/hour,
-             under that ceiling by construction); 0 disables pacing.""",
+             {DEFAULT_SWEEP_REQUESTS_PER_MINUTE:g} ({DEFAULT_SWEEP_REQUESTS_PER_MINUTE * 60:g}/hour),
+             under the documented anonymous ceiling of 100/hour: the
+             authenticated tier is unverifiable since 2026-10-22, when the API
+             moved to a host that validates no token (issue #452). 0 disables
+             pacing.""",
     )
 
     concurrency_group.add_argument(
@@ -859,7 +865,9 @@ async def async_main():
                 # into a CDN that is already refusing us. THROTTLED (#444) needs
                 # no rank of its own: only the Mapillary tile host raises it, and
                 # a grid run has one Mapillary provider, so it never meets a
-                # BLOCKED error from the same host here.
+                # BLOCKED error from the same host here. ENDPOINT MOVED (#452,
+                # exits 89/90) needs none for the same reason: a grid run has one
+                # provider per host, so its error is the only one for that host.
                 worst = next(
                     (e for e in unavailable if not isinstance(e, HostBusyError)), unavailable[0]
                 )

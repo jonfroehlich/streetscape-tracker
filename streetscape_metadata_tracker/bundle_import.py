@@ -100,7 +100,7 @@ GEOMETRY_FIELDS = ("center_lat", "center_lon", "grid_width_m", "grid_height_m", 
 #
 # Three of the four providers meter by IP address rather than by credential
 # (docs/provider-access.md): Mapillary's tile CDN, Overpass, and — for the
-# per-IP half of its limit — kartaview.org. A laptop investigation genuinely
+# per-IP half of its limit — api.kartaview.org. A laptop investigation genuinely
 # spent those against a different IP, so charging them here would tighten a
 # budget gate against requests this host never made. That matters most for
 # Mapillary, whose budget is the instrument in an open block investigation.
