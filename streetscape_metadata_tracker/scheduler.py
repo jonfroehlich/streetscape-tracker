@@ -43,7 +43,7 @@ import threading
 import time
 import tomllib
 import traceback
-from collections import Counter
+from collections import Counter, defaultdict
 from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
@@ -12183,6 +12183,9 @@ class FillVerdict(NamedTuple):
     admit: bool
     blocker: str | None
     message: str
+    # The host token(s) behind a host blocker (issue #443), so the Done line can
+    # name the host that ENDED the fill rather than every host latched tonight.
+    hosts: frozenset[str] = frozenset()
 
 
 _FILL_BLOCKER_DEADLINE = "deadline"
@@ -12820,6 +12823,13 @@ class FillReport:
     # Opt-in channels left out of a city's run because they are failing.
     realign_blocked: Counter[str] = field(default_factory=Counter)
     ended_by: str = ""
+    # What the night left unused when the fill ended (issue #443): the batch
+    # window's remaining seconds and the city cap's remaining slots. None on a
+    # report the fill never finished (an error), which prints no ``left:``.
+    window_left_s: float | None = None
+    window_h: float | None = None
+    slots_left: int | None = None
+    city_cap: int | None = None
     # A stop the NIGHT must also report (SIGTERM, an unexpected error); a cap,
     # deadline or budget end is the fill's own and is not a night stop.
     stop_reason: str | None = None
@@ -12850,7 +12860,24 @@ class FillReport:
             f"fill (early refresh, >= {floor_days} d): {self.cities} cities{resumed}"
             f"{realigned}, {self.succeeded}/{self.attempted} runs, {self.early_refreshes} "
             f"early refresh(es) recorded{declined}{held}{blocked}{reserved}; "
-            f"ended by {self.ended_by}"
+            f"ended by {self.ended_by}{self._left_clause()}"
+        )
+
+    def _left_clause(self) -> str:
+        """``; left: 9.0 h of the 12 h window, 33 of 80 city slots`` (issue #443).
+
+        Printed on every fill end but an error, so the series is uniform. A
+        ``deadline`` end is produced two ways and reads differently: at the
+        launch gate (``_MIN_PACED_LAUNCH_S`` or less left) it reads at most
+        ``0.2 h``; when the last candidates were each declined for the deadline
+        (``_FILL_BLOCKER_DEADLINE``) it reads the remainder none of them fit,
+        which can be hours. A ``city cap`` end reads ``0 of 80``.
+        """
+        if self.window_left_s is None:
+            return ""
+        return (
+            f"; left: {self.window_left_s / 3600:.1f} h of the {self.window_h:g} h window, "
+            f"{self.slots_left} of {self.city_cap} city slots"
         )
 
 
@@ -12912,6 +12939,7 @@ def _fill_prebudget_refusal(
                 False,
                 _FILL_BLOCKER_HOST_HELD,
                 f"{_host_names(on_hold)} is held tonight ({channel}): rest night or cooldown",
+                hosts=frozenset(on_hold),
             )
         refused = wanted & latched
         if refused:
@@ -12919,6 +12947,7 @@ def _fill_prebudget_refusal(
                 False,
                 _FILL_BLOCKER_HOST_REFUSED,
                 f"{_host_names(refused)} refused or throttled this host tonight ({channel})",
+                hosts=frozenset(refused),
             )
     return None
 
@@ -13400,9 +13429,10 @@ def _run_fill(
         if not verdict.admit:
             report.declined[verdict.blocker] += 1
             trailing[verdict.blocker] += 1
+            trailing_hosts[verdict.blocker] |= verdict.hosts
             logger.info(f"{city.city_id} [{label}]: declined — {verdict.message}")
             return None
-        trailing.clear()
+        clear_trailing()
         if label == "fill":
             blocked = _failing_opt_in(conn, city.city_id, channels, prior, since_iso)
             for channel in blocked:
@@ -13470,6 +13500,17 @@ def _run_fill(
         return None
 
     trailing: Counter[str] = Counter()
+    # The hosts behind each trailing host blocker (issue #443): named in
+    # ``ended_by`` from the VERDICTS, never from ``blocked_hosts.latched`` -- a
+    # latched Overpass that frozen walks never ask about did not end the fill.
+    trailing_hosts: dict[str, set[str]] = defaultdict(set)
+
+    def clear_trailing() -> None:
+        # One reset for both, so a host named in ``ended_by`` is always one
+        # behind the declines that END the fill, never an earlier run of them.
+        trailing.clear()
+        trailing_hosts.clear()
+
     try:
         ended: str | None = None
         db.prune_fill_attempts(conn, today - timedelta(days=_FILL_ATTEMPT_HORIZON_DAYS))
@@ -13489,7 +13530,7 @@ def _run_fill(
             ended = attempt(city, whole, "fill resume", fallback=core if core != whole else None)
             if ended is not None:
                 break
-        trailing.clear()
+        clear_trailing()
         backlog_note = ""
         if ended is None:
             backlog, _never = _fill_backlog(cfg, conn, due, providers_for_city, channels, since_iso)
@@ -13527,11 +13568,10 @@ def _run_fill(
                     ended = f"deadline ({cfg.max_batch_hours:g} h)"
                 elif blocker == _FILL_BLOCKER_BACKLOG:
                     ended = backlog_note
-                elif blocker in (
-                    _FILL_BLOCKER_HOST_REFUSED,
-                    _FILL_BLOCKER_HOST_HELD,
-                    _FILL_BLOCKER_UNFROZEN,
-                ):
+                elif blocker in (_FILL_BLOCKER_HOST_REFUSED, _FILL_BLOCKER_HOST_HELD):
+                    hosts = trailing_hosts.get(blocker)
+                    ended = f"{blocker}: {_host_names(hosts)}" if hosts else blocker
+                elif blocker == _FILL_BLOCKER_UNFROZEN:
                     ended = blocker
                 else:
                     ended = f"budget ({blocker})"
@@ -13568,6 +13608,16 @@ def _run_fill(
                 report.early_refreshes += _record_early_refreshes(
                     cfg, conn, touched[cid], today, {walk: prior_success}
                 )
+        # What the night left on the table (issue #443): read LAST, after the
+        # stranded-walk retry pass (which may wait out a breaker re-check), so
+        # the window it spent is not reported as unused and ``processed``
+        # includes every city the fill advanced. The LAST statements of the
+        # ``try``: an error anywhere above leaves them None, so an error end
+        # prints no ``left:`` with no reset needed in the ``except``.
+        report.window_left_s = max(0.0, batch_deadline - time.monotonic())
+        report.window_h = cfg.max_batch_hours
+        report.slots_left = max(0, max_cities - processed)
+        report.city_cap = max_cities
     except Exception:
         logger.exception("Fill phase aborted by an unexpected error")
         report.ended_by = report.stop_reason = _STOP_REASON_FILL_ERROR
