@@ -77,11 +77,16 @@ that looked like the pre-treatment ones.
 Absence of evidence is never a pass: an active night with no tile-status line
 in its child logs is counted in ``nights_without_status``, and while any such
 night is in the window the 429/5xx clause -- and so the criterion -- is
-unknown, not met. Every crawl writes the line (download_mapillary's
-``finally``, and the cache-hit path), so a missing one means pruned or
-mis-pathed child logs. Start ``--since`` at the step's first night: nights
-before the status line was deployed (2026-10-21) have none and keep the clock
-from starting.
+unknown, not met. Every scheduled crawl writes the line (download_mapillary's
+``finally``, and the cache-hit path), so on a night the scheduler ran a missing
+one means pruned or mis-pathed child logs. Two other shapes leave an active
+night without one, and both are read the same conservative way: a direct
+``streetscape_tracker.py --provider mapillary`` run against the catalog ledgers
+``api_usage`` (so ``served`` > 0) but only the scheduler's subprocess runner
+writes a ``collect_*`` child log, and a night still in flight when the report
+runs has not reached the crawl's ``finally`` yet. Start ``--since`` at the
+step's first night: nights before the status line was deployed (2026-10-21)
+have none and keep the clock from starting.
 """
 
 from __future__ import annotations
@@ -141,7 +146,10 @@ _PRESENCE_RE = re.compile(
     r"(?:, ([\d.]+) h after its previous ledgered request)?"
 )
 _HELD_RE = re.compile(rf"HELD (?:[^;]*?){_LABEL}: (?P<why>[^;]*?), (?P<n>\d+) launch\(es\) held")
-_ANY_LABEL = "|".join(re.escape(label) for label in sorted(HOST_LABELS.values()))
+# Any label-shaped token ("the <name> (<host>)"), not the live HOST_LABELS: a
+# label can be renamed (the KartaView one moved hosts in #452), and the log
+# keeps the spelling of the night it was written on.
+_ANY_LABEL = rf"the [^;,()]+ \([a-z0-9.-]+\)|{_LABEL}"
 # One verdict group of the blocked clause: a run of host labels at a clause
 # boundary ("; " between clauses, ", " between the clause's parts), then its
 # verdict. The boundary keeps the pool clause's "budget of <label>" out of it.
@@ -218,8 +226,8 @@ class LogRun:
     winddown_cut: int = 0
     # From the start line: how many cities were due and how many the run said
     # it would process. A bare `run-due --limit N` leaves no [--...] mark, so
-    # a cap below both the due count and max_cities_per_day is what tells it
-    # from the nightly (build_report).
+    # a cap below the due count AND below another full run's cap on the same
+    # date is what tells it from the nightly (_narrowed).
     due_count: int | None = None
     day_cap: int | None = None
     # A start line with no Done: line before the NEXT start line: the run
@@ -491,10 +499,14 @@ def build_report(conn, cfg, *, since: str, until: str, as_of: date, log_dir: str
     nights = []
     for d in sorted(dates):
         on_date = [r for r in log_runs if r.date == d]
-        nightly = [r for r in on_date if not r.filtered and not _narrowed(r, cfg)]
-        # The FIRST full run of the date is the 02:00 nightly; a later
-        # unfiltered one is a hand run, and so is anything narrowed.
-        run = nightly[0] if nightly else None
+        nightly = [r for r in on_date if not r.filtered and not _narrowed(r, on_date)]
+        # The FIRST full run of the date that reached its Done: line is the
+        # 02:00 nightly; a later unfiltered one is a hand run, and so is
+        # anything narrowed. A crashed or in-flight run is the night only when
+        # no full run finished: an evening `run-due --dry-run` (the checklist
+        # step in docs/scheduler.md) leaves a start line and no Done: on the
+        # SAME UTC date as the nightly that follows it.
+        run = next((r for r in nightly if r.done), nightly[0] if nightly else None)
         hand = [r for r in on_date if r is not run]
         cat = catalog.get(d, {"served": 0, "served_by": {}, "grid_runs": 0, "sweep_total": 0})
         st = statuses.get(d)
@@ -538,13 +550,22 @@ def build_report(conn, cfg, *, since: str, until: str, as_of: date, log_dir: str
     }
 
 
-def _narrowed(run: LogRun, cfg) -> bool:
-    """A bare ``--limit N`` run: its start line's cap is below both the due
-    count and ``max_cities_per_day``, which only ``--limit`` does (``--provider``
-    and ``--city`` carry their own ``[--...]`` mark)."""
-    if run.day_cap is None or run.due_count is None:
+def _narrowed(run: LogRun, on_date: list[LogRun]) -> bool:
+    """A bare ``--limit N`` run: its start line's cap is below the due count
+    AND below another full run's cap on the same date (``--provider`` and
+    ``--city`` carry their own ``[--...]`` mark).
+
+    Never against the CURRENT ``max_cities_per_day``: a night before a cap
+    raise (due 120, ``processing up to 80``) read with the config at 120 is
+    still that night's only run, so it is the nightly. A lone ``--limit`` run
+    on a date with nothing else is likewise the only run there was.
+    """
+    if run.day_cap is None or run.due_count is None or run.day_cap >= run.due_count:
         return False
-    return run.day_cap < min(run.due_count, cfg.max_cities_per_day)
+    return any(
+        o is not run and not o.filtered and o.day_cap is not None and o.day_cap > run.day_cap
+        for o in on_date
+    )
 
 
 def _ended_by(run: LogRun | None, cfg) -> str | None:
@@ -558,8 +579,14 @@ def _ended_by(run: LogRun | None, cfg) -> str | None:
         return run.stopped
     if run.fill and "ended by" in run.fill:
         return "fill: " + run.fill.split("ended by ", 1)[1]
-    if run.cities is not None and run.cities >= cfg.max_cities_per_day:
-        return f"city cap ({cfg.max_cities_per_day})"
+    # The run's OWN cap from its start line, so a night before a cap raise
+    # still reads its cap; without a start line, today's config.
+    if run.day_cap is not None and run.due_count is not None:
+        cap = run.day_cap if run.day_cap < run.due_count else None
+    else:
+        cap = cfg.max_cities_per_day
+    if cap is not None and run.cities is not None and run.cities >= cap:
+        return f"city cap ({cap})"
     return "due slate worked through"
 
 

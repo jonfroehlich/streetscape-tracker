@@ -526,10 +526,12 @@ It also counted the wrong arm: H1's treatment is *less* daily presence, so a flo
 The script prints each night's presence and its range over the design nights, so a presence effect stays visible without holding the clock.
 **Missing evidence is unknown, never clean.**
 An active night with no `mapillary tile statuses:` line in its child logs makes the 429/5xx clause, and so the criterion, unknown (the summary says `UNKNOWN: N active night(s) with no status line`).
-Every crawl writes that line, so a missing one means pruned or mis-pathed child logs; run the script with `--since` at a step's first night, since nights before 2026-10-21 predate the line.
+Every scheduled crawl writes that line, so on a night the scheduler ran a missing one means pruned or mis-pathed child logs.
+Two other shapes leave an active night without one, and both read the same conservative way: a direct `streetscape_tracker.py --provider mapillary` run against the prod catalog ledgers `api_usage` (so the night is active) but writes no `collect_*` child log, and a night still in flight when the script runs has not reached the crawl's `finally` yet.
+Run the script with `--since` at a step's first night, since nights before 2026-10-21 predate the line.
 Until it is met, raising any volume knob is a jump from an unmeasured level.
 
-**The next stage moves volume only inside the unchanged pool:** `opt_in_cities_per_day` 10 → 20 on prod (kind 2 then takes 6 of the 20 on a prod-shaped test slate whose 60 Mapillary-only-due cities are an assumed figure, pinned in `tests/test_scheduler.py`; kind 1, the Panoramax enrolments, also goes from about 4 to 8, recorded in the Panoramax section below), so the already-due Mapillary backlog drains at the night's own presence window.
+**The next stage moves volume only inside the unchanged pool:** `opt_in_cities_per_day` 10 → 20 on prod (kind 2 then takes 6 of the 20 on a prod-shaped test slate whose 60 Mapillary-only-due cities are an assumed figure, pinned in `tests/test_scheduler.py`; kind 1 — the Panoramax enrolments alone while both KartaView channels are paused, split round-robin between the KartaView and Panoramax sub-queues the night they are re-enabled — also goes from about 4 to 8, recorded in the Panoramax section below), so the already-due Mapillary backlog drains at the night's own presence window.
 The pool, the fill ceiling, the daily budgets, the rest nights, the cooldown and the 40/min pace are unchanged, and every launch is still gated on the 1,200 pool.
 A daytime `run-due --provider mapillary --limit N` to drain it faster is **not** recommended: it adds a second presence window per day, the shape H1 names.
 Mapillary's API documentation and forum were re-read for this stage on 2026-10-27, through a web fetcher, never from a collecting host: the rate-limits section is unchanged (tiles 50,000 per day per app, "status code 4xx" on excess, nothing on 429, `Retry-After`, `User-Agent` or IP blocking); thread 10644 still ends unanswered at this project's 2026-08-28 question; the forum's latest threads (to 10-27) carry nothing on tile rate limits, IP blocks or login redirects, and the 10-22 "Maps 2.0" announcement does not touch the vector-tile API.
@@ -803,6 +805,7 @@ The fourth column is a DEPLOY fact, not a merge fact, so the repo cannot derive 
 - **Enrolment of the 41 screen-positive tracked cities proceeds in tranches only after stage 1 holds.**
 - **The Panoramax pair's share of the night roughly doubled on 2026-10-27, a side effect of #444, not a Panoramax decision.**
   Prod's `opt_in_cities_per_day` went 10 → 20 to drain the Mapillary-only-due backlog, and the 442 tranche-2 enrolments are kind 1 of the same hoist, so on the prod-shaped test slate kind 1 goes from about 4 hoisted slots a night to 8 (6 plus the 2 live-checkpoint resumers).
+  Those 8 are Panoramax's only while both KartaView channels stay paused: kind 1 round-robins across its opt-in channels, so the night KartaView is re-enabled the Panoramax sub-queue's share roughly halves, and the city count this stage is judged at moves again on that date.
   The 8,000/day per-channel budget still bounds the requests; what moves is the CITY count per night inside this stage's window.
   Judge the nights from 2026-10-27 on at that city count, and do not read a change in this gate's request totals across that date as a pacing effect.
 - Whole-catalog screening should move to the weekly parquet dump for 0 API requests; that is a separate ticket.

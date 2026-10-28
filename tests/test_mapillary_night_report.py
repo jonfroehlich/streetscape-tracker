@@ -22,6 +22,7 @@ import pytest
 
 from scripts import mapillary_night_report as report
 from streetscape_metadata_tracker import db
+from streetscape_metadata_tracker.download_common import HOST_LABELS
 
 DONE_1016 = (
     "2026-10-16 06:30:19,488 - streetscape_scheduler - INFO - Done: run-due 2026-10-16: "
@@ -237,6 +238,13 @@ def test_the_0200_nightly_wins_over_an_unmarked_hand_run_on_the_same_date(prod):
     so it is read off the start line's cap. Kills: taking the LAST unfiltered
     run of the date (the old ``nightly[-1]``), and dropping the narrowed check
     (the 3-city ``--limit`` run that comes first then becomes the night).
+
+    Second-review finding 1: an evening ``run-due --dry-run`` (the checklist
+    step) logs a start line and no ``Done:`` on the SAME UTC date as the
+    nightly after it, so the night's first full run is a crashed one. The
+    first full run that FINISHED is the nightly; the dry run is a hand run.
+    Kills: ``nightly[0]`` without the ``done`` preference (10-20 then reads
+    ``crashed`` and the real night is counted as a hand run).
     """
     lines = [
         # Before 02:00 local, same UTC date: a bare --limit 3 catch-up.
@@ -247,11 +255,53 @@ def test_the_0200_nightly_wins_over_an_unmarked_hand_run_on_the_same_date(prod):
         # Later that day, an unfiltered full hand run.
         _start("2026-10-19", due=93, cap=80),
         _done("2026-10-19", 5),
+        # The next evening's `run-due --dry-run`: a start line, no Done:.
+        _start("2026-10-20", due=110, cap=80),
+        _start("2026-10-20", due=110, cap=80),
+        _done("2026-10-20", 40),
     ]
     (prod["log_dir"] / "streetscape_scheduler.log").write_text("\n".join(lines) + "\n")
-    night = _night(_run_report(prod), "2026-10-19")
+    result = _run_report(prod)
+    night = _night(result, "2026-10-19")
     assert night["nightly_run"]["cities"] == 27
     assert night["hand_runs"] == 2
+    after_dry_run = _night(result, "2026-10-20")
+    assert after_dry_run["nightly_run"]["cities"] == 40
+    assert after_dry_run["nightly_run"]["done"] is True
+    assert after_dry_run["hand_runs"] == 1
+    assert not after_dry_run["ended_by"].startswith("crashed")
+
+
+def test_a_lone_nightly_before_a_cap_raise_is_still_the_nightly_at_the_new_cap(prod):
+    """Second-review finding 2: ``_narrowed`` must not compare a night's cap
+    to the CURRENT ``max_cities_per_day``.
+
+    A night before the planned 80 -> 120 step (due 120, ``processing up to
+    80``) read with the config at 120 is the only run of its date, so it is
+    the nightly, and its ``ended_by`` names ITS cap, not today's. A lone
+    ``--limit 3`` run on a date with nothing else is likewise the only run
+    there was. Kills: ``day_cap < min(due_count, cfg.max_cities_per_day)``
+    (10-21 then has no nightly and every Done-derived column reads n/a), and
+    the city-cap arm reading ``cfg.max_cities_per_day`` (10-21 then reads
+    ``due slate worked through`` at 80 of 120 due).
+    """
+    cfg = prod["cfg"]
+    cfg.write_text(cfg.read_text().replace("max_cities_per_day = 80", "max_cities_per_day = 120"))
+    lines = [
+        _start("2026-10-21", due=120, cap=80),
+        _done("2026-10-21", 80),
+        _start("2026-10-22", due=120, cap=3),
+        _done("2026-10-22", 3),
+    ]
+    (prod["log_dir"] / "streetscape_scheduler.log").write_text("\n".join(lines) + "\n")
+    result = _run_report(prod)
+    pre_raise = _night(result, "2026-10-21")
+    assert pre_raise["nightly_run"]["cities"] == 80
+    assert pre_raise["hand_runs"] == 0
+    assert pre_raise["ended_by"] == "city cap (80)"
+    lone_limit = _night(result, "2026-10-22")
+    assert lone_limit["nightly_run"]["cities"] == 3
+    assert lone_limit["hand_runs"] == 0
 
 
 def test_a_mapillary_refusal_is_read_when_another_host_refused_the_same_night():
@@ -269,6 +319,12 @@ def test_a_mapillary_refusal_is_read_when_another_host_refused_the_same_night():
     )
     mly = "Mapillary's tile CDN (tiles.mapillary.com)"
     kv = "the KartaView API (kartaview.org)"
+    # The label a log written after #452 carries (the host moved); the run of
+    # labels is read by SHAPE, never from the live HOST_LABELS, so a night
+    # written under either spelling reads the same (second-review finding 3).
+    kv_moved = "the KartaView API (api.kartaview.org)"
+    # One of the two spellings is NOT live, or this pins nothing across the rename.
+    assert {kv, kv_moved} - set(HOST_LABELS.values())
     ovp = "the Overpass API (overpass-api.de)"
 
     def parse(rest):
@@ -278,6 +334,8 @@ def test_a_mapillary_refusal_is_read_when_another_host_refused_the_same_night():
     # Mapillary + KartaView, as the scheduler sorts and joins them.
     two = parse(f"; {mly}; {kv} unavailable, 2 launch(es) skipped while latched")
     assert two.refused and not two.throttled and two.skipped_latched == 2
+    moved = parse(f"; {mly}; {kv_moved} unavailable, 3 launch(es) skipped while latched")
+    assert moved.refused and not moved.throttled and moved.skipped_latched == 3
     # The 2026-08-14 shape: Mapillary + Overpass.
     assert parse(f"; {mly}; {ovp} unavailable, 4 launch(es) skipped while latched").refused
     # Mapillary throttled while KartaView refused: the second part follows ", ".
