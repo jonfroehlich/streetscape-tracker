@@ -1413,6 +1413,32 @@ def test_a_server_page_cap_of_200_at_production_ipp_is_paged_not_truncated(monke
     assert result["failed_cells"] == []
 
 
+def test_a_counting_host_that_caps_a_page_below_the_ask_is_paged_from_the_page_it_served(
+    monkeypatch,
+):
+    """THE #456 REVIEW'S MINOR 3, the known-total twin of the test above. A host
+    that counts (total 500) but serves 200 a page against an ask of 2,000 used
+    to be paged from `ipp`: one page, 200 rows, no failed cell, no error. The
+    short page under a larger total is the host's page cap, so the page count
+    is sized from it. Kills: `pages_for_total(total, ipp)`."""
+    roots = _roots(1000)
+    first = roots[0]
+    first_key = (round(first.lat, 5), round(first.lon, 5), first.radius_m)
+    cap = kv.MEASURED_BLIND_PAGE_SIZE
+    pages = {1: _ids("a", cap), 2: _ids("b", cap), 3: _ids("c", 100)}
+
+    def responder(call):
+        if call.key == first_key:
+            return pages[call.page], 500
+        return [], 0
+
+    result, calls = _sweep(monkeypatch, responder, radius_m=1000)  # ipp defaults to IPP_MAX
+    assert [c.page for c in calls if c.key == first_key] == [1, 2, 3]
+    assert len(result["census"]) == 500
+    assert result["cells_paged_blind"] == 0, "the total was usable; this is the counting branch"
+    assert result["failed_cells"] == []
+
+
 def test_the_measured_2026_10_22_shape_is_paged_to_a_short_page(monkeypatch):
     """THE HOST-ONLY MUTANT KILLER. A repoint without the paging change reads
     page 1 of each circle and publishes a truncated census with no error."""
@@ -2183,7 +2209,8 @@ def test_the_anonymous_pace_does_not_fit_a_metro_inside_the_checkpoint_wall():
     """The caveat docs/census.md and docs/provider-access.md carry since #452:
     at the anonymous pace a Singapore-class sweep (~111 h of pacing, ~3x that
     in wall clock across nights) cannot finish inside the 7-day wall, so the
-    scheduler refuses its resume and records a failure by design. Kills:
+    scheduler skips it at its first launch under the per-city ceiling rather
+    than start it (#456 review). Kills:
     silently changing the wall or the default without touching those docs."""
     paced_s = 9_974 / kv.DEFAULT_SWEEP_REQUESTS_PER_MINUTE * 60
     assert paced_s * 3 > kv.CHECKPOINT_MAX_AGE_S, (
@@ -3653,16 +3680,21 @@ def _clock_stop_mid_cell(monkeypatch, tmp_path, fake_crawl_clock):
     page-loop check at t=120 stops the sweep INSIDE the cell."""
     from streetscape_metadata_tracker.download_common import crawl_deadline_from_budget
 
+    # Three full pages of three: the page is FULL at ipp=3, so the total sizes
+    # the paging under both page-count rules (a short page under a larger total
+    # is read as the host's page cap since the #456 review, and 3 items against
+    # a claimed 6,000 would subdivide instead of paging).
     def paged(call):
         fake_crawl_clock.advance(CLOCK_REQUEST_COST_S)
         items, _ = _photos(call)
-        return items, 3 * kv.IPP_MAX
+        return items, 3 * len(items)
 
     error, calls = _failed_sweep_ckpt(
         monkeypatch,
         paged,
         tmp_path / "sweep",
         radius_m=500,
+        ipp=3,
         deadline_monotonic=crawl_deadline_from_budget(CLOCK_BUDGET_S),
     )
     assert [c.page for c in calls] == [1, 2], "the clock must stop between pages"

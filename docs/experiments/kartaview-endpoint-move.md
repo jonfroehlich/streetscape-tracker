@@ -93,11 +93,14 @@ Nothing new was measured for this section; it records what the code does now and
   16/min is kept as `AUTH_SWEEP_REQUESTS_PER_MINUTE`.
 - Each KartaView launch is held to a per-city wall-clock ceiling, `[providers.kartaview*].max_city_minutes`, default **60** (#452 review), because the city loop is sequential and a launch sized to the night's remainder held every later city's Mapillary and GSV lanes for ~6 h at this pace.
   The cap that follows is ~37 requests a launch (priced at the 0.5 achieved fraction), which a child at the full 40 s interval spends in ~25 min before pausing with exit 83.
+- Two consequences of that ceiling were decided by Jon on 2026-10-28 (#456 review).
+  A FRESH crawl the ceiling cannot finish before the checkpoint wall — more than one launch's cap times the nights before the wall, 6 × 37 = 222 at the default (`_ceiling_window`) — is skipped at its first launch: logged at WARNING with the three levers (`max_city_minutes`, the grid, `enroll-city --remove`), counted on the `Done:` line, not a failure, still due, and left out of the opt-in reservation so it holds no slot nightly.
+  And the fill leaves a fresh KartaView crawl over ONE launch's cap to its due schedule and refreshes the city's other channels anyway — the one exception to the fill's whole-city rule, because KartaView is the least important provider and the fill cannot promise consecutive nights to a multi-night crawl; a crawl with a live checkpoint is resumed capped instead.
 
 **Still open.**
 
 - The pace is not decided: 1/min keeps every type an integer at 40% less throughput, and 100/60 hits the documented figure exactly.
-- At 90/h a Singapore-class sweep (~9,974 requests, ~111 h) cannot finish inside the 7-day `CHECKPOINT_MAX_AGE_S`, so the scheduler refuses its resume and records a failure by design; the wall is not raised here.
+- At 90/h a Singapore-class sweep (~9,974 requests, ~111 h) cannot finish inside the 7-day `CHECKPOINT_MAX_AGE_S` under the per-city ceiling, so the scheduler skips it at its first launch (above); the wall is not raised here, and whether to raise it, raise the ceiling or shrink those grids is open.
 - Whether the authenticated tier returns: only a probe showing a bogus token refused would say so.
 - How often to re-probe `kartaview.org` (the probe script, from a laptop); `probe-host` has no KartaView entry.
 - Whether the 10-15 sweeps were already truncated.
@@ -108,7 +111,8 @@ Nothing new was measured for this section; it records what the code does now and
 
 1. Deploy main to makelab2.
 2. A config PR flipping `enabled = true` on both KartaView blocks of `config/scheduler.makelab1.toml` (`test_makelab1_production_config_is_wired` flips with it).
-3. Before the flip, read `scheduler status` for the enrolled KartaView cities and price the first night's shape: at most `opt_in_cities_per_day` hoisted KartaView cities, each holding the city loop for at most one `max_city_minutes` per channel (two for a city due on both), so 10 cities at the default bound KartaView to ~10–20 h of loop time in the worst case and ~4–8 h if each child spends its ~37-request cap at the full pace. That worst case is a whole night, which is why the ceiling's value is an open decision rather than settled here.
+3. Before the flip, run `run-due --dry-run` against the enrolled KartaView cities (it prints each launch's plan, every city skipped as unfinishable under the ceiling, and what the fill would leave to the due schedule; `scheduler status` shows only dueness) and price the first night's shape.
+   At most `opt_in_cities_per_day` hoisted KartaView cities, each holding the city loop for at most one `max_city_minutes` per channel (two for a city due on both), so 10 cities at the default bound KartaView to ~10–20 h of loop time in the worst case and ~4–8 h if each child spends its ~37-request cap at the full pace. That worst case is a whole night, which is why the ceiling's value is an open decision rather than settled here.
 4. After night 1: `grep -h "paged blind" logs/collect_*_kartaview_*` and read the `Done:` line.
 5. Compare every re-collected 10-15 city's pano count against its previous run (`runs` rows per city and provider). On this host every visited cell is paged blind, so `cells_paged_blind` > 0 says nothing (#452 review); the signal is `cells_paged_deep`. A collapse over 30% in a city whose `cells_paged_deep` is 0 means no circle ever filled a page, which is what a page cap below 200 would look like.
 6. An `ENDPOINT MOVED` alert means `api.kartaview.org` moved too: pause again and re-probe from a laptop.

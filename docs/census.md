@@ -161,7 +161,7 @@ One further date hazard is **not** a KartaView property but a pandas one, and it
 — so the vectorized parser pins `format="ISO8601"` and a test pins the pin.
 **Pacing and the host lock:** KartaView documents 100 req/hour anonymous and 1,000 authenticated (the FAQ is reachable only by scraping `kartaview.org/main.*.js` — the docs are a JS SPA
 — corroborated by Bellingcat), returns **no** `X-RateLimit-*` or `Retry-After` headers at all, and enforced neither figure when measured (130 consecutive requests, zero 429s).
-A client therefore cannot observe its own budget, so we pace to the published number regardless: `DEFAULT_SWEEP_REQUESTS_PER_MINUTE` is **1.5 (90/hour, under the documented ANONYMOUS ceiling)** since #452, because `api.kartaview.org` validates no token and the authenticated tier (16/min, kept as `AUTH_SWEEP_REQUESTS_PER_MINUTE`) is unverifiable — at that pace a Singapore-class sweep (~111 h) cannot finish inside the 7-day checkpoint wall, so the scheduler refuses its resume and records a failure by design,
+A client therefore cannot observe its own budget, so we pace to the published number regardless: `DEFAULT_SWEEP_REQUESTS_PER_MINUTE` is **1.5 (90/hour, under the documented ANONYMOUS ceiling)** since #452, because `api.kartaview.org` validates no token and the authenticated tier (16/min, kept as `AUTH_SWEEP_REQUESTS_PER_MINUTE`) is unverifiable — at that pace a Singapore-class sweep (~111 h) cannot finish inside the 7-day checkpoint wall under the per-city ceiling, so the scheduler skips it at its first launch — logged, not a failure, it stays due and takes no reserved slot (#456 review) — rather than start a crawl the wall would discard,
 the sweep is **serial** (pacing is the bottleneck, the next question depends on the last answer, and fanning out into a server that answers 400 under load is #198's shape), and one `host_lock(HOST_KARTAVIEW)` is held for the whole sweep
 — which for Singapore is hours, so any concurrent KartaView work gets the busy code rather than a queue.
 KartaView is the **third** locked host (`HOST_LABELS` is the registry; there is no separate set) and has its own exit codes
@@ -219,7 +219,7 @@ This is what turns the whole-catalog pass the cost study calls "not affordable y
 `naming.KNOWN_PROVIDERS` carries the token, so `PROVIDER_RUN_DTYPES["kartaview"]` is finally reachable and a run reads with its own schema instead of inferring `sequence_index` to float64 and `way_id` to a float;
 `streetscape_tracker.py --provider kartaview` collects a city.
 **KartaView is never in the default channel set**
-— a 16 req/min serial sweep is hours for a metro and must never be something you get by typing nothing.
+— a serial sweep at 1.5 req/min is hours for even a mid-sized city and must never be something you get by typing nothing.
 `--provider` is a comma-separated LIST whose default is the stated `gsv,mapillary` (issue #247), so KartaView is reached only by naming it or by `--provider all`, which expands from `naming.KNOWN_PROVIDERS` and fails fast if any named provider's credential is absent.
 The retired `both` still works, with a deprecation notice: it named two of two when it was written and names two of three now, which is precisely why redefining it in place was refused
 — every bare `streetscape_tracker.py "City"` would have silently acquired both a third mandatory credential and the sweep.

@@ -1464,6 +1464,165 @@ def test_an_opt_in_channel_that_does_not_fit_declines_the_whole_city(conn, monke
     assert "declined 1 for kartaview" in _done_line(caplog)
 
 
+# ── The one exception to whole-or-nothing: a ceiling channel's fresh crawl (#456) ──
+
+
+def test_a_kartaview_crawl_over_one_launch_is_left_to_its_due_schedule_and_the_city_still_fills(
+    conn, monkeypatch, caplog
+):
+    """THE #456 REVIEW'S MAJOR 1, Jon's decision (2026-10-28). A KartaView
+    member whose sweep (~115 req) is more than one launch under the 60-minute
+    ceiling affords (37) used to be declined WHOLE, so its Mapillary and GSV
+    refresh was lost to the enrolment. The fill now leaves that channel to its
+    own due schedule and refreshes the rest of the city on one date; the Done
+    line and the log say so. Kills: the narrowing in `_fill_judge` removed
+    (the city is declined for kartaview and nothing runs)."""
+    caplog.set_level("INFO")
+    cid = _city(
+        conn, "Enrolled", {"gsv": 60, "mapillary": 60, "kartaview": 60}, width=10_000, height=10_000
+    )
+    db.set_channel_membership(conn, cid, "kartaview", True, cycle_days=90)
+    city = db.resolve_city(conn, cid)
+    cfg = _opt_in_cfg()
+    assert 37 < sched._channel_estimate(cfg, city, "kartaview", conn) <= 222
+
+    ran, _ = _run_night(monkeypatch, conn, cfg)
+
+    assert ran == [(cid, "gsv"), (cid, "mapillary")]
+    assert sorted(r[1] for r in _early_rows(conn)) == ["gsv", "mapillary"]
+    done = _done_line(caplog)
+    assert "1 cities" in done and "2/2 runs" in done
+    assert "left to the due schedule: kartaview 1 (over the per-city ceiling)" in done
+    assert "declined" not in done
+    assert (
+        f"{cid} [fill]: left to the due schedule -- kartaview: more than one launch under "
+        "the per-city ceiling affords; the city runs without it"
+    ) in caplog.text
+
+
+def test_a_kartaview_crawl_one_launch_affords_still_fills_with_the_city(conn, monkeypatch):
+    """The complement: a ~28-request sweep fits one launch's 37, so it is NOT
+    left and the city realigns on every member channel as before. Kills: the
+    rule keyed on the ceiling's existence rather than on `est > per_night`."""
+    cid = _city(conn, "Enrolled", {"gsv": 60, "mapillary": 60, "kartaview": 60})
+    db.set_channel_membership(conn, cid, "kartaview", True, cycle_days=90)
+    assert (
+        sched._channel_estimate(_opt_in_cfg(), db.resolve_city(conn, cid), "kartaview", conn) <= 37
+    )
+
+    ran, _ = _run_night(monkeypatch, conn, _opt_in_cfg())
+
+    assert ran == [(cid, "gsv"), (cid, "mapillary"), (cid, "kartaview")]
+
+
+def test_a_city_with_nothing_but_an_oversized_kartaview_crawl_is_declined_over_the_ceiling(
+    conn,
+):
+    """When the ONLY channel the fill would run is the one left to its due
+    schedule, there is nothing to refresh: the judge declines the city under
+    its own token (counted on the Done line like any decline), names what it
+    left, and admits nothing. Kills: an empty run admitted (a fill city with
+    0/0 runs)."""
+    cid = _city(conn, "Enrolled", {"gsv": 60, "kartaview": 60}, width=10_000, height=10_000)
+    city = db.resolve_city(conn, cid)
+    cfg = _opt_in_cfg()
+
+    verdict, est = sched._fill_judge(
+        cfg,
+        conn,
+        city,
+        ["kartaview"],
+        latched=set(),
+        channel_room={"kartaview": 10_000},
+        used_by_host={},
+        remaining_s=None,
+    )
+
+    assert verdict.admit is False
+    assert verdict.blocker == sched._FILL_BLOCKER_CEILING == "over the per-city ceiling"
+    assert verdict.left == ("kartaview",) and verdict.run is None
+    assert f"kartaview: ~{est['kartaview']:,} req is more than one launch" in verdict.message
+    assert "nothing else of the city is left to refresh" in verdict.message
+
+
+def test_the_dry_run_previews_the_narrowed_fill_run_and_what_it_leaves(conn, monkeypatch, capsys):
+    """The preview goes through the same judge, so it lists gsv and mapillary
+    for the city, never kartaview, and counts what it left. Kills: the preview
+    printing `city_channels` rather than the verdict's `run`."""
+    cid = _city(
+        conn, "Enrolled", {"gsv": 60, "mapillary": 60, "kartaview": 60}, width=10_000, height=10_000
+    )
+    db.set_channel_membership(conn, cid, "kartaview", True, cycle_days=90)
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+
+    sched.cmd_run_due(_opt_in_cfg(), dry_run=True, today=TODAY)
+
+    fill = capsys.readouterr().out.split("Would FILL", 1)[1]
+    listed = [line.split()[1] for line in fill.splitlines() if line.strip().startswith(cid)]
+    assert listed == ["gsv", "mapillary"]
+    assert (
+        "Fill: 1 cities admitted; left to the due schedule: kartaview 1 (over the per-city ceiling)."
+        in fill
+    )
+
+
+def test_a_checkpointed_ceiling_bound_crawl_is_resumed_capped_not_declined(conn, monkeypatch):
+    """A fill crawl that paused (its spend outran its estimate) is paid-for
+    work the next fill resumes first; under the ceiling its cap is 37 against
+    a whole-sweep estimate of 115, which `_fill_launch_refusal` used to read as
+    "would pause un-paired" and decline. A cap the CEILING sized is tolerated;
+    one the budget sized still declines. Kills: `not plan.ceiling_caps` dropped
+    from the refusal."""
+    cid = _city(
+        conn, "Paused", {"gsv": 60, "mapillary": 60, "kartaview": 60}, width=10_000, height=10_000
+    )
+    db.set_channel_membership(conn, cid, "kartaview", True, cycle_days=90)
+    city = db.resolve_city(conn, cid)
+    cfg = _opt_in_cfg()
+    est = {"kartaview": sched._channel_estimate(cfg, city, "kartaview", conn)}
+    assert est["kartaview"] > 37
+    _live_checkpoints(monkeypatch, {(cid, "kartaview")})
+
+    resumed = sched._fill_launch_refusal(
+        cfg, conn, city, ["kartaview"], est, {"kartaview": 10_000}, {}, None
+    )
+    assert resumed is None, "the ceiling's cap pauses it, and the fill tolerates that"
+    by_budget = sched._fill_launch_refusal(
+        cfg, conn, city, ["kartaview"], est, {"kartaview": 36}, {}, None
+    )
+    assert by_budget is not None and "would pause un-paired" in by_budget.message
+
+
+def test_a_checkpointed_crawl_is_not_left_to_the_due_schedule(conn, monkeypatch):
+    """`_fill_leaves_to_due_schedule` leaves only a FRESH crawl: with a live
+    checkpoint the channel stays in the run (and is resumed capped, above).
+    Kills: the checkpoint test dropped from the predicate."""
+    cid = _city(
+        conn, "Paused", {"gsv": 60, "mapillary": 60, "kartaview": 60}, width=10_000, height=10_000
+    )
+    city = db.resolve_city(conn, cid)
+    cfg = _opt_in_cfg()
+    est = sched._channel_estimate(cfg, city, "kartaview", conn)
+    assert sched._fill_leaves_to_due_schedule(cfg, city, "kartaview", est) is True
+    _live_checkpoints(monkeypatch, {(cid, "kartaview")})
+    assert sched._fill_leaves_to_due_schedule(cfg, city, "kartaview", est) is False
+    assert sched._fill_leaves_to_due_schedule(cfg, city, "mapillary", 10_000) is False, "no ceiling"
+
+
+def test_the_fill_prices_a_ceiling_channels_time_need_at_its_ceiling(conn):
+    """A launch is held to the ceiling, so the deadline rule must not charge
+    the unceiled derived need (hours for a metro) against the night: admission
+    would decline cities for a deadline their launch could not reach. Kills:
+    the clamp in `_fill_city_price` removed."""
+    cid = _city(conn, "Metro", {"gsv": 60, "kartaview": 60}, width=20_000, height=20_000)
+    city = db.resolve_city(conn, cid)
+    cfg = _opt_in_cfg()
+    assert sched.city_timeout_estimate_seconds(cfg, city, "kartaview", conn=conn) > 3600
+    _est, need = sched._fill_city_price(cfg, conn, city, ["gsv", "kartaview"])
+    assert need["kartaview"] == 3600
+    assert need["gsv"] == sched.city_timeout_estimate_seconds(cfg, city, "gsv", conn=conn)
+
+
 def test_a_city_the_due_phase_ran_on_an_opt_in_channel_is_realigned(conn, monkeypatch, caplog):
     """A late KartaView enrolment: never collected there, so DUE and hoisted.
     The due phase runs kartaview; the fill then runs gsv and mapillary the same

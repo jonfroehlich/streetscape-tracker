@@ -656,6 +656,15 @@ Added in the fifth review round:
 - `test_a_retried_fill_walk_is_capped_at_the_fill_room` and `test_the_fills_walk_retry_is_a_fill_launch`; killed by not threading `fill`/`fill_cap` through the fill's retry pass.
 - `test_credits_let_the_next_city_into_tomorrows_window_and_reserve_it`; killed by cutting tomorrow's lists before the credits.
 
+Added for Jon's 2026-10-28 decision in the #456 review (a fresh KartaView crawl over one launch's per-city-ceiling cap is LEFT to its due schedule, not declined with the city):
+
+- `test_a_kartaview_crawl_over_one_launch_is_left_to_its_due_schedule_and_the_city_still_fills` — gsv and mapillary run, kartaview does not, the log says `left to the due schedule`, the `Done:` line counts `left to the due schedule: kartaview 1 (over the per-city ceiling)`; killed by never leaving a channel.
+- `test_a_kartaview_crawl_one_launch_affords_still_fills_with_the_city` — a small KartaView city runs all three.
+- `test_a_city_with_nothing_but_an_oversized_kartaview_crawl_is_declined_over_the_ceiling` — `_fill_judge` on `["kartaview"]` alone: `admit False`, `_FILL_BLOCKER_CEILING`, `left == ("kartaview",)`, `run is None`.
+- `test_the_dry_run_previews_the_narrowed_fill_run_and_what_it_leaves` — the preview prints the narrowed run and the left note.
+- `test_a_checkpointed_ceiling_bound_crawl_is_resumed_capped_not_declined` (killed by `ceiling_caps` always False) and `test_a_checkpointed_crawl_is_not_left_to_the_due_schedule` — paid-for work is resumed, never left.
+- `test_the_fill_prices_a_ceiling_channels_time_need_at_its_ceiling`; killed by dropping the clamp.
+
 **The equivalent mutant**: dropping `CHANNEL_METERED_HOST.get(channel) is None` from the resume's free extras (the reviewers' M21) changes nothing, because the coverage gate admits extras only when every usable metered member channel is already in the resume — so no metered channel is left for the extras loop to add. The check stays as the statement of intent.
 
 ## The failure quarantine, made visible (issues #421 and #424)
@@ -947,6 +956,7 @@ and `hosts_unavailable` is anchored to the blocked-host note's own `; `-delimite
   `test_the_request_goes_to_the_api_host` (killed by the URL not repointed);
   `test_a_total_smaller_than_its_page_is_unusable` (`>` for `>=`, a dropped None arm, the server cap ignored in `page_is_full`, and `MEASURED_BLIND_PAGE_SIZE` dropped from it);
   `test_a_server_page_cap_of_200_at_production_ipp_is_paged_not_truncated` (the #452 review's first major finding: only `ipp=200` was measured on the blind host, so at production's `ipp=2000` a 200-row page must be paged on, never read as short);
+  `test_a_counting_host_that_caps_a_page_below_the_ask_is_paged_from_the_page_it_served` (a usable total of 500 on a 200-row page is paged at 200, three pages, never two of 2,000 that would skip rows 200–1,999; killed by paging from `ipp`);
   `test_the_measured_2026_10_22_shape_is_paged_to_a_short_page` — the HOST-ONLY MUTANT KILLER: totals of 0 on pages of 2, 2, 1 page the circle to page 3 and keep all five ids, with `cells_paged_blind == 1` and `cells_paged_deep == 1`;
   `test_an_unknown_total_with_a_short_first_page_costs_one_request` (blind paging that ignores fullness doubles every sparse city, and `cells_paged_deep` counted before the short-page check) and `test_a_usable_total_that_exactly_fills_the_page_is_not_paged_blind` (a counting host is untouched);
   `test_a_blind_paged_circle_meets_the_page_cap_and_subdivides` (pages 1..`MAX_PAGES_PER_CELL`, then four children, rows kept) and `test_a_blind_paged_circle_at_the_floor_is_unmeasured_not_unbounded`;
@@ -955,7 +965,7 @@ and `hosts_unavailable` is anchored to the blocked-host note's own `; `-delimite
   `test_a_backpressure_refusal_COUNTS_AS_AN_ANSWER_against_the_404_strikes` (PR deviation 3: an `apiCode 690` proves the route is served, so the 404s after it are the city's own failed cells, never exit 89);
   `test_an_http_404_is_a_route_not_found_error` (text/plain and HTML, never a `HostBlockedError`);
   `test_a_404_at_every_calibration_probe_is_a_moved_endpoint` (six requests, one per rung, `HostEndpointMovedError` naming the URL), `test_a_404_at_one_probe_among_answers_is_not_a_moved_endpoint`, `test_a_resumed_sweep_meeting_only_404s_stops_after_the_strike_count` and `test_a_404_after_an_answer_is_a_failed_cell_not_a_moved_endpoint`;
-  the pace pins (`DEFAULT` under the anonymous ceiling, `AUTH` under the authenticated one), the checkpoint-wall sandwich re-based on `AUTH_SWEEP_REQUESTS_PER_MINUTE`, and `test_the_anonymous_pace_does_not_fit_a_metro_inside_the_checkpoint_wall`, which fails when the metro caveat in `docs/census.md` and `docs/provider-access.md` stops being true.
+  the pace pins (`DEFAULT` under the anonymous ceiling, `AUTH` under the authenticated one), the checkpoint-wall sandwich re-based on `AUTH_SWEEP_REQUESTS_PER_MINUTE`, and `test_the_anonymous_pace_does_not_fit_a_metro_inside_the_checkpoint_wall`, which fails when the metro caveat in `docs/census.md` and `docs/provider-access.md` (skipped at its first launch under the per-city ceiling) stops being true.
   Panoramax's moved-endpoint guard (`tests/test_panoramax_grid_run.py`) is now `HostEndpointMovedError` on a whole lattice of at least `ENDPOINT_MOVED_MIN_TILES` tiles (the #452 review gave the whole-lattice guard the resume's floor, and `test_a_ONE_TILE_city_that_404s_is_refused_as_a_moved_endpoint` asserts its type stays the city's own), a lone 404 among answers is not, a two-tile all-404 resume stays the city's own refusal under `ENDPOINT_MOVED_MIN_TILES`, and `test_a_resume_of_ENOUGH_404s_with_nothing_answering_is_a_moved_endpoint` is the floor met.
 
 ## Catalog backups (issue #145)
@@ -1179,6 +1189,9 @@ A hold keeps a host's channels from launching without anything having refused us
   - `test_a_kartaview_launch_is_held_to_the_per_city_ceiling_not_the_nights_remainder` — a Metro whose unceiled timeout is over 4 h launches at the 60-minute default: `timeout_s` 3,600, `request_cap` 37, `max_seconds` 3,000 (killed by `request_cap = remaining`, by the ceiling not applied to the timeout, and by the clock stop derived from the unceiled timeout).
   - `test_a_configured_per_city_ceiling_is_honoured_and_reaches_the_walk` (a configured 120 min, the walk's default resolved through `STREET_CHANNELS`, none for the tile censuses) and `test_a_per_city_ceiling_under_the_launch_floor_is_raised_rather_than_skipping_every_city` (1, 20 and 55 min raise to 3,321 s, whose cap clears the 34-request floor).
   - `test_a_deadline_clamp_under_the_per_city_ceiling_still_stands`, `test_an_age_wall_the_per_city_ceiling_binds_names_that_ceiling`, and `test_max_city_minutes_parses_and_bad_values_fall_back` (a string, a negative and a non-resumable channel are named and ignored).
+  - The unfinishable skip (Jon's decision, 2026-10-28, #456 review): `test_the_ceiling_window_is_the_per_launch_cap_times_the_nights_before_the_wall` (37 × 6 = 222 at the default, None without a ceiling), `test_a_fresh_crawl_the_ceiling_cannot_finish_before_the_wall_is_skipped_not_failed` (a 20 km Metro at ~405 requests: no launch, no `consecutive_failure`, still due, counted on the `Done:` line, the log names the three levers; killed by the arm never firing),
+    `test_a_crawl_with_a_live_checkpoint_is_never_unfinishable_the_age_wall_judges_it` (killed by dropping the checkpoint guard), `test_ceiling_caps_says_the_ceiling_sized_the_cap_not_a_smaller_budget` and `test_an_unfinishable_city_takes_no_reserved_opt_in_slot` (the slate leaves it out of the reservation and logs it; killed by keeping it in).
+    Four older tests whose 20 km Metro fixtures are now over the window shrank them to 12 km (~145 requests), so they keep testing what they tested.
   - The budget-arm tests that predate it (`test_a_sweep_priced_over_the_whole_budget_is_capped_rather_than_skipped_forever`, `test_a_timeout_with_room_to_spare_leaves_the_cap_at_the_budget_remainder` and `_wall_cfg`'s cases) set the ceiling out of the way with `_NO_CITY_CEILING_MIN`, so they keep testing the budget.
 - The cross-night refusal cooldown (`[hosts.<token>].refusal_cooldown_h`):
   - `test_a_refusal_cooldown_loads` (36, 0.5, 168) and `test_an_invalid_refusal_cooldown_fails_closed` (0, −1, 169, a bool, a string, a list).

@@ -9708,7 +9708,7 @@ def test_a_remainder_under_the_calibration_floor_is_still_skipped(
     from streetscape_metadata_tracker.scheduler import _MIN_RADIUS_SWEEP_LAUNCH_REQUESTS
 
     budget = _MIN_RADIUS_SWEEP_LAUNCH_REQUESTS + delta
-    cid = _register(conn, "Metro", width=20_000, height=20_000, step=20)
+    cid = _register(conn, "Metro", width=12_000, height=12_000, step=20)
     _enroll_kartaview(conn, cid)
     cfg = _sweep_cfg(publish_enabled=False)
     cfg.providers["kartaview"] = ProviderConfig(enabled=True, daily_request_budget=budget)
@@ -9754,7 +9754,7 @@ def test_a_non_resumable_channel_keeps_the_permanent_skip(conn, monkeypatch):
     """The branch is scoped by CHANNEL_RESUMABLE, not applied to everything. A
     partial GSV grid is not a run — there is no way to spend half a budget
     usefully — so for gsv the dead end is still the honest answer."""
-    cid = _register(conn, "Metro", width=20_000, height=20_000, step=20)
+    cid = _register(conn, "Metro", width=12_000, height=12_000, step=20)
     _enroll_kartaview(conn, cid)
     cfg = _sweep_cfg(publish_enabled=False)
     # Per-provider, not the global [download] ceiling: the gate reads
@@ -10178,7 +10178,7 @@ def test_a_kartaview_launch_is_held_to_the_per_city_ceiling_not_the_nights_remai
         _crawl_max_seconds,
     )
 
-    cid = _register(conn, "Metro", width=20_000, height=20_000, step=20)
+    cid = _register(conn, "Metro", width=12_000, height=12_000, step=20)
     _enroll_kartaview(conn, cid)
     cfg = _sweep_cfg(publish_enabled=False, max_batch_hours=12)
     assert cfg.providers["kartaview"].max_city_minutes is None, "premise: the default applies"
@@ -10306,6 +10306,171 @@ def test_an_age_wall_the_per_city_ceiling_binds_names_that_ceiling(conn, tmp_pat
     assert "raise [providers.kartaview].max_city_minutes" in plan.message
     assert "derived timeout" not in plan.message
     assert "daily_request_budget" not in plan.message
+
+
+# ── A fresh crawl the ceiling cannot finish before the age wall (#456 review) ──
+
+
+def test_the_ceiling_window_is_the_per_launch_cap_times_the_nights_before_the_wall():
+    """At the KartaView defaults one launch affords 37 and a checkpoint gets six
+    launches before `_SWEEP_SKIP_AGE_WALL` (the wall fires at 7 d − 1 d of
+    margin), so a fresh crawl can spend 222 before it is discarded. A tile
+    census has no ceiling, and pacing switched off makes the figure unknowable.
+    Kills: `nights` read from CHECKPOINT_MAX_AGE_S without the margin (7)."""
+    from streetscape_metadata_tracker.scheduler import CeilingWindow, _ceiling_window
+
+    window = _ceiling_window("kartaview", None)
+    assert window == CeilingWindow(ceiling_s=3600, per_night=37, nights=6)
+    assert window.total == 222
+    assert _ceiling_window("kartaview_streets", None) == window, "the walk shares the pair's"
+    assert _ceiling_window("mapillary", None) is None
+    assert _ceiling_window("kartaview", ProviderConfig(max_requests_per_minute=0)) is None
+
+
+def test_a_fresh_crawl_the_ceiling_cannot_finish_before_the_wall_is_skipped_not_failed(
+    conn, monkeypatch, caplog
+):
+    """THE #456 REVIEW'S MAJOR 2, Jon's decision (2026-10-28). Held to ~37 a
+    launch, a ~405-request sweep would resume on six nights, each taking a
+    reserved opt-in slot, be refused at the age wall with a consecutive_failure,
+    and start over -- ~35 nights of slots per city before #421 quarantined it.
+    It is skipped at the FIRST launch instead: no launch, no failure, the pair
+    stays due, the WARNING names the levers and the Done line counts it apart.
+    Kills: the `_SWEEP_SKIP_UNFINISHABLE` arm removed (the sweep launches
+    capped), and the skip recorded as a failure."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    caplog.set_level(logging.INFO)
+    cid = _register(conn, "Metro", width=20_000, height=20_000, step=20)
+    _enroll_kartaview(conn, cid)
+    cfg = _sweep_cfg(publish_enabled=False)
+    city = db.resolve_city(conn, cid)
+    est = sched._channel_estimate(cfg, city, "kartaview", conn)
+    assert est > sched._ceiling_window("kartaview", cfg.providers["kartaview"]).total
+
+    calls = []
+    _run_loop_capturing_kwargs(monkeypatch, conn, cfg, calls)
+
+    assert [c for c in calls if c[1] == "kartaview"] == [], "never launched"
+    row = conn.execute(
+        "SELECT consecutive_failures, last_success_at FROM schedule_state "
+        "WHERE city_id = ? AND provider = ?",
+        (cid, "kartaview"),
+    ).fetchone()
+    assert row is None or (row["consecutive_failures"] == 0 and row["last_success_at"] is None)
+    warning = [r for r in caplog.records if r.levelno == logging.WARNING and cid in r.message]
+    assert len(warning) == 1
+    text = warning[0].message
+    assert f"~{est:,} estimated requests is more than the ~222" in text
+    assert "37 a launch over 6 nights" in text
+    assert "raise [providers.kartaview].max_city_minutes" in text
+    assert f"`enroll-city {cid} --channel kartaview --remove`" in text
+    done = [r.message for r in caplog.records if r.message.startswith("Done: ")][0]
+    assert "1 channel(s) skipped as unfinishable under the per-city ceiling (kartaview 1)" in done
+    assert "deferred for budget" not in done
+    assert "failed" not in done.split("skipped as unfinishable")[0].split("runs succeeded")[1]
+
+
+def test_a_crawl_with_a_live_checkpoint_is_never_unfinishable_the_age_wall_judges_it(
+    conn, tmp_path, monkeypatch
+):
+    """A checkpoint is paid-for work: the unfinishable arm needs NO checkpoint,
+    so a crawl that has started is resumed capped (and refused only by the age
+    wall, with the progress it actually made). Kills: `has_checkpoint` ignored
+    in `_fresh_crawl_unfinishable`."""
+    from streetscape_metadata_tracker.scheduler import _sweep_launch_plan
+
+    city = _checkpointed_city(
+        conn,
+        tmp_path,
+        monkeypatch,
+        roots_done=3,
+        root_count=800,
+        days_old=1.0,
+        name="Metro",
+        width=20_000,
+        height=20_000,
+    )
+    plan = _sweep_launch_plan(
+        _sweep_cfg(publish_enabled=False),
+        city,
+        "kartaview",
+        conn,
+        est=10_000,
+        remaining=20_000,
+        remaining_s=None,
+        city_channels=["kartaview"],
+    )
+    assert plan.skip is None
+    assert plan.request_cap == 37
+    assert plan.ceiling_caps is True
+    assert "launch capped at 37; resumes" == plan.label
+
+
+def test_ceiling_caps_says_the_ceiling_sized_the_cap_not_a_smaller_budget(conn):
+    """The fill reads `ceiling_caps` to tolerate a pause the CEILING causes and
+    decline one the budget causes, so a budget remainder under the ceiling's
+    cap must read False. Kills: `ceiling_caps=ceiling_binds` alone."""
+    from streetscape_metadata_tracker.scheduler import _sweep_launch_plan
+
+    cid = _register(conn, "Mid", width=12_000, height=12_000, step=20)
+    city = db.resolve_city(conn, cid)
+    cfg = _sweep_cfg(publish_enabled=False)
+
+    def plan(remaining):
+        return _sweep_launch_plan(
+            cfg,
+            city,
+            "kartaview",
+            conn,
+            est=145,
+            remaining=remaining,
+            remaining_s=None,
+            city_channels=["kartaview"],
+        )
+
+    by_ceiling = plan(20_000)
+    assert (by_ceiling.request_cap, by_ceiling.ceiling_caps) == (37, True)
+    by_budget = plan(36)
+    assert by_budget.skip is None, "36 clears the 34-request launch floor"
+    assert (by_budget.request_cap, by_budget.ceiling_caps) == (36, False)
+
+
+def test_an_unfinishable_city_takes_no_reserved_opt_in_slot(conn, monkeypatch, caplog):
+    """The skip is free at the launch site but not in the slate: an unfinishable
+    city stays due and never moves in the stalest-first order, so hoisted it
+    would hold the same reserved slot every night and, once the finishable
+    cities ahead of it had run, its channel would collect nothing at all. The
+    reservation leaves it out and takes the finishable city behind it; the
+    launch site's own predicate decides, so the two cannot disagree. Kills:
+    the exclusion removed (Aaa, alphabetically first among never-run cities,
+    takes the one slot and is skipped)."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    caplog.set_level(logging.INFO)
+    # Two never-run enrolled cities whose gsv clocks are fresh: stranded, kind 1.
+    big = _register(conn, "Aaa", width=20_000, height=20_000, step=20)
+    small = _register(conn, "Bbb", width=1000, height=1000, step=20)
+    filler = [_register(conn, n, width=1000, height=1000, step=20) for n in ("Ccc", "Ddd")]
+    db.assign_schedule(conn, 90, providers=("gsv", "kartaview"))
+    for cid in (big, small):
+        db.set_channel_membership(conn, cid, "kartaview", True, cycle_days=90)
+        db.record_attempt(conn, cid, success=True, provider="gsv")
+    cfg = _sweep_cfg(publish_enabled=False)
+
+    slate = sched._collect_due(
+        conn, cfg, date(2026, 7, 2), ["gsv", "kartaview"], max_opt_in=1, max_cities=2
+    )
+
+    assert slate.cities[0].city_id == small, "the finishable city takes the one slot"
+    assert slate.hoisted == 1
+    assert [c.city_id for c in slate.cities][1:] == filler + [big], "still due, behind the cap"
+    text = caplog.text
+    assert "1 stranded city left out of the opt-in reservation" in text
+    assert f"first {big} [kartaview]" in text
+    assert (
+        "(1 of them left out of the reservation as unfinishable under the per-city ceiling)" in text
+    )
 
 
 def test_max_city_minutes_parses_and_bad_values_fall_back(tmp_path, caplog):
@@ -11651,6 +11816,7 @@ def _run_channels(sched, cfg, conn, city, providers, **overrides):
         deferred_host_budget=Counter(),
         rejected_argv=sched.ArgvRejections(),
         deadline_deferred=Counter(),
+        ceiling_skipped=Counter(),
         batch_deadline=None,
         stop_requested=None,
     )
@@ -15889,7 +16055,7 @@ def test_resumable_channels_take_their_launch_plan_not_the_deadline_gate(conn, m
 
     resumable = sorted(p for p in sched.CHANNEL_HOSTS if sched.is_resumable_channel(p))
     assert len(resumable) == 6
-    city = db.resolve_city(conn, _register(conn, "Mid", width=20_000, height=20_000, step=20))
+    city = db.resolve_city(conn, _register(conn, "Mid", width=12_000, height=12_000, step=20))
     cfg = SchedulerConfig(
         providers={p: ProviderConfig(enabled=True, daily_request_budget=40_000) for p in resumable}
     )
@@ -15944,7 +16110,8 @@ def test_a_fully_deferred_city_costs_no_city_cap_slot(conn, monkeypatch):
     assert launched == [(small.city_id, "gsv", 3600)]
     assert (processed, succeeded, attempted, skipped_budget) == (1, 1, 1, 0)
     assert stop_reason is None
-    assert result[-1] == Counter({"gsv": 1})
+    # deadline_deferred is second to last since ceiling_skipped joined the tuple (#456).
+    assert result[-2] == Counter({"gsv": 1})
     assert sleeps == []
 
 
@@ -16009,6 +16176,7 @@ def test_a_walk_is_judged_on_its_own_estimate_once_its_grid_launched(conn, monke
         ["gsv", "gsv_streets"],
         batch_deadline=3600.0,
         deadline_deferred=deferred,
+        ceiling_skipped=Counter(),
         blocked_hosts=breaker,
     )
 
@@ -16172,7 +16340,7 @@ def test_the_loop_stops_once_no_paced_channel_can_launch(conn, monkeypatch, capl
         f"batch deadline reached ({cfg.max_batch_hours:g} h); 30 due cities not attempted"
     )
     assert (processed, succeeded, attempted, skipped_budget) == (0, 0, 0, 0)
-    assert result[-1] == Counter()
+    assert result[-2] == Counter()
     assert launched == []
     assert len(caplog.records) < 5
 
@@ -16304,6 +16472,7 @@ def test_a_channel_no_night_can_hold_warns(conn, monkeypatch, caplog, need_s, wa
             ["gsv"],
             batch_deadline=3600.0,
             deadline_deferred=deferred,
+            ceiling_skipped=Counter(),
         )
 
     assert deferred == Counter({"gsv": 1})
@@ -16527,6 +16696,7 @@ def test_a_walk_deferred_after_its_grid_FAILED_is_not_stranded(conn, monkeypatch
         ["gsv", "gsv_streets"],
         batch_deadline=3600.0,
         deadline_deferred=deferred,
+        ceiling_skipped=Counter(),
         blocked_hosts=breaker,
         record_failures=False,
     )
@@ -16561,6 +16731,7 @@ def test_a_deferred_first_WALK_defers_only_itself(conn, monkeypatch):
         ["gsv_streets", "mapillary"],
         batch_deadline=3600.0,
         deadline_deferred=deferred,
+        ceiling_skipped=Counter(),
     )
 
     assert [p for _cid, p, _t in launched] == ["mapillary"]

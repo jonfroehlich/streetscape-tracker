@@ -2750,6 +2750,71 @@ def _crawl_city_ceiling_floor_s(channel: str, pc: ProviderConfig | None) -> int:
     return _TIMEOUT_FIXED_SLACK_S + math.ceil(paced_s) + 1
 
 
+class CeilingWindow(NamedTuple):
+    """What a crawl held to its per-city ceiling can spend before the age wall.
+
+    ``per_night`` is the request cap ONE launch at the ceiling affords and
+    ``nights`` how many launches a checkpoint gets before the age wall refuses
+    it; ``total`` is their product, the most a fresh crawl can spend before
+    ``CHECKPOINT_MAX_AGE_S`` discards it (#456 review).
+    """
+
+    ceiling_s: int
+    per_night: int
+    nights: int
+
+    @property
+    def total(self) -> int:
+        return self.per_night * self.nights
+
+
+def _ceiling_window(channel: str, pc: ProviderConfig | None) -> CeilingWindow | None:
+    """
+    The requests a FRESH crawl of ``channel`` can spend under its per-city
+    ceiling before the checkpoint wall discards it, or None when the channel
+    has no ceiling or its pace makes the figure unknowable (#456 review).
+
+    The wall fires at ``CHECKPOINT_MAX_AGE_S - _CHECKPOINT_AGE_WALL_MARGIN_S``
+    of age, so a checkpoint committed on night 1 is resumed on nights 2 to 6
+    and refused on night 7: six launches at the 7-day wall. Example (KartaView
+    at the anonymous 1.5/min)::
+
+        _ceiling_window("kartaview", None)   # CeilingWindow(3600, 37, 6): total 222
+        _ceiling_window("mapillary", None)   # None -- a tile census has no ceiling
+    """
+    ceiling_s = _crawl_city_ceiling_s(channel, pc)
+    if ceiling_s is None:
+        return None
+    per_night = _sweep_requests_within_timeout(ceiling_s, channel, pc)
+    if per_night is None:
+        return None
+    nights = int((CHECKPOINT_MAX_AGE_S - _CHECKPOINT_AGE_WALL_MARGIN_S) // 86400)
+    return CeilingWindow(ceiling_s, per_night, max(1, nights))
+
+
+def _fresh_crawl_unfinishable(
+    channel: str, pc: ProviderConfig | None, *, est: int, has_checkpoint: bool
+) -> CeilingWindow | None:
+    """
+    The ceiling window a FRESH crawl of ``est`` requests cannot finish inside,
+    or None when it can, has already started, or no ceiling bounds it.
+
+    THE ONE predicate behind ``_SWEEP_SKIP_UNFINISHABLE`` and the opt-in
+    reservation's exclusion in ``_collect_due`` -- the launch site and the
+    slate must agree about which cities are skipped, or a city the slate
+    reserves a slot for is skipped at launch and holds that slot every night
+    (the exact starvation the exclusion exists to prevent). A crawl with a
+    live checkpoint is paid-for work and is never unfinishable here: the age
+    wall arm judges it, with the progress it has actually made.
+    """
+    if est <= 0 or has_checkpoint or not is_resumable_channel(channel):
+        return None
+    window = _ceiling_window(channel, pc)
+    if window is None or est <= window.total:
+        return None
+    return window
+
+
 # Floor for a deadline-clamped timeout. A city is only started while the batch
 # deadline still has room, so the clamp should shorten a run — never hand a
 # child a timeout too short to reach its first request.
@@ -3394,6 +3459,19 @@ _SWEEP_SKIP_AGE_WALL = "checkpoint at the age wall"
 # wording rides in `_CRAWL_PRICING.floor_buys` and reaches the message; this
 # token is the label both share, so it must not name either one's mechanism.
 _SWEEP_SKIP_FLOOR = "under the launch floor"
+# A FRESH crawl the per-city ceiling cannot finish before the age wall (#456
+# review; Jon's decision, 2026-10-28). Held to `max_city_minutes`, one launch
+# spends at most `CeilingWindow.per_night` requests, and a checkpoint is resumed
+# on at most `CeilingWindow.nights` nights before `_SWEEP_SKIP_AGE_WALL` refuses
+# it -- so a sweep estimated above their product would take a reserved opt-in
+# slot on each of those nights and be thrown away at the wall, every cycle,
+# until #421 quarantined the pair (~35 nights of slots per city at the
+# defaults). Skipped at the FIRST launch instead, before a checkpoint exists:
+# not a failure, the pair stays due, and `_collect_due` leaves such a city out
+# of the opt-in reservation so it holds no slot either. `est` is a floor, so
+# the bar errs the right way: a city it skips certainly cannot finish; one it
+# admits may still meet the wall (a Yogyakarta sweep ran 3.0x its estimate).
+_SWEEP_SKIP_UNFINISHABLE = "unfinishable under the per-city ceiling"
 
 # How close to CHECKPOINT_MAX_AGE_S a checkpoint may get before the scheduler
 # refuses to add another night to it: ONE night. The wall is measured from the
@@ -3417,7 +3495,11 @@ class SweepLaunchPlan(NamedTuple):
     and they are decided together deliberately -- see
     :func:`_sweep_requests_within_timeout`. ``max_seconds`` is the third, the
     child's own wall-clock stop, derived from ``timeout_s`` alone (issue #344,
-    :func:`_crawl_max_seconds`); None forwards no flag.
+    :func:`_crawl_max_seconds`); None forwards no flag. ``ceiling_caps`` says
+    the per-city ceiling (#452 review) is what sized ``request_cap``: the
+    fill reads it to tell a crawl the ceiling pauses, which it tolerates for
+    a checkpointed crawl, from one the budget or the deadline would cut, which
+    it declines (#456 review).
     """
 
     timeout_s: int
@@ -3427,6 +3509,7 @@ class SweepLaunchPlan(NamedTuple):
     message: str
     label: str
     max_seconds: int | None = None
+    ceiling_caps: bool = False
 
 
 # The window a [hosts.*] budget is counted over (issue #385).
@@ -3724,7 +3807,7 @@ def _sweep_launch_plan(
     per-city ceiling bounds it further (see `_KARTAVIEW_CITY_CEILING_S`). Sizing the cap to what BOTH afford makes the
     deliberate pause the arm a healthy child takes (#273).
 
-    THE THREE SKIPS, in the order they are asked, which is the order of how much
+    THE FOUR SKIPS, in the order they are asked, which is the order of how much
     each one costs to get wrong:
 
     * ``_SWEEP_SKIP_SIBLING`` -- this is a road walk whose GRID sibling has an
@@ -3746,6 +3829,16 @@ def _sweep_launch_plan(
       is not self-correcting -- a pause records nothing, so without a failure
       the five-night backstop, the nightly alert and the operator all stay
       unaware while ~60k requests a cycle are discarded.
+    * ``_SWEEP_SKIP_UNFINISHABLE`` -- there is NO checkpoint yet, and the crawl
+      is bigger than the per-city ceiling can finish before the age wall
+      (:func:`_fresh_crawl_unfinishable`: ``est`` over the ceiling's cap times
+      the nights a checkpoint gets). Started, it would take a reserved opt-in
+      slot on each of those nights and then meet the arm above -- a failure,
+      a discarded checkpoint, and the same again next cycle until the pair is
+      quarantined (#421). Skipped before any of that is spent: NOT a failure,
+      the pair stays due, and ``_collect_due`` keeps such a city out of the
+      reservation. The levers are the ceiling, the grid, or ``enroll-city
+      --remove`` (#456 review).
     * ``_SWEEP_SKIP_FLOOR`` -- the cap cannot clear what this provider's crawl
       needs to make ANY durable progress. Per provider, because the failure is a
       different failure: a radius sweep cannot clear its calibration ladder, and
@@ -3817,6 +3910,9 @@ def _sweep_launch_plan(
             message,
             label,
             max_seconds=_crawl_max_seconds(timeout_s),
+            # The ceiling SIZED the cap only when the clock term is the one
+            # the min took; a budget remainder under it is the budget's cap.
+            ceiling_caps=ceiling_binds and affordable is not None and request_cap == affordable,
         )
 
     if est > 0 and is_street_channel(channel):
@@ -3952,6 +4048,25 @@ def _sweep_launch_plan(
                 f"delete the checkpoint to start the crawl over deliberately.",
                 f"REFUSED (checkpoint {age_s / 86400:.1f} d old, {done}/{total})",
             )
+
+    # THE FOURTH SKIP (#456 review): a crawl with no checkpoint that the ceiling
+    # cannot finish before the age wall. Asked AFTER the age-wall arm, which
+    # owns every crawl that has started, and BEFORE the floor, which would
+    # otherwise defer the same city for budget and hide the real reason.
+    window = _fresh_crawl_unfinishable(channel, pc, est=est, has_checkpoint=progress is not None)
+    if window is not None:
+        return plan(
+            _SWEEP_SKIP_UNFINISHABLE,
+            f"skipping — ~{est:,} estimated requests is more than the ~{window.total:,} a "
+            f"crawl held to the {window.ceiling_s // 60:,}-minute per-city ceiling can spend "
+            f"before the {CHECKPOINT_MAX_AGE_S / 86400:.0f}-day checkpoint wall "
+            f"({window.per_night:,} a launch over {window.nights} nights), so a checkpoint "
+            f"started tonight would be refused at the wall with every night spent on it "
+            f"thrown away. Not a failure, and it stays due: raise "
+            f"[providers.{channel}].max_city_minutes, shrink the city's grid, or "
+            f"`enroll-city {city.city_id} --channel {channel} --remove`.",
+            f"skipped (~{est:,} req over the {window.total:,} the ceiling finishes by the wall)",
+        )
 
     pricing = _crawl_pricing(channel)
     floor, floor_buys = pricing.launch_floor, pricing.floor_buys
@@ -7783,6 +7898,7 @@ def cmd_assess_city(
     # batch deadline and this passes None. Owned here because the parameter
     # has no default; pinned empty by the assess-city suite.
     deadline_deferred: Counter[str] = Counter()
+    ceiling_skipped: Counter[str] = Counter()
     attempted, succeeded, skipped_budget = _run_city_channels(
         cfg,
         conn,
@@ -7795,6 +7911,7 @@ def cmd_assess_city(
         deferred_host_budget=deferred_host_budget,
         rejected_argv=rejected_argv,
         deadline_deferred=deadline_deferred,
+        ceiling_skipped=ceiling_skipped,
         # No batch deadline: an operator run has nothing queued behind it, and
         # each child still carries its own derived per-city timeout.
         batch_deadline=None,
@@ -9155,6 +9272,7 @@ def _collect_due(
     rank0 = providers[0] if providers else None
     hoisted = 0
     promoted_opt_in = 0
+    left_out_unfinishable = 0
     if rank0 is not None:
         # BOUNDED since #282. The promotion is now a RESERVATION -- at most
         # `max_opt_in` cities move -- and the bound is what makes the mechanism
@@ -9296,6 +9414,48 @@ def _collect_due(
                 # Only kind 1 splits by channel; kinds 0 and 2 are one queue.
                 kind = _stranded_kind(index)
                 return kind, _leading_channel(index) if kind == 1 else ""
+
+            def _unfinishable_on_every_due_channel(city) -> bool:
+                # The launch site's own predicate, so the slate and the
+                # launch cannot disagree about which cities are skipped.
+                # Cheap tests first: a non-resumable or unceiled due channel
+                # answers without touching the disk or the catalog.
+                for p in providers_for_city[city.city_id]:
+                    if not is_resumable_channel(p):
+                        return False
+                    pc = (cfg.providers or {}).get(p)
+                    if _ceiling_window(p, pc) is None:
+                        return False
+                    if _sweep_checkpoint_progress(cfg, city, p) is not None:
+                        return False
+                    est = _channel_estimate(cfg, city, p, conn)
+                    if _fresh_crawl_unfinishable(p, pc, est=est, has_checkpoint=False) is None:
+                        return False
+                return True
+
+            # A city whose EVERY due channel is a fresh crawl the per-city
+            # ceiling cannot finish before the age wall takes no reserved slot
+            # (#456 review). The launch site skips it without a failure, so it
+            # stays due and never moves in this stalest-first order: hoisted,
+            # it would hold the same slot every night, and once the finishable
+            # cities ahead of it had run, its channel's sub-queue would hand
+            # every take to cities that spend nothing. Priced only here, when
+            # the reservation has to choose, like the checkpoint probe above.
+            unfinishable = [i for i in stranded if _unfinishable_on_every_due_channel(ordered[i])]
+            if unfinishable:
+                left_out_unfinishable = len(unfinishable)
+                first = ordered[unfinishable[0]]
+                logger.warning(
+                    f"{left_out_unfinishable} stranded "
+                    f"{'city' if left_out_unfinishable == 1 else 'cities'} left out of the "
+                    f"opt-in reservation: every due channel is a fresh crawl too big to "
+                    f"finish before the checkpoint wall under its per-city ceiling "
+                    f"([providers.<channel>].max_city_minutes); first {first.city_id} "
+                    f"[{', '.join(providers_for_city[first.city_id])}]. Raise the ceiling, "
+                    f"shrink the grid, or `enroll-city <city> --channel <channel> --remove`."
+                )
+                dropped = set(unfinishable)
+                stranded = [i for i in stranded if i not in dropped]
 
             n_sub_queues = len({_sub_queue(i) for i in stranded})
             resumers = [i for i in stranded if _has_live_checkpoint(ordered[i])]
@@ -9518,6 +9678,11 @@ def _collect_due(
                 f"{waiting} wait for a later night"
                 if waiting
                 else f"past the first {promoted_opt_in}, the deadline decides how many run"
+            ) + (
+                f" ({left_out_unfinishable} of them left out of the reservation as "
+                f"unfinishable under the per-city ceiling)"
+                if left_out_unfinishable
+                else ""
             )
             logger.info(
                 f"{reached} of {len(stranded)} {noun} are inside tonight's "
@@ -10324,6 +10489,7 @@ def cmd_run_due(
             deferred_host_budget,
             rejected_argv,
             deadline_deferred,
+            ceiling_skipped,
         ) = _run_city_loop(
             cfg,
             conn,
@@ -10359,6 +10525,7 @@ def cmd_run_due(
                 deferred_host_budget=deferred_host_budget,
                 rejected_argv=rejected_argv,
                 deadline_deferred=deadline_deferred,
+                ceiling_skipped=ceiling_skipped,
             )
             processed += fill_report.cities
             attempted += fill_report.attempted
@@ -10439,6 +10606,19 @@ def cmd_run_due(
             + ", ".join(f"{ch} {n}" for ch, n in sorted(deadline_deferred.items()))
             + ")"
             if deadline_deferred
+            else ""
+        )
+        # Apart from every deferral above (#456 review): tonight's budget and
+        # clock are not the reason and tomorrow's will not change it -- the
+        # crawl is bigger than its per-city ceiling can finish before the
+        # checkpoint wall. Not a failure; the pair stays due and the WARNING
+        # per city names the levers.
+        + (
+            f"; {sum(ceiling_skipped.values())} channel(s) skipped as unfinishable under "
+            f"the per-city ceiling ("
+            + ", ".join(f"{ch} {n}" for ch, n in sorted(ceiling_skipped.items()))
+            + ")"
+            if ceiling_skipped
             else ""
         )
         + (f"; {blocked_note}" if blocked_note else "")
@@ -10691,6 +10871,7 @@ def _run_city_channels(
     deferred_host_budget: Counter[str],
     rejected_argv: ArgvRejections,
     deadline_deferred: Counter[str],
+    ceiling_skipped: Counter[str],
     batch_deadline: float | None,
     stop_requested: threading.Event | None,
     record_failures: bool = True,
@@ -10769,6 +10950,9 @@ def _run_city_channels(
     -- per-city argv differs (the connection share, the request cap), so the
     next city's launch is still asked.
 
+    ``ceiling_skipped`` counts, per channel, fresh crawls skipped as
+    ``_SWEEP_SKIP_UNFINISHABLE`` (#456 review): not failures, not budget
+    deferrals, and nothing about tomorrow changes them.
     ``deadline_deferred`` counts, per channel, launches declined for the batch
     deadline (issue #373): a NON-resumable channel whose derived need
     (``city_timeout_estimate_seconds``) exceeds what is left of
@@ -11231,6 +11415,15 @@ def _run_city_channels(
                                 # so a night that quietly collected no walk says so.
                                 logger.info(f"{city.city_id} [{provider}]: {plan.message}")
                                 deferred_channels[provider] += 1
+                                continue
+                            if plan.skip == _SWEEP_SKIP_UNFINISHABLE:
+                                # Not a failure and not a budget deferral either
+                                # (#456 review): tonight's budget is not the reason
+                                # and tomorrow's will not change it. WARNING, since
+                                # only an operator can move it, and counted apart so
+                                # the Done line names the channel whose lever it is.
+                                logger.warning(f"{city.city_id} [{provider}]: {plan.message}")
+                                ceiling_skipped[provider] += 1
                                 continue
                             if plan.skip == _SWEEP_SKIP_FLOOR and remainder.host_bound(
                                 plan.request_cap
@@ -11891,6 +12084,7 @@ def _retry_stranded_walks(
     deferred_host_budget: Counter[str],
     rejected_argv: ArgvRejections,
     deadline_deferred: Counter[str],
+    ceiling_skipped: Counter[str],
     batch_deadline: float,
     sigterm_seen: threading.Event,
     tally: Counter[str],
@@ -12067,6 +12261,7 @@ def _retry_stranded_walks(
                     deferred_host_budget=deferred_host_budget,
                     rejected_argv=rejected_argv,
                     deadline_deferred=deadline_deferred,
+                    ceiling_skipped=ceiling_skipped,
                     batch_deadline=batch_deadline,
                     stop_requested=sigterm_seen,
                     fill=fill,
@@ -12182,7 +12377,8 @@ def _run_city_loop(
 
     Returns ``(processed, succeeded, attempted, skipped_budget, stop_reason,
     blocked_hosts, busy_hosts, deferred_channels, deferred_host_budget,
-    rejected_argv, deadline_deferred)``; ``stop_reason`` is None when the whole
+    rejected_argv, deadline_deferred, ceiling_skipped)``; ``stop_reason`` is None
+    when the whole
     due list was worked through. Split out of ``cmd_run_due`` so every way of ending
     the night still reaches the publish tail — an unexpected exception here is
     logged and converted into a stop reason rather than discarding a night's
@@ -12244,6 +12440,7 @@ def _run_city_loop(
     deferred_host_budget: Counter[str] = Counter()
     rejected_argv = ArgvRejections()
     deadline_deferred: Counter[str] = Counter()
+    ceiling_skipped: Counter[str] = Counter()
     # The stranded-walk retry's runs (issue #380), folded in after the `except`
     # so a pass that raises part-way still reports what it collected.
     retry_tally: Counter[str] = Counter()
@@ -12282,6 +12479,7 @@ def _run_city_loop(
                 deferred_host_budget=deferred_host_budget,
                 rejected_argv=rejected_argv,
                 deadline_deferred=deadline_deferred,
+                ceiling_skipped=ceiling_skipped,
                 batch_deadline=batch_deadline,
                 stop_requested=sigterm_seen,
             )
@@ -12331,6 +12529,7 @@ def _run_city_loop(
             deferred_host_budget=deferred_host_budget,
             rejected_argv=rejected_argv,
             deadline_deferred=deadline_deferred,
+            ceiling_skipped=ceiling_skipped,
             batch_deadline=batch_deadline,
             sigterm_seen=sigterm_seen,
             tally=retry_tally,
@@ -12371,6 +12570,7 @@ def _run_city_loop(
         deferred_host_budget,
         rejected_argv,
         deadline_deferred,
+        ceiling_skipped,
     )
 
 
@@ -12419,14 +12619,26 @@ class FillVerdict(NamedTuple):
     channel name (its daily remainder, or its launch plan), a host token (that
     host's room), ``"deadline"``, or one of the two pre-budget refusals. None
     on an admission.
+
+    ``run`` is the channels an admission actually runs and ``left`` the ones
+    :func:`_fill_judge` left to their own due schedule first (#456 review): a
+    fresh crawl more than one launch under its per-city ceiling affords. The
+    ONE exception to "whole or not at all", and it is scoped to the ceiling
+    channels (today the KartaView pair). None/empty on every other verdict,
+    so a verdict built without them reads exactly as before.
     """
 
     admit: bool
     blocker: str | None
     message: str
+    run: tuple[str, ...] | None = None
+    left: tuple[str, ...] = ()
 
 
 _FILL_BLOCKER_DEADLINE = "deadline"
+# Every channel of the city was left to its due schedule (#456 review): nothing
+# is left for the fill to refresh, so the city is declined under this token.
+_FILL_BLOCKER_CEILING = "over the per-city ceiling"
 _FILL_BLOCKER_HOST_REFUSED = "host refused tonight"
 # A standing hold (issue #444): a rest night or a refusal cooldown.
 _FILL_BLOCKER_HOST_HELD = "host held"
@@ -12571,7 +12783,16 @@ def _fill_launch_refusal(
                     f"{channel}: the launch would skip it ({plan.skip}), so the city would "
                     f"be refreshed on a subset of its channels",
                 )
-            if plan.request_cap < est[channel]:
+            # A cap the PER-CITY CEILING sized is the one pause the fill
+            # tolerates (#456 review): the channel reaches here only with a
+            # live checkpoint (a fresh crawl over one launch's cap was left to
+            # its due schedule by _fill_judge before this), that checkpoint is
+            # paid-for work the fill resumes first, and un-pairing a ceiling
+            # channel -- today the KartaView pair, the least important
+            # provider -- is the trade Jon accepted so the city's Mapillary
+            # and GSV refresh is never lost to it. A cap the budget or the
+            # deadline sized still declines the whole city, as before.
+            if plan.request_cap < est[channel] and not plan.ceiling_caps:
                 return FillVerdict(
                     False,
                     channel,
@@ -13060,6 +13281,9 @@ class FillReport:
     held: Counter[str] = field(default_factory=Counter)
     # Opt-in channels left out of a city's run because they are failing.
     realign_blocked: Counter[str] = field(default_factory=Counter)
+    # Ceiling channels left to their due schedule (#456 review): a fresh crawl
+    # more than one launch under the per-city ceiling affords.
+    ceiling_left: Counter[str] = field(default_factory=Counter)
     ended_by: str = ""
     # A stop the NIGHT must also report (SIGTERM, an unexpected error); a cap,
     # deadline or budget end is the fill's own and is not a night stop.
@@ -13090,9 +13314,21 @@ class FillReport:
         return (
             f"fill (early refresh, >= {floor_days} d): {self.cities} cities{resumed}"
             f"{realigned}, {self.succeeded}/{self.attempted} runs, {self.early_refreshes} "
-            f"early refresh(es) recorded{declined}{held}{blocked}{reserved}; "
+            f"early refresh(es) recorded{declined}{held}{blocked}"
+            f"{_fill_left_note(self.ceiling_left)}{reserved}; "
             f"ended by {self.ended_by}"
         )
+
+
+def _fill_left_note(left: Counter[str]) -> str:
+    """``; left to the due schedule: kartaview 3 (over the per-city ceiling)``, or empty."""
+    if not left:
+        return ""
+    return (
+        "; left to the due schedule: "
+        + ", ".join(f"{c} {n}" for c, n in sorted(left.items()))
+        + " (over the per-city ceiling)"
+    )
 
 
 def _fill_city_price(
@@ -13113,7 +13349,38 @@ def _fill_city_price(
     """
     est = {c: _channel_estimate(cfg, city, c, conn) for c in channels}
     need = {c: city_timeout_estimate_seconds(cfg, city, c, conn=conn) for c in channels}
+    # A launch is held to its per-city ceiling (#452 review), so a ceiling
+    # channel can never hold the night longer than that, whatever its derived
+    # need says; charging the unceiled figure declined cities for a deadline
+    # their launch could not reach (#456 review).
+    for c in channels:
+        if need[c] is None or not is_resumable_channel(c):
+            continue
+        ceiling_s = _crawl_city_ceiling_s(c, (cfg.providers or {}).get(c))
+        if ceiling_s is not None:
+            need[c] = min(need[c], ceiling_s)
     return est, need
+
+
+def _fill_leaves_to_due_schedule(
+    cfg: "SchedulerConfig", city: db.CityRow, channel: str, est: int
+) -> bool:
+    """Is ``channel`` a FRESH crawl more than one launch under its ceiling affords? (#456 review)
+
+    The fill leaves such a channel to its own due schedule rather than
+    declining the whole city (Jon's decision, 2026-10-28): declining lost the
+    city's Mapillary and GSV refresh to its KartaView enrolment, and launching
+    it capped would start a multi-night crawl the fill cannot promise to
+    resume on consecutive nights (it runs only on under-full nights), so the
+    checkpoint would likely age out. A crawl with a live checkpoint is not
+    left: it is paid-for work, and the fill resumes it first.
+    """
+    if est <= 0 or not is_resumable_channel(channel):
+        return False
+    window = _ceiling_window(channel, (cfg.providers or {}).get(channel))
+    if window is None or est <= window.per_night:
+        return False
+    return _sweep_checkpoint_progress(cfg, city, channel) is None
 
 
 def _fill_prebudget_refusal(
@@ -13186,6 +13453,13 @@ def _fill_judge(
     Returns the verdict and the per-channel prices (empty on a pre-budget
     refusal). ``held`` is the channels a due backlog holds tonight: a city
     that would run one is declined first, whole, as ``backlog``.
+
+    Between pricing and the budget rule, a ceiling channel's fresh crawl over
+    one launch's cap is LEFT to its due schedule (#456 review,
+    :func:`_fill_leaves_to_due_schedule`): the verdict's ``run`` is the city
+    without it and ``left`` names it; a city with nothing else to run is
+    declined as ``_FILL_BLOCKER_CEILING``. Every other channel is still
+    whole-or-nothing.
     """
     on_hold = [c for c in channels if c in held]
     if on_hold:
@@ -13201,6 +13475,24 @@ def _fill_judge(
     if refusal is not None:
         return refusal, {}
     est, need = _fill_city_price(cfg, conn, city, channels)
+    # THE ONE exception to whole-or-nothing (#456 review): a ceiling channel's
+    # fresh crawl over one launch's cap is left to its due schedule, and the
+    # rest of the city is judged -- and run -- without it.
+    left = tuple(c for c in channels if _fill_leaves_to_due_schedule(cfg, city, c, est[c]))
+    if left:
+        channels = [c for c in channels if c not in left]
+        if not channels:
+            return (
+                FillVerdict(
+                    False,
+                    _FILL_BLOCKER_CEILING,
+                    f"{', '.join(left)}: ~{sum(est[c] for c in left):,} req is more than one "
+                    f"launch under the per-city ceiling affords, and nothing else of the city "
+                    f"is left to refresh",
+                    left=left,
+                ),
+                est,
+            )
     host_room = _fill_host_room(cfg, used_by_host, reserve=reserve, fill_spent=fill_spent)
     verdict = _fill_verdict(channels, est, channel_room, host_room, need, remaining_s)
     if verdict.admit:
@@ -13209,6 +13501,10 @@ def _fill_judge(
         )
         if launch is not None:
             verdict = launch
+    if verdict.admit:
+        verdict = verdict._replace(run=tuple(channels), left=left)
+    elif left:
+        verdict = verdict._replace(left=left)
     return verdict, est
 
 
@@ -13421,6 +13717,7 @@ def _print_fill_preview(
     room = max_cities - due_count
     admitted = 0
     declined: Counter[str] = Counter()
+    left_to_due: Counter[str] = Counter()
 
     demand = _tomorrow_due_demand(cfg, conn, today, providers, running_tonight=providers_for_city)
     reserve = _tomorrow_due_reserve(cfg, conn, today, providers, demand=demand)
@@ -13458,7 +13755,9 @@ def _print_fill_preview(
                 declined[verdict.blocker] += 1
             return False
         admitted += 1
-        for channel in city_channels:
+        for channel in verdict.left:
+            left_to_due[channel] += 1
+        for channel in city_channels if verdict.run is None else verdict.run:
             print(f"  {city.city_id:60s} {channel:16s} ~{est[channel]:>9,} req  {label}")
             budget_left[channel] -= est[channel]
             host = CHANNEL_METERED_HOST.get(channel)
@@ -13505,6 +13804,7 @@ def _print_fill_preview(
             if declined
             else ""
         )
+        + _fill_left_note(left_to_due)
         + "."
     )
 
@@ -13528,6 +13828,7 @@ def _run_fill(
     deferred_host_budget: Counter[str],
     rejected_argv: ArgvRejections,
     deadline_deferred: Counter[str],
+    ceiling_skipped: Counter[str],
 ) -> FillReport:
     """Refresh not-yet-due cities early until the night's idle capacity is spent (#404).
 
@@ -13644,6 +13945,19 @@ def _run_fill(
             logger.info(f"{city.city_id} [{label}]: declined — {verdict.message}")
             return None
         trailing.clear()
+        if verdict.run is not None:
+            # The one subset the fill runs on purpose (#456 review): a ceiling
+            # channel's fresh crawl is left to its due schedule, and the Done
+            # line counts it apart from the failing channels below.
+            city_channels = [c for c in city_channels if c in verdict.run]
+        for channel in verdict.left:
+            report.ceiling_left[channel] += 1
+        if verdict.left:
+            logger.info(
+                f"{city.city_id} [{label}]: left to the due schedule -- "
+                f"{', '.join(verdict.left)}: more than one launch under the per-city ceiling "
+                f"affords; the city runs without it"
+            )
         if label == "fill":
             blocked = _failing_opt_in(conn, city.city_id, channels, prior, since_iso)
             for channel in blocked:
@@ -13674,6 +13988,7 @@ def _run_fill(
             deferred_host_budget=deferred_host_budget,
             rejected_argv=rejected_argv,
             deadline_deferred=deadline_deferred,
+            ceiling_skipped=ceiling_skipped,
             batch_deadline=batch_deadline,
             stop_requested=sigterm_seen,
             fill=True,
@@ -13792,6 +14107,7 @@ def _run_fill(
                 deferred_host_budget=deferred_host_budget,
                 rejected_argv=rejected_argv,
                 deadline_deferred=deadline_deferred,
+                ceiling_skipped=ceiling_skipped,
                 batch_deadline=batch_deadline,
                 sigterm_seen=sigterm_seen,
                 tally=tally,

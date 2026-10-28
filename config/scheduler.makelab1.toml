@@ -603,7 +603,9 @@ jitter = 0.6
 # measured (Singapore, ~9,974) in a single night; both seed cities are far under
 # it. Set it too low for an enrolled metro and the sweep cannot finish inside
 # CHECKPOINT_MAX_AGE_S, at which point the scheduler refuses to resume it and
-# records a failure rather than re-sweeping from zero every week (#274).
+# records a failure rather than re-sweeping from zero every week (#274); a
+# FRESH crawl the per-city ceiling cannot finish before that wall is skipped at
+# its first launch instead, not failed (#456 review).
 #
 # max_requests_per_minute is load-bearing beyond pacing: _kartaview_timeout_seconds
 # derives every sweep's per-city timeout from this rate, so changing it here
@@ -612,7 +614,8 @@ jitter = 0.6
 # then) is unverifiable since 2026-10-22, because api.kartaview.org validates no
 # token. KARTAVIEW_ACCESS_TOKEN is still required in .env and still sent. At this
 # pace a 12 h night paces at most ~1,080 KartaView requests, and a Singapore-class
-# sweep (~111 h) cannot finish inside the 7-day checkpoint wall.
+# sweep (~111 h) cannot finish inside the 7-day checkpoint wall, so it is skipped
+# at its first launch under the per-city ceiling (code default 60 min).
 #
 # See config/scheduler.toml for the full field docs.
 # PAUSED 2026-10-23: kartaview.org stopped routing /1.0/list/nearby-photos/

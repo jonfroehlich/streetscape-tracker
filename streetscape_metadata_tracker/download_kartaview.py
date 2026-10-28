@@ -2980,7 +2980,21 @@ async def _fetch_city_images(
                             page += 1
                         continue
 
-                    pages = pages_for_total(total, ipp)
+                    # A total the page it arrived with CONTRADICTS (#456 review):
+                    # page 1 came back short of what was asked, yet the host
+                    # says the circle holds more. The page is then the host's
+                    # own cap -- api.kartaview.org was measured at 200 against
+                    # an ask of 2,000 -- and sizing the page count from `ipp`
+                    # would read every circle under 2,000 as one page and
+                    # publish it truncated with no error, the known-total twin
+                    # of the blind loop's MEASURED_BLIND_PAGE_SIZE argument.
+                    # Sized from the page actually served instead. An empty
+                    # page 1 under a positive total is nonsense no page size
+                    # can fix, and keeps reading as one page.
+                    page_size = ipp
+                    if 0 < len(items) < min(ipp, IPP_MAX) and total > len(items):
+                        page_size = len(items)
+                    pages = pages_for_total(total, page_size)
                     if pages > MAX_PAGES_PER_CELL:
                         # Deep paging is untested past page 7; four
                         # shallower circles cost less risk than one long

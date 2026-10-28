@@ -490,7 +490,10 @@ enabled = true
 # night of the wall, and with more lattice left than the night can cover, it
 # logs at WARNING, declines to launch and records a real failure, so the run
 # alerts and the five-night backstop applies. An enrolled metro therefore needs
-# a budget that finishes it inside a week, not merely one that starts it.
+# a budget that finishes it inside a week, not merely one that starts it. And a
+# FRESH crawl the per-city ceiling below cannot finish before that wall (more
+# than ~37 a launch over the 6 nights before it, 222 at the default) is skipped
+# at its first launch instead (#456 review): logged, not a failure, still due.
 daily_request_budget = 10000
 # DEFAULT_SWEEP_REQUESTS_PER_MINUTE — 1.5/min = 90/h, under the documented
 # 100/h ANONYMOUS ceiling (issue #452). The authenticated 1,000/h tier (16/min
@@ -512,6 +515,10 @@ max_requests_per_minute = 1.5
 # A child at the full pace spends its cap in ~25 min. Never applied below what
 # funds the calibration ladder at this pace (~55.3 min at 1.5/min), so a smaller
 # value is raised rather than skipping every city. 60 is also the code default.
+# A fresh crawl over 6 launches' worth (222 at the default) is skipped at its
+# first launch, not failed, and takes no reserved slot (#456 review); the fill
+# leaves a fresh crawl over ONE launch's cap (~37) to this channel's own due
+# schedule and refreshes the city's other channels.
 max_city_minutes = 60
 
 # KartaView road walk (issue #258) — the SECOND opt-in channel, and the same
@@ -562,7 +569,8 @@ daily_request_budget = 10000
 max_requests_per_minute = 1.5
 # Same per-city ceiling as [providers.kartaview], and it adds to it: the two
 # channels run back to back under one host lock, so a city due on both can hold
-# the city loop for up to two ceilings (#452 review).
+# the city loop for up to two ceilings (#452 review). The unfinishable skip
+# and the fill's leave-to-due rule above apply to this channel too.
 max_city_minutes = 60
 # Match the other street channels so they all walk the same sample points and
 # land on one comparable streets.html row.
