@@ -1604,10 +1604,97 @@ def test_a_checkpointed_crawl_is_not_left_to_the_due_schedule(conn, monkeypatch)
     city = db.resolve_city(conn, cid)
     cfg = _opt_in_cfg()
     est = sched._channel_estimate(cfg, city, "kartaview", conn)
-    assert sched._fill_leaves_to_due_schedule(cfg, city, "kartaview", est) is True
+    assert est > 37
+    assert sched._fill_leaves_to_due_schedule(cfg, conn, city, "kartaview") == est
     _live_checkpoints(monkeypatch, {(cid, "kartaview")})
-    assert sched._fill_leaves_to_due_schedule(cfg, city, "kartaview", est) is False
-    assert sched._fill_leaves_to_due_schedule(cfg, city, "mapillary", 10_000) is False, "no ceiling"
+    assert sched._fill_leaves_to_due_schedule(cfg, conn, city, "kartaview") is None
+    assert sched._fill_leaves_to_due_schedule(cfg, conn, city, "mapillary") is None, "no ceiling"
+
+
+def test_an_unfinishable_due_kartaview_pair_does_not_hold_the_fill(conn, monkeypatch, caplog):
+    """#456 third round, finding 1(a): a due-only-on-kartaview city the ceiling
+    cannot finish is skipped at launch (no attempt recorded), so it read as a
+    backlog and held kartaview, which declined every KartaView-enrolled fill
+    city whole -- permanently, since the skip leaves the pair due forever.
+    `_never_fits_tonight` now names it, so it does not hold the fill, and the
+    enrolled city fills on gsv and mapillary with its own oversized kartaview
+    left to the due schedule. Kills: the unfinishable arm dropped from
+    `_never_fits_tonight`."""
+    caplog.set_level("INFO")
+    big = _city(conn, "Big", {"gsv": 10, "mapillary": 10}, width=40_000, height=40_000)
+    db.set_channel_membership(conn, big, "kartaview", True, cycle_days=90)
+    cfg = _opt_in_cfg()
+    assert sched._channel_estimate(cfg, db.resolve_city(conn, big), "kartaview", conn) > 222
+    fill = _city(
+        conn, "Enrolled", {"gsv": 60, "mapillary": 60, "kartaview": 60}, width=10_000, height=10_000
+    )
+    db.set_channel_membership(conn, fill, "kartaview", True, cycle_days=90)
+
+    ran, _ = _run_night(monkeypatch, conn, cfg)
+
+    assert (big, "kartaview") not in ran, "skipped as unfinishable, never launched"
+    assert (fill, "gsv") in ran and (fill, "mapillary") in ran
+    assert (fill, "kartaview") not in ran
+    done = _done_line(caplog)
+    assert "holding kartaview" not in done
+    assert "left to the due schedule: kartaview 1 (over the per-city ceiling)" in done
+    assert (
+        f"{big} [kartaview]: due and not attempted, but a fresh crawl too big to finish "
+        f"before the checkpoint wall under its per-city ceiling, which the launch skips "
+        f"(not a failure); it does not hold the fill"
+    ) in caplog.text
+
+
+def test_a_fill_ended_by_a_ceiling_decline_says_so(conn, monkeypatch, caplog):
+    """#456 third round, finding 5: a fill whose last candidate was declined
+    because nothing but an oversized KartaView crawl was left to run ends
+    `over the per-city ceiling`, not `budget (over the per-city ceiling)`.
+    The city is one the due phase partly ran tonight (gsv and mapillary), so
+    the fill's run set is kartaview alone. Kills: the token missing from the
+    `ended` branches."""
+    caplog.set_level("INFO")
+    partly = _city(
+        conn, "Partly", {"gsv": 100, "mapillary": 100, "kartaview": 60}, width=10_000, height=10_000
+    )
+    db.set_channel_membership(conn, partly, "kartaview", True, cycle_days=90)
+    cfg = _opt_in_cfg()
+
+    ran, _ = _run_night(monkeypatch, conn, cfg)
+
+    assert (partly, "gsv") in ran and (partly, "kartaview") not in ran
+    done = _done_line(caplog)
+    assert "ended by over the per-city ceiling" in done
+    assert "budget (over the per-city ceiling)" not in done
+
+
+def test_the_dry_run_spends_no_cap_slot_on_a_city_skipped_as_unfinishable(
+    conn, monkeypatch, capsys
+):
+    """#456 third round, finding 2: live, a city whose every channel is skipped
+    as unfinishable attempts nothing and `processed` does not move, so the
+    night reaches the next due city; the preview spent a city-cap slot on it
+    and stopped short. Resume-plan step 3 reads this preview, so the two must
+    agree. Kills: the pass-over missing from the preview."""
+    import dataclasses
+
+    big = _city(conn, "Big", {"gsv": 10, "mapillary": 10}, width=40_000, height=40_000)
+    db.set_channel_membership(conn, big, "kartaview", True, cycle_days=90)
+    due = _register(conn, "Due")
+    cfg = dataclasses.replace(_opt_in_cfg(), max_cities_per_day=1, fill_min_days=None)
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+    capsys.readouterr()
+
+    sched.cmd_run_due(cfg, dry_run=True, today=TODAY)
+    out = capsys.readouterr().out
+    ran, _ = _run_night(monkeypatch, conn, cfg)
+
+    assert (due, "gsv") in ran, "the live night reaches the next city"
+    assert f"{due:60s} gsv" in out, "and so does the preview"
+    assert "skipped (~" in out and big in out, "the skipped city's rows still print"
+    assert (
+        "(1 due city(ies) skipped as unfinishable under the per-city ceiling on every "
+        "channel passed over"
+    ) in out
 
 
 def test_the_fill_prices_a_ceiling_channels_time_need_at_its_ceiling(conn):
@@ -2213,10 +2300,16 @@ def test_a_never_collected_opt_in_channel_is_the_due_phases_not_the_fills(conn):
 
 
 def test_a_paused_kartaview_due_sweep_holds_kartaview_visibly(conn, monkeypatch, caplog):
-    """Review 411d #9: a due KartaView sweep that pauses holds the kartaview
-    channel -- an enrolled city is declined -- while a city without KartaView
-    is filled, and the Done line names the hold. Killed by dropping the
-    held count from the report."""
+    """Review 411d #9, re-based on the #456 third round: a due KartaView sweep
+    that pauses holds the kartaview channel, and the Done line names the hold
+    -- but an enrolled fill city is no longer declined whole for it: its
+    kartaview is LEFT to its due schedule (held) and its gsv and mapillary
+    still fill, because a KartaView crawl paused at the per-city ceiling is a
+    backlog every night of a multi-night crawl, and declining every KartaView
+    member for it was the second review's major A through another door. A
+    city with nothing but the held channel to run is still declined, as
+    `backlog`. Killed by dropping the held count from the report, and by
+    asking the hold of the city before what it leaves."""
     from streetscape_metadata_tracker.download_common import SWEEP_INCOMPLETE_EXIT_CODE
 
     caplog.set_level("INFO")
@@ -2225,16 +2318,41 @@ def test_a_paused_kartaview_due_sweep_holds_kartaview_visibly(conn, monkeypatch,
     enrolled = _city(conn, "Enrolled", {"gsv": 60, "mapillary": 60, "kartaview": 60})
     db.set_channel_membership(conn, enrolled, "kartaview", True, cycle_days=90)
     plain = _city(conn, "Plain", {"gsv": 50, "mapillary": 50})
+    cfg = _opt_in_cfg()
+    city = db.resolve_city(conn, enrolled)
+    assert sched._channel_estimate(cfg, city, "kartaview", conn) <= 37, "premise: one launch"
 
     def outcome(city, p):
         if city.city_id == due and p == "kartaview":
             return _outcome(SWEEP_INCOMPLETE_EXIT_CODE)
         return True
 
-    ran, _ = _run_night(monkeypatch, conn, _opt_in_cfg(), outcome=outcome)
-    assert all(c != enrolled for c, _ in ran)
+    ran, _ = _run_night(monkeypatch, conn, cfg, outcome=outcome)
+    assert (enrolled, "gsv") in ran and (enrolled, "mapillary") in ran
+    assert (enrolled, "kartaview") not in ran
     assert (plain, "gsv") in ran
-    assert "holding kartaview (1 due not attempted)" in _done_line(caplog)
+    done = _done_line(caplog)
+    assert "holding kartaview (1 due not attempted)" in done
+    assert "left to the due schedule: kartaview 1 (held by its due backlog)" in done
+    assert (
+        f"{enrolled} [fill]: left to the due schedule -- kartaview: held by its due backlog"
+        in caplog.text
+    )
+
+    verdict, _est = sched._fill_judge(
+        cfg,
+        conn,
+        city,
+        ["kartaview"],
+        latched=set(),
+        channel_room={"kartaview": 10_000},
+        used_by_host={},
+        remaining_s=None,
+        held={"kartaview"},
+    )
+    assert verdict.admit is False and verdict.blocker == sched._FILL_BLOCKER_BACKLOG
+    assert verdict.held_left == ("kartaview",) == verdict.left
+    assert "nothing else of the city is left to refresh" in verdict.message
 
 
 def test_the_fills_own_spend_excludes_what_was_already_in_the_window(conn, monkeypatch):

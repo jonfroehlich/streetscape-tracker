@@ -95,7 +95,8 @@ Nothing new was measured for this section; it records what the code does now and
   The cap that follows is ~37 requests a launch (priced at the 0.5 achieved fraction), which a child at the full 40 s interval spends in ~25 min before pausing with exit 83.
 - Two consequences of that ceiling were decided by Jon on 2026-10-28 (#456 review).
   A FRESH crawl the ceiling cannot finish before the checkpoint wall — more than one launch's cap times the nights before the wall, 6 × 37 = 222 at the default (`_ceiling_window`) — is skipped at its first launch: logged at WARNING with the three levers (`max_city_minutes`, the grid, `enroll-city --remove`), counted on the `Done:` line, not a failure, still due, and left out of the opt-in reservation so it holds no slot nightly.
-  And the fill leaves a fresh KartaView crawl over ONE launch's cap to its due schedule and refreshes the city's other channels anyway — the one exception to the fill's whole-city rule, because KartaView is the least important provider and the fill cannot promise consecutive nights to a multi-night crawl; a crawl with a live checkpoint is resumed capped instead.
+  And the fill leaves a fresh KartaView crawl over ONE launch's cap, or a KartaView channel a due backlog holds, to its due schedule and refreshes the city's other channels anyway — the one exception to the fill's whole-city rule, because KartaView is the least important provider and the fill cannot promise consecutive nights to a multi-night crawl; a crawl with a live checkpoint is resumed capped instead, and an unfinishable due pair never holds the fill.
+  The ceiling, and so both rules, is KartaView-only: the loader refuses `max_city_minutes` on any other channel.
 
 **Still open.**
 

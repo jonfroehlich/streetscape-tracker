@@ -1987,6 +1987,16 @@ def load_scheduler_config(path: str | None = None) -> SchedulerConfig:
                         f"pause and resume, so a launch cut short would be SIGKILLed and "
                         f"counted a failure rather than spread across nights"
                     )
+                elif name not in _CEILING_CHANNELS:
+                    # #456 review: the ceiling brings the unfinishable skip and
+                    # the fill's leave-to-due exception with it, both accepted
+                    # for the least important provider only.
+                    logger.warning(
+                        f"[providers.{name}] max_city_minutes is ignored: the per-city "
+                        f"ceiling is a KartaView feature ({', '.join(sorted(_CEILING_CHANNELS))}); "
+                        f"on {name} it would also skip big cities as unfinishable and let the "
+                        f"fill leave the channel to its due schedule"
+                    )
                 else:
                     max_city_minutes = float(raw_ceiling)
             providers[name] = ProviderConfig(
@@ -2654,6 +2664,13 @@ class _CrawlPricing:
 # clock stop at 50 min. Both KartaView channels share one host lock and run one
 # after the other, so a city due on both can hold the loop up to twice this.
 _KARTAVIEW_CITY_CEILING_S = 60 * 60
+# The channels the per-city ceiling applies to -- and with it the unfinishable
+# skip and the fill's leave-to-due exception (#456 review). Jon's exception to
+# the fill's whole-city rule was justified by KartaView being the LEAST
+# important provider; a `max_city_minutes` accepted on Mapillary would have
+# silently extended both to the top-priority one. The loader refuses the key
+# elsewhere and `_crawl_city_ceiling_s` answers None, so one set scopes all.
+_CEILING_CHANNELS = frozenset({"kartaview", "kartaview_streets"})
 
 
 # Keyed on the PROVIDER behind the channel via STREET_CHANNELS -- the table that
@@ -2723,7 +2740,11 @@ def _crawl_city_ceiling_s(channel: str, pc: ProviderConfig | None) -> int | None
         _crawl_city_ceiling_s("kartaview", ProviderConfig(max_city_minutes=20))
         # -> 3321, the floor: 600 s slack + 34 requests at 0.75/min
         _crawl_city_ceiling_s("mapillary", None)                         # None
+        _crawl_city_ceiling_s("mapillary", ProviderConfig(max_city_minutes=30))
+        # -> None: the ceiling is a KartaView feature (`_CEILING_CHANNELS`)
     """
+    if channel not in _CEILING_CHANNELS:
+        return None
     pricing = _crawl_pricing(channel)
     configured = pc.max_city_minutes if pc else None
     ceiling = pricing.default_city_ceiling_s if configured is None else int(configured * 60)
@@ -2813,6 +2834,40 @@ def _fresh_crawl_unfinishable(
     if window is None or est <= window.total:
         return None
     return window
+
+
+def _city_channel_unfinishable(
+    cfg: "SchedulerConfig", conn, city: db.CityRow, channel: str
+) -> CeilingWindow | None:
+    """
+    :func:`_fresh_crawl_unfinishable` asked of one (city, channel) from the
+    catalog, cheapest test first: a non-resumable or unceiled channel answers
+    without touching the disk, a live checkpoint without pricing the city.
+    The slate (`_collect_due`), the dry run and the fill's backlog pricing all
+    ask THIS, so none of them can disagree with the launch site.
+    """
+    if not is_resumable_channel(channel):
+        return None
+    pc = (cfg.providers or {}).get(channel)
+    if _ceiling_window(channel, pc) is None:
+        return None
+    if _sweep_checkpoint_progress(cfg, city, channel) is not None:
+        return None
+    est = _channel_estimate(cfg, city, channel, conn)
+    return _fresh_crawl_unfinishable(channel, pc, est=est, has_checkpoint=False)
+
+
+def _unfinishable_on_every_channel(
+    cfg: "SchedulerConfig", conn, city: db.CityRow, channels: Sequence[str]
+) -> bool:
+    """Is EVERY one of ``channels`` a fresh crawl the ceiling cannot finish? (#456 review)
+
+    "Every", never "any": a city due on an unfinishable grid sweep and a
+    finishable walk still launches the walk, so it keeps its slot.
+    """
+    return bool(channels) and all(
+        _city_channel_unfinishable(cfg, conn, city, c) is not None for c in channels
+    )
 
 
 # Floor for a deadline-clamped timeout. A city is only started while the batch
@@ -9418,20 +9473,9 @@ def _collect_due(
             def _unfinishable_on_every_due_channel(city) -> bool:
                 # The launch site's own predicate, so the slate and the
                 # launch cannot disagree about which cities are skipped.
-                # Cheap tests first: a non-resumable or unceiled due channel
-                # answers without touching the disk or the catalog.
-                for p in providers_for_city[city.city_id]:
-                    if not is_resumable_channel(p):
-                        return False
-                    pc = (cfg.providers or {}).get(p)
-                    if _ceiling_window(p, pc) is None:
-                        return False
-                    if _sweep_checkpoint_progress(cfg, city, p) is not None:
-                        return False
-                    est = _channel_estimate(cfg, city, p, conn)
-                    if _fresh_crawl_unfinishable(p, pc, est=est, has_checkpoint=False) is None:
-                        return False
-                return True
+                return _unfinishable_on_every_channel(
+                    cfg, conn, city, providers_for_city[city.city_id]
+                )
 
             # A city whose EVERY due channel is a fresh crawl the per-city
             # ceiling cannot finish before the age wall takes no reserved slot
@@ -10309,6 +10353,7 @@ def cmd_run_due(
         # night reaches. Its held pairs still hold the fill, as they do live.
         previewed = 0
         passed_over = 0
+        passed_over_unfinishable = 0
         for city in due:
             if previewed >= day_cap:
                 break
@@ -10318,7 +10363,18 @@ def cmd_run_due(
                 for provider in city_channels:
                     preview_unfinished[provider] += 1
                 continue
-            previewed += 1
+            # The same pass-over for a city whose every unheld channel the
+            # launch skips as unfinishable under the per-city ceiling (#456
+            # review): live, nothing is attempted and `processed` does not
+            # move, so the night reaches the next city. Its rows still print
+            # below, as the live loop logs the skips.
+            if city_channels and all(
+                _held_by(p) or _city_channel_unfinishable(cfg, conn, city, p) is not None
+                for p in city_channels
+            ):
+                passed_over_unfinishable += 1
+            else:
+                previewed += 1
             for provider in city_channels:
                 held_by = _held_by(provider)
                 if held_by:
@@ -10438,6 +10494,12 @@ def cmd_run_due(
             print(
                 f"  ({passed_over:,} due city(ies) HELD on every channel passed over, as the "
                 f"night passes them: they take no city-cap slot; issue #444)"
+            )
+        if passed_over_unfinishable:
+            print(
+                f"  ({passed_over_unfinishable:,} due city(ies) skipped as unfinishable under "
+                f"the per-city ceiling on every channel passed over, as the night passes "
+                f"them: they take no city-cap slot and stay due; #456 review)"
             )
         if cfg.fill_min_days is not None:
             _print_fill_preview(
@@ -12633,6 +12695,9 @@ class FillVerdict(NamedTuple):
     message: str
     run: tuple[str, ...] | None = None
     left: tuple[str, ...] = ()
+    # The subset of ``left`` left because a due BACKLOG holds the channel
+    # tonight, not because of its size (#456 review, third round).
+    held_left: tuple[str, ...] = ()
     # The host token(s) behind a host blocker (issue #443), so the Done line can
     # name the host that ENDED the fill rather than every host latched tonight.
     hosts: frozenset[str] = frozenset()
@@ -13059,6 +13124,11 @@ def _never_fits_tonight(
       cascaded pair -- a resumable mapillary included -- is never attempted
       either, every night, for the same reason.
 
+    * a resumable channel whose FRESH crawl the per-city ceiling cannot finish
+      before the checkpoint wall (#456 review): the launch skips it, not a
+      failure, every night it stays that size -- held on it, the fill would
+      be off for as long as the city is enrolled.
+
     A resumable channel is otherwise never "never": it launches capped and
     resumes.
     """
@@ -13076,6 +13146,11 @@ def _never_fits_tonight(
         if sibling in city_channels and _sweep_checkpoint_progress(cfg, city, sibling) is not None:
             return "behind its grid sibling's in-flight sweep"
     if is_resumable_channel(channel):
+        if _city_channel_unfinishable(cfg, conn, city, channel) is not None:
+            return (
+                "a fresh crawl too big to finish before the checkpoint wall under its "
+                "per-city ceiling, which the launch skips (not a failure)"
+            )
         return None
     if _channel_estimate(cfg, city, channel, conn) > cfg.providers[channel].daily_request_budget:
         return "priced over its whole daily budget"
@@ -13287,6 +13362,7 @@ class FillReport:
     # Ceiling channels left to their due schedule (#456 review): a fresh crawl
     # more than one launch under the per-city ceiling affords.
     ceiling_left: Counter[str] = field(default_factory=Counter)
+    held_left: Counter[str] = field(default_factory=Counter)
     ended_by: str = ""
     # What the night left unused when the fill ended (issue #443): the batch
     # window's remaining seconds and the city cap's remaining slots. None on a
@@ -13325,7 +13401,7 @@ class FillReport:
             f"fill (early refresh, >= {floor_days} d): {self.cities} cities{resumed}"
             f"{realigned}, {self.succeeded}/{self.attempted} runs, {self.early_refreshes} "
             f"early refresh(es) recorded{declined}{held}{blocked}"
-            f"{_fill_left_note(self.ceiling_left)}{reserved}; "
+            f"{_fill_left_note(self.ceiling_left, self.held_left)}{reserved}; "
             f"ended by {self.ended_by}{self._left_clause()}"
         )
 
@@ -13347,15 +13423,21 @@ class FillReport:
         )
 
 
-def _fill_left_note(left: Counter[str]) -> str:
-    """``; left to the due schedule: kartaview 3 (over the per-city ceiling)``, or empty."""
-    if not left:
+def _fill_left_note(left: Counter[str], held_left: Counter[str] | None = None) -> str:
+    """``; left to the due schedule: kartaview 3 (over the per-city ceiling), kartaview 1 (held by its due backlog)``, or empty."""
+    parts = []
+    if left:
+        parts.append(
+            ", ".join(f"{c} {n}" for c, n in sorted(left.items())) + " (over the per-city ceiling)"
+        )
+    if held_left:
+        parts.append(
+            ", ".join(f"{c} {n}" for c, n in sorted(held_left.items()))
+            + " (held by its due backlog)"
+        )
+    if not parts:
         return ""
-    return (
-        "; left to the due schedule: "
-        + ", ".join(f"{c} {n}" for c, n in sorted(left.items()))
-        + " (over the per-city ceiling)"
-    )
+    return "; left to the due schedule: " + ", ".join(parts)
 
 
 def _fill_city_price(
@@ -13390,9 +13472,9 @@ def _fill_city_price(
 
 
 def _fill_leaves_to_due_schedule(
-    cfg: "SchedulerConfig", city: db.CityRow, channel: str, est: int
-) -> bool:
-    """Is ``channel`` a FRESH crawl more than one launch under its ceiling affords? (#456 review)
+    cfg: "SchedulerConfig", conn, city: db.CityRow, channel: str
+) -> int | None:
+    """The estimate of ``channel``'s FRESH crawl when more than one launch under its ceiling affords it, else None (#456 review).
 
     The fill leaves such a channel to its own due schedule rather than
     declining the whole city (Jon's decision, 2026-10-28): declining lost the
@@ -13402,12 +13484,15 @@ def _fill_leaves_to_due_schedule(
     checkpoint would likely age out. A crawl with a live checkpoint is not
     left: it is paid-for work, and the fill resumes it first.
     """
-    if est <= 0 or not is_resumable_channel(channel):
-        return False
+    if not is_resumable_channel(channel):
+        return None
     window = _ceiling_window(channel, (cfg.providers or {}).get(channel))
-    if window is None or est <= window.per_night:
-        return False
-    return _sweep_checkpoint_progress(cfg, city, channel) is None
+    if window is None or _sweep_checkpoint_progress(cfg, city, channel) is not None:
+        return None
+    est = _channel_estimate(cfg, city, channel, conn)
+    if est <= 0 or est <= window.per_night:
+        return None
+    return est
 
 
 def _fill_prebudget_refusal(
@@ -13483,57 +13568,83 @@ def _fill_judge(
     refusal). ``held`` is the channels a due backlog holds tonight: a city
     that would run one is declined first, whole, as ``backlog``.
 
-    Between pricing and the budget rule, a ceiling channel's fresh crawl over
-    one launch's cap is LEFT to its due schedule (#456 review,
-    :func:`_fill_leaves_to_due_schedule`): the verdict's ``run`` is the city
-    without it and ``left`` names it; a city with nothing else to run is
-    declined as ``_FILL_BLOCKER_CEILING``. Every other channel is still
-    whole-or-nothing.
+    FIRST, before the hold and every refusal, a ceiling channel is LEFT to its
+    due schedule (#456 review, the one exception to whole-or-nothing) when its
+    fresh crawl is more than one launch's cap (:func:`_fill_leaves_to_due_schedule`)
+    OR a due backlog holds it tonight (``held_left``: a KartaView crawl paused at
+    the ceiling is a backlog, and declining every KartaView member for it was
+    the same loss through another door -- third round). The verdict's ``run``
+    is the city without them and ``left`` names them; a city with nothing else
+    to run is declined as ``_FILL_BLOCKER_CEILING``, or as ``backlog`` when a
+    hold is what emptied it. Every other channel is still whole-or-nothing:
+    the hold check and the pre-budget refusals are asked of ``run`` alone.
     """
-    on_hold = [c for c in channels if c in held]
+    ceiling_left = {
+        c: e
+        for c in channels
+        if (e := _fill_leaves_to_due_schedule(cfg, conn, city, c)) is not None
+    }
+    held_left = tuple(
+        c
+        for c in channels
+        if c in held
+        and c not in ceiling_left
+        and _ceiling_window(c, (cfg.providers or {}).get(c)) is not None
+    )
+    left = tuple(c for c in channels if c in ceiling_left or c in held_left)
+    run = [c for c in channels if c not in left]
+    if not run:
+        if held_left:
+            return (
+                FillVerdict(
+                    False,
+                    _FILL_BLOCKER_BACKLOG,
+                    f"{', '.join(held_left)} has due work tonight's due phase did not "
+                    f"attempt, and nothing else of the city is left to refresh",
+                    left=left,
+                    held_left=held_left,
+                ),
+                {},
+            )
+        return (
+            FillVerdict(
+                False,
+                _FILL_BLOCKER_CEILING,
+                f"{', '.join(left)}: ~{sum(ceiling_left.values()):,} req is more than one "
+                f"launch under the per-city ceiling affords, and nothing else of the city "
+                f"is left to refresh",
+                left=left,
+            ),
+            dict(ceiling_left),
+        )
+    on_hold = [c for c in run if c in held]
     if on_hold:
         return (
             FillVerdict(
                 False,
                 _FILL_BLOCKER_BACKLOG,
                 f"{', '.join(on_hold)} has due work tonight's due phase did not attempt",
+                left=left,
+                held_left=held_left,
             ),
             {},
         )
-    refusal = _fill_prebudget_refusal(cfg, city, channels, latched, held_hosts)
+    refusal = _fill_prebudget_refusal(cfg, city, run, latched, held_hosts)
     if refusal is not None:
-        return refusal, {}
-    est, need = _fill_city_price(cfg, conn, city, channels)
-    # THE ONE exception to whole-or-nothing (#456 review): a ceiling channel's
-    # fresh crawl over one launch's cap is left to its due schedule, and the
-    # rest of the city is judged -- and run -- without it.
-    left = tuple(c for c in channels if _fill_leaves_to_due_schedule(cfg, city, c, est[c]))
-    if left:
-        channels = [c for c in channels if c not in left]
-        if not channels:
-            return (
-                FillVerdict(
-                    False,
-                    _FILL_BLOCKER_CEILING,
-                    f"{', '.join(left)}: ~{sum(est[c] for c in left):,} req is more than one "
-                    f"launch under the per-city ceiling affords, and nothing else of the city "
-                    f"is left to refresh",
-                    left=left,
-                ),
-                est,
-            )
+        return refusal._replace(left=left, held_left=held_left), {}
+    est, need = _fill_city_price(cfg, conn, city, run)
     host_room = _fill_host_room(cfg, used_by_host, reserve=reserve, fill_spent=fill_spent)
-    verdict = _fill_verdict(channels, est, channel_room, host_room, need, remaining_s)
+    verdict = _fill_verdict(run, est, channel_room, host_room, need, remaining_s)
     if verdict.admit:
         launch = _fill_launch_refusal(
-            cfg, conn, city, channels, est, channel_room, host_room, remaining_s, need
+            cfg, conn, city, run, est, channel_room, host_room, remaining_s, need
         )
         if launch is not None:
             verdict = launch
     if verdict.admit:
-        verdict = verdict._replace(run=tuple(channels), left=left)
+        verdict = verdict._replace(run=tuple(run), left=left, held_left=held_left)
     elif left:
-        verdict = verdict._replace(left=left)
+        verdict = verdict._replace(left=left, held_left=held_left)
     return verdict, est
 
 
@@ -13747,6 +13858,7 @@ def _print_fill_preview(
     admitted = 0
     declined: Counter[str] = Counter()
     left_to_due: Counter[str] = Counter()
+    held_left_to_due: Counter[str] = Counter()
 
     demand = _tomorrow_due_demand(cfg, conn, today, providers, running_tonight=providers_for_city)
     reserve = _tomorrow_due_reserve(cfg, conn, today, providers, demand=demand)
@@ -13785,7 +13897,10 @@ def _print_fill_preview(
             return False
         admitted += 1
         for channel in verdict.left:
-            left_to_due[channel] += 1
+            if channel in verdict.held_left:
+                held_left_to_due[channel] += 1
+            else:
+                left_to_due[channel] += 1
         for channel in city_channels if verdict.run is None else verdict.run:
             print(f"  {city.city_id:60s} {channel:16s} ~{est[channel]:>9,} req  {label}")
             budget_left[channel] -= est[channel]
@@ -13833,7 +13948,7 @@ def _print_fill_preview(
             if declined
             else ""
         )
-        + _fill_left_note(left_to_due)
+        + _fill_left_note(left_to_due, held_left_to_due)
         + "."
     )
 
@@ -13981,12 +14096,20 @@ def _run_fill(
             # line counts it apart from the failing channels below.
             city_channels = [c for c in city_channels if c in verdict.run]
         for channel in verdict.left:
-            report.ceiling_left[channel] += 1
+            if channel in verdict.held_left:
+                report.held_left[channel] += 1
+            else:
+                report.ceiling_left[channel] += 1
         if verdict.left:
+            why = "; ".join(
+                f"{c}: held by its due backlog tonight"
+                if c in verdict.held_left
+                else f"{c}: more than one launch under the per-city ceiling affords"
+                for c in verdict.left
+            )
             logger.info(
-                f"{city.city_id} [{label}]: left to the due schedule -- "
-                f"{', '.join(verdict.left)}: more than one launch under the per-city ceiling "
-                f"affords; the city runs without it"
+                f"{city.city_id} [{label}]: left to the due schedule -- {why}; the city runs "
+                f"without it"
             )
         if label == "fill":
             blocked = _failing_opt_in(conn, city.city_id, channels, prior, since_iso)
@@ -14127,7 +14250,7 @@ def _run_fill(
                 elif blocker in (_FILL_BLOCKER_HOST_REFUSED, _FILL_BLOCKER_HOST_HELD):
                     hosts = trailing_hosts.get(blocker)
                     ended = f"{blocker}: {_host_names(hosts)}" if hosts else blocker
-                elif blocker == _FILL_BLOCKER_UNFROZEN:
+                elif blocker in (_FILL_BLOCKER_UNFROZEN, _FILL_BLOCKER_CEILING):
                     ended = blocker
                 else:
                     ended = f"budget ({blocker})"

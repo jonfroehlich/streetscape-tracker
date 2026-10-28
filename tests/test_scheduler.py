@@ -10214,6 +10214,11 @@ def test_a_configured_per_city_ceiling_is_honoured_and_reaches_the_walk(conn, mo
     # Tile censuses keep no default ceiling: Mapillary's lanes are what this protects.
     assert _crawl_city_ceiling_s("mapillary", None) is None
     assert _crawl_city_ceiling_s("panoramax", None) is None
+    # And take none when configured either (#456 third round): the ceiling
+    # brings the unfinishable skip and the fill's leave-to-due exception with
+    # it, both accepted for the least important provider only.
+    assert _crawl_city_ceiling_s("mapillary", ProviderConfig(max_city_minutes=30)) is None
+    assert _crawl_city_ceiling_s("panoramax_streets", ProviderConfig(max_city_minutes=30)) is None
 
     cid = _register(conn, "Metro", width=20_000, height=20_000, step=20)
     _enroll_kartaview(conn, cid)
@@ -10473,17 +10478,46 @@ def test_an_unfinishable_city_takes_no_reserved_opt_in_slot(conn, monkeypatch, c
     )
 
 
+def test_a_city_with_one_finishable_due_channel_keeps_its_reserved_slot(conn):
+    """The reservation's exclusion is "unfinishable on EVERY due channel", never
+    "any" (#456 third round, finding 4): a city due on an unfinishable
+    kartaview sweep and a finishable panoramax census still launches the
+    census, so it keeps its slot -- excluded, its finishable channel would
+    starve behind the skip. Kills: `all` for `any` in
+    `_unfinishable_on_every_channel` (the "any" mutant that survived the
+    first round)."""
+    from streetscape_metadata_tracker import scheduler as sched
+
+    cid = _register(conn, "Aaa", width=20_000, height=20_000, step=20)
+    city = db.resolve_city(conn, cid)
+    cfg = _sweep_cfg(publish_enabled=False)
+    assert sched._city_channel_unfinishable(cfg, conn, city, "kartaview") is not None
+    assert sched._city_channel_unfinishable(cfg, conn, city, "panoramax") is None, "no ceiling"
+    assert sched._unfinishable_on_every_channel(cfg, conn, city, ["kartaview"]) is True
+    assert (
+        sched._unfinishable_on_every_channel(cfg, conn, city, ["kartaview", "panoramax"]) is False
+    )
+    assert (
+        sched._unfinishable_on_every_channel(cfg, conn, city, ["panoramax", "kartaview"]) is False
+    )
+    assert sched._unfinishable_on_every_channel(cfg, conn, city, []) is False
+
+
 def test_max_city_minutes_parses_and_bad_values_fall_back(tmp_path, caplog):
-    """A bad value or a non-resumable channel is named and ignored, never a
-    night-aborting error. Kills: the key not read at load, and the
-    non-resumable guard dropped (a gsv child cut short is SIGKILLed and
-    counted a failure, never paused)."""
+    """A bad value, a non-resumable channel or a channel outside the KartaView
+    pair is named and ignored, never a night-aborting error. Kills: the key
+    not read at load, the non-resumable guard dropped (a gsv child cut short
+    is SIGKILLed and counted a failure, never paused), and the KartaView scope
+    dropped (#456 third round: a Mapillary ceiling would skip big Mapillary
+    cities as unfinishable and let the fill leave the top-priority provider to
+    its due schedule)."""
     cfg_path = tmp_path / "s.toml"
     cfg_path.write_text(
         "[providers.gsv]\nenabled = true\nmax_city_minutes = 30\n\n"
         "[providers.kartaview]\nenabled = true\nmax_city_minutes = 90\n\n"
         '[providers.kartaview_streets]\nenabled = true\nmax_city_minutes = "soon"\n\n'
-        "[providers.mapillary]\nenabled = true\nmax_city_minutes = -5\n"
+        "[providers.mapillary]\nenabled = true\nmax_city_minutes = -5\n\n"
+        "[providers.panoramax]\nenabled = true\nmax_city_minutes = 30\n"
     )
     with caplog.at_level(logging.WARNING):
         cfg = load_scheduler_config(str(cfg_path))
@@ -10491,10 +10525,15 @@ def test_max_city_minutes_parses_and_bad_values_fall_back(tmp_path, caplog):
     assert cfg.providers["gsv"].max_city_minutes is None
     assert cfg.providers["kartaview_streets"].max_city_minutes is None
     assert cfg.providers["mapillary"].max_city_minutes is None
+    assert cfg.providers["panoramax"].max_city_minutes is None
     text = caplog.text
     assert "[providers.gsv] max_city_minutes is ignored" in text
     assert "[providers.kartaview_streets] max_city_minutes='soon'" in text
     assert "[providers.mapillary] max_city_minutes=-5" in text
+    assert (
+        "[providers.panoramax] max_city_minutes is ignored: the per-city ceiling is a "
+        "KartaView feature (kartaview, kartaview_streets)"
+    ) in text
 
 
 # ── A paused grid sweep and its paired walk (issues #274, #290) ──────────────

@@ -678,6 +678,13 @@ Added for Jon's 2026-10-28 decision in the #456 review (a fresh KartaView crawl 
 - `test_a_checkpointed_ceiling_bound_crawl_is_resumed_capped_not_declined` (killed by `ceiling_caps` always False) and `test_a_checkpointed_crawl_is_not_left_to_the_due_schedule` — paid-for work is resumed, never left.
 - `test_the_fill_prices_a_ceiling_channels_time_need_at_its_ceiling`; killed by dropping the clamp.
 
+Added in the #456 third round (the same loss through the fill's backlog hold):
+
+- `test_an_unfinishable_due_kartaview_pair_does_not_hold_the_fill` — a due-only-on-kartaview 40 km city is skipped as unfinishable and `_never_fits_tonight` names it, so the enrolled fill city still runs gsv and mapillary and the `Done:` line shows no `holding kartaview`; killed by dropping the unfinishable arm.
+- `test_a_paused_kartaview_due_sweep_holds_kartaview_visibly` (re-based) — a due KartaView crawl paused at the ceiling holds kartaview, and the enrolled city fills on gsv and mapillary with kartaview left as `held by its due backlog`; a city with nothing but the held channel is declined as `backlog` with `held_left`; killed by not leaving a held ceiling channel, and by asking the hold of the whole city before the narrowing.
+- `test_a_fill_ended_by_a_ceiling_decline_says_so` — `ended by over the per-city ceiling`, never `budget (...)`; killed by dropping the token from the `ended` branches.
+- `test_the_dry_run_spends_no_cap_slot_on_a_city_skipped_as_unfinishable` — at a cap of 1 the preview still reaches the next due city, as the live night does, and prints the pass-over footer; killed by spending the slot.
+
 **The equivalent mutant**: dropping `CHANNEL_METERED_HOST.get(channel) is None` from the resume's free extras (the reviewers' M21) changes nothing, because the coverage gate admits extras only when every usable metered member channel is already in the resume — so no metered channel is left for the extras loop to add. The check stays as the statement of intent.
 
 ## The failure quarantine, made visible (issues #421 and #424)
@@ -1205,6 +1212,7 @@ A hold keeps a host's channels from launching without anything having refused us
   - The unfinishable skip (Jon's decision, 2026-10-28, #456 review): `test_the_ceiling_window_is_the_per_launch_cap_times_the_nights_before_the_wall` (37 × 6 = 222 at the default, None without a ceiling), `test_a_fresh_crawl_the_ceiling_cannot_finish_before_the_wall_is_skipped_not_failed` (a 20 km Metro at ~405 requests: no launch, no `consecutive_failure`, still due, counted on the `Done:` line, the log names the three levers; killed by the arm never firing),
     `test_a_crawl_with_a_live_checkpoint_is_never_unfinishable_the_age_wall_judges_it` (killed by dropping the checkpoint guard), `test_ceiling_caps_says_the_ceiling_sized_the_cap_not_a_smaller_budget` and `test_an_unfinishable_city_takes_no_reserved_opt_in_slot` (the slate leaves it out of the reservation and logs it; killed by keeping it in).
     Four older tests whose 20 km Metro fixtures are now over the window shrank them to 12 km (~145 requests), so they keep testing what they tested.
+  - The third round's `test_a_city_with_one_finishable_due_channel_keeps_its_reserved_slot` pins EVERY against ANY in `_unfinishable_on_every_channel` (an unfinishable kartaview beside an unceiled panoramax is not excluded; killed by `any`), and `test_max_city_minutes_parses_and_bad_values_fall_back` and `test_a_configured_per_city_ceiling_is_honoured_and_reaches_the_walk` now pin the KartaView-only scope (`[providers.panoramax] max_city_minutes = 30` is named and ignored; a configured Mapillary ceiling resolves to None; killed by dropping either guard).
   - The budget-arm tests that predate it (`test_a_sweep_priced_over_the_whole_budget_is_capped_rather_than_skipped_forever`, `test_a_timeout_with_room_to_spare_leaves_the_cap_at_the_budget_remainder` and `_wall_cfg`'s cases) set the ceiling out of the way with `_NO_CITY_CEILING_MIN`, so they keep testing the budget.
 - The cross-night refusal cooldown (`[hosts.<token>].refusal_cooldown_h`):
   - `test_a_refusal_cooldown_loads` (36, 0.5, 168) and `test_an_invalid_refusal_cooldown_fails_closed` (0, −1, 169, a bool, a string, a list).

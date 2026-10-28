@@ -517,8 +517,10 @@ max_requests_per_minute = 1.5
 # value is raised rather than skipping every city. 60 is also the code default.
 # A fresh crawl over 6 launches' worth (222 at the default) is skipped at its
 # first launch, not failed, and takes no reserved slot (#456 review); the fill
-# leaves a fresh crawl over ONE launch's cap (~37) to this channel's own due
-# schedule and refreshes the city's other channels.
+# leaves a fresh crawl over ONE launch's cap (~37), or a channel a due backlog
+# holds, to this channel's own due schedule and refreshes the city's other
+# channels. The key is accepted on the two KartaView blocks ONLY -- elsewhere
+# it is ignored with a warning, because the skip and the exception come with it.
 max_city_minutes = 60
 
 # KartaView road walk (issue #258) — the SECOND opt-in channel, and the same
