@@ -19,6 +19,7 @@ at all. These tests pin, in order:
 
 import os
 import time
+from collections import Counter
 from datetime import UTC, date, datetime, timedelta
 
 import pytest
@@ -1643,6 +1644,53 @@ def test_an_unfinishable_due_kartaview_pair_does_not_hold_the_fill(conn, monkeyp
         f"before the checkpoint wall under its per-city ceiling, which the launch skips "
         f"(not a failure); it does not hold the fill"
     ) in caplog.text
+
+
+def test_a_kartaview_host_refused_or_held_tonight_leaves_the_channel_not_the_city(conn):
+    """#456 fourth round, finding 2: the same loss through a third door. A
+    KartaView host that refused this machine (latched) or is held tonight
+    declined every KartaView-enrolled fill city whole, Mapillary and GSV
+    included, through `_fill_prebudget_refusal`. For Mapillary that end is
+    deliberate (#443); the KartaView exception rests on it being the least
+    important provider, so its channel is LEFT (`host_left`) and the city
+    fills on the rest; a city with nothing else to run is still declined as
+    the host refusal. Kills: `host_left` never filled."""
+    cid = _city(conn, "Enrolled", {"gsv": 60, "mapillary": 60, "kartaview": 60})
+    city = db.resolve_city(conn, cid)
+    cfg = _opt_in_cfg()
+    kv_hosts = set(sched.CHANNEL_HOSTS["kartaview"])
+    assert sched._channel_estimate(cfg, city, "kartaview", conn) <= 37, "premise: one launch"
+
+    def judge(channels, **kw):
+        return sched._fill_judge(
+            cfg,
+            conn,
+            city,
+            channels,
+            channel_room=dict.fromkeys(channels, 10_000_000),
+            used_by_host={},
+            remaining_s=None,
+            **kw,
+        )[0]
+
+    for kw in ({"latched": kv_hosts}, {"latched": set(), "held_hosts": kv_hosts}):
+        verdict = judge(["gsv", "mapillary", "kartaview"], **kw)
+        assert verdict.admit is True, kw
+        assert verdict.run == ("gsv", "mapillary")
+        assert verdict.left == ("kartaview",) == verdict.host_left
+        assert verdict.held_left == ()
+        alone = judge(["kartaview"], **kw)
+        assert alone.admit is False and alone.left == ("kartaview",) == alone.host_left
+        assert alone.blocker in (sched._FILL_BLOCKER_HOST_REFUSED, sched._FILL_BLOCKER_HOST_HELD)
+    # A latched MAPILLARY host still declines the city whole (#443): the exception is KartaView's.
+    verdict = judge(
+        ["gsv", "mapillary", "kartaview"], latched=set(sched.CHANNEL_HOSTS["mapillary"])
+    )
+    assert verdict.admit is False and verdict.blocker == sched._FILL_BLOCKER_HOST_REFUSED
+    assert verdict.left == ()
+    assert sched._fill_left_note(Counter(), Counter(), Counter({"kartaview": 2})) == (
+        "; left to the due schedule: kartaview 2 (its host refused or held tonight)"
+    )
 
 
 def test_a_fill_ended_by_a_ceiling_decline_says_so(conn, monkeypatch, caplog):

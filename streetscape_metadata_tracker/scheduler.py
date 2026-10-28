@@ -12695,9 +12695,11 @@ class FillVerdict(NamedTuple):
     message: str
     run: tuple[str, ...] | None = None
     left: tuple[str, ...] = ()
-    # The subset of ``left`` left because a due BACKLOG holds the channel
-    # tonight, not because of its size (#456 review, third round).
+    # The subsets of ``left`` left because a due BACKLOG holds the channel
+    # tonight, or because its HOST refused this machine or is held tonight --
+    # not because of its size (#456 review, third and fourth rounds).
     held_left: tuple[str, ...] = ()
+    host_left: tuple[str, ...] = ()
     # The host token(s) behind a host blocker (issue #443), so the Done line can
     # name the host that ENDED the fill rather than every host latched tonight.
     hosts: frozenset[str] = frozenset()
@@ -13363,6 +13365,7 @@ class FillReport:
     # more than one launch under the per-city ceiling affords.
     ceiling_left: Counter[str] = field(default_factory=Counter)
     held_left: Counter[str] = field(default_factory=Counter)
+    host_left: Counter[str] = field(default_factory=Counter)
     ended_by: str = ""
     # What the night left unused when the fill ended (issue #443): the batch
     # window's remaining seconds and the city cap's remaining slots. None on a
@@ -13401,7 +13404,7 @@ class FillReport:
             f"fill (early refresh, >= {floor_days} d): {self.cities} cities{resumed}"
             f"{realigned}, {self.succeeded}/{self.attempted} runs, {self.early_refreshes} "
             f"early refresh(es) recorded{declined}{held}{blocked}"
-            f"{_fill_left_note(self.ceiling_left, self.held_left)}{reserved}; "
+            f"{_fill_left_note(self.ceiling_left, self.held_left, self.host_left)}{reserved}; "
             f"ended by {self.ended_by}{self._left_clause()}"
         )
 
@@ -13423,8 +13426,12 @@ class FillReport:
         )
 
 
-def _fill_left_note(left: Counter[str], held_left: Counter[str] | None = None) -> str:
-    """``; left to the due schedule: kartaview 3 (over the per-city ceiling), kartaview 1 (held by its due backlog)``, or empty."""
+def _fill_left_note(
+    left: Counter[str],
+    held_left: Counter[str] | None = None,
+    host_left: Counter[str] | None = None,
+) -> str:
+    """``; left to the due schedule: kartaview 3 (over the per-city ceiling), kartaview 1 (held by its due backlog), kartaview 2 (its host refused or held tonight)``, or empty."""
     parts = []
     if left:
         parts.append(
@@ -13434,6 +13441,11 @@ def _fill_left_note(left: Counter[str], held_left: Counter[str] | None = None) -
         parts.append(
             ", ".join(f"{c} {n}" for c, n in sorted(held_left.items()))
             + " (held by its due backlog)"
+        )
+    if host_left:
+        parts.append(
+            ", ".join(f"{c} {n}" for c, n in sorted(host_left.items()))
+            + " (its host refused or held tonight)"
         )
     if not parts:
         return ""
@@ -13573,27 +13585,43 @@ def _fill_judge(
     fresh crawl is more than one launch's cap (:func:`_fill_leaves_to_due_schedule`)
     OR a due backlog holds it tonight (``held_left``: a KartaView crawl paused at
     the ceiling is a backlog, and declining every KartaView member for it was
-    the same loss through another door -- third round). The verdict's ``run``
-    is the city without them and ``left`` names them; a city with nothing else
-    to run is declined as ``_FILL_BLOCKER_CEILING``, or as ``backlog`` when a
-    hold is what emptied it. Every other channel is still whole-or-nothing:
-    the hold check and the pre-budget refusals are asked of ``run`` alone.
+    the same loss through another door -- third round) OR its host refused this
+    machine or is held tonight (``host_left``, the fourth round's third door:
+    for Mapillary a latched host ends the fill on purpose, #443, but the
+    KartaView exception rests on it being the least important provider). The
+    verdict's ``run`` is the city without them and ``left`` names them; a city
+    with nothing else to run is declined as ``_FILL_BLOCKER_CEILING``, or as
+    ``backlog`` / the host refusal when that is what emptied it. Every other
+    channel is still whole-or-nothing: the hold check and the pre-budget
+    refusals are asked of ``run`` alone.
     """
     ceiling_left = {
         c: e
         for c in channels
         if (e := _fill_leaves_to_due_schedule(cfg, conn, city, c)) is not None
     }
-    held_left = tuple(
+    ceiled = [
         c
         for c in channels
-        if c in held
-        and c not in ceiling_left
-        and _ceiling_window(c, (cfg.providers or {}).get(c)) is not None
+        if c not in ceiling_left and _ceiling_window(c, (cfg.providers or {}).get(c)) is not None
+    ]
+    held_left = tuple(c for c in ceiled if c in held)
+    # Only a HOST refusal leaves the channel; an unfrozen walk still declines
+    # the city, since that refusal is about Overpass traffic, not KartaView.
+    host_left = tuple(
+        c
+        for c in ceiled
+        if c not in held_left
+        and (r := _fill_prebudget_refusal(cfg, city, [c], latched, held_hosts)) is not None
+        and r.blocker in (_FILL_BLOCKER_HOST_HELD, _FILL_BLOCKER_HOST_REFUSED)
     )
-    left = tuple(c for c in channels if c in ceiling_left or c in held_left)
+    left = tuple(c for c in channels if c in ceiling_left or c in held_left or c in host_left)
     run = [c for c in channels if c not in left]
     if not run:
+        if host_left and not held_left:
+            refusal = _fill_prebudget_refusal(cfg, city, list(host_left), latched, held_hosts)
+            assert refusal is not None
+            return refusal._replace(left=left, host_left=host_left), {}
         if held_left:
             return (
                 FillVerdict(
@@ -13603,6 +13631,7 @@ def _fill_judge(
                     f"attempt, and nothing else of the city is left to refresh",
                     left=left,
                     held_left=held_left,
+                    host_left=host_left,
                 ),
                 {},
             )
@@ -13626,12 +13655,13 @@ def _fill_judge(
                 f"{', '.join(on_hold)} has due work tonight's due phase did not attempt",
                 left=left,
                 held_left=held_left,
+                host_left=host_left,
             ),
             {},
         )
     refusal = _fill_prebudget_refusal(cfg, city, run, latched, held_hosts)
     if refusal is not None:
-        return refusal._replace(left=left, held_left=held_left), {}
+        return refusal._replace(left=left, held_left=held_left, host_left=host_left), {}
     est, need = _fill_city_price(cfg, conn, city, run)
     host_room = _fill_host_room(cfg, used_by_host, reserve=reserve, fill_spent=fill_spent)
     verdict = _fill_verdict(run, est, channel_room, host_room, need, remaining_s)
@@ -13642,9 +13672,11 @@ def _fill_judge(
         if launch is not None:
             verdict = launch
     if verdict.admit:
-        verdict = verdict._replace(run=tuple(run), left=left, held_left=held_left)
+        verdict = verdict._replace(
+            run=tuple(run), left=left, held_left=held_left, host_left=host_left
+        )
     elif left:
-        verdict = verdict._replace(left=left, held_left=held_left)
+        verdict = verdict._replace(left=left, held_left=held_left, host_left=host_left)
     return verdict, est
 
 
@@ -13859,6 +13891,7 @@ def _print_fill_preview(
     declined: Counter[str] = Counter()
     left_to_due: Counter[str] = Counter()
     held_left_to_due: Counter[str] = Counter()
+    host_left_to_due: Counter[str] = Counter()
 
     demand = _tomorrow_due_demand(cfg, conn, today, providers, running_tonight=providers_for_city)
     reserve = _tomorrow_due_reserve(cfg, conn, today, providers, demand=demand)
@@ -13899,6 +13932,8 @@ def _print_fill_preview(
         for channel in verdict.left:
             if channel in verdict.held_left:
                 held_left_to_due[channel] += 1
+            elif channel in verdict.host_left:
+                host_left_to_due[channel] += 1
             else:
                 left_to_due[channel] += 1
         for channel in city_channels if verdict.run is None else verdict.run:
@@ -13948,7 +13983,7 @@ def _print_fill_preview(
             if declined
             else ""
         )
-        + _fill_left_note(left_to_due, held_left_to_due)
+        + _fill_left_note(left_to_due, held_left_to_due, host_left_to_due)
         + "."
     )
 
@@ -14098,12 +14133,16 @@ def _run_fill(
         for channel in verdict.left:
             if channel in verdict.held_left:
                 report.held_left[channel] += 1
+            elif channel in verdict.host_left:
+                report.host_left[channel] += 1
             else:
                 report.ceiling_left[channel] += 1
         if verdict.left:
             why = "; ".join(
                 f"{c}: held by its due backlog tonight"
                 if c in verdict.held_left
+                else f"{c}: its host refused this machine or is held tonight"
+                if c in verdict.host_left
                 else f"{c}: more than one launch under the per-city ceiling affords"
                 for c in verdict.left
             )
