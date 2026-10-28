@@ -18,6 +18,7 @@ at all. These tests pin, in order:
 """
 
 import os
+import time
 from datetime import UTC, date, datetime, timedelta
 
 import pytest
@@ -2230,3 +2231,218 @@ def test_a_paired_walk_pays_when_its_grid_will_not_run_tomorrow(conn):
     assert walk_b > 0
     got = sched._tomorrow_due_reserve(cfg, conn, TODAY, ["gsv", "mapillary", "mapillary_streets"])
     assert got == {"mapillary_tiles": (grid_a + walk_b, 2)}
+
+
+# ---------------------------------------------------------------------------
+# What ends the fill once the tile CDN is gone for the night (issue #443)
+# ---------------------------------------------------------------------------
+
+
+def _refuse_mapillary(only=None):
+    """An outcome refusing ``mapillary`` with the tile-CDN exit (for ``only`` cities, or all)."""
+    from streetscape_metadata_tracker.download_common import HOST_EXIT_CODES, HOST_MAPILLARY_TILES
+
+    def outcome(city, provider):
+        if provider == "mapillary" and (only is None or city.city_id in only):
+            return _outcome(HOST_EXIT_CODES[HOST_MAPILLARY_TILES])
+        return True
+
+    return outcome
+
+
+def _fill_clause(done):
+    """The fill clause's counters, without its ``ended by`` trailer."""
+    return done.split("fill (")[1].split("; ended by")[0]
+
+
+def test_a_mapillary_excluded_city_is_still_admitted_after_the_tile_cdn_latches(
+    conn, monkeypatch, caplog
+):
+    """The whole-city rule asks the latch of the city's RUN SET, not of the
+    night: a city excluded from Mapillary (#301) is admitted on gsv after the
+    tile CDN refused fill city ``a``. Killed by refusing every city while any
+    host is latched (``if latched:`` in ``_fill_prebudget_refusal``), and by
+    asking the latch of every channel's hosts rather than this channel's.
+
+    The latch itself is asserted from the night's own ``unavailable`` clause,
+    or the test would pass unchanged with nothing refused at all (killed by
+    dropping ``outcome=_refuse_mapillary()``: review of PR 454, finding 3)."""
+    caplog.set_level("INFO")
+    a = _city(conn, "Alpha", {"gsv": 70, "mapillary": 70})
+    x = _city(conn, "Xcluded", {"gsv": 60})
+    db.set_channel_membership(conn, x, "mapillary", False, cycle_days=90)
+
+    ran, _ = _run_night(monkeypatch, conn, _grid_cfg(), outcome=_refuse_mapillary())
+
+    assert ran == [(a, "gsv"), (a, "mapillary"), (x, "gsv")]
+    assert (x, "gsv") in {(r[0], r[1]) for r in _early_rows(conn)}
+    done = _done_line(caplog)
+    assert "Mapillary's tile CDN (tiles.mapillary.com) unavailable" in done
+    assert "declined" not in _fill_clause(done)
+    # An admission after the latch clears what trails, so nothing declined ENDED it.
+    assert "ended by candidates exhausted" in done
+
+
+def test_a_city_whose_mapillary_the_due_phase_ran_is_finished_by_the_fill_after_a_latch(
+    conn, monkeypatch, caplog
+):
+    """``a`` is due on mapillary only (hoisted first); ``b`` is due on both and
+    its mapillary latches the tile CDN. The fill still finishes ``a`` on gsv --
+    its run set is the channels NOT run tonight, which touches no latched or
+    backlog-held host -- and ``a`` ends the night aligned. Killed by asking the
+    latch or the backlog of every member channel instead of the run set."""
+    caplog.set_level("INFO")
+    a = _city(conn, "Alpha", {"gsv": 60, "mapillary": 83})
+    b = _city(conn, "Bravo", {"gsv": 90, "mapillary": 90})
+
+    ran, _ = _run_night(monkeypatch, conn, _grid_cfg(), outcome=_refuse_mapillary(only={b}))
+
+    assert ran == [(a, "mapillary"), (b, "gsv"), (b, "mapillary"), (a, "gsv")]
+    assert "1 realigned" in _done_line(caplog)
+
+
+def test_the_fill_names_the_host_that_ended_it_and_what_it_left_unused(conn, monkeypatch, caplog):
+    """The Done line names the HOST that ended the fill and the window hours and
+    city slots the night left. ``processed`` counts the due city and the
+    admitted fill city ``a``, so 38 of 40 slots are left. Killed by counting only
+    fill cities (39), and by dropping the host from ``ended_by``."""
+    caplog.set_level("INFO")
+    _city(conn, "Due", {"gsv": 90, "mapillary": 90})
+    a = _city(conn, "Alpha", {"gsv": 70, "mapillary": 70})
+    b = _city(conn, "Bravo", {"gsv": 60, "mapillary": 60})
+
+    ran, _ = _run_night(
+        monkeypatch,
+        conn,
+        _grid_cfg(max_cities_per_day=40, max_batch_hours=12.0),
+        outcome=_refuse_mapillary(only={a, b}),
+    )
+
+    assert all(cid != b for cid, _ in ran)
+    assert (
+        "ended by host refused tonight: Mapillary's tile CDN (tiles.mapillary.com); "
+        "left: 12.0 h of the 12 h window, 38 of 40 city slots"
+    ) in _done_line(caplog)
+
+
+def test_the_fill_names_only_the_host_its_declines_asked_about(conn, monkeypatch, caplog, data_dir):
+    """Overpass latches on a walk; the fill's walks are frozen and never ask it,
+    so the tile CDN alone ended the fill. Killed by naming
+    ``blocked_hosts.latched`` in ``ended_by``."""
+    from streetscape_metadata_tracker.download_common import (
+        HOST_EXIT_CODES,
+        HOST_MAPILLARY_TILES,
+        HOST_OVERPASS,
+    )
+
+    caplog.set_level("INFO")
+    providers = {
+        "gsv": ProviderConfig(daily_request_budget=10_000_000),
+        "gsv_streets": ProviderConfig(daily_request_budget=10_000_000),
+        "mapillary": ProviderConfig(daily_request_budget=3_500),
+    }
+    a = _city(conn, "Alpha", {"gsv": 70, "gsv_streets": 70, "mapillary": 70})
+    b = _city(conn, "Bravo", {"gsv": 60, "gsv_streets": 60, "mapillary": 60})
+    for cid in (a, b):
+        _freeze_network(data_dir, cid)
+
+    def outcome(city, provider):
+        if provider == "gsv_streets":
+            return _outcome(HOST_EXIT_CODES[HOST_OVERPASS])
+        if provider == "mapillary":
+            return _outcome(HOST_EXIT_CODES[HOST_MAPILLARY_TILES])
+        return True
+
+    ran, _ = _run_night(
+        monkeypatch, conn, _grid_cfg(providers=providers, data_dir=data_dir), outcome=outcome
+    )
+
+    assert all(cid != b for cid, _ in ran)
+    ended = _done_line(caplog).split("; ended by ")[1]
+    assert ended.startswith(
+        "host refused tonight: Mapillary's tile CDN (tiles.mapillary.com); left:"
+    )
+    assert "Overpass" not in ended
+
+
+def _overpass_stranded_fill_night(monkeypatch, conn, data_dir, retry):
+    """A fill whose walk strands on Overpass, so the fill's retry pass runs.
+
+    ``retry`` replaces ``_retry_stranded_walks`` for the FILL's call only (the
+    due phase's end-of-night pass keeps the real one).
+    """
+    from streetscape_metadata_tracker.download_common import HOST_EXIT_CODES, HOST_OVERPASS
+
+    providers = {
+        "gsv": ProviderConfig(daily_request_budget=10_000_000),
+        "gsv_streets": ProviderConfig(daily_request_budget=10_000_000),
+        "mapillary": ProviderConfig(daily_request_budget=3_500),
+    }
+    a = _city(conn, "Alpha", {"gsv": 70, "gsv_streets": 70, "mapillary": 70})
+    _freeze_network(data_dir, a)
+    real = sched._retry_stranded_walks
+    called = []
+
+    def fake(*args, fill=False, **kwargs):
+        if not fill:
+            return real(*args, fill=fill, **kwargs)
+        called.append(True)
+        return retry()
+
+    monkeypatch.setattr(sched, "_retry_stranded_walks", fake)
+
+    def outcome(city, provider):
+        if provider == "gsv_streets":
+            return _outcome(HOST_EXIT_CODES[HOST_OVERPASS])
+        return True
+
+    _run_night(
+        monkeypatch, conn, _grid_cfg(providers=providers, data_dir=data_dir), outcome=outcome
+    )
+    assert called, "the fill's stranded-walk retry pass never ran"
+
+
+def test_left_is_read_after_the_fill_stranded_walk_retry_pass(conn, monkeypatch, caplog, data_dir):
+    """The retry pass can wait out a breaker re-check; that time is SPENT, so
+    ``left:`` must be read after it. The fake pass advances the clock 3 h:
+    left reads 9.0 h, not 12.0. Killed by reading the four ``left:`` fields
+    before the retry pass (review of PR 454, finding 2)."""
+    caplog.set_level("INFO")
+    real_monotonic = time.monotonic
+    offset = [0.0]
+    monkeypatch.setattr(sched.time, "monotonic", lambda: real_monotonic() + offset[0])
+
+    def retry():
+        offset[0] += 3 * 3600
+        return None
+
+    _overpass_stranded_fill_night(monkeypatch, conn, data_dir, retry)
+    assert "; left: 9.0 h of the 12 h window, " in _done_line(caplog)
+
+
+def test_an_error_in_the_fill_retry_pass_prints_no_left_clause(conn, monkeypatch, caplog, data_dir):
+    """An error anywhere in the fill, its retry pass included, ends it as
+    ``unexpected error in the fill phase`` with NO ``left:`` -- driven through
+    ``_run_fill``, not a bare ``FillReport``. Killed by reading the four
+    ``left:`` fields before the retry pass (review of PR 454, finding 2)."""
+    caplog.set_level("INFO")
+
+    def retry():
+        raise RuntimeError("boom in the retry pass")
+
+    _overpass_stranded_fill_night(monkeypatch, conn, data_dir, retry)
+    done = _done_line(caplog)
+    assert "ended by unexpected error in the fill phase" in done
+    assert "left:" not in done
+
+
+def test_a_fill_report_the_fill_never_finished_prints_no_left_clause():
+    """A bare report (the fill raised before recording it) renders as before;
+    a finished one appends ``left:`` whatever ended it."""
+    assert sched.FillReport().summary_clause(30).endswith("ended by ")
+    report = sched.FillReport(
+        ended_by="deadline (12 h)", window_left_s=0.0, window_h=12.0, slots_left=5, city_cap=80
+    )
+    assert report.summary_clause(30).endswith(
+        "ended by deadline (12 h); left: 0.0 h of the 12 h window, 5 of 80 city slots"
+    )

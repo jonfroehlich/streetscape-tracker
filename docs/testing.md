@@ -660,6 +660,19 @@ Added in the fifth review round:
 - `test_a_retried_fill_walk_is_capped_at_the_fill_room` and `test_the_fills_walk_retry_is_a_fill_launch`; killed by not threading `fill`/`fill_cap` through the fill's retry pass.
 - `test_credits_let_the_next_city_into_tomorrows_window_and_reserve_it`; killed by cutting tomorrow's lists before the credits.
 
+Added for issue #443 (what ends the fill once the tile CDN is gone, 2026-10-27; each mutation run one at a time, file restored after):
+
+- `test_a_city_whose_mapillary_the_due_phase_ran_is_finished_by_the_fill_after_a_latch` — a Mapillary-only-due city hoisted first, then a due city whose mapillary latches the tile CDN; the fill still finishes the first on gsv and counts it `1 realigned`; killed by refusing every city while any host is latched, by asking the latch of every channel's hosts, and by judging every member channel instead of the run set.
+- `test_a_fill_report_the_fill_never_finished_prints_no_left_clause` — a bare `FillReport()` renders exactly as before, and a finished one appends `left:` whatever ended it; killed by printing the clause when nothing was recorded.
+- `test_a_mapillary_excluded_city_is_still_admitted_after_the_tile_cdn_latches` — a city excluded from Mapillary (#301) is admitted on gsv after the latch, nothing is declined, and the fill ends `candidates exhausted`; killed by the same three mutations as the realigned test.
+  It also asserts the latch happened (the night's own `unavailable` clause), because without that it passed unchanged with nothing refused at all; killed by dropping the refusing outcome (PR 454 review, finding 3).
+- `test_an_error_in_the_fill_retry_pass_prints_no_left_clause` — the fill's stranded-walk retry pass raises, and the `Done:` line ends `unexpected error in the fill phase` with no `left:`, driven through `_run_fill`; killed by reading the `left:` fields before the retry pass (PR 454 review, finding 2).
+- `test_left_is_read_after_the_fill_stranded_walk_retry_pass` — the fake retry pass advances the clock 3 h, so `left:` reads `9.0 h`, not `12.0 h`; killed by reading the `left:` fields before the retry pass (PR 454 review, finding 2).
+- `test_the_fill_names_only_the_host_its_declines_asked_about` — Overpass latches on a frozen walk, the tile CDN on mapillary; `ended by` names the tile CDN alone; killed by naming `blocked_hosts.latched`, and by dropping the host from `ended_by`.
+- `test_the_fill_names_the_host_that_ended_it_and_what_it_left_unused` — `host refused tonight: Mapillary's tile CDN (tiles.mapillary.com); left: 12.0 h of the 12 h window, 38 of 40 city slots`, the due city counted in the slots; killed by counting fill cities only (39), and by dropping the host.
+
+One mutation survives by construction: clearing `trailing` but not `trailing_hosts` on an admission would name an earlier run of declines' host, which needs two different per-IP hosts declining around an admission to observe; the two resets are therefore one helper (`clear_trailing`), so neither can be dropped alone.
+
 **The equivalent mutant**: dropping `CHANNEL_METERED_HOST.get(channel) is None` from the resume's free extras (the reviewers' M21) changes nothing, because the coverage gate admits extras only when every usable metered member channel is already in the resume — so no metered channel is left for the extras loop to add. The check stays as the statement of intent.
 
 ## The failure quarantine, made visible (issues #421 and #424)
