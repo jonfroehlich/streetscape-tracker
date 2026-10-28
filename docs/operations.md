@@ -114,6 +114,7 @@ The snippet prints both paces from the deployed config, so use its numbers, not 
   A scheduler-path GSV run has no cap, so size it with `--limit` to end well before 02:00; `kill -TERM <run-due pid>` stops further launches but does not signal the in-flight child (only a unit's control-group stop reaches it), so that city still runs to its end.
 - **Per-IP providers (Mapillary, KartaView, Panoramax, Overpass):** `host_lock` already serializes them across processes, so a second process fails fast instead of doubling the rate; if the batch's child is the one that loses, its city skips that channel tonight and the night alerts ([`deploy/README.md`](../deploy/README.md), "Running anything by hand alongside the scheduler").
   They still respect their budgets: catch up through `run-due --provider … --limit N` or `--city`, which draw on the daily and rolling-24h ledgers, never a detached script; the staging rules are in [`provider-access.md`](provider-access.md).
+  **Before any Mapillary `--limit` catch-up, read the Mapillary-only-due population** (the last block of `scripts/mapillary_night_report.py`, below): it is the backlog a catch-up would drain, its priced total is what the catch-up asks of the 1,200 rolling pool the night also draws on, and since #444 the standing advice is to let the night's bounded hoist drain it rather than add a second daily presence window.
 - **Never start a catch-up while a deploy or a repair script is running.** A deploy changes the code the next child runs and a repair script rewrites the catalog a run writes into, so the snippet's "deploys, repair scripts" list must be empty; if another session might be deploying, ask the operator first.
 
 ### 5. Afterwards
@@ -131,6 +132,33 @@ A `quota window reset` retry means a pass saw OVER_QUERY_LIMIT or UNKNOWN_ERROR 
 For a scheduler-launched catch-up, read its `logs/collect_<city_id>_<channel>_<UTC date>.log` instead.
 If a nightly lane collected the same key during the hand run, read that night's child logs for the same strings too, because the nightly run is the series whose data matters.
 Any hit is a finding: record it in the #304 section of [`provider-access.md`](provider-access.md) with the hand run's rate and the overlap window, rather than lowering a configured pace on one sample.
+
+## The weekly Mapillary read-out: `scripts/mapillary_night_report.py` (issue #444)
+
+Stage 1 of #444 is judged night by night, and the evidence is spread over the catalog, the scheduler log and the per-attempt child logs.
+One read-only command puts it in one table, on the catalog host:
+
+```bash
+python scripts/mapillary_night_report.py --config config/scheduler.makelab1.toml --since 2026-10-22
+# add --json logs/mapillary_nights_<date>.json to keep the record (logs/, never data/)
+```
+
+It makes no provider request, opens the catalog read-only (refusing, exit 2, any schema version but this code's own: the 2026-10-18 outage was a script that migrated prod's catalog), reads only `[paths].log_dir` and never lists `data/`.
+Safe beside a running `run-due`: a night with no `Done:` line yet prints as in flight.
+
+How to read it:
+
+- **served** is `api_usage` for both Mapillary channels, the per-process ledger: what this IP asked the tile CDN that UTC day.
+  `sweep_tot` is the `runs` rows' `api_requests`, which for a census crawl is its CUMULATIVE total across resumed nights, so a crawl paused at the pool and finished the next night shows its whole sweep there; never add it to served.
+- **tiles** sums every `mapillary tile statuses:` line in the night's `collect_*_mapillary*_<date>.log` files as 200/429/5xx/3xx with (crawls with a status line / Mapillary child logs).
+  `n/a` means no status line was found, never "no 429s".
+- **room first->last** is the fill's tile-CDN room as its decline lines quote it; `n/a` when no city was declined for it.
+- **stranded** is the hoist's `N of M cities not due on gsv` line, every stranded kind together; the exact Mapillary-only-due figure is the block under the table, as of today (the catalog keeps only each channel's newest clock, so it cannot be read for an earlier night).
+- **Stage 1 clock** counts active nights at the design point (at least 75% of the rolling pool served; presence is printed beside it, not gated) and says whether the criterion in [`provider-access.md`](provider-access.md) is met.
+  An active night with no tile-status line makes it `UNKNOWN`, never met, so pass `--since` at the current step's first night.
+  Until it is met, no volume knob moves.
+- **ended by** reads `crashed` for a run whose start line was followed by another run's before any `Done:` line; the first full run of a UTC date is the nightly, and any later one, or a bare `--limit` run, is counted as `[+N hand run(s)]`.
+- **#375** prints how many Mapillary channels the batch deadline deferred and a wind-down cut, the measurement that issue asks for.
 
 ## Answering a partner inquiry the same day: `scheduler assess-city "City, Region"` (issue #215)
 

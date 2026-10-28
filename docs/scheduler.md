@@ -565,6 +565,9 @@ The fill declines a city whose channel is on a held host (`_FILL_BLOCKER_HOST_HE
 **A rest night can waste part of the bounded opt-in reservation, and that is left as is.**
 `_collect_due` builds the slate without the holds, so on a rest night it still hoists Mapillary-only-due cities and live-checkpoint resumers into the `opt_in_cities_per_day` slots, the loop then passes over them as held, and those slots are not handed back to the plain queue or the refresh reserve.
 The cost is at most that reservation's share of two nights a week; teaching the slate about holds would make the hoist's rotation depend on the weekday, so it is noted for the Maintainer rather than changed.
+**Rest-held, pool-deferred and block-stranded cities all re-enter through kind 2 of the hoist**, not at the head of the next night: each collected its gsv half on schedule, so it is due on Mapillary and not on gsv.
+Measured after Stage 1 (#444): the gsv-ordered slate then held almost no Mapillary-due work (6 of 80 cities on 10-24, none on 10-25), and at a reservation of 10 kind 2 got three or four slots a night.
+Prod's reservation is 20 since 2026-10-27, which on a prod-shaped test slate (10 gsv-excluded, 440 Panoramax-only-due, an ASSUMED 60 Mapillary-only-due, 2 live checkpoints) gives kind 2 six; `scripts/mapillary_night_report.py` prints the population's size and priced total.
 `assess-city` treats a held channel as an incomplete answer (exit 1), like a refused one, without claiming anything refused us.
 `run-due --ignore-host-holds` lifts both kinds for one invocation, logged at WARNING; the nightly unit never passes it.
 
@@ -771,6 +774,8 @@ The demand (`_tomorrow_due_demand`) is read once, as the fill starts: each chann
 The reserve (`_tomorrow_due_reserve`) is **re-summed per admission, in this order**: drop the CREDITS — the pairs a fill city collected tonight (no longer due tomorrow) and the city being judged (so an 82-day city fits a ceiling of 1.5× its price instead of being declined against its own tomorrow).
 Then it cuts each channel's list at `max_cities_per_day` — after the credits, so the cities that move up into tomorrow's window are reserved; finds the cities each GRID channel's daily budget lets tomorrow actually run; prices a paired walk 0 only when its grid sibling is one of those (#290), and in full otherwise; then cuts each channel at its daily budget and each host at its cap, and sum per host (the grid and the walk on the tile CDN are one pool).
 It stays conservative where it is not exact: each channel's list is cut at the cap but not at the shared cap or the opt-in reservation, and a resumable crawl is priced whole.
+**Measured, that over-count binds on the tile CDN** (#444, 2026-10-26): Mapillary-only-due cities are stranded, and tomorrow's hoist reaches only its kind-2 share of them, but the reserve prices every one inside the cap, so 10-26's fill room on the tile CDN fell 69 → 5 and declined about 100 cities with ~980 of the 1,200 pool idle.
+Cutting the reserve at the hoist's reachable set is the candidate fix, left for a later change beside the fill's other open work; the stage that raised the prod reservation to 20 left it as is.
 A host with no rolling bound (KartaView and Panoramax on prod) has no figure to subtract a reserve from, and its daily budgets reset at midnight, so tonight cannot borrow them.
 The log, the `Done:` line and the dry run say what was reserved: `reserved 812 on mapillary_tiles for tomorrow's due (23 cities)`; the dry run assumes tonight's due slate succeeds.
 
@@ -935,7 +940,7 @@ Raise the key for the duration of a rollout rather than expecting ten cities on 
 **Seeding an opt-in channel: DUE IMMEDIATELY is not REACHABLE TONIGHT, and the gap can be weeks.**
 Dueness is per-(city, channel), so a fresh `schedule_state` row has `last_success_at` NULL and the city is due on the next run regardless of any sibling channel's 90-day clock.
 That is the whole of the eligibility question and none of the reachability one — the #328 lesson, arrived at from the enrolment side instead of the exclusion side.
-A newly enrolled city is stranded (not due on rank 0), so it enters the bounded hoist, competing for `opt_in_cities_per_day` (10 on prod) against every other stranded city: mapillary-stranded cities, and every never-collected KartaView-enrolled city from the #282 widening — ~380 of the 502 enrolled on 2026-09-03 still had a NULL `last_success_at`.
+A newly enrolled city is stranded (not due on rank 0), so it enters the bounded hoist, competing for `opt_in_cities_per_day` (20 on prod since 2026-10-27, 10 before) against every other stranded city: mapillary-stranded cities, and every never-collected KartaView-enrolled city from the #282 widening — ~380 of the 502 enrolled on 2026-09-03 still had a NULL `last_success_at`.
 Ordering inside the reservation is live-checkpoint first, then union order, then `city_id`, so a seed city with an unlucky slug can sit behind hundreds of them.
 **So do not wait for the nightly batch to prove a new channel works.** Run it filtered, which makes the new channel rank 0 and therefore strands nobody:
 

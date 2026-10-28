@@ -69,7 +69,25 @@ max_cities_per_day = 80    # cities/day (a city runs all enabled providers)
 # Set explicitly on 2026-09-25, when max_cities_per_day began a staged raise
 # from 40: the derived quarter would grow with every step (20 at 80), a faster
 # opt-in widening nobody decided on. 10 keeps the rate #282 has been running at.
-opt_in_cities_per_day = 10
+#
+# 10 -> 20 on 2026-10-27 (#444, the stage after Stage 1), config only. Since
+# Stage 1 the Mapillary work that is DUE has migrated out of the gsv-ordered
+# slate: a rest night, a rolling-pool deferral or a block collects a city's
+# gsv half and leaves its Mapillary half due on mapillary and not on gsv --
+# kind 2 of the hoist, which shares this reservation round-robin with
+# gsv-excluded cities (kind 0) and the Panoramax tranche's 442 enrolments
+# (kind 1), so it got 3-4 slots a night. Measured: 10-24's 80-city slate held
+# 6 Mapillary-due cities and 10-25's none, and the five active post-deploy
+# nights served a mean ~570 of the 1,200 pool. At 20 kind 2 gets 6 a night
+# (pinned by test_a_mapillary_only_due_city_gets_at_least_six_hoist_slots_
+# at_prods_reservation). The pool, the fill ceiling, the daily budgets, the rest
+# nights, the cooldown and the 40/min pace are all UNCHANGED, so this moves
+# volume only INSIDE the pool every launch is already gated on. With
+# refresh_slots the night now reserves 30 of 80, leaving 50 to stalest-first
+# (pinned from below by test_raising_the_reservation_never_starves_the_plain_
+# queue_at_prods_cap). Read the Mapillary-only-due population with
+# scripts/mapillary_night_report.py before and after.
+opt_in_cities_per_day = 20
 max_consecutive_failures = 5
 city_timeout_minutes = 180
 # Stop STARTING cities after this many hours so the aggregate/manifest/publish
