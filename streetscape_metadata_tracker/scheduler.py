@@ -12866,9 +12866,12 @@ class FillReport:
     def _left_clause(self) -> str:
         """``; left: 9.0 h of the 12 h window, 33 of 80 city slots`` (issue #443).
 
-        Printed on every fill end but an error, so the series is uniform: a
-        ``deadline`` end reads under ``0.2 h`` (the fill stops launching once
-        ``_MIN_PACED_LAUNCH_S`` or less is left), a ``city cap`` end ``0 of 80``.
+        Printed on every fill end but an error, so the series is uniform. A
+        ``deadline`` end is produced two ways and reads differently: at the
+        launch gate (``_MIN_PACED_LAUNCH_S`` or less left) it reads at most
+        ``0.2 h``; when the last candidates were each declined for the deadline
+        (``_FILL_BLOCKER_DEADLINE``) it reads the remainder none of them fit,
+        which can be hours. A ``city cap`` end reads ``0 of 80``.
         """
         if self.window_left_s is None:
             return ""
