@@ -1,0 +1,94 @@
+# The #442 GSV capture-history backfill queue, one instance per pass
+# (deploy/crawler/README.md). Install, as root, on the dedicated crawler host ONLY:
+#   cp deploy/crawler/gsv-history-queue@.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now gsv-history-queue@1
+#
+# WHERE IT RUNS. The harvester queries an undocumented, IP-identified endpoint
+# (docs/capture-dates.md), so it runs from a dedicated address that no lab
+# service shares -- never makelab1 or makelab2 -- and this file names no host:
+# the host's identity lives in the lab's private planning notes. The unit is a
+# system unit (the host exists for this), unlike the user units in
+# deploy/systemd, and WantedBy=multi-user.target makes it reboot-safe: the
+# queue restarts at boot and every crawl resumes from its ledger.
+#
+# WHAT IT RUNS. deploy/crawler/run_gsv_history_queue.sh over
+# /srv/crawler/worklists/queue-pass%i.txt: the work lists in the order to crawl
+# them, one harvester at a time, each resuming from its own out-dir. The script
+# header spells out what each harvester exit code does to the rest of the queue.
+#
+# ONE CRAWL PER HOST. The harvester holds /srv/crawler/results/crawl.lock for
+# its whole run, so enable ONE instance at a time: @2 only after @1's queue has
+# ended and @1 is disabled. Two instances enabled at boot race for the lock and
+# the loser exits 88, which (below) does not restart.
+#
+# RESTART POLICY. Restart=on-failure is for a crash (an exception, an OOM
+# kill): the queue re-runs from the top and every finished work list is skipped
+# at the cost of reading its ledger, never a request. The exits that must NOT
+# restart are listed by number, read from the harvester
+# (tests/test_deploy_crawler.py pins the set):
+#   2   our own argv, work list or out-dir refusal: deterministic
+#   83  the queue ended with work lists still incomplete: an operator's re-run,
+#       after reading which ones (the queue log), not a loop
+#   86  refused by the endpoint, or the 24 h latch is in force: a restart
+#       would be refused by the harvester the moment it started, every
+#       RestartSec, for a day
+#   88  another crawl holds the lock
+# RestartSec is long because the only failure that restarts is a crash, and a
+# crash that repeats on the same city would otherwise re-run every few seconds;
+# StartLimit* then bounds it to five starts a day. EVERY start counts toward
+# that, the operator's own `systemctl start` after an 83 or a code move
+# included; a start refused as "repeated too quickly" needs `systemctl
+# reset-failed gsv-history-queue@<pass>` first.
+#
+# STOPPING. KillSignal=SIGINT, not the default SIGTERM: the harvester has no
+# signal handler, and SIGTERM ends Python without its `finally`, cutting the
+# gzip member in progress (dropped on resume, up to chunk_size = 50 answers
+# re-queried); SIGINT raises KeyboardInterrupt, so the crawl's final flush
+# writes a complete member first. TimeoutStopSec covers one in-flight request
+# (the fetch timeout) plus that flush before systemd falls back to SIGKILL.
+[Unit]
+Description=Streetscape Tracker: GSV capture-history queue, pass %i (issue #442)
+Documentation=file:///srv/streetscape-tracker/deploy/crawler/README.md
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=1d
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=crawler
+Group=crawler
+WorkingDirectory=/srv/streetscape-tracker
+ExecStart=/srv/streetscape-tracker/deploy/crawler/run_gsv_history_queue.sh %i /srv/crawler/worklists/queue-pass%i.txt
+Restart=on-failure
+RestartSec=10min
+RestartPreventExitStatus=2 83 86 88
+KillSignal=SIGINT
+TimeoutStopSec=2min
+# The host does nothing else, but the agent that gives the operator a shell
+# must stay responsive; the crawl is paced, so it has nothing to gain from
+# priority.
+Nice=5
+# A 34 k-row work list ran at ~360 MB RSS (2026-10-26). The work list is held
+# as a DataFrame and the done set in memory, so a million-row pass-2 list is
+# several times that; read MemoryPeak (systemctl show -p MemoryPeak) after a
+# big pass-1 city before pass 2, and raise this rather than let an OOM kill
+# (a SIGKILL: no flush, and a restart that dies the same way) look like a crash.
+MemoryAccounting=true
+MemoryMax=1536M
+
+# ── Sandboxing ────────────────────────────────────────────────────────────
+# The checkout is read-only under ProtectSystem=strict (Python skips a
+# __pycache__ it cannot write); the only writable tree is the crawler root,
+# where the work lists, every out-dir, the latch, the lock and the queue log
+# live -- which is also the crawler user's home (ProtectHome hides /home and
+# /root, not /srv), so the libraries the package imports can write their
+# per-user caches. The harvester holds no credential and reads no catalog.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/srv/crawler
+
+[Install]
+WantedBy=multi-user.target
