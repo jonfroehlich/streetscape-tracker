@@ -1,0 +1,125 @@
+{
+ "kuna": {
+  "poly_km2": null,
+  "old_wh": [
+   16932,
+   14704
+  ],
+  "new_wh": [
+   4900,
+   5700
+  ],
+  "new_center": [
+   43.49753,
+   -116.42638
+  ],
+  "old_center": [
+   43.494971,
+   -116.358861
+  ],
+  "comps": 24,
+  "kept": 1,
+  "built_cells": 287,
+  "poly_local_km": 239,
+  "local_km_in_old": 798,
+  "local_km_in_new": 186,
+  "poly_streets_in_old": 1.0,
+  "poly_streets_in_new": 0.67,
+  "gsv_old": 622420,
+  "gsv_new": 69825,
+  "tiles_old": 99,
+  "tiles_new": 16,
+  "area_old": 249.0,
+  "area_new": 27.9,
+  "sweep_recent_km_old": 699,
+  "sweep_recent_km_new": 197,
+  "overlaps": [],
+  "geo_pt_in_new": true
+ },
+ "magna": {
+  "poly_km2": null,
+  "old_wh": [
+   16651,
+   14607
+  ],
+  "new_wh": [
+   4500,
+   4100
+  ],
+  "new_center": [
+   40.69992,
+   -112.0871
+  ],
+  "old_center": [
+   40.747605,
+   -112.161633
+  ],
+  "comps": 5,
+  "kept": 1,
+  "built_cells": 237,
+  "poly_local_km": 193,
+  "local_km_in_old": 230,
+  "local_km_in_new": 202,
+  "poly_streets_in_old": 1.0,
+  "poly_streets_in_new": 0.96,
+  "gsv_old": 608052,
+  "gsv_new": 46124,
+  "tiles_old": 80,
+  "tiles_new": 12,
+  "area_old": 243.2,
+  "area_new": 18.4,
+  "sweep_recent_km_old": 238,
+  "sweep_recent_km_new": 230,
+  "overlaps": [
+   [
+    "salt-lake-city--utah--united-states",
+    0.393
+   ],
+   [
+    "west-valley-city--utah--united-states",
+    0.693
+   ]
+  ],
+  "geo_pt_in_new": true
+ },
+ "carmel": {
+  "poly_km2": null,
+  "old_wh": [
+   9550,
+   4032
+  ],
+  "new_wh": [
+   2100,
+   2900
+  ],
+  "new_center": [
+   36.55307,
+   -121.92104
+  ],
+  "old_center": [
+   36.547727,
+   -121.966113
+  ],
+  "comps": 1,
+  "kept": 1,
+  "built_cells": 65,
+  "poly_local_km": 50,
+  "local_km_in_old": 83,
+  "local_km_in_new": 84,
+  "poly_streets_in_old": 1.0,
+  "poly_streets_in_new": 1.0,
+  "gsv_old": 96264,
+  "gsv_new": 15224,
+  "tiles_old": 18,
+  "tiles_new": 6,
+  "area_old": 38.5,
+  "area_new": 6.1,
+  "sweep_recent_km_old": 47,
+  "sweep_recent_km_new": 47,
+  "overlaps": [],
+  "geo_pt_in_new": true
+ },
+ "_about": {
+  "generated_by": "scripts/mapillary_discovery_rescore/fit_grids.py"
+ }
+}

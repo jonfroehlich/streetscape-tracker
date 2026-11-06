@@ -750,6 +750,67 @@ Before night 2, read night 1's ledger: its combined Mapillary spend plus 388 mus
 Never enable this tranche on the same night as another batch's tranche (e.g. #406's Panoramax manifest): the Mapillary tiles add up against the same per-IP ceiling.
 Reno is the owner's decision point ([`worldwide_sampling.md`](worldwide_sampling.md)): leaving it disabled after registration costs nothing.
 
+## Registering the Mapillary discovery screen's third tranche (`mapillary_discovery_cities_tranche3.csv`, issue #441)
+
+The 25-town third tranche, landed the same way as the second, with one added step: three towns get street-fitted grids after the audit.
+The selection, the advance prediction and the fits are in [`experiments/mapillary-discovery-screen.md`](experiments/mapillary-discovery-screen.md) ("Tranche 3").
+Every write below is gated: no `run-due` in flight, the night's `Done:` line in the scheduler log, and the owner's OK before `enable-city`.
+
+**1. Deploy a `main` that contains the manifest**, as for tranche 2.
+
+**2. Register, disabled.**
+
+```bash
+DATA=/projects/makeabilitylab/streetscape-tracker/data
+python scripts/register_frame.py --manifest mapillary_discovery_cities_tranche3.csv \
+    --db-path "$DATA/streetscape_tracker.db" \
+    --notes-label "mapillary discovery screen 2026-11-05 tranche 3" --overlap-km 4 --max-center-km 10
+# read the dry run: every row "-> NEW", and "newly-registered=25 failed=0"; then the same with --execute
+```
+
+- `--overlap-km 4`, not tranche 2's 5.
+  `find_overlap` measures from each row's GeoNames point to every centre already in the catalog, and with `--execute` that includes the GEOCODED centres of the rows this same run has just registered (the dry run registers nothing, so it cannot see those).
+  Stanford's point is 5.56 km from East Palo Alto's vetted centre, so at 5 km a 0.6 km geocode drift on the day would silently alias Stanford onto East Palo Alto.
+  The nearest catalog centres are 5.51 km (Delavan from tranche 2's Delavan Lake) and 5.52 km (Fair Oaks from Orangevale); 4 km leaves every margin at least 1.5 km of headroom (`_tranche3_overlaps.json`, pinned by the manifest's test).
+  So a nonzero `reused-existing` means the catalog holds a city within 4 km that the 2026-11-05 snapshot did not, or a row geocoded more than 1.5 km from where it was vetted; stop and find which.
+- `--max-center-km 10`: every row geocoded 0.0–6.6 km from its GeoNames point at vetting (Magna is the 6.6). Live Oak and Elko carry county-qualified queries because their bare names matched other places.
+- Each `--execute` line prints the frozen W x H; compare it with `docs/experiments/mapillary-discovery-screen_tranche3_vet*.csv` and stop on any difference.
+
+**3. Audit the boundaries**: tranche 2's step 3 verbatim, with the label `'mapillary discovery screen 2026-11-05 tranche 3%'`, the directory `audit/mdt3`, and 25 ids.
+Read the plan before `--execute`: a RESIZE of one of the 22 unfitted towns changes its price (re-price it as tranche 2's step 3 says), and the three below are re-sized in step 4 whatever the audit did to them.
+
+**4. Fit Kuna, Magna and Carmel-by-the-Sea to their streets, AFTER the audit.**
+Their boundary-derived grids are mostly farmland, lake flats and ocean.
+The order matters: `reregister_boundaries.py` grades a grid smaller than its OSM bbox `UNDER` and, below 30 km, grows it back to the bbox unattended, so a fit applied before the audit would be undone by it.
+For the same reason, **never pass these three to a later `reregister_boundaries.py --execute`.**
+`resize_city.py` refuses a city with real runs unless `--force`; these have none, so no `--force` is needed, and a refusal means something collected them — stop.
+
+```bash
+python scripts/resize_city.py kuna--idaho--united-states --width 4900 --height 5700 --center-lat 43.49753 --center-lon -116.42638 --data-dir "$DATA"
+python scripts/resize_city.py magna--utah--united-states --width 4500 --height 4100 --center-lat 40.69992 --center-lon -112.0871 --data-dir "$DATA"
+python scripts/resize_city.py carmel-by-the-sea--california--united-states --width 2100 --height 2900 --center-lat 36.55307 --center-lon -121.92104 --data-dir "$DATA"
+# each is a dry run; read it, then repeat with --execute
+```
+
+The numbers are `GRID_FITS` in `scripts/build_mapillary_discovery_tranche3.py`, which the manifest's test holds to the committed fit record.
+
+**5. Enable, one night at a time; then freeze the networks** exactly as tranche 2's steps 4 and 5.
+Never enable for a night whose UTC snapshot date is a Mapillary rest day (`[hosts.mapillary_tiles].rest_weekdays`, Wed and Sun on prod): the GSV channels would collect and Mapillary would be held, un-pairing the towns' first runs.
+
+**6. Pricing, and the nights.**
+With the fits, one collection of all 25 is 1,951,348 GSV grid points and 368 Mapillary z14 tiles; the Mapillary walks are free on a paired night (#290).
+Mapillary is priced against the **1,200-tile rolling-24 h pool** (`[hosts.mapillary_tiles]`, #444 Stage 1), which also has to hold that night's due Mapillary demand (a mean of about 570 over the five active nights after Stage 1 deployed, `provider-access.md`).
+The whole tranche would fit one night; it is split in two, alternating in GSV order, so a block lands on half of it:
+
+| Night | Cities | GSV points (h at 48k/min) | Mapillary tiles | KartaView requests (h at 16/min) | Panoramax tiles (min at 60/min) |
+|---|---|---|---|---|---|
+| 1 | White City, Ahuimanu, Pell Lake, Live Oak, Magna, Makakilo City, Muscoy, Belmont, Longwood, Delavan, Sterling, Eureka, Elko | 1,064,914 (0.37) | 203 | ≤ 673 (0.70) | ≤ 912 (15) |
+| 2 | Carmel-by-the-Sea, East Palo Alto, Rio Linda, Stanford, Royal Kunia, Evansdale, Makaha, Kuna, North Tustin, Fair Oaks, Worland, Colton | 886,434 (0.31) | 165 | ≤ 640 (0.67) | ≤ 861 (14) |
+
+The KartaView and Panoramax columns are upper bounds: they use the vetted grids for Kuna and Magna (237 KartaView requests each), and each opt-in pair is enrolled only if `enable-city`'s rule admits it.
+While both KartaView channels are paused on production (`enabled = false`, #452), the KartaView column is enrolment, not collection.
+Before night 2, read night 1's log as for tranche 2: every tranche city collected (or paused at a cap, exit 83), no Mapillary refusal or throttle (exit 75 or 87), no Overpass latch.
+
 ## Keeping Overpass out of the night: `scripts/prefreeze_street_networks.py` (issue #341)
 
 A road walk on a frozen network never contacts Overpass — `fetch_graph` returns the cached GraphML before it takes the host lock or probes — and only a city's *first* walk fetches one.

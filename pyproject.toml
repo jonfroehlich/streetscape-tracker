@@ -33,6 +33,11 @@ ignore = [
 # leaves string contents alone, so W291/W293 here flag whitespace *inside those
 # templates*, not real code.
 "streetscape_metadata_tracker/vis.py" = ["W291", "W293"]
+# The #441 tranche-3 re-score is research code kept as it was run, so the
+# committed record traces to the code that produced it; these rules would ask
+# for rewrites (closures over loop variables, zip strictness) that change
+# nothing the record depends on but would make it no longer the code that ran.
+"scripts/mapillary_discovery_rescore/*.py" = ["B007", "B023", "B905", "C416", "E402", "E731", "E741", "UP031"]
 
 [tool.ruff.format]
 # Ruff's Black-compatible defaults (double quotes, spaces). Explicit for clarity.

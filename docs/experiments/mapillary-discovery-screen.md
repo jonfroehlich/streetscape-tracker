@@ -159,6 +159,85 @@ Together they are **3,959,917 GSV grid points** (1,588 km²; largest Apex, NC at
 **All 25 were enabled on 2026-10-02 at 15:20 PDT** with `scheduler enable-city`, 0 failures, which put them on every default channel from that night and enrolled them on the opt-in channels whose screen found imagery: both KartaView channels for all 25, both Panoramax channels for 12.
 That is recorded from the project's operating notes for that day, not from a query of the production catalog made for this writeup.
 
+## Tranche 3 (2026-11-05, #441): a re-score, an advance prediction, and street-fitted grids
+
+Offline only: zero Mapillary requests, from the 2026-10-02 z6 scan's cached sequences and a read-only production snapshot exported on 2026-11-05.
+Every number in this section traces to [`mapillary-discovery-screen_tranche3_metrics.json`](mapillary-discovery-screen_tranche3_metrics.json) (`generated_by`: `scripts/mapillary_discovery_rescore/`), to the grid record [`mapillary-discovery-screen_tranche3_grids.json`](mapillary-discovery-screen_tranche3_grids.json), or to the registration-geometry record [`mapillary-discovery-screen_tranche3_overlaps.json`](mapillary-discovery-screen_tranche3_overlaps.json), each naming its script in `_about.generated_by` or `generated_by`.
+The re-score scripts are committed as re-run on 2026-11-06, with a scoped lint exemption in `pyproject.toml`.
+Between the 11-05 run and the commit they gained JSON exports of the numbers they print, `overlaps.py` was added, and one bug was fixed in `tier3.py`'s bootstrap (below); re-running them reproduced the 11-05 ranked record and grid fit byte for byte.
+
+### The re-score
+
+By 2026-11-05, 39 discovery-tranche towns and 1,111 other catalog cities inside the scanned tiles had a Mapillary drive walk.
+Five scores were compared against those walks, with "strict" meaning ≥ 50% street-km covered at a median age ≤ 2 years; three of them (`evaluation.by_target`, n = 1,111 non-tranche cities, 14 strict positives):
+
+| Score | Spearman ρ vs walk coverage | Average precision (strict) |
+|---|---|---|
+| V0, the committed score (recent length in 2 km) | 0.670 | 0.265 |
+| V4, age-weighted occupied 250 m cells, best of 1/2/3 km discs | 0.801 | 0.292 |
+| V5, V4 × the top uploader's shrunk leave-one-out walk record | 0.796 | 0.469 |
+
+V4 orders cities by coverage better (ρ 0.67 → 0.80), but on the strict bar its precision is unchanged within noise: AP(V4) − AP(V0) = +0.027, and resampling uploaders gives a 95% CI of [−0.129, +0.163] (`ap_diff_vs_V0_uploader_clustered`).
+The uploader record is what moves precision, and only suggestively: AP(V5) − AP(V0) = +0.204, but resampling uploaders rather than cities gives a 95% CI of [−0.113, +0.561], which crosses zero.
+The 11-05 run of that bootstrap removed only one copy of a resampled city's own outcome from its uploader record, so the other copies leaked into its score and the CI read [−0.045, +0.656]; the committed `record()` removes every copy.
+A city-level bootstrap gives a CI that excludes zero, and it is the wrong one to quote: towns from one uploader share their outcome.
+V4 is not a fraction and can exceed 1.
+
+**How many towns an uploader has does not predict how they walk** (`uploader_scorecard`, uploaders who dominate ≥ 3 walked cities): `quickness805` 0 strict hits of 31, `ctroadway360` 0 of 21, `nthp_gis` 0 of 19, against `rking` 10 of 34, `marker_geo1` 7 of 15 and `hmhtb` 3 of 4.
+
+### Selection
+
+The ranked record [`mapillary-discovery-screen_tranche3_ranked.csv`](mapillary-discovery-screen_tranche3_ranked.csv) holds the uncatalogued cities500 places with V4 ≥ 0.7, top-uploader share ≥ 0.6, on-foot share < 0.5, median age ≤ 2 years, population ≤ 60,000, in the US or Canada, outside every catalog grid and more than 5 km from its centre, and at least 5 km from every higher-ranked place: 468 places had V4 ≥ 0.7, 189 of them outside the catalog, 120 passed every rule and 105 survived the 5 km thinning (`funnel`).
+The tranche is the first 25 in V5 order with **at most 5 per uploader** (marker_geo1 has 35 open towns and rking 28), written as [`mapillary_discovery_cities_tranche3.csv`](../../mapillary_discovery_cities_tranche3.csv) by `scripts/build_mapillary_discovery_tranche3.py`.
+Fourteen of the 25 are cities500-only; their GeoNames lines were added verbatim to `data_sources/geonames_supplement.txt`.
+Every row was vetted with `vet_manifest_geometry.py` on 2026-11-05 ([`_tranche3_vet.csv`](mapillary-discovery-screen_tranche3_vet.csv)); Live Oak (matched Sutter County's Live Oak, 257 km off) and Elko (the county centroid, 32 km off) needed county-qualified queries, re-vetted the same day ([`_tranche3_vet_retry.csv`](mapillary-discovery-screen_tranche3_vet_retry.csv)), and all 25 then landed 0.0–6.6 km from their GeoNames point.
+
+### Advance prediction, recorded before any tranche-3 town is walked
+
+**The V4 ≥ 0.7 threshold is post hoc.**
+It was read off the same 39 screened tranche towns it is now used to predict: among them, V4 ≥ 0.7 gave 20 of 23 strict hits and 23 of 23 at ≥ 50% coverage, against 5 of 16 strict hits below it (`v4_threshold`).
+Tranche 3 is its first real test, and every one of its 25 towns is at V4 ≥ 0.7.
+
+At the observed rate (0.870), the expectation is **21.7 strict hits of 25**.
+**The threshold is falsified as a selector if fewer than **19** of the 25 meet the strict bar on their first Mapillary drive walk**; at the observed rate that outcome has probability 0.036 (`advance_prediction_tranche3`).
+Two reasons it may come in low, stated now rather than after:
+the screened tranches were already selected on V0 ≥ 3, while tranche 3 was selected on V4 and V5, so the populations differ;
+and among *catalog* cities the same threshold gave only 9 strict hits of 30.
+The three re-gridded towns are scored on their fitted grids, since those are what will be walked.
+
+### Grids fitted to the streets
+
+Registration sizes a grid from the geocoded boundary.
+Three of the vetted boundaries are mostly empty ground, so their grids were refitted from the streets inside them (the map: [`mapillary-discovery-screen_tranche3_grids.png`](mapillary-discovery-screen_tranche3_grids.png)):
+
+| Town | Vetted grid | Fitted grid | Town's local streets inside | GSV points | Mapillary tiles |
+|---|---|---|---|---|---|
+| Kuna, ID | 16.9 × 14.7 km | 4.9 × 5.7 km | 67% | 622,420 → 69,825 | 99 → 16 |
+| Magna, UT | 16.7 × 14.6 km | 4.5 × 4.1 km | 96% | 608,052 → 46,124 | 80 → 12 |
+| Carmel-by-the-Sea, CA | 9.6 × 4.0 km | 2.1 × 2.9 km | 100% | 96,264 → 15,224 | 18 → 6 |
+
+The rule: take the municipal polygon (Nominatim), rasterize the Census TIGER 2024 local streets (MTFCC S1400) inside it onto 200 m cells, keep the cells holding at least 0.3 km of street, join them into clusters allowing a one-cell gap, keep the **largest** cluster by street length, and draw its bounding rectangle plus 250 m.
+The uploader's recent sweep is drawn on the map as a check and was **not** an input, so the fitted grids do not inflate the coverage these towns will be scored on.
+
+- **The rule changed after a look.**
+  The first version also kept any cluster holding at least 2% of the town's streets.
+  Under it Kuna came out 16,500 × 9,300 m (three clusters); the rule was changed to the largest cluster only after looking at a map that also showed the imagery.
+  Magna and Carmel came out the same under both versions.
+  The variable `KEEP` in `fit_grids.py` is the first version's threshold and is now unused; the first-version sizes are re-derivable by keeping every cluster at or above it, and were re-derived that way in the PR #457 review rather than recorded on 11-05.
+- **Kuna leaves out a third of its streets**: its eastern annexed land holds about a third of the municipal street length, thinly spread across farmland; including it returns the grid to near the vetted, mostly empty rectangle.
+- **Magna and Carmel** were mostly lake flats and ocean.
+- **TIGER, not OpenStreetMap.**
+  Overpass (`overpass.kumi.systems`, from a laptop) failed three times that day, so the streets are TIGER's.
+  The road walks will use OSM; for drawing a rectangle around a town the two should agree closely, but they were not compared.
+
+The table's GSV figures are the fit record's area count (W × H / 400 m²), which runs under the scheduler's lattice count, (W/20 + 1)(H/20 + 1), by 0.2–0.3% on the vetted grids and 0.8–1.6% on the small fitted ones.
+In lattice counts (`overlaps.json`, `gsv_lattice_points`), with the fits the tranche is 1,951,348 GSV grid points and 368 Mapillary z14 tiles, down from 3,147,831 and 531 on the vetted grids; the runbook in `docs/operations.md` has the per-night split.
+
+### Overlaps with grids already tracked
+
+Measured on the registration grids (fitted for the three above) against the 2026-11-05 catalog snapshot (`catalog_overlaps`): Magna's fitted grid lies 69% inside West Valley City's and 39% inside Salt Lake City's, Rio Linda's 47% inside Sacramento's, White City's 17% inside Cottonwood Heights', and four more overlap a neighbour by 1–7% (Fair Oaks with Orangevale, Royal Kunia with Honolulu, Delavan with tranche 2's Delavan Lake, Belmont with Foster City).
+Overlap is allowed, but each grid is its own census: none of these shares its neighbour's Mapillary tile downloads, because the census cache keys on geometry.
+
 ## Caveats
 
 - **Screening signal, never coverage.** z6 geometry is simplified, so lengths are approximate, and length says nothing about which streets were driven. A walk is the only measurement.
