@@ -38,6 +38,8 @@ VET = EXP / "mapillary-discovery-screen_tranche3_vet.csv"
 VET_RETRY = EXP / "mapillary-discovery-screen_tranche3_vet_retry.csv"
 GRIDS = EXP / "mapillary-discovery-screen_tranche3_grids.json"
 METRICS = EXP / "mapillary-discovery-screen_tranche3_metrics.json"
+OVERLAPS = EXP / "mapillary-discovery-screen_tranche3_overlaps.json"
+OPS = REPO_ROOT / "docs" / "operations.md"
 WRITEUP = EXP / "mapillary-discovery-screen.md"
 DATA_SOURCES = REPO_ROOT / "data_sources"
 
@@ -206,6 +208,7 @@ def test_the_two_narrow_reuse_margins_clear_registrations_radius(manifest_rows):
     lat/lon. The record's catalog_km is a flat approximation over 3-decimal
     coordinates, so the two rows nearest the radius are held here with the
     registration's own haversine, against the catalog centres the runbook names.
+    The centres are hand-copied from the gitignored 2026-11-05 snapshot.
     """
     from scripts.register_frame import _haversine_km
 
@@ -224,6 +227,7 @@ def test_the_two_narrow_reuse_margins_clear_registrations_radius(manifest_rows):
 
 def test_grid_fits_are_the_committed_fit_record(manifest_rows, vetted):
     fits = json.loads(GRIDS.read_text(encoding="utf-8"))
+    assert fits.pop("_about")["generated_by"] == "scripts/mapillary_discovery_rescore/fit_grids.py"
     assert set(fits) == set(GRID_KEYS.values())
     assert set(gen.GRID_FITS) == set(GRID_KEYS)
     for gid, key in GRID_KEYS.items():
@@ -244,16 +248,80 @@ def test_grid_fits_are_the_committed_fit_record(manifest_rows, vetted):
         assert abs(dx) <= w / 2 and abs(dy) <= h / 2, gid
 
 
+def _overlap_rows():
+    return {r["geonameid"]: r for r in json.loads(OVERLAPS.read_text(encoding="utf-8"))["rows"]}
+
+
+def _registration_cost(vetted):
+    """geonameid -> (lattice GSV points, Mapillary tiles, KartaView, Panoramax) as registered."""
+    fits = json.loads(GRIDS.read_text(encoding="utf-8"))
+    rows = _overlap_rows()
+    out = {}
+    for gid, v in vetted.items():
+        tiles = int(v["mapillary_z14_tiles"])
+        if gid in GRID_KEYS:
+            tiles = fits[GRID_KEYS[gid]]["tiles_new"]
+        else:  # an unfitted grid's lattice count is the vetting run's own
+            assert rows[gid]["gsv_lattice_points"] == int(v["gsv_points"]), gid
+        out[gid] = (
+            rows[gid]["gsv_lattice_points"],
+            tiles,
+            int(v["kartaview_requests"]),
+            int(v["panoramax_z15_tiles"]),
+        )
+    return out
+
+
 def _tranche_totals(vetted):
     """(vetted GSV, vetted tiles, fitted GSV, fitted tiles) over the 25 rows."""
-    fits = json.loads(GRIDS.read_text(encoding="utf-8"))
     gsv = sum(int(v["gsv_points"]) for v in vetted.values())
     tiles = sum(int(v["mapillary_z14_tiles"]) for v in vetted.values())
-    fit_gsv, fit_tiles = gsv, tiles
-    for gid, key in GRID_KEYS.items():
-        fit_gsv += fits[key]["gsv_new"] - int(vetted[gid]["gsv_points"])
-        fit_tiles += fits[key]["tiles_new"] - int(vetted[gid]["mapillary_z14_tiles"])
-    return gsv, tiles, fit_gsv, fit_tiles
+    cost = _registration_cost(vetted).values()
+    return gsv, tiles, sum(c[0] for c in cost), sum(c[1] for c in cost)
+
+
+# The runbook's two nights, by manifest city name.
+NIGHTS = {
+    1: "White City, Ahuimanu, Pell Lake, Live Oak, Magna, Makakilo City, Muscoy, Belmont, "
+    "Longwood, Delavan, Sterling, Eureka, Elko",
+    2: "Carmel-by-the-Sea, East Palo Alto, Rio Linda, Stanford, Royal Kunia, Evansdale, "
+    "Makaha, Kuna, North Tustin, Fair Oaks, Worland, Colton",
+}
+
+
+def test_the_runbooks_night_table_is_the_committed_records(manifest_rows, vetted):
+    by_name = {r["city"]: r["geonameid"] for r in manifest_rows}
+    cost = _registration_cost(vetted)
+    named = [n for names in NIGHTS.values() for n in names.split(", ")]
+    assert sorted(named) == sorted(by_name)  # every town on exactly one night
+    ops = OPS.read_text(encoding="utf-8")
+    for night, names in NIGHTS.items():
+        c = [cost[by_name[n]] for n in names.split(", ")]
+        gsv, tiles, kv, px = (sum(x[i] for x in c) for i in range(4))
+        line = (
+            f"| {night} | {names} | {gsv:,} ({gsv / 48000 / 60:.2f}) | {tiles} | "
+            f"≤ {kv:,} ({kv / 16 / 60:.2f}) | ≤ {px:,} ({round(px / 60)}) |"
+        )
+        assert line in ops, line
+
+
+def test_registration_reuse_margins_leave_headroom_at_the_runbooks_radius(manifest_rows):
+    """
+    register_frame.py appends each newly registered row's GEOCODED centre to the
+    cities later rows are checked against, so the in-batch margin is GeoNames
+    point to vetted centre; overlaps.json records it per row. The runbook's
+    --overlap-km must sit at least 1.5 km under every margin.
+    """
+    rows = _overlap_rows()
+    assert list(rows) == [r["geonameid"] for r in manifest_rows]
+    ops = OPS.read_text(encoding="utf-8")
+    assert '--notes-label "mapillary discovery screen 2026-11-05 tranche 3" --overlap-km 4 ' in ops
+    margins = [r["nearest_catalog_km"] for r in rows.values()]
+    margins += [r["nearest_earlier_row_km"] for r in rows.values() if "nearest_earlier_row_km" in r]
+    assert min(margins) >= 4 + 1.5
+    stanford = rows["5398563"]
+    assert stanford["nearest_earlier_row"] == "East Palo Alto"
+    assert stanford["nearest_earlier_row_km"] == pytest.approx(5.558, abs=0.001)
 
 
 def test_the_docs_tranche_totals_are_the_committed_records(vetted):
@@ -280,11 +348,72 @@ def test_advance_prediction_is_the_metrics_jsons(ranked):
     assert len(t7) == 1
     assert pred["rate"] == round(t7[0]["good2"] / t7[0]["n"], 3)
     assert pred["n"] == gen.CAP
+    # The floor, recomputed: the smallest k with P(X < k) <= 5% at the rate is
+    # the largest k whose P(X <= k - 1) is still under 5%.
+    n, p = pred["n"], t7[0]["good2"] / t7[0]["n"]
+
+    def cdf(k):
+        return sum(math.comb(n, i) * p**i * (1 - p) ** (n - i) for i in range(k + 1))
+
+    floor = max(k for k in range(n + 1) if cdf(k - 1) <= 0.05)
+    assert pred["falsified_below"] == floor
+    assert pred["p_below_floor_at_rate"] == round(cdf(floor - 1), 3)
+    assert pred["expected_strict_hits"] == round(n * p, 1)
+    total = [
+        r
+        for r in metrics["v4_threshold"]
+        if r["v4_at_least"] == 0.0 and r["population"] == "tranche"
+    ][0]
     text = WRITEUP.read_text(encoding="utf-8")
-    assert f"fewer than **{pred['falsified_below']}**" in text
-    assert f"{t7[0]['good2']} of {t7[0]['n']}" in text
-    # The prediction's basis needs every row at the threshold it was measured at.
-    assert min(float(r["v4"]) for r in ranked[:40]) >= 0.7
+    assert f"fewer than **{floor}**" in text
+    assert f"probability {pred['p_below_floor_at_rate']:.3f}" in text
+    assert f"**{pred['expected_strict_hits']} strict hits of 25**" in text
+    assert f"observed rate ({p:.3f})" in text
+    assert (
+        f"{t7[0]['good2']} of {t7[0]['n']} strict hits and {t7[0]['any50']} of {t7[0]['n']}" in text
+    )
+    below = (total["good2"] - t7[0]["good2"], total["n"] - t7[0]["n"])
+    assert f"against {below[0]} of {below[1]} strict hits below it" in text
+
+
+def test_the_writeups_rescore_numbers_are_the_metrics_jsons():
+    metrics = json.loads(METRICS.read_text(encoding="utf-8"))
+    text = WRITEUP.read_text(encoding="utf-8")
+    scores = metrics["evaluation"]["by_target"]["good2"]["scores"]
+    v0 = scores["V0 committed: recent length, 2 km"]
+    v4 = scores["V4 age-weighted cells, best of 1/2/3 km"]
+    v5 = scores["V5 V4 x LOO uploader record"]
+    for s in (v0, v4, v5):
+        cell = f"| {s['spearman_rho_vs_walk_coverage']:.3f} | {s['average_precision']:.3f} |"
+        assert cell in text, cell
+    for name, s in (("V4", v4), ("V5", v5)):
+        diff = s["average_precision"] - v0["average_precision"]
+        assert f"AP({name}) − AP(V0) = +{diff:.3f}" in text, name
+        lo, hi = metrics["ap_diff_vs_V0_uploader_clustered"][name]["ci95"]
+        assert f"[{lo:+.3f}, {hi:+.3f}]".replace("-", "−") in text, name
+    f = metrics["funnel"]
+    assert (
+        f"{f['places_v4_at_least_0_7']} places had V4 ≥ 0.7, {f['outside_grids_and_over_5km']} "
+        f"of them outside the catalog, {f['pass_all_rules']} passed every rule and "
+        f"{f['after_5km_thinning']} survived"
+    ) in text
+    card = {u["user"]: u for u in metrics["uploader_scorecard"]}
+    for user in ("quickness805", "ctroadway360", "nthp_gis", "rking", "marker_geo1", "hmhtb"):
+        assert f"`{user}` {card[user]['good2']}" in text, user
+        assert f"of {card[user]['walked']}" in text, user
+
+
+def test_the_writeups_overlaps_are_the_overlap_records():
+    text = WRITEUP.read_text(encoding="utf-8")
+    rows = {r["city"]: r["catalog_overlaps"] for r in _overlap_rows().values()}
+    assert round(rows["Magna"]["west-valley-city--utah--united-states"] * 100) == 69
+    assert round(rows["Magna"]["salt-lake-city--utah--united-states"] * 100) == 39
+    assert round(rows["Rio Linda"]["sacramento--california--united-states"] * 100) == 47
+    assert round(rows["White City"]["cottonwood-heights--utah--united-states"] * 100) == 17
+    small = {c: max(o.values()) for c, o in rows.items() if o and max(o.values()) < 0.1}
+    assert set(small) == {"Fair Oaks", "Royal Kunia", "Delavan", "Belmont"}
+    assert all(0.01 <= v <= 0.07 for v in small.values())
+    assert "four more overlap a neighbour by 1–7%" in text
 
 
 def test_generator_select_caps_per_uploader_and_in_total():

@@ -9,15 +9,31 @@
    "draws": 999
   },
   "V5": {
-   "mean": 0.271,
+   "mean": 0.196,
    "ci95": [
-    -0.045,
-    0.656
+    -0.113,
+    0.561
    ],
    "draws": 999
   }
  },
  "v4_threshold": [
+  {
+   "v4_at_least": 0.0,
+   "population": "tranche",
+   "n": 39,
+   "good2": 25,
+   "good3": 27,
+   "any50": 28
+  },
+  {
+   "v4_at_least": 0.0,
+   "population": "catalog",
+   "n": 1111,
+   "good2": 14,
+   "good3": 18,
+   "any50": 46
+  },
   {
    "v4_at_least": 0.5,
    "population": "tranche",

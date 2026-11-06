@@ -764,12 +764,14 @@ Every write below is gated: no `run-due` in flight, the night's `Done:` line in 
 DATA=/projects/makeabilitylab/streetscape-tracker/data
 python scripts/register_frame.py --manifest mapillary_discovery_cities_tranche3.csv \
     --db-path "$DATA/streetscape_tracker.db" \
-    --notes-label "mapillary discovery screen 2026-11-05 tranche 3" --overlap-km 5 --max-center-km 10
+    --notes-label "mapillary discovery screen 2026-11-05 tranche 3" --overlap-km 4 --max-center-km 10
 # read the dry run: every row "-> NEW", and "newly-registered=25 failed=0"; then the same with --execute
 ```
 
-- `--overlap-km 5`: every row's GeoNames point (what `find_overlap` measures from) is more than 5 km from every catalog centre in the 2026-11-05 snapshot and from every other row, so a nonzero `reused-existing` means the catalog holds a city that snapshot did not; stop and find it.
-  Two rows clear it by about half a kilometre: Fair Oaks (5.52 km from Orangevale) and Delavan (5.51 km from tranche 2's Delavan Lake); the manifest's test pins both.
+- `--overlap-km 4`, not tranche 2's 5. `find_overlap` measures from each row's GeoNames point to every centre already in the catalog, and with `--execute` that includes the GEOCODED centres of the rows this same run has just registered (the dry run registers nothing, so it cannot see those).
+  Stanford's point is 5.56 km from East Palo Alto's vetted centre, so at 5 km a 0.6 km geocode drift on the day would silently alias Stanford onto East Palo Alto.
+  The nearest catalog centres are 5.51 km (Delavan from tranche 2's Delavan Lake) and 5.52 km (Fair Oaks from Orangevale); 4 km leaves every margin at least 1.5 km of headroom (`_tranche3_overlaps.json`, pinned by the manifest's test).
+  So a nonzero `reused-existing` means the catalog holds a city within 4 km that the 2026-11-05 snapshot did not, or a row geocoded more than 1.5 km from where it was vetted; stop and find which.
 - `--max-center-km 10`: every row geocoded 0.0–6.6 km from its GeoNames point at vetting (Magna is the 6.6). Live Oak and Elko carry county-qualified queries because their bare names matched other places.
 - Each `--execute` line prints the frozen W x H; compare it with `docs/experiments/mapillary-discovery-screen_tranche3_vet*.csv` and stop on any difference.
 
@@ -795,16 +797,17 @@ The numbers are `GRID_FITS` in `scripts/build_mapillary_discovery_tranche3.py`, 
 Never enable for a night whose UTC snapshot date is a Mapillary rest day (`[hosts.mapillary_tiles].rest_weekdays`, Wed and Sun on prod): the GSV channels would collect and Mapillary would be held, un-pairing the towns' first runs.
 
 **6. Pricing, and the nights.**
-With the fits, one collection of all 25 is 1,950,133 GSV grid points and 368 Mapillary z14 tiles; the Mapillary walks are free on a paired night (#290).
-Mapillary is priced against the **1,200-tile rolling-24 h pool** (`[hosts.mapillary_tiles]`, #444 Stage 1), which also has to hold that night's due Mapillary demand (mean ~570 on the first post-deploy nights).
+With the fits, one collection of all 25 is 1,951,348 GSV grid points and 368 Mapillary z14 tiles; the Mapillary walks are free on a paired night (#290).
+Mapillary is priced against the **1,200-tile rolling-24 h pool** (`[hosts.mapillary_tiles]`, #444 Stage 1), which also has to hold that night's due Mapillary demand (a mean of about 570 over the five active nights after Stage 1 deployed, `provider-access.md`).
 The whole tranche would fit one night; it is split in two, alternating in GSV order, so a block lands on half of it:
 
 | Night | Cities | GSV points (h at 48k/min) | Mapillary tiles | KartaView requests (h at 16/min) | Panoramax tiles (min at 60/min) |
 |---|---|---|---|---|---|
-| 1 | White City, Ahuimanu, Pell Lake, Live Oak, Magna, Makakilo City, Muscoy, Belmont, Longwood, Delavan, Sterling, Eureka, Elko | 1,064,482 (0.37) | 203 | ≤ 673 (0.70) | ≤ 912 (15) |
-| 2 | Carmel-by-the-Sea, East Palo Alto, Rio Linda, Stanford, Royal Kunia, Evansdale, Makaha, Kuna, North Tustin, Fair Oaks, Worland, Colton | 885,651 (0.31) | 165 | ≤ 640 (0.67) | ≤ 861 (14) |
+| 1 | White City, Ahuimanu, Pell Lake, Live Oak, Magna, Makakilo City, Muscoy, Belmont, Longwood, Delavan, Sterling, Eureka, Elko | 1,064,914 (0.37) | 203 | ≤ 673 (0.70) | ≤ 912 (15) |
+| 2 | Carmel-by-the-Sea, East Palo Alto, Rio Linda, Stanford, Royal Kunia, Evansdale, Makaha, Kuna, North Tustin, Fair Oaks, Worland, Colton | 886,434 (0.31) | 165 | ≤ 640 (0.67) | ≤ 861 (14) |
 
 The KartaView and Panoramax columns are upper bounds: they use the vetted grids for Kuna and Magna (237 KartaView requests each), and each opt-in pair is enrolled only if `enable-city`'s rule admits it.
+While both KartaView channels are paused on production (`enabled = false`, #452), the KartaView column is enrolment, not collection.
 Before night 2, read night 1's log as for tranche 2: every tranche city collected (or paused at a cap, exit 83), no Mapillary refusal or throttle (exit 75 or 87), no Overpass latch.
 
 ## Keeping Overpass out of the night: `scripts/prefreeze_street_networks.py` (issue #341)

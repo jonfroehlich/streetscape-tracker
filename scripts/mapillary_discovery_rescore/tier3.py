@@ -25,8 +25,13 @@ def record(df, ref):
     g = ref[ref.top_share >= 0.5].groupby("top")[TGT].agg(["sum", "count"])
     sm = df.top.map(g["sum"]).fillna(0).astype(float)
     n = df.top.map(g["count"]).fillna(0).astype(float)
-    inref = df.index.isin(ref.index) & (df.top_share >= 0.5)
-    return (sm - df[TGT].astype(float) * inref + 5 * base) / (n - inref + 5)
+    # Leave out EVERY copy of the row's own city: a cluster bootstrap draws an
+    # uploader's cities k times, and subtracting one copy leaked the other k-1
+    # copies of the city's own outcome into its score (fixed 2026-11-06, PR #457
+    # review; the 11-05 run subtracted one copy).
+    own = ref[ref.top_share >= 0.5].city_id.value_counts()
+    k = df.city_id.map(own).fillna(0).astype(float) * (df.top_share >= 0.5)
+    return (sm - df[TGT].astype(float) * k + 5 * base) / (n - k + 5)
 
 
 def ap(y, s):
@@ -78,7 +83,7 @@ print(
     )
 )
 # Threshold check, both populations
-for th in (0.5, 0.6, 0.7, 0.8, 1.0):
+for th in (0.0, 0.5, 0.6, 0.7, 0.8, 1.0):
     for nm, d in (("tranche", t), ("catalog", b)):
         h = d[d.v3max >= th]
         M.setdefault("v4_threshold", []).append(

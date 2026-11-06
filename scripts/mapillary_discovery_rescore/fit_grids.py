@@ -191,4 +191,5 @@ for k, (fp, gla, glo, _, _) in T.items():
         },
         open(f"{K}/{k}_fit.json", "w"),
     )
+res["_about"] = {"generated_by": "scripts/mapillary_discovery_rescore/fit_grids.py"}
 json.dump(res, open(K + "/fit_results.json", "w"), indent=1)

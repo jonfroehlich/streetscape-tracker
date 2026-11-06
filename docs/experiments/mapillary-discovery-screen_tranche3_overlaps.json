@@ -1,0 +1,421 @@
+{
+ "_about": {
+  "generated_by": "scripts/mapillary_discovery_rescore/overlaps.py",
+  "catalog_snapshot": "production, exported read-only 2026-11-05"
+ },
+ "rows": [
+  {
+   "geonameid": "5404122",
+   "city": "North Tustin",
+   "grid": [
+    33.763375,
+    -117.796104,
+    6295,
+    5434
+   ],
+   "catalog_overlaps": {},
+   "nearest_catalog": "lakewood--california--united-states",
+   "nearest_catalog_km": 31.365,
+   "gsv_lattice_points": 85680
+  },
+  {
+   "geonameid": "5367314",
+   "city": "Live Oak",
+   "grid": [
+    36.990384,
+    -121.983266,
+    3177,
+    5095
+   ],
+   "catalog_overlaps": {},
+   "nearest_catalog": "monte-sereno--california--united-states",
+   "nearest_catalog_km": 28.479,
+   "gsv_lattice_points": 40545,
+   "nearest_earlier_row": "North Tustin",
+   "nearest_earlier_row_km": 521.569
+  },
+  {
+   "geonameid": "5387687",
+   "city": "Rio Linda",
+   "grid": [
+    38.687172,
+    -121.460556,
+    3868,
+    4008
+   ],
+   "catalog_overlaps": {
+    "sacramento--california--united-states": 0.467
+   },
+   "nearest_catalog": "foothill-farms--california--united-states",
+   "nearest_catalog_km": 8.318,
+   "gsv_lattice_points": 38994,
+   "nearest_earlier_row": "Live Oak",
+   "nearest_earlier_row_km": 194.842
+  },
+  {
+   "geonameid": "5347287",
+   "city": "Fair Oaks",
+   "grid": [
+    38.643356,
+    -121.242453,
+    8683,
+    5051
+   ],
+   "catalog_overlaps": {
+    "orangevale--california--united-states": 0.068
+   },
+   "nearest_catalog": "orangevale--california--united-states",
+   "nearest_catalog_km": 5.515,
+   "gsv_lattice_points": 110055,
+   "nearest_earlier_row": "Rio Linda",
+   "nearest_earlier_row_km": 17.026
+  },
+  {
+   "geonameid": "7262791",
+   "city": "Royal Kunia",
+   "grid": [
+    21.403311,
+    -158.029654,
+    4147,
+    4428
+   ],
+   "catalog_overlaps": {
+    "honolulu--hawaii--united-states": 0.054
+   },
+   "nearest_catalog": "ewa-gentry--hawaii--united-states",
+   "nearest_catalog_km": 6.378,
+   "gsv_lattice_points": 46176,
+   "nearest_earlier_row": "Live Oak",
+   "nearest_earlier_row_km": 3873.327
+  },
+  {
+   "geonameid": "5597955",
+   "city": "Kuna",
+   "grid": [
+    43.49753,
+    -116.42638,
+    4900,
+    5700
+   ],
+   "catalog_overlaps": {},
+   "nearest_catalog": "meridian--idaho--united-states",
+   "nearest_catalog_km": 13.168,
+   "gsv_lattice_points": 70356,
+   "nearest_earlier_row": "Fair Oaks",
+   "nearest_earlier_row_km": 673.597
+  },
+  {
+   "geonameid": "5856516",
+   "city": "Ahuimanu",
+   "grid": [
+    21.44057,
+    -157.835217,
+    2830,
+    3439
+   ],
+   "catalog_overlaps": {},
+   "nearest_catalog": "honolulu--hawaii--united-states",
+   "nearest_catalog_km": 12.579,
+   "gsv_lattice_points": 24424,
+   "nearest_earlier_row": "Royal Kunia",
+   "nearest_earlier_row_km": 20.388
+  },
+  {
+   "geonameid": "5703670",
+   "city": "Elko",
+   "grid": [
+    40.846931,
+    -115.766983,
+    11276,
+    9748
+   ],
+   "catalog_overlaps": {},
+   "nearest_catalog": "hollister--idaho--united-states",
+   "nearest_catalog_km": 195.541,
+   "gsv_lattice_points": 275232,
+   "nearest_earlier_row": "Kuna",
+   "nearest_earlier_row_km": 300.104
+  },
+  {
+   "geonameid": "5850554",
+   "city": "Makakilo City",
+   "grid": [
+    21.346944,
+    -158.085833,
+    4149,
+    4428
+   ],
+   "catalog_overlaps": {},
+   "nearest_catalog": "ewa-gentry--hawaii--united-states",
+   "nearest_catalog_km": 6.186,
+   "gsv_lattice_points": 46176,
+   "nearest_earlier_row": "Royal Kunia",
+   "nearest_earlier_row_km": 8.551
+  },
+  {
+   "geonameid": "4162783",
+   "city": "Longwood",
+   "grid": [
+    28.70073,
+    -81.357759,
+    6616,
+    4678
+   ],
+   "catalog_overlaps": {},
+   "nearest_catalog": "orlando--florida--united-states",
+   "nearest_catalog_km": 21.508,
+   "gsv_lattice_points": 77454,
+   "nearest_earlier_row": "Elko",
+   "nearest_earlier_row_km": 3394.358
+  },
+  {
+   "geonameid": "4385835",
+   "city": "Eureka",
+   "grid": [
+    38.494315,
+    -90.647794,
+    9865,
+    6623
+   ],
+   "catalog_overlaps": {},
+   "nearest_catalog": "crestwood--missouri--united-states",
+   "nearest_catalog_km": 22.144,
+   "gsv_lattice_points": 164008,
+   "nearest_earlier_row": "Longwood",
+   "nearest_earlier_row_km": 1385.764
+  },
+  {
+   "geonameid": "5582392",
+   "city": "Sterling",
+   "grid": [
+    40.624457,
+    -103.194199,
+    9291,
+    5129
+   ],
+   "catalog_overlaps": {},
+   "nearest_catalog": "iliff--colorado--united-states",
+   "nearest_catalog_km": 18.812,
+   "gsv_lattice_points": 119505,
+   "nearest_earlier_row": "Elko",
+   "nearest_earlier_row_km": 1057.559
+  },
+  {
+   "geonameid": "5843495",
+   "city": "Worland",
+   "grid": [
+    43.988637,
+    -107.952748,
+    5657,
+    9262
+   ],
+   "catalog_overlaps": {},
+   "nearest_catalog": "manderson--wyoming--united-states",
+   "nearest_catalog_km": 28.085,
+   "gsv_lattice_points": 131312,
+   "nearest_earlier_row": "Sterling",
+   "nearest_earlier_row_km": 543.443
+  },
+  {
+   "geonameid": "5850511",
+   "city": "Makaha",
+   "grid": [
+    21.466631,
+    -158.219038,
+    4601,
+    5157
+   ],
+   "catalog_overlaps": {},
+   "nearest_catalog": "waipio-acres--hawaii--united-states",
+   "nearest_catalog_km": 20.183,
+   "gsv_lattice_points": 59598,
+   "nearest_earlier_row": "Makakilo City",
+   "nearest_earlier_row_km": 18.501
+  },
+  {
+   "geonameid": "5345032",
+   "city": "East Palo Alto",
+   "grid": [
+    37.467847,
+    -122.135601,
+    3669,
+    3558
+   ],
+   "catalog_overlaps": {},
+   "nearest_catalog": "los-altos--california--united-states",
+   "nearest_catalog_km": 11.889,
+   "gsv_lattice_points": 32752,
+   "nearest_earlier_row": "Live Oak",
+   "nearest_earlier_row_km": 55.005
+  },
+  {
+   "geonameid": "5398563",
+   "city": "Stanford",
+   "grid": [
+    37.426621,
+    -122.170516,
+    3716,
+    4503
+   ],
+   "catalog_overlaps": {},
+   "nearest_catalog": "los-altos--california--united-states",
+   "nearest_catalog_km": 8.79,
+   "gsv_lattice_points": 42036,
+   "nearest_earlier_row": "East Palo Alto",
+   "nearest_earlier_row_km": 5.558
+  },
+  {
+   "geonameid": "5250399",
+   "city": "Delavan",
+   "grid": [
+    42.627548,
+    -88.630392,
+    7901,
+    5217
+   ],
+   "catalog_overlaps": {
+    "delavan-lake--wisconsin--united-states": 0.056
+   },
+   "nearest_catalog": "delavan-lake--wisconsin--united-states",
+   "nearest_catalog_km": 5.512,
+   "gsv_lattice_points": 103356,
+   "nearest_earlier_row": "Eureka",
+   "nearest_earlier_row_km": 490.316
+  },
+  {
+   "geonameid": "4855806",
+   "city": "Evansdale",
+   "grid": [
+    42.466764,
+    -92.274334,
+    5849,
+    3684
+   ],
+   "catalog_overlaps": {},
+   "nearest_catalog": "cedar-falls--iowa--united-states",
+   "nearest_catalog_km": 15.346,
+   "gsv_lattice_points": 54205,
+   "nearest_earlier_row": "Delavan",
+   "nearest_earlier_row_km": 299.547
+  },
+  {
+   "geonameid": "5266483",
+   "city": "Pell Lake",
+   "grid": [
+    42.538073,
+    -88.350927,
+    3285,
+    4443
+   ],
+   "catalog_overlaps": {},
+   "nearest_catalog": "como--wisconsin--united-states",
+   "nearest_catalog_km": 13.556,
+   "gsv_lattice_points": 36795,
+   "nearest_earlier_row": "Delavan",
+   "nearest_earlier_row_km": 24.95
+  },
+  {
+   "geonameid": "5327455",
+   "city": "Belmont",
+   "grid": [
+    37.515543,
+    -122.294967,
+    5994,
+    4087
+   ],
+   "catalog_overlaps": {
+    "foster-city--california--united-states": 0.011
+   },
+   "nearest_catalog": "foster-city--california--united-states",
+   "nearest_catalog_km": 7.332,
+   "gsv_lattice_points": 61500,
+   "nearest_earlier_row": "East Palo Alto",
+   "nearest_earlier_row_km": 13.671
+  },
+  {
+   "geonameid": "5334320",
+   "city": "Carmel-by-the-Sea",
+   "grid": [
+    36.55307,
+    -121.92104,
+    2100,
+    2900
+   ],
+   "catalog_overlaps": {},
+   "nearest_catalog": "monte-sereno--california--united-states",
+   "nearest_catalog_km": 76.312,
+   "gsv_lattice_points": 15476,
+   "nearest_earlier_row": "Live Oak",
+   "nearest_earlier_row_km": 48.68
+  },
+  {
+   "geonameid": "5777793",
+   "city": "Magna",
+   "grid": [
+    40.69992,
+    -112.0871,
+    4500,
+    4100
+   ],
+   "catalog_overlaps": {
+    "west-valley-city--utah--united-states": 0.693,
+    "salt-lake-city--utah--united-states": 0.393
+   },
+   "nearest_catalog": "west-valley-city--utah--united-states",
+   "nearest_catalog_km": 8.514,
+   "gsv_lattice_points": 46556,
+   "nearest_earlier_row": "Elko",
+   "nearest_earlier_row_km": 308.989
+  },
+  {
+   "geonameid": "5338783",
+   "city": "Colton",
+   "grid": [
+    34.057098,
+    -117.320306,
+    9369,
+    8512
+   ],
+   "catalog_overlaps": {},
+   "nearest_catalog": "sunnyslope--california--united-states",
+   "nearest_catalog_km": 11.94,
+   "gsv_lattice_points": 199794,
+   "nearest_earlier_row": "North Tustin",
+   "nearest_earlier_row_km": 56.339
+  },
+  {
+   "geonameid": "5784731",
+   "city": "White City",
+   "grid": [
+    40.568743,
+    -111.862713,
+    1610,
+    2842
+   ],
+   "catalog_overlaps": {
+    "cottonwood-heights--utah--united-states": 0.168
+   },
+   "nearest_catalog": "cottonwood-heights--utah--united-states",
+   "nearest_catalog_km": 5.788,
+   "gsv_lattice_points": 11583,
+   "nearest_earlier_row": "Magna",
+   "nearest_earlier_row_km": 32.211
+  },
+  {
+   "geonameid": "5375938",
+   "city": "Muscoy",
+   "grid": [
+    34.155238,
+    -117.360209,
+    5382,
+    4269
+   ],
+   "catalog_overlaps": {},
+   "nearest_catalog": "sunnyslope--california--united-states",
+   "nearest_catalog_km": 16.567,
+   "gsv_lattice_points": 57780,
+   "nearest_earlier_row": "Colton",
+   "nearest_earlier_row_km": 11.017
+  }
+ ]
+}

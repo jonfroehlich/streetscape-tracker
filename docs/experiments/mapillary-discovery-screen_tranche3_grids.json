@@ -118,5 +118,8 @@
   "sweep_recent_km_new": 47,
   "overlaps": [],
   "geo_pt_in_new": true
+ },
+ "_about": {
+  "generated_by": "scripts/mapillary_discovery_rescore/fit_grids.py"
  }
 }

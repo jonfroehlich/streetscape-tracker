@@ -1,6 +1,7 @@
 # Mapillary discovery re-score (#441, tranche 3)
 
-Research code, committed **as it was run on 2026-11-05** so the tranche-3 record traces to the code that produced it (the lint exemption in `pyproject.toml` is scoped to this directory for that reason).
+Research code from the 2026-11-05 run, committed as re-run on 2026-11-06 so the tranche-3 record traces to the code that produced it (the lint exemption in `pyproject.toml` is scoped to this directory for that reason).
+Since the 11-05 run the scripts gained JSON exports of what they print, `overlaps.py` was added, and `tier3.py`'s cluster bootstrap now leaves out every copy of a resampled city (the writeup says what that changed); the ranked record is byte-identical to the 11-05 output, and the grid record differs from it only by its added `_about` key.
 Every script makes **zero Mapillary requests**: it reads the 2026-10-02 z6 scan's cached sequences.
 Only `fetch_boundaries.py` touches the network (Nominatim and Overpass, from a laptop, cached per town).
 The writeup is `docs/experiments/mapillary-discovery-screen.md`, "Tranche 3".
@@ -16,6 +17,8 @@ python scripts/mapillary_discovery_rescore/tier3.py "$W" docs/experiments/mapill
 #   also writes experiments/mapillary-discovery-383/tranche3_ranked_2026-11-05.csv,
 #   committed as docs/experiments/mapillary-discovery-screen_tranche3_ranked.csv
 python scripts/build_mapillary_discovery_tranche3.py                                  # the manifest, from the committed record
+
+python scripts/mapillary_discovery_rescore/overlaps.py "$T/prod_snapshot.csv" docs/experiments/mapillary-discovery-screen_tranche3_overlaps.json
 
 # grid fits for Kuna, Magna and Carmel-by-the-Sea (K holds <town>_poly.json and tiger/tl_2024_*_roads.zip)
 K=$T/boundaries
