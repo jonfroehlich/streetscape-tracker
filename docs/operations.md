@@ -768,7 +768,8 @@ python scripts/register_frame.py --manifest mapillary_discovery_cities_tranche3.
 # read the dry run: every row "-> NEW", and "newly-registered=25 failed=0"; then the same with --execute
 ```
 
-- `--overlap-km 4`, not tranche 2's 5. `find_overlap` measures from each row's GeoNames point to every centre already in the catalog, and with `--execute` that includes the GEOCODED centres of the rows this same run has just registered (the dry run registers nothing, so it cannot see those).
+- `--overlap-km 4`, not tranche 2's 5.
+  `find_overlap` measures from each row's GeoNames point to every centre already in the catalog, and with `--execute` that includes the GEOCODED centres of the rows this same run has just registered (the dry run registers nothing, so it cannot see those).
   Stanford's point is 5.56 km from East Palo Alto's vetted centre, so at 5 km a 0.6 km geocode drift on the day would silently alias Stanford onto East Palo Alto.
   The nearest catalog centres are 5.51 km (Delavan from tranche 2's Delavan Lake) and 5.52 km (Fair Oaks from Orangevale); 4 km leaves every margin at least 1.5 km of headroom (`_tranche3_overlaps.json`, pinned by the manifest's test).
   So a nonzero `reused-existing` means the catalog holds a city within 4 km that the 2026-11-05 snapshot did not, or a row geocoded more than 1.5 km from where it was vetted; stop and find which.

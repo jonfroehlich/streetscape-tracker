@@ -162,7 +162,7 @@ That is recorded from the project's operating notes for that day, not from a que
 ## Tranche 3 (2026-11-05, #441): a re-score, an advance prediction, and street-fitted grids
 
 Offline only: zero Mapillary requests, from the 2026-10-02 z6 scan's cached sequences and a read-only production snapshot exported on 2026-11-05.
-Every number in this section traces to [`mapillary-discovery-screen_tranche3_metrics.json`](mapillary-discovery-screen_tranche3_metrics.json) (`generated_by`: `scripts/mapillary_discovery_rescore/`) to the grid record [`mapillary-discovery-screen_tranche3_grids.json`](mapillary-discovery-screen_tranche3_grids.json), or to the registration-geometry record [`mapillary-discovery-screen_tranche3_overlaps.json`](mapillary-discovery-screen_tranche3_overlaps.json), each naming its script in `_about.generated_by` or `generated_by`.
+Every number in this section traces to [`mapillary-discovery-screen_tranche3_metrics.json`](mapillary-discovery-screen_tranche3_metrics.json) (`generated_by`: `scripts/mapillary_discovery_rescore/`), to the grid record [`mapillary-discovery-screen_tranche3_grids.json`](mapillary-discovery-screen_tranche3_grids.json), or to the registration-geometry record [`mapillary-discovery-screen_tranche3_overlaps.json`](mapillary-discovery-screen_tranche3_overlaps.json), each naming its script in `_about.generated_by` or `generated_by`.
 The re-score scripts are committed as re-run on 2026-11-06, with a scoped lint exemption in `pyproject.toml`.
 Between the 11-05 run and the commit they gained JSON exports of the numbers they print, `overlaps.py` was added, and one bug was fixed in `tier3.py`'s bootstrap (below); re-running them reproduced the 11-05 ranked record and grid fit byte for byte.
 

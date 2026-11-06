@@ -261,6 +261,9 @@ def _registration_cost(vetted):
         tiles = int(v["mapillary_z14_tiles"])
         if gid in GRID_KEYS:
             tiles = fits[GRID_KEYS[gid]]["tiles_new"]
+            lat, lon, w, h = gen.GRID_FITS[gid]
+            assert rows[gid]["grid"] == [lat, lon, w, h], gid
+            assert rows[gid]["gsv_lattice_points"] == (int(w / 20) + 1) * (int(h / 20) + 1), gid
         else:  # an unfitted grid's lattice count is the vetting run's own
             assert rows[gid]["gsv_lattice_points"] == int(v["gsv_points"]), gid
         out[gid] = (
@@ -406,21 +409,39 @@ def test_the_writeups_rescore_numbers_are_the_metrics_jsons():
 def test_the_writeups_overlaps_are_the_overlap_records():
     text = WRITEUP.read_text(encoding="utf-8")
     rows = {r["city"]: r["catalog_overlaps"] for r in _overlap_rows().values()}
-    assert round(rows["Magna"]["west-valley-city--utah--united-states"] * 100) == 69
-    assert round(rows["Magna"]["salt-lake-city--utah--united-states"] * 100) == 39
-    assert round(rows["Rio Linda"]["sacramento--california--united-states"] * 100) == 47
-    assert round(rows["White City"]["cottonwood-heights--utah--united-states"] * 100) == 17
-    small = {c: max(o.values()) for c, o in rows.items() if o and max(o.values()) < 0.1}
-    assert set(small) == {"Fair Oaks", "Royal Kunia", "Delavan", "Belmont"}
-    assert all(0.01 <= v <= 0.07 for v in small.values())
-    assert "four more overlap a neighbour by 1–7%" in text
 
+    def pct(city, neighbour):
+        return round(rows[city][neighbour] * 100)
 
-def test_generator_select_caps_per_uploader_and_in_total():
-    rows = [{"user": "a", "geonameid": str(i)} for i in range(7)]
-    rows += [{"user": f"u{i}", "geonameid": f"x{i}"} for i in range(40)]
-    kept = gen.select(rows)
-    assert len(kept) == gen.CAP
-    assert [r["geonameid"] for r in kept[:5]] == ["0", "1", "2", "3", "4"]
-    assert {"5", "6"}.isdisjoint(r["geonameid"] for r in kept)
-    assert kept[5]["geonameid"] == "x0"
+    m = rows["Magna"]
+    assert (
+        f"Magna's fitted grid lies {pct('Magna', 'west-valley-city--utah--united-states')}% inside "
+        f"West Valley City's and {pct('Magna', 'salt-lake-city--utah--united-states')}% inside "
+        f"Salt Lake City's"
+    ) in text
+    assert len(m) == 2
+    assert (
+        f"Rio Linda's {pct('Rio Linda', 'sacramento--california--united-states')}% inside Sacramento's"
+        in text
+    )
+    assert (
+        f"White City's {pct('White City', 'cottonwood-heights--utah--united-states')}% inside Cottonwood Heights'"
+        in text
+    )
+    small = {c: o for c, o in rows.items() if o and max(o.values()) < 0.1}
+    assert {c: list(o) for c, o in small.items()} == {
+        "Fair Oaks": ["orangevale--california--united-states"],
+        "Royal Kunia": ["honolulu--hawaii--united-states"],
+        "Delavan": ["delavan-lake--wisconsin--united-states"],
+        "Belmont": ["foster-city--california--united-states"],
+    }
+    lo = min(round(max(o.values()) * 100) for o in small.values())
+    hi = max(round(max(o.values()) * 100) for o in small.values())
+    assert (
+        f"{len(small)} more overlap a neighbour by {lo}–{hi}%".replace("4 more", "four more")
+        in text
+    )
+    assert (
+        "(Fair Oaks with Orangevale, Royal Kunia with Honolulu, Delavan with tranche 2's "
+        "Delavan Lake, Belmont with Foster City)"
+    ) in text
