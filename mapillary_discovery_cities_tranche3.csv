@@ -1,0 +1,26 @@
+query_string,city,admin,iso2,country,continent,size_band,population,coverage_regime,geonameid,lat,lon
+"North Tustin, California, United States",North Tustin,California,US,United States,NA,,24917,,5404122,33.76446,-117.79394
+"Live Oak, Santa Cruz County, California, United States",Live Oak,California,US,United States,NA,,17158,,5367314,36.98356,-121.98052
+"Rio Linda, California, United States",Rio Linda,California,US,United States,NA,,15106,,5387687,38.69101,-121.44857
+"Fair Oaks, California, United States",Fair Oaks,California,US,United States,NA,,30912,,5347287,38.64463,-121.27217
+"Royal Kunia, Hawaii, United States",Royal Kunia,Hawaii,US,United States,NA,,14525,,7262791,21.39392,-158.0267
+"Kuna, Idaho, United States",Kuna,Idaho,US,United States,NA,,17226,,5597955,43.49183,-116.42012
+"Ahuimanu, Hawaii, United States",Ahuimanu,Hawaii,US,United States,NA,,8810,,5856516,21.44472,-157.83778
+"Elko, Elko County, Nevada, United States",Elko,Nevada,US,United States,NA,,20279,,5703670,40.83242,-115.76312
+"Makakilo City, Hawaii, United States",Makakilo City,Hawaii,US,United States,NA,,15383,,5850554,21.34694,-158.08583
+"Longwood, Florida, United States",Longwood,Florida,US,United States,NA,,14085,,4162783,28.70305,-81.3384
+"Eureka, Missouri, United States",Eureka,Missouri,US,United States,NA,,10602,,4385835,38.50255,-90.6279
+"Sterling, Colorado, United States",Sterling,Colorado,US,United States,NA,,14104,,5582392,40.62554,-103.20771
+"Worland, Wyoming, United States",Worland,Wyoming,US,United States,NA,,5372,,5843495,44.0169,-107.95537
+"Makaha, Hawaii, United States",Makaha,Hawaii,US,United States,NA,,8278,,5850511,21.46627,-158.21037
+"East Palo Alto, California, United States",East Palo Alto,California,US,United States,NA,,29662,,5345032,37.46883,-122.14108
+"Stanford, California, United States",Stanford,California,US,United States,NA,,13809,,5398563,37.42411,-122.16608
+"Delavan, Wisconsin, United States",Delavan,Wisconsin,US,United States,NA,,8389,,5250399,42.63307,-88.64371
+"Evansdale, Iowa, United States",Evansdale,Iowa,US,United States,NA,,4812,,4855806,42.46915,-92.28102
+"Pell Lake, Wisconsin, United States",Pell Lake,Wisconsin,US,United States,NA,,3722,,5266483,42.53807,-88.35093
+"Belmont, California, United States",Belmont,California,US,United States,NA,,27218,,5327455,37.52021,-122.2758
+"Carmel-by-the-Sea, California, United States",Carmel-by-the-Sea,California,US,United States,NA,,3897,,5334320,36.55524,-121.92329
+"Magna, Utah, United States",Magna,Utah,US,United States,NA,,26505,,5777793,40.70911,-112.10161
+"Colton, California, United States",Colton,California,US,United States,NA,,54621,,5338783,34.0739,-117.31365
+"White City, Utah, United States",White City,Utah,US,United States,NA,,5407,,5784731,40.56578,-111.86438
+"Muscoy, California, United States",Muscoy,California,US,United States,NA,,10644,,5375938,34.15418,-117.34421

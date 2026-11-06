@@ -1,0 +1,562 @@
+{
+ "ap_diff_vs_V0_uploader_clustered": {
+  "V4": {
+   "mean": 0.023,
+   "ci95": [
+    -0.129,
+    0.163
+   ],
+   "draws": 999
+  },
+  "V5": {
+   "mean": 0.271,
+   "ci95": [
+    -0.045,
+    0.656
+   ],
+   "draws": 999
+  }
+ },
+ "v4_threshold": [
+  {
+   "v4_at_least": 0.5,
+   "population": "tranche",
+   "n": 30,
+   "good2": 23,
+   "good3": 25,
+   "any50": 26
+  },
+  {
+   "v4_at_least": 0.5,
+   "population": "catalog",
+   "n": 56,
+   "good2": 12,
+   "good3": 15,
+   "any50": 21
+  },
+  {
+   "v4_at_least": 0.6,
+   "population": "tranche",
+   "n": 27,
+   "good2": 22,
+   "good3": 24,
+   "any50": 25
+  },
+  {
+   "v4_at_least": 0.6,
+   "population": "catalog",
+   "n": 42,
+   "good2": 10,
+   "good3": 13,
+   "any50": 18
+  },
+  {
+   "v4_at_least": 0.7,
+   "population": "tranche",
+   "n": 23,
+   "good2": 20,
+   "good3": 22,
+   "any50": 23
+  },
+  {
+   "v4_at_least": 0.7,
+   "population": "catalog",
+   "n": 30,
+   "good2": 9,
+   "good3": 11,
+   "any50": 15
+  },
+  {
+   "v4_at_least": 0.8,
+   "population": "tranche",
+   "n": 20,
+   "good2": 17,
+   "good3": 19,
+   "any50": 20
+  },
+  {
+   "v4_at_least": 0.8,
+   "population": "catalog",
+   "n": 22,
+   "good2": 7,
+   "good3": 7,
+   "any50": 11
+  },
+  {
+   "v4_at_least": 1.0,
+   "population": "tranche",
+   "n": 9,
+   "good2": 8,
+   "good3": 9,
+   "any50": 9
+  },
+  {
+   "v4_at_least": 1.0,
+   "population": "catalog",
+   "n": 10,
+   "good2": 4,
+   "good3": 4,
+   "any50": 6
+  }
+ ],
+ "funnel": {
+  "places_v4_at_least_0_7": 468,
+  "outside_grids_and_over_5km": 189,
+  "pass_all_rules": 120,
+  "after_5km_thinning": 105
+ },
+ "uploader_scorecard": [
+  {
+   "user": "rking",
+   "walked": 34,
+   "good2": 10,
+   "good3": 12,
+   "any50": 19,
+   "median_walk_coverage": 53.3
+  },
+  {
+   "user": "quickness805",
+   "walked": 31,
+   "good2": 0,
+   "good3": 0,
+   "any50": 0,
+   "median_walk_coverage": 9.2
+  },
+  {
+   "user": "ctroadway360",
+   "walked": 21,
+   "good2": 0,
+   "good3": 0,
+   "any50": 5,
+   "median_walk_coverage": 45.5
+  },
+  {
+   "user": "nthp_gis",
+   "walked": 19,
+   "good2": 0,
+   "good3": 0,
+   "any50": 0,
+   "median_walk_coverage": 4.5
+  },
+  {
+   "user": "marker_geo1",
+   "walked": 15,
+   "good2": 7,
+   "good3": 9,
+   "any50": 9,
+   "median_walk_coverage": 58.1
+  },
+  {
+   "user": "mapillary01730",
+   "walked": 13,
+   "good2": 2,
+   "good3": 2,
+   "any50": 2,
+   "median_walk_coverage": 8.8
+  },
+  {
+   "user": "Lanka6359",
+   "walked": 9,
+   "good2": 2,
+   "good3": 2,
+   "any50": 2,
+   "median_walk_coverage": 27.2
+  },
+  {
+   "user": "LowestPotential",
+   "walked": 9,
+   "good2": 0,
+   "good3": 0,
+   "any50": 0,
+   "median_walk_coverage": 9.6
+  },
+  {
+   "user": "105986451641170",
+   "walked": 9,
+   "good2": 0,
+   "good3": 0,
+   "any50": 0,
+   "median_walk_coverage": 6.9
+  },
+  {
+   "user": "101900342055806",
+   "walked": 9,
+   "good2": 0,
+   "good3": 0,
+   "any50": 0,
+   "median_walk_coverage": 13.5
+  },
+  {
+   "user": "hdmaps1",
+   "walked": 9,
+   "good2": 0,
+   "good3": 0,
+   "any50": 0,
+   "median_walk_coverage": 10.7
+  },
+  {
+   "user": "flug32",
+   "walked": 8,
+   "good2": 1,
+   "good3": 1,
+   "any50": 1,
+   "median_walk_coverage": 10.9
+  },
+  {
+   "user": "atd2019",
+   "walked": 8,
+   "good2": 0,
+   "good3": 0,
+   "any50": 0,
+   "median_walk_coverage": 19.6
+  },
+  {
+   "user": "Hopen111",
+   "walked": 7,
+   "good2": 0,
+   "good3": 0,
+   "any50": 0,
+   "median_walk_coverage": 9.5
+  },
+  {
+   "user": "jvetters",
+   "walked": 6,
+   "good2": 1,
+   "good3": 1,
+   "any50": 1,
+   "median_walk_coverage": 20.3
+  },
+  {
+   "user": "davidsommer",
+   "walked": 6,
+   "good2": 0,
+   "good3": 0,
+   "any50": 0,
+   "median_walk_coverage": 1.8
+  },
+  {
+   "user": "108659518035445",
+   "walked": 5,
+   "good2": 0,
+   "good3": 0,
+   "any50": 3,
+   "median_walk_coverage": 88.2
+  },
+  {
+   "user": "watmildon",
+   "walked": 5,
+   "good2": 0,
+   "good3": 0,
+   "any50": 0,
+   "median_walk_coverage": 18.1
+  },
+  {
+   "user": "415376911071534",
+   "walked": 4,
+   "good2": 0,
+   "good3": 0,
+   "any50": 0,
+   "median_walk_coverage": 11.2
+  },
+  {
+   "user": "GIS_ISG",
+   "walked": 4,
+   "good2": 2,
+   "good3": 2,
+   "any50": 2,
+   "median_walk_coverage": 38.5
+  },
+  {
+   "user": "hmhtb",
+   "walked": 4,
+   "good2": 3,
+   "good3": 3,
+   "any50": 4,
+   "median_walk_coverage": 70.0
+  },
+  {
+   "user": "1055255770191286",
+   "walked": 4,
+   "good2": 0,
+   "good3": 0,
+   "any50": 0,
+   "median_walk_coverage": 10.2
+  },
+  {
+   "user": "codgis",
+   "walked": 4,
+   "good2": 0,
+   "good3": 0,
+   "any50": 3,
+   "median_walk_coverage": 66.4
+  },
+  {
+   "user": "pmfox97",
+   "walked": 4,
+   "good2": 0,
+   "good3": 0,
+   "any50": 1,
+   "median_walk_coverage": 13.0
+  },
+  {
+   "user": "uwrapid",
+   "walked": 3,
+   "good2": 0,
+   "good3": 0,
+   "any50": 1,
+   "median_walk_coverage": 16.8
+  },
+  {
+   "user": "treestryder",
+   "walked": 3,
+   "good2": 0,
+   "good3": 0,
+   "any50": 0,
+   "median_walk_coverage": 17.0
+  },
+  {
+   "user": "milk_man",
+   "walked": 3,
+   "good2": 0,
+   "good3": 0,
+   "any50": 0,
+   "median_walk_coverage": 5.7
+  },
+  {
+   "user": "TimmonsPavement",
+   "walked": 3,
+   "good2": 2,
+   "good3": 2,
+   "any50": 2,
+   "median_walk_coverage": 61.0
+  },
+  {
+   "user": "104497838459143",
+   "walked": 3,
+   "good2": 0,
+   "good3": 0,
+   "any50": 1,
+   "median_walk_coverage": 36.2
+  },
+  {
+   "user": "kinneyeng",
+   "walked": 3,
+   "good2": 0,
+   "good3": 0,
+   "any50": 0,
+   "median_walk_coverage": 13.2
+  },
+  {
+   "user": "102452782000048",
+   "walked": 3,
+   "good2": 0,
+   "good3": 0,
+   "any50": 0,
+   "median_walk_coverage": 12.1
+  },
+  {
+   "user": "nonusablebody",
+   "walked": 3,
+   "good2": 0,
+   "good3": 0,
+   "any50": 0,
+   "median_walk_coverage": 15.3
+  },
+  {
+   "user": "cartographer",
+   "walked": 3,
+   "good2": 0,
+   "good3": 0,
+   "any50": 0,
+   "median_walk_coverage": 19.2
+  }
+ ],
+ "advance_prediction_tranche3": {
+  "n": 25,
+  "basis": "screened tranches 1-2, V4 >= 0.7: 20/23 strict hits",
+  "rate": 0.87,
+  "expected_strict_hits": 21.7,
+  "falsified_below": 19,
+  "p_below_floor_at_rate": 0.036
+ },
+ "evaluation": {
+  "reproduce_committed_score_spearman": 1.0,
+  "walked_in_tiles": 1150,
+  "screened_tranche_walked": 39,
+  "by_target": {
+   "good2": {
+    "n": 1111,
+    "positives": 14,
+    "scores": {
+     "V0 committed: recent length, 2 km": {
+      "spearman_rho_vs_walk_coverage": 0.67,
+      "average_precision": 0.265,
+      "hits_at_40": 11,
+      "hits_at_100": 12
+     },
+     "V1 age-weighted length, 2 km": {
+      "spearman_rho_vs_walk_coverage": 0.779,
+      "average_precision": 0.213,
+      "hits_at_40": 10,
+      "hits_at_100": 13
+     },
+     "V2 recent cells occupied, 2 km": {
+      "spearman_rho_vs_walk_coverage": 0.67,
+      "average_precision": 0.323,
+      "hits_at_40": 10,
+      "hits_at_100": 12
+     },
+     "V3 age-weighted cells, 2 km": {
+      "spearman_rho_vs_walk_coverage": 0.777,
+      "average_precision": 0.293,
+      "hits_at_40": 10,
+      "hits_at_100": 13
+     },
+     "V4 age-weighted cells, best of 1/2/3 km": {
+      "spearman_rho_vs_walk_coverage": 0.801,
+      "average_precision": 0.292,
+      "hits_at_40": 10,
+      "hits_at_100": 13
+     },
+     "V5 V4 x LOO uploader record": {
+      "spearman_rho_vs_walk_coverage": 0.796,
+      "average_precision": 0.469,
+      "hits_at_40": 11,
+      "hits_at_100": 13
+     }
+    },
+    "ap_diff_V4_minus_V0_city_bootstrap": {
+     "mean": 0.028,
+     "ci95": [
+      -0.084,
+      0.159
+     ]
+    },
+    "ap_diff_V5_minus_V0_city_bootstrap": {
+     "mean": 0.209,
+     "ci95": [
+      0.024,
+      0.452
+     ]
+    }
+   },
+   "good3": {
+    "n": 1111,
+    "positives": 18,
+    "scores": {
+     "V0 committed: recent length, 2 km": {
+      "spearman_rho_vs_walk_coverage": 0.67,
+      "average_precision": 0.246,
+      "hits_at_40": 12,
+      "hits_at_100": 13
+     },
+     "V1 age-weighted length, 2 km": {
+      "spearman_rho_vs_walk_coverage": 0.779,
+      "average_precision": 0.259,
+      "hits_at_40": 12,
+      "hits_at_100": 17
+     },
+     "V2 recent cells occupied, 2 km": {
+      "spearman_rho_vs_walk_coverage": 0.67,
+      "average_precision": 0.296,
+      "hits_at_40": 11,
+      "hits_at_100": 13
+     },
+     "V3 age-weighted cells, 2 km": {
+      "spearman_rho_vs_walk_coverage": 0.777,
+      "average_precision": 0.323,
+      "hits_at_40": 13,
+      "hits_at_100": 17
+     },
+     "V4 age-weighted cells, best of 1/2/3 km": {
+      "spearman_rho_vs_walk_coverage": 0.801,
+      "average_precision": 0.313,
+      "hits_at_40": 13,
+      "hits_at_100": 16
+     },
+     "V5 V4 x LOO uploader record": {
+      "spearman_rho_vs_walk_coverage": 0.796,
+      "average_precision": 0.549,
+      "hits_at_40": 14,
+      "hits_at_100": 17
+     }
+    },
+    "ap_diff_V4_minus_V0_city_bootstrap": {
+     "mean": 0.067,
+     "ci95": [
+      -0.044,
+      0.192
+     ]
+    },
+    "ap_diff_V5_minus_V0_city_bootstrap": {
+     "mean": 0.307,
+     "ci95": [
+      0.129,
+      0.527
+     ]
+    }
+   },
+   "any50": {
+    "n": 1111,
+    "positives": 46,
+    "scores": {
+     "V0 committed: recent length, 2 km": {
+      "spearman_rho_vs_walk_coverage": 0.67,
+      "average_precision": 0.318,
+      "hits_at_40": 18,
+      "hits_at_100": 21
+     },
+     "V1 age-weighted length, 2 km": {
+      "spearman_rho_vs_walk_coverage": 0.779,
+      "average_precision": 0.372,
+      "hits_at_40": 19,
+      "hits_at_100": 27
+     },
+     "V2 recent cells occupied, 2 km": {
+      "spearman_rho_vs_walk_coverage": 0.67,
+      "average_precision": 0.324,
+      "hits_at_40": 17,
+      "hits_at_100": 21
+     },
+     "V3 age-weighted cells, 2 km": {
+      "spearman_rho_vs_walk_coverage": 0.777,
+      "average_precision": 0.371,
+      "hits_at_40": 20,
+      "hits_at_100": 26
+     },
+     "V4 age-weighted cells, best of 1/2/3 km": {
+      "spearman_rho_vs_walk_coverage": 0.801,
+      "average_precision": 0.349,
+      "hits_at_40": 18,
+      "hits_at_100": 27
+     },
+     "V5 V4 x LOO uploader record": {
+      "spearman_rho_vs_walk_coverage": 0.802,
+      "average_precision": 0.455,
+      "hits_at_40": 21,
+      "hits_at_100": 31
+     }
+    },
+    "ap_diff_V4_minus_V0_city_bootstrap": {
+     "mean": 0.031,
+     "ci95": [
+      -0.046,
+      0.11
+     ]
+    },
+    "ap_diff_V5_minus_V0_city_bootstrap": {
+     "mean": 0.143,
+     "ci95": [
+      0.031,
+      0.271
+     ]
+    }
+   }
+  }
+ },
+ "generated_by": [
+  "scripts/mapillary_discovery_rescore/features.py",
+  "scripts/mapillary_discovery_rescore/evaluate.py",
+  "scripts/mapillary_discovery_rescore/tier3.py"
+ ]
+}

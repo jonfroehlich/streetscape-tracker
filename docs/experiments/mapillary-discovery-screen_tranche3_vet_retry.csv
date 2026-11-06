@@ -1,0 +1,3 @@
+n,city,geonameid,geocode_query,osm_match,center_lat,center_lon,width_m,height_m,gsv_points,gsv_streets_samples,mapillary_z14_tiles,kartaview_requests,panoramax_z15_tiles,offset_km,center,flags
+1,Live Oak,5367314,"Live Oak, Santa Cruz County, California, United States",boundary/census,36.990384,-121.983266,3177,5095,40545,8039,12,21,28,0.7,geocoded,
+2,Elko,5703670,"Elko, Elko County, Nevada, United States",boundary/administrative,40.846931,-115.766983,11276,9748,275232,54592,42,100,156,1.7,geocoded,
