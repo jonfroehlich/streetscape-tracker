@@ -121,9 +121,15 @@ Nothing new was measured for this section; it records what the code does now and
 The 62 pairs at 2 of 5 `consecutive_failures` reset on their first success; no `reset-failures` is needed.
 
 **Step 3's result (2026-11-09, prod at `bf27faf`, read-only; `resume_dry_run_2026_11_09` in the production JSON).**
-The due queue is the 313 KartaView-enrolled cities with no KartaView collection yet (553 others already have one), and the grid sweeps price at 12,180 requests in all (p50 36, p90 64, max 100).
+The due queue is 313 KartaView-enrolled cities: the catalog holds 866 enrolled, 313 of them with no KartaView success yet.
+Their grid sweeps price at 12,180 requests in all (p50 36, p90 64, max 100).
 179 fit one 37-request launch, the other 134 are capped and resume, and none is over the 222-request wall, so the unfinishable skip removes nobody.
-The walks price the same but are ~0 on a paired night (#290).
-At the anonymous 90/h that is ~135 h of KartaView.
-`opt_in_cities_per_day` (20 on prod) is the rate the queue drains at, so first launches alone take at least 16 nights, and while it drains those slots are KartaView-heavy and the fill sees less room.
+That is against the ESTIMATE: KartaView has run up to 3.0× its estimate (Yogyakarta), and the 1.80× multiplier is not re-measured for blind paging, so a city near the top could still meet the wall.
+The walks price the same, but a walk costs ~0 only once its grid sweep completes (#290); behind a capped grid's checkpoint it is deferred until then.
+At the anonymous 90/h the grid sweeps are ~135 h of KartaView.
+
+**The first night's shape** (the same flip, unfiltered, `resume_night_shape_2026_11_09` in the production JSON).
+All 336 due cities are not due on gsv, so the 80-city slate is all of that kind, not just the 20 reserved opt-in slots: 57 of the 80 carry KartaView (41 of them nothing else), and their launches sum to 1,793 requests (each estimate capped at 37), ~19.9 h at 40 s a request.
+The 12 h deadline therefore governs every night of the drain, at no more than ~1,080 KartaView requests a night (12 h at 90/h, less whatever the other channels take), so the queue takes at least ~11 nights, and the fill does not run meanwhile.
+The 33 Mapillary-due cities sit at slate positions 7–49, which a sequential estimate reaches within ~9 h (no gsv grid run was due that night), so the deadline does not cut them; each is still gated on the rolling-24h tile budget, which at read time deferred all of them.
 The catalog's other enabled cities stay unenrolled on KartaView: at this pace a whole-catalog pass outlasts the 90-day cycle, so widening waits on the authenticated tier being verifiable.

@@ -1082,8 +1082,8 @@ def test_makelab1_production_config_is_wired():
     # in step deliberately, which is what this assertion is for.
     cfg = load_scheduler_config(os.path.join(_PROJECT_ROOT, "config", "scheduler.makelab1.toml"))
     # Order is canonical, not alphabetical: most expensive first, EXCEPT kartaview,
-    # which ranks LAST because a multi-hour sweep absorbs deadline truncation most
-    # cheaply (#238). Asserting the list therefore pins the launch order too.
+    # which ranks after the other two providers because a multi-hour sweep absorbs
+    # deadline truncation most cheaply (#238); the panoramax pair came later still. Asserting the list therefore pins the launch order too.
     #
     # Both Mapillary channels were PAUSED 2026-08-28 (third per-IP block) and
     # RESUMED with #292's pacing: a slower mean rate and, the actual change
@@ -1109,6 +1109,12 @@ def test_makelab1_production_config_is_wired():
     ]
     for channel in ("kartaview", "kartaview_streets"):
         assert cfg.providers[channel].enabled, f"{channel} resumed 2026-11-09"
+        # The resume was priced against this window (37 requests a launch, six
+        # launches before the checkpoint wall, so 222): prod sets no
+        # max_city_minutes, so a drift in the code default or the rate would
+        # silently move the figures the resume record quotes.
+        window = _sched._ceiling_window(channel, cfg.providers[channel])
+        assert (window.per_night, window.nights, window.total) == (37, 6, 222)
     for channel in ("mapillary", "mapillary_streets"):
         pc = cfg.providers[channel]
         assert pc.enabled, f"{channel} resumed under #292"
