@@ -1,6 +1,6 @@
 # KartaView's nearby-photos endpoint moved, and the host that still answers no longer counts (2026-10-22)
 
-**Decision: both KartaView channels are PAUSED on production** (`enabled = false` in `config/scheduler.makelab1.toml`, membership kept).
+**Decision: both KartaView channels were PAUSED on production** (`enabled = false` in `config/scheduler.makelab1.toml`, membership kept), **and RESUMED on 2026-11-09** once the #452 collector fix was deployed (see "The resume plan" below for the dry run that priced it).
 The endpoint had broken by the 2026-10-22 night; the pause was applied by hand on 2026-10-23 at 06:30 PDT, after a second night of failures, and committed here.
 They come back with a collector fix, never with a one-line host change, because the host change alone would publish truncated censuses.
 
@@ -113,9 +113,23 @@ Nothing new was measured for this section; it records what the code does now and
 1. Deploy main to makelab2.
 2. A config PR flipping `enabled = true` on both KartaView blocks of `config/scheduler.makelab1.toml` (`test_makelab1_production_config_is_wired` flips with it).
 3. Before the flip, run `run-due --dry-run` against the enrolled KartaView cities (it prints each launch's plan, every city skipped as unfinishable under the ceiling, and what the fill would leave to the due schedule; `scheduler status` shows only dueness) and price the first night's shape.
-   At most `opt_in_cities_per_day` hoisted KartaView cities, each holding the city loop for at most one `max_city_minutes` per channel (two for a city due on both), so 10 cities at the default bound KartaView to ~10–20 h of loop time in the worst case and ~4–8 h if each child spends its ~37-request cap at the full pace. That worst case is a whole night, which is why the ceiling's value is an open decision rather than settled here.
-4. After night 1: `grep -h "paged blind" logs/collect_*_kartaview_*` and read the `Done:` line.
+   (Superseded by the measured shape below, which found 57 KartaView cities on the slate, not 10 or 20.) At most `opt_in_cities_per_day` hoisted KartaView cities, each holding the city loop for at most one `max_city_minutes` per channel (two for a city due on both), so 10 cities at the default bound KartaView to ~10–20 h of loop time in the worst case and ~4–8 h if each child spends its ~37-request cap at the full pace. That worst case is a whole night, which is why the ceiling's value is an open decision rather than settled here.
+4. After night 1: `grep -h "paged blind" logs/collect_*_kartaview_*` and read the `Done:` line. Read the KartaView children's seconds per request too: the night's shape below assumes the full 40 s, never measured on `api.kartaview.org`, and at the 0.5 fraction the cap is priced at the Mapillary-due cities fall past the deadline.
 5. Compare every re-collected 10-15 city's pano count against its previous run (`runs` rows per city and provider). On this host every visited cell is paged blind, so `cells_paged_blind` > 0 says nothing (#452 review); the signal is `cells_paged_deep`. A collapse over 30% in a city whose `cells_paged_deep` is 0 means no circle ever filled a page, which is what a page cap below 200 would look like.
 6. An `ENDPOINT MOVED` alert means `api.kartaview.org` moved too: pause again and re-probe from a laptop.
 
 The 62 pairs at 2 of 5 `consecutive_failures` reset on their first success; no `reset-failures` is needed.
+
+**Step 3's result (2026-11-09, prod at `bf27faf`, read-only; `resume_dry_run_2026_11_09` in the production JSON).**
+The due queue is 313 KartaView-enrolled cities: the catalog holds 866 enrolled, 313 of them with no KartaView success yet.
+Their grid sweeps price at 12,180 requests in all (p50 36, p90 64, max 100).
+179 fit one 37-request launch, the other 134 are capped and resume, and none is over the 222-request wall, so the unfinishable skip removes nobody.
+That is against the ESTIMATE: KartaView has run up to 3.0× its estimate (Yogyakarta), and the 1.80× multiplier is not re-measured for blind paging, so a city near the top could still meet the wall.
+The walks price the same, but a walk costs ~0 only once its grid sweep completes (#290); behind a capped grid's checkpoint it is deferred until then.
+At the anonymous 90/h the grid sweeps are ~135 h of KartaView.
+
+**The first night's shape** (the same flip, unfiltered, `resume_night_shape_2026_11_09` in the production JSON).
+All 336 due cities are not due on gsv, so the 80-city slate is all of that kind, not just the 20 reserved opt-in slots: 57 of the 80 carry KartaView (41 of them nothing else), and their launches sum to 1,793 requests (each estimate capped at 37), ~19.9 h at 40 s a request.
+The 12 h deadline therefore governs night 1 and every later night whose slate carries more than ~1,080 KartaView requests (12 h at 90/h, less whatever the other channels take); once gsv-due cities lead the queue again, KartaView falls back toward its reserved slots. Either way the queue takes at least ~11 nights, and the fill does not run while the cap or the deadline ends the night.
+The 33 Mapillary-due cities sit at slate positions 7–49. At the full 40 s a request (not yet measured on the new host) a sequential estimate reaches them within ~9 h (no gsv grid run was due that night); at the 0.5 achieved fraction the cap is priced at, each launch runs to its 50-min clock stop and the deadline falls near position 24, cutting 26 of the 33. Each is also gated on the rolling-24h tile budget, which at read time deferred all of them.
+The catalog's other enabled cities stay unenrolled on KartaView: at this pace a whole-catalog pass outlasts the 90-day cycle, so widening waits on the authenticated tier being verifiable.

@@ -1082,8 +1082,8 @@ def test_makelab1_production_config_is_wired():
     # in step deliberately, which is what this assertion is for.
     cfg = load_scheduler_config(os.path.join(_PROJECT_ROOT, "config", "scheduler.makelab1.toml"))
     # Order is canonical, not alphabetical: most expensive first, EXCEPT kartaview,
-    # which ranks LAST because a multi-hour sweep absorbs deadline truncation most
-    # cheaply (#238). Asserting the list therefore pins the launch order too.
+    # which ranks after the other two providers because a multi-hour sweep absorbs
+    # deadline truncation most cheaply (#238); the panoramax pair came later still. Asserting the list therefore pins the launch order too.
     #
     # Both Mapillary channels were PAUSED 2026-08-28 (third per-IP block) and
     # RESUMED with #292's pacing: a slower mean rate and, the actual change
@@ -1095,19 +1095,26 @@ def test_makelab1_production_config_is_wired():
     # routing the nearby-photos endpoint, and the api. hosts that still answer
     # report totalFilteredItems as 0, which would truncate every circle to one
     # page (docs/experiments/kartaview-endpoint-move.md). The collector fix
-    # landed with #452 (api.kartaview.org, blind paging, exit 89); the channels
-    # stay pinned off until the deliberate config PR that resumes them, which
-    # flips this assertion with it.
+    # landed with #452 (api.kartaview.org, blind paging, exit 89), and both were
+    # RESUMED 2026-11-09 by the deliberate config PR the resume plan names.
     assert cfg.enabled_providers() == [
         "gsv",
         "gsv_streets",
         "mapillary",
         "mapillary_streets",
+        "kartaview",
+        "kartaview_streets",
         "panoramax",
         "panoramax_streets",
     ]
     for channel in ("kartaview", "kartaview_streets"):
-        assert not cfg.providers[channel].enabled, f"{channel} paused 2026-10-23"
+        assert cfg.providers[channel].enabled, f"{channel} resumed 2026-11-09"
+        # The resume was priced against this window (37 requests a launch, six
+        # launches before the checkpoint wall, so 222): prod sets no
+        # max_city_minutes, so a drift in the code default or the rate would
+        # silently move the figures the resume record quotes.
+        window = _sched._ceiling_window(channel, cfg.providers[channel])
+        assert (window.per_night, window.nights, window.total) == (37, 6, 222)
     for channel in ("mapillary", "mapillary_streets"):
         pc = cfg.providers[channel]
         assert pc.enabled, f"{channel} resumed under #292"

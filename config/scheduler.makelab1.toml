@@ -643,12 +643,17 @@ jitter = 0.6
 # docs/experiments/kartaview-endpoint-move.md.
 # REPOINTED (issue #452): the collector now sweeps api.kartaview.org, pages
 # blind to a short page when the host reports no usable total, and exits 89
-# (amnestied, night-latching) if the route 404s again. Still PAUSED: flipping
-# `enabled = true` is a deliberate prod step (see the resume plan in
-# docs/experiments/kartaview-endpoint-move.md); the pace is the anonymous tier
-# until the token is verifiable. Membership is kept.
+# (amnestied, night-latching) if the route 404s again.
+# RESUMED 2026-11-09 (resume plan step 2 in
+# docs/experiments/kartaview-endpoint-move.md), after step 3's dry run on prod:
+# the due queue is the 313 enrolled cities never collected, 12,180 grid
+# requests in all, none over the 222-request unfinishable wall. The pace stays
+# the anonymous tier until the token is verifiable, so that backlog is ~135 h
+# of KartaView: night 1's slate alone needs ~20 h against the 12 h deadline,
+# the drain takes >= ~11 nights, and no city beyond the enrolled set is
+# enrolled at this pace.
 [providers.kartaview]
-enabled = false
+enabled = true
 daily_request_budget = 10000
 max_requests_per_minute = 1.5
 
@@ -677,12 +682,11 @@ max_requests_per_minute = 1.5
 # current concurrency ceiling — re-derived there rather than restated here,
 # since the figure is a property of the host graph and moves when a channel is
 # added.
-# PAUSED 2026-10-23 and REPOINTED (issue #452), exactly as [providers.kartaview]
-# above: flipping `enabled = true` is a deliberate prod step (the resume plan is
-# in docs/experiments/kartaview-endpoint-move.md), and the pace is the anonymous
-# tier until the token is verifiable. Membership is kept.
+# PAUSED 2026-10-23, REPOINTED (issue #452) and RESUMED 2026-11-09, exactly as
+# [providers.kartaview] above; the pace is the anonymous tier until the token is
+# verifiable.
 [providers.kartaview_streets]
-enabled = false
+enabled = true
 daily_request_budget = 10000
 max_requests_per_minute = 1.5
 spacing_m = 15

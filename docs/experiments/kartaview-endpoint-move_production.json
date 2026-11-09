@@ -95,5 +95,43 @@
   "command": "sqlite3 'file:data/streetscape_tracker.db?mode=ro' \"select provider, max(last_success_at) from schedule_state where provider like 'kartaview%' group by 1\"",
   "kartaview": "2026-10-15T11:42:49+00:00",
   "kartaview_streets": "2026-10-15T11:42:52+00:00"
+ },
+ "resume_dry_run_2026_11_09": {
+  "command": "cd ~/streetscape-tracker && .venv-makelab2/bin/python -m streetscape_metadata_tracker.scheduler --config <(sed '/^\\[providers.kartaview/{n;s/^enabled = false/enabled = true/}' config/scheduler.makelab1.toml) run-due --dry-run --provider kartaview,kartaview_streets --limit 1000",
+  "read_at": "2026-11-09T13:10:24+00:00",
+  "prod_head": "bf27faf",
+  "note": "Read-only: the enabled flip exists only in the process-substituted config, and --dry-run collects nothing. --limit 1000 lifts the 80-city cap so the whole due queue prints; the kartaview grid column is summarized, since every kartaview_streets row prices identically and is ~0 when paired through the #290 census cache.",
+  "due_cities": 313,
+  "grid_requests_total": 12180,
+  "grid_requests_p50": 36,
+  "grid_requests_p90": 64,
+  "grid_requests_max": 100,
+  "fit_one_37_request_launch": 179,
+  "launch_capped_and_resumes": 134,
+  "over_222_request_unfinishable_wall": 0,
+  "opt_in_cities_per_day": 20,
+  "enrolled_and_never_collected_command": "sqlite3 -readonly data/streetscape_tracker.db \"select s.provider, count(*), sum(s.last_success_at is null) from schedule_state s join cities c using(city_id) where c.enabled=1 and s.member=1 and s.provider like 'kartaview%' group by 1\"",
+  "kartaview_enrolled": 866,
+  "kartaview_enrolled_never_collected": 313,
+  "kartaview_streets_enrolled": 866,
+  "kartaview_streets_enrolled_never_collected": 313
+ },
+ "resume_night_shape_2026_11_09": {
+  "command": "cd ~/streetscape-tracker && .venv-makelab2/bin/python -m streetscape_metadata_tracker.scheduler --config <(sed '/^\\[providers.kartaview/{n;s/^enabled = false/enabled = true/}' config/scheduler.makelab1.toml) run-due --dry-run",
+  "read_at": "2026-11-09T13:37:30+00:00",
+  "prod_head": "bf27faf",
+  "note": "Read-only, unfiltered: the whole night as the scheduler would plan it with both KartaView channels on. Summed by hand from the printed slate: kartaview launch requests are min(estimate, 37) per city, timed at 40 s a request (1.5/min); the walk is excluded because it is ~0 once the grid sweep lands or deferred behind its checkpoint. The Mapillary rows were all 'deferred ... [host rolling-24h budget]' at read time, three hours after the night's Mapillary spend.",
+  "due_cities": 336,
+  "due_cities_not_due_on_gsv": 336,
+  "slate_cities": 80,
+  "hoisted_opt_in_only": 10,
+  "slate_cities_with_kartaview": 57,
+  "slate_cities_kartaview_only": 41,
+  "kartaview_launch_requests": 1793,
+  "kartaview_launch_hours_at_90_per_h": 19.9,
+  "mapillary_due_in_slate": 33,
+  "mapillary_slate_positions": [7, 49],
+  "mapillary_deferred_for_rolling_budget": 33,
+  "batch_deadline_hours": 12
  }
 }
