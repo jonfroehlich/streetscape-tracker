@@ -1,6 +1,6 @@
 # KartaView's nearby-photos endpoint moved, and the host that still answers no longer counts (2026-10-22)
 
-**Decision: both KartaView channels are PAUSED on production** (`enabled = false` in `config/scheduler.makelab1.toml`, membership kept).
+**Decision: both KartaView channels were PAUSED on production** (`enabled = false` in `config/scheduler.makelab1.toml`, membership kept), **and RESUMED on 2026-11-09** once the #452 collector fix was deployed (see "The resume plan" below for the dry run that priced it).
 The endpoint had broken by the 2026-10-22 night; the pause was applied by hand on 2026-10-23 at 06:30 PDT, after a second night of failures, and committed here.
 They come back with a collector fix, never with a one-line host change, because the host change alone would publish truncated censuses.
 
@@ -119,3 +119,11 @@ Nothing new was measured for this section; it records what the code does now and
 6. An `ENDPOINT MOVED` alert means `api.kartaview.org` moved too: pause again and re-probe from a laptop.
 
 The 62 pairs at 2 of 5 `consecutive_failures` reset on their first success; no `reset-failures` is needed.
+
+**Step 3's result (2026-11-09, prod at `bf27faf`, read-only; `resume_dry_run_2026_11_09` in the production JSON).**
+The due queue is the 313 KartaView-enrolled cities with no KartaView collection yet (553 others already have one), and the grid sweeps price at 12,180 requests in all (p50 36, p90 64, max 100).
+179 fit one 37-request launch, the other 134 are capped and resume, and none is over the 222-request wall, so the unfinishable skip removes nobody.
+The walks price the same but are ~0 on a paired night (#290).
+At the anonymous 90/h that is ~135 h of KartaView.
+`opt_in_cities_per_day` (20 on prod) is the rate the queue drains at, so first launches alone take at least 16 nights, and while it drains those slots are KartaView-heavy and the fill sees less room.
+The catalog's other enabled cities stay unenrolled on KartaView: at this pace a whole-catalog pass outlasts the 90-day cycle, so widening waits on the authenticated tier being verifiable.

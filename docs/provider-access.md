@@ -812,7 +812,7 @@ The fourth column is a DEPLOY fact, not a merge fact, so the repo cannot derive 
 - **Enrolment of the 41 screen-positive tracked cities proceeds in tranches only after stage 1 holds.**
 - **The Panoramax pair's share of the night roughly doubled on 2026-10-27, a side effect of #444, not a Panoramax decision.**
   Prod's `opt_in_cities_per_day` went 10 → 20 to drain the Mapillary-only-due backlog, and the 442 tranche-2 enrolments are kind 1 of the same hoist, so on the prod-shaped test slate kind 1 goes from about 4 hoisted slots a night to 8 (6 plus the 2 live-checkpoint resumers).
-  Those 8 are Panoramax's only while both KartaView channels stay paused: kind 1 round-robins across its opt-in channels, so the night KartaView is re-enabled the Panoramax sub-queue's share roughly halves, and the city count this stage is judged at moves again on that date.
+  Those 8 are Panoramax's only while both KartaView channels stay paused: kind 1 round-robins across its opt-in channels, so the night KartaView is re-enabled (2026-11-09, by the resume config PR) the Panoramax sub-queue's share roughly halves, and the city count this stage is judged at moves again on that date.
   The 8,000/day per-channel budget still bounds the requests; what moves is the CITY count per night inside this stage's window.
   Judge the nights from 2026-10-27 on at that city count, and do not read a change in this gate's request totals across that date as a pacing effect.
 - Whole-catalog screening should move to the weekly parquet dump for 0 API requests; that is a separate ticket.

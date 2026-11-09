@@ -1095,19 +1095,20 @@ def test_makelab1_production_config_is_wired():
     # routing the nearby-photos endpoint, and the api. hosts that still answer
     # report totalFilteredItems as 0, which would truncate every circle to one
     # page (docs/experiments/kartaview-endpoint-move.md). The collector fix
-    # landed with #452 (api.kartaview.org, blind paging, exit 89); the channels
-    # stay pinned off until the deliberate config PR that resumes them, which
-    # flips this assertion with it.
+    # landed with #452 (api.kartaview.org, blind paging, exit 89), and both were
+    # RESUMED 2026-11-09 by the deliberate config PR the resume plan names.
     assert cfg.enabled_providers() == [
         "gsv",
         "gsv_streets",
         "mapillary",
         "mapillary_streets",
+        "kartaview",
+        "kartaview_streets",
         "panoramax",
         "panoramax_streets",
     ]
     for channel in ("kartaview", "kartaview_streets"):
-        assert not cfg.providers[channel].enabled, f"{channel} paused 2026-10-23"
+        assert cfg.providers[channel].enabled, f"{channel} resumed 2026-11-09"
     for channel in ("mapillary", "mapillary_streets"):
         pc = cfg.providers[channel]
         assert pc.enabled, f"{channel} resumed under #292"

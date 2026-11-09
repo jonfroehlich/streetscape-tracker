@@ -808,7 +808,7 @@ The whole tranche would fit one night; it is split in two, alternating in GSV or
 | 2 | Carmel-by-the-Sea, East Palo Alto, Rio Linda, Stanford, Royal Kunia, Evansdale, Makaha, Kuna, North Tustin, Fair Oaks, Worland, Colton | 886,434 (0.31) | 165 | ≤ 640 (0.67) | ≤ 861 (14) |
 
 The KartaView and Panoramax columns are upper bounds: they use the vetted grids for Kuna and Magna (237 KartaView requests each), and each opt-in pair is enrolled only if `enable-city`'s rule admits it.
-While both KartaView channels are paused on production (`enabled = false`, #452), the KartaView column is enrolment, not collection.
+Both KartaView channels were paused on production from 2026-10-23 to 2026-11-09 (#452), so for a tranche enabled in that window the KartaView column was enrolment, not collection, until the resume.
 Before night 2, read night 1's log as for tranche 2: every tranche city collected (or paused at a cap, exit 83), no Mapillary refusal or throttle (exit 75 or 87), no Overpass latch.
 
 ## Keeping Overpass out of the night: `scripts/prefreeze_street_networks.py` (issue #341)

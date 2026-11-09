@@ -95,5 +95,20 @@
   "command": "sqlite3 'file:data/streetscape_tracker.db?mode=ro' \"select provider, max(last_success_at) from schedule_state where provider like 'kartaview%' group by 1\"",
   "kartaview": "2026-10-15T11:42:49+00:00",
   "kartaview_streets": "2026-10-15T11:42:52+00:00"
+ },
+ "resume_dry_run_2026_11_09": {
+  "command": "cd ~/streetscape-tracker && .venv-makelab2/bin/python -m streetscape_metadata_tracker.scheduler --config <(sed '/^\\[providers.kartaview/{n;s/^enabled = false/enabled = true/}' config/scheduler.makelab1.toml) run-due --dry-run --provider kartaview,kartaview_streets --limit 1000",
+  "read_at": "2026-11-09T13:10:24+00:00",
+  "prod_head": "bf27faf",
+  "note": "Read-only: the enabled flip exists only in the process-substituted config, and --dry-run collects nothing. --limit 1000 lifts the 80-city cap so the whole due queue prints; the kartaview grid column is summarized, since every kartaview_streets row prices identically and is ~0 when paired through the #290 census cache.",
+  "due_cities": 313,
+  "grid_requests_total": 12180,
+  "grid_requests_p50": 36,
+  "grid_requests_p90": 64,
+  "grid_requests_max": 100,
+  "fit_one_37_request_launch": 179,
+  "launch_capped_and_resumes": 134,
+  "over_222_request_unfinishable_wall": 0,
+  "opt_in_cities_per_day": 20
  }
 }
