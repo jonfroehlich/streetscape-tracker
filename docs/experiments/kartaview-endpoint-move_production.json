@@ -111,8 +111,10 @@
   "over_222_request_unfinishable_wall": 0,
   "opt_in_cities_per_day": 20,
   "enrolled_and_never_collected_command": "sqlite3 -readonly data/streetscape_tracker.db \"select s.provider, count(*), sum(s.last_success_at is null) from schedule_state s join cities c using(city_id) where c.enabled=1 and s.member=1 and s.provider like 'kartaview%' group by 1\"",
-  "enrolled_kartaview": 866,
-  "enrolled_never_collected": 313
+  "kartaview_enrolled": 866,
+  "kartaview_enrolled_never_collected": 313,
+  "kartaview_streets_enrolled": 866,
+  "kartaview_streets_enrolled_never_collected": 313
  },
  "resume_night_shape_2026_11_09": {
   "command": "cd ~/streetscape-tracker && .venv-makelab2/bin/python -m streetscape_metadata_tracker.scheduler --config <(sed '/^\\[providers.kartaview/{n;s/^enabled = false/enabled = true/}' config/scheduler.makelab1.toml) run-due --dry-run",

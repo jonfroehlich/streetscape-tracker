@@ -649,8 +649,9 @@ jitter = 0.6
 # the due queue is the 313 enrolled cities never collected, 12,180 grid
 # requests in all, none over the 222-request unfinishable wall. The pace stays
 # the anonymous tier until the token is verifiable, so that backlog is ~135 h
-# of KartaView: every night of the drain runs to the 12 h deadline (>= ~11
-# nights), and no city beyond the enrolled set is enrolled at this pace.
+# of KartaView: night 1's slate alone needs ~20 h against the 12 h deadline,
+# the drain takes >= ~11 nights, and no city beyond the enrolled set is
+# enrolled at this pace.
 [providers.kartaview]
 enabled = true
 daily_request_budget = 10000
