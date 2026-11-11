@@ -18,7 +18,7 @@ every sample matching a collected location within its tolerance and every
 location matched, and the coverage artifact's edge ids being exactly the
 regenerated edges'.
 
-Anchors follow the walk's own covered rule (PRESENT, `© Google`, within the
+Anchors follow the walk's own covered rule (PRESENT, official `© [YYYY ]Google`, within the
 walk's `match_dist_m` of the sample); a present pano too far to anchor is
 written as `OUT_OF_RADIUS`. Writes by default; there is nothing to execute
 but the files.

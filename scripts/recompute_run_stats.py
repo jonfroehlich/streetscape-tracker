@@ -13,7 +13,7 @@ Four definitions have moved so far, and one column was added:
     counts toward both coverage and pano totals instead of sitting in the
     status_other error bucket (see analysis.PRESENT_STATUSES).
   * issue #213 narrowed the capture-date columns to dates that can actually be
-    true, and for gsv to official '© Google' imagery. This one must be applied
+    true, and for gsv to official '© [YYYY ]Google' imagery. This one must be applied
     to the WHOLE series in one pass: a half-recomputed city would show a run
     history mixing two definitions of "median age", which reads as a trend that
     never happened.
@@ -644,6 +644,7 @@ def main() -> int:
     json_repairs = []  # (run_id, csv_filename, implausible pano count)
     n_date_moved = 0  # of those repairs, how many were triggered by a moved date
     n_radius = 0  # of those repairs, how many hold a pano beyond the query radius
+    n_google_moved = 0  # of those repairs, how many had their official-Google count move
     # Runs whose capture-date columns this pass moves while --regenerate-json is
     # off, as "city_id [provider] run_date": applying them repairs the catalog
     # but not the published JSON, and leaves no trace a later --regenerate-json
@@ -710,12 +711,23 @@ def main() -> int:
             radius_stale = bool(n_out_of_radius) and not _json_has_query_radius(
                 args.data_dir, r["json_filename"]
             )
-            if n_implausible or date_moved or radius_stale:
+            # (4) The official-Google classification moved (Google began
+            # writing "© YYYY Google" on 2026-10-21). The per-run JSON's
+            # google_panos block is built by the same is_google_copyright the
+            # catalog column is, so a moved count means the published block is
+            # stale too. Needed on its own because a run straddling the change
+            # (both string forms) can move this count without moving any date
+            # column, and once the catalog is repaired nothing moves again, so a
+            # run missed here would publish the stale block forever.
+            google_moved = "unique_google_panos" in changed
+            if n_implausible or date_moved or radius_stale or google_moved:
                 json_repairs.append((r["run_id"], r["csv_filename"], n_implausible))
                 if date_moved:
                     n_date_moved += 1
                 if radius_stale:
                     n_radius += 1
+                if google_moved:
+                    n_google_moved += 1
         if not args.regenerate_json and any(c in changed for c in DATE_COLUMNS):
             dates_unrebuilt.append(f"{r['city_id']} [{r['provider']}] {r['run_date']}")
         if changed:
@@ -791,7 +803,8 @@ def main() -> int:
             f"{len(json_repairs)} runs need their per-run JSON rebuilt "
             f"({n_bad_dates} hold an impossible capture date, {total_bad} panos "
             f"in all; {n_date_moved} have capture-date columns this pass moves; "
-            f"{n_radius} hold a pano beyond the query radius); "
+            f"{n_radius} hold a pano beyond the query radius; "
+            f"{n_google_moved} have an official-Google count this pass moves); "
             f"they {'will' if args.execute else 'would'} be rebuilt"
         )
 

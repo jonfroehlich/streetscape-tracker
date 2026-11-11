@@ -169,8 +169,8 @@ def select_pano_points(df: pd.DataFrame, provider: str) -> gpd.GeoDataFrame:
     Filtering on ``== "OK"`` silently dropped every NO_DATE pano, which for
     KartaView is a large population by construction (its ``shot_date >=
     date_added`` rule nulls the date rather than trusting it) and for Mapillary
-    a small real one. For GSV, restricts to official Google imagery (exact
-    ``© Google`` match, mirroring the stats/JSON/frontend definition); for
+    a small real one. For GSV, restricts to official Google imagery (whole-string
+    ``© [YYYY ]Google`` match, mirroring the stats/JSON/frontend definition); for
     other providers keeps every pano. Retains ``capture_date`` (coerced to
     datetime) so coverage can be aged; a NO_DATE pano contributes coverage but
     no age, exactly as it does in the grid stats.

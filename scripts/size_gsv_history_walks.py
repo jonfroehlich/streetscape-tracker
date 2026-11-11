@@ -4,7 +4,7 @@
 Reads the catalog and walk CSVs only; makes no network requests.
 
   1. Backfill size: distinct matched pano IDs across every city's latest GSV drive walk
-     (all, and official '© Google' only), per city and globally deduplicated.
+     (all, and official '© [YYYY ]Google' only), per city and globally deduplicated.
   2. Ongoing load: for cities with two or more walks, how many sample points changed
      matched pano between the last two walks, normalized per day. A pair is used only
      when both walks hold the identical sample list in the identical order

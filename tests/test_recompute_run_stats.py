@@ -450,6 +450,58 @@ def test_moved_capture_dates_rebuild_the_json_without_an_impossible_date(conn, d
     }
 
 
+def test_a_moved_official_google_count_alone_triggers_the_json_rebuild(conn, data_dir):
+    """Trigger (4): only ``unique_google_panos`` stale, every date column right.
+
+    The shape of a gsv run that straddles Google's 2026-10-21 switch to
+    "© YYYY Google": the reclassification moves the official count, and may
+    move no date column. Without its own trigger that run's published
+    google_panos block stays stale forever, since a repaired catalog never
+    moves again. The unique_panos control in the test below keeps this from
+    being "any change rebuilds".
+    """
+    run_date = date(2026, 10, 21)
+    cid = db.register_city(
+        conn,
+        city_name="Bend",
+        state_name="Oregon",
+        state_code="OR",
+        country_name="United States",
+        country_code="US",
+        center_lat=44.0,
+        center_lon=-121.0,
+        grid_width_m=1000,
+        grid_height_m=1000,
+        step_m=20,
+    )
+    df = make_city_df(
+        [("p1", "2020-06-15"), ("p2", "2024-01-10")],
+        run_date=run_date,
+        n_empty=1,
+        copyright_info="© 2026 Google",
+    )
+    csv_name = "bend--oregon--united-states_width_1000_height_1000_step_20_2026-10-21.csv.gz"
+    csv_path = os.path.join(data_dir, csv_name)
+    write_city_csv_gz(df, csv_path)
+
+    truth = calculate_run_stats(load_city_csv_file(csv_path), run_date, provider="gsv")
+    assert truth["unique_google_panos"] == 2  # premise: the year form counts
+    db.register_run(
+        conn,
+        city_id=cid,
+        run_date=run_date,
+        csv_filename=csv_name,
+        **{**truth, "unique_google_panos": 0},
+    )
+
+    result = _run_script(data_dir, "--execute", "--regenerate-json")
+    assert result.returncode == 0, result.stderr
+    assert "0 have capture-date columns this pass moves" in result.stdout
+    assert "1 have an official-Google count this pass moves" in result.stdout
+    assert "Rebuilt 1 of 1" in result.stdout
+    assert os.path.exists(csv_path.replace(".csv.gz", ".json.gz"))
+
+
 @pytest.mark.parametrize(
     "column, wrong_value, rebuilt",
     [

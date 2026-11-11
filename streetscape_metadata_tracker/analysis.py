@@ -26,7 +26,8 @@ logger = logging.getLogger(__name__)
 # third-party photographer. Substring or loose matching is wrong because
 # photographer names contain 'Google' and even a year: '© MIB 2023 - Google
 # Virtual Tours Agency', '© IWorkForGoogleForFree', '© A Google User'.
-# So the test is a WHOLE-STRING match. Must stay in sync with
+# So the test is a WHOLE-STRING match, and [0-9] rather than \d so it does
+# not depend on the engine (Python's re \d matches any Unicode digit). Must stay in sync with
 # isGoogleCopyright in www/js/streetscape-utils.js
 # (tests/test_google_copyright_parity.py pins the two together).
 GOOGLE_COPYRIGHT = "© Google"

@@ -11,8 +11,11 @@ run's official counts and capture-date statistics, with nothing failing.
 Widening one copy and not the other would reopen half of that silently, so
 the JS pattern is read out of its source and held to the Python one.
 
-``[0-9]`` rather than ``\\d`` in both, because Python's ``\\d`` matches
-non-ASCII digits and JS's does not.
+``[0-9]`` rather than ``\\d`` in both, so the rule does not depend on the
+regex engine: JS's ``\\d`` is ASCII-only, Python's ``re`` matches any Unicode
+digit, and pandas' pyarrow-backed strings run RE2, ASCII-only again. Under
+pyarrow strings the corpus test cannot see a ``\\d`` regression in Python;
+the pattern-equality test is what catches it.
 """
 
 import re

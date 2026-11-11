@@ -66,13 +66,15 @@ class TestDetectSystemicFailure:
 
 class TestIsGoogleCopyright:
     """
-    Official imagery is exactly '© Google'; substring matching is wrong
-    because photographer names can contain 'Google' (found in real data:
-    '© MIB 360 - Google Virtual Tours Agency' in the Philadelphia run).
-    Must stay in sync with the exact match in www/js/city.js.
+    Official imagery is exactly '© Google' or '© YYYY Google' (the year form
+    since 2026-10-21); substring matching is wrong because photographer names
+    can contain 'Google' (found in real data: '© MIB 360 - Google Virtual
+    Tours Agency' in the Philadelphia run). Must stay in sync with
+    isGoogleCopyright in www/js/streetscape-utils.js
+    (tests/test_google_copyright_parity.py).
     """
 
-    def test_exact_match_only(self):
+    def test_whole_string_match_only(self):
         s = pd.Series(
             [
                 "© Google",  # official, until 2026-10-20

@@ -5,8 +5,8 @@ A work list is one road walk's sample points, re-derived from the frozen
 network exactly as ``street_coverage.compute_streetwalk_coverage`` derives them
 (``road_sampling.generate_samples`` + the ``quantize_coord`` join to the walk's
 collected rows), with each sample's current official pano as its *anchor* --
-under the walk's own covered rule: PRESENT, ``© Google`` exactly
-(``analysis.is_google_copyright``), and within the walk's ``match_dist_m`` of
+under the walk's own covered rule: PRESENT, official Google
+(``analysis.is_google_copyright``: ``© Google`` or ``© YYYY Google``), and within the walk's ``match_dist_m`` of
 the sample, measured in the same metric CRS coverage measures it in. A pano the
 walk scores as too far is not an anchor; its row reads ``OUT_OF_RADIUS``, the
 grid loader's word for the same thing (issue #367). The grid's 50 m
