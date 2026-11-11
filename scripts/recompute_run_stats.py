@@ -96,10 +96,11 @@ driving.html showing the pre-repair dates — and the driven_unplanned verdicts
 derived from them — until some later unrelated `scheduler run-due`.
 
 --execute WITHOUT --regenerate-json is refused (exit 64, nothing written)
-when it would move any run's capture-date columns, and the refusal lists
+when it would move any run's capture-date columns or official-Google count
+(unique_google_panos, PR #462), and the refusal lists
 those runs by city_id, provider and run_date. Applying it would strand their
-published JSONs: the rebuild trigger keys on a date column MOVING, so once
-the catalog holds the new dates no later --regenerate-json pass can find
+published JSONs: the rebuild trigger keys on those columns MOVING, so once
+the catalog holds the new values no later --regenerate-json pass can find
 them. A dry run prints the same list as a warning. --allow-unrebuilt-dates
 overrides the refusal for an operator who will rebuild those runs by hand.
 
@@ -250,10 +251,13 @@ JSON_TRIGGER_COLUMNS = (*DATE_COLUMNS, "unique_google_panos")
 #
 # `raise`, not `assert`: python -O strips asserts, and this guard is worth more
 # than it costs.
-if not set(DATE_COLUMNS) <= set(STAT_COLUMNS):
+# JSON_TRIGGER_COLUMNS (DATE_COLUMNS plus unique_google_panos) is checked for
+# the same reason: a misspelled entry would silently disable the refusal and
+# trigger (4) for that column.
+if not set(JSON_TRIGGER_COLUMNS) <= set(STAT_COLUMNS):
     raise RuntimeError(
-        f"DATE_COLUMNS must be a subset of STAT_COLUMNS; "
-        f"unknown: {sorted(set(DATE_COLUMNS) - set(STAT_COLUMNS))}"
+        f"JSON_TRIGGER_COLUMNS must be a subset of STAT_COLUMNS; "
+        f"unknown: {sorted(set(JSON_TRIGGER_COLUMNS) - set(STAT_COLUMNS))}"
     )
 
 
@@ -602,8 +606,9 @@ def main() -> int:
         "--allow-unrebuilt-dates",
         action="store_true",
         help="Let --execute without --regenerate-json move capture-date columns "
-        "anyway. By default that pass is refused (exit 64) before writing, "
-        "because those runs' published JSONs keep the old dates and no later "
+        "or unique_google_panos anyway. By default that pass is refused (exit 64) "
+        "before writing, because those runs' published JSONs keep the old values "
+        "and no later "
         "--regenerate-json pass can find them; with this flag, the listed runs "
         "need a manual rebuild",
     )
