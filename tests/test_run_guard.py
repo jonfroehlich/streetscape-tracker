@@ -66,24 +66,33 @@ class TestDetectSystemicFailure:
 
 class TestIsGoogleCopyright:
     """
-    Official imagery is exactly '© Google'; substring matching is wrong
-    because photographer names can contain 'Google' (found in real data:
-    '© MIB 360 - Google Virtual Tours Agency' in the Philadelphia run).
-    Must stay in sync with the exact match in www/js/city.js.
+    Official imagery is exactly '© Google' or '© YYYY Google' (the year form
+    since 2026-10-21); substring matching is wrong because photographer names
+    can contain 'Google' (found in real data: '© MIB 360 - Google Virtual
+    Tours Agency' in the Philadelphia run). Must stay in sync with
+    isGoogleCopyright in www/js/streetscape-utils.js
+    (tests/test_google_copyright_parity.py).
     """
 
-    def test_exact_match_only(self):
+    def test_whole_string_match_only(self):
         s = pd.Series(
             [
-                "© Google",  # official
+                "© Google",  # official, until 2026-10-20
+                "© 2026 Google",  # official, from 2026-10-21 (Google stamps the year)
                 "© MIB 360 - Google Virtual Tours Agency",  # third party (real)
+                "© MIB 2023 - Google Virtual Tours Agency",  # third party with a year (real)
+                "© IWorkForGoogleForFree",  # third party (real)
+                "© A Google User",  # third party (real)
+                "© Lucerna Google",  # third party (real)
+                "© 26 Google",  # not a four-digit year
+                "© 2026 Google ",  # trailing text is not the official form
                 "© Google Loser",  # third party (real)
                 "© google",  # not the official form
                 "© Jane Photographer",
                 None,  # archival: never recorded
             ]
         )
-        assert list(is_google_copyright(s)) == [True, False, False, False, False, False]
+        assert list(is_google_copyright(s)) == [True, True] + [False] * 11
 
     def test_constant_matches_api_form(self):
         assert GOOGLE_COPYRIGHT == "© Google"

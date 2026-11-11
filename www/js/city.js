@@ -603,7 +603,7 @@ function updateLegend(years) {
       <div class="gsv-mode-toggle" role="radiogroup" aria-label="Google Street View imagery filter">
         <button type="button" class="gsv-mode-btn ${!showAllGsv ? "active" : ""}"
                 role="radio" aria-checked="${!showAllGsv}"
-                title="Only official Google panoramas (copyright exactly '© Google') — the imagery Google's own cars collected"
+                title="Only official Google panoramas (copyright exactly '© Google' or '© YYYY Google') — the imagery Google's own cars collected"
                 onclick="setGsvMode(false)">
           Google only <span class="year-count">(${googleCount.toLocaleString()})</span>
         </button>
@@ -1949,7 +1949,7 @@ async function loadData() {
           ? `${Math.round(ageInYears * 12)} months`
           : `${ageInYears.toFixed(1)} years`;
 
-        // Official-Google iff the copyright matches exactly (see
+        // Official-Google iff the whole copyright string is "© Google" or "© YYYY Google" (see
         // isGoogleCopyright). Rows from a provider that publishes no copyright
         // field — and archival rows that recorded none — have no such
         // distinction and are treated as always-visible.

@@ -44,7 +44,7 @@ It is complementary rather than competing, in two ways worth acting on: it is an
 ### Multi-provider coverage extraction
 
 [**tracelines**](https://github.com/Prekzursil/tracelines) is the closest in shape.
-It extracts continuous official-vehicle coverage from all three of our providers as GeoJSON polylines, deliberately excluding user photospheres — the same official-versus-contributed distinction Streetscape Tracker enforces through an exact `© Google` copyright match.
+It extracts continuous official-vehicle coverage from all three of our providers as GeoJSON polylines, deliberately excluding user photospheres — the same official-versus-contributed distinction Streetscape Tracker enforces through a whole-string `© Google` / `© YYYY Google` copyright match.
 It is a one-shot extractor: no dated series, no diffs, no scheduling.
 
 ### Street view imagery analysis toolkits

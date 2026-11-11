@@ -224,7 +224,7 @@ Note the doc was ahead of the code here — "Road-walk: four providers, three of
 (That heading read "both providers, and scheduled" when this sentence was written; it is quoted by its current wording so the pointer survives the next provider too.)
 
 A `NO_DATE` sample covers and **ages nothing**: its `capture_date` is NaT, so it never reaches `nearest_pano_date` or `median_covered_age_years`, exactly as in the grid stats.
-The GSV official-imagery gate is untouched and still applies — an undated third-party pano is still third-party, and the exact `© Google` match is the only thing standing between the two.
+The GSV official-imagery gate is untouched and still applies — an undated third-party pano is still third-party, and the whole-string `© [YYYY ]Google` match is the only thing standing between the two.
 
 ### Coverage and age now have different denominators, so the artifact records both
 

@@ -13,7 +13,7 @@ Four definitions have moved so far, and one column was added:
     counts toward both coverage and pano totals instead of sitting in the
     status_other error bucket (see analysis.PRESENT_STATUSES).
   * issue #213 narrowed the capture-date columns to dates that can actually be
-    true, and for gsv to official '© Google' imagery. This one must be applied
+    true, and for gsv to official '© [YYYY ]Google' imagery. This one must be applied
     to the WHOLE series in one pass: a half-recomputed city would show a run
     history mixing two definitions of "median age", which reads as a trend that
     never happened.
@@ -96,10 +96,11 @@ driving.html showing the pre-repair dates — and the driven_unplanned verdicts
 derived from them — until some later unrelated `scheduler run-due`.
 
 --execute WITHOUT --regenerate-json is refused (exit 64, nothing written)
-when it would move any run's capture-date columns, and the refusal lists
+when it would move any run's capture-date columns or official-Google count
+(unique_google_panos, PR #462), and the refusal lists
 those runs by city_id, provider and run_date. Applying it would strand their
-published JSONs: the rebuild trigger keys on a date column MOVING, so once
-the catalog holds the new dates no later --regenerate-json pass can find
+published JSONs: the rebuild trigger keys on those columns MOVING, so once
+the catalog holds the new values no later --regenerate-json pass can find
 them. A dry run prints the same list as a warning. --allow-unrebuilt-dates
 overrides the refusal for an operator who will rebuild those runs by hand.
 
@@ -228,6 +229,10 @@ DATE_COLUMNS = (
     "newest_capture_date",
     "median_pano_age_years",
 )
+# Columns whose MOVE triggers a per-run JSON rebuild (triggers 2 and 4), and so
+# whose move without --regenerate-json is refused. unique_google_panos joined on
+# 2026-10-21's "© YYYY Google" switch (PR #462).
+JSON_TRIGGER_COLUMNS = (*DATE_COLUMNS, "unique_google_panos")
 # Checked rather than trusted: the trigger is
 # `any(c in changed for c in DATE_COLUMNS)` and `changed` is keyed by
 # STAT_COLUMNS, so a name here that is not one of those is not an error -- it is
@@ -246,10 +251,13 @@ DATE_COLUMNS = (
 #
 # `raise`, not `assert`: python -O strips asserts, and this guard is worth more
 # than it costs.
-if not set(DATE_COLUMNS) <= set(STAT_COLUMNS):
+# JSON_TRIGGER_COLUMNS (DATE_COLUMNS plus unique_google_panos) is checked for
+# the same reason: a misspelled entry would silently disable the refusal and
+# trigger (4) for that column.
+if not set(JSON_TRIGGER_COLUMNS) <= set(STAT_COLUMNS):
     raise RuntimeError(
-        f"DATE_COLUMNS must be a subset of STAT_COLUMNS; "
-        f"unknown: {sorted(set(DATE_COLUMNS) - set(STAT_COLUMNS))}"
+        f"JSON_TRIGGER_COLUMNS must be a subset of STAT_COLUMNS; "
+        f"unknown: {sorted(set(JSON_TRIGGER_COLUMNS) - set(STAT_COLUMNS))}"
     )
 
 
@@ -598,8 +606,9 @@ def main() -> int:
         "--allow-unrebuilt-dates",
         action="store_true",
         help="Let --execute without --regenerate-json move capture-date columns "
-        "anyway. By default that pass is refused (exit 64) before writing, "
-        "because those runs' published JSONs keep the old dates and no later "
+        "or unique_google_panos anyway. By default that pass is refused (exit 64) "
+        "before writing, because those runs' published JSONs keep the old values "
+        "and no later "
         "--regenerate-json pass can find them; with this flag, the listed runs "
         "need a manual rebuild",
     )
@@ -644,6 +653,7 @@ def main() -> int:
     json_repairs = []  # (run_id, csv_filename, implausible pano count)
     n_date_moved = 0  # of those repairs, how many were triggered by a moved date
     n_radius = 0  # of those repairs, how many hold a pano beyond the query radius
+    n_google_moved = 0  # of those repairs, how many had their official-Google count move
     # Runs whose capture-date columns this pass moves while --regenerate-json is
     # off, as "city_id [provider] run_date": applying them repairs the catalog
     # but not the published JSON, and leaves no trace a later --regenerate-json
@@ -710,13 +720,27 @@ def main() -> int:
             radius_stale = bool(n_out_of_radius) and not _json_has_query_radius(
                 args.data_dir, r["json_filename"]
             )
-            if n_implausible or date_moved or radius_stale:
+            # (4) The official-Google classification moved (Google began
+            # writing "© YYYY Google" on 2026-10-21). The per-run JSON's
+            # google_panos block is built by the same is_google_copyright the
+            # catalog column is, so a moved count means the published block is
+            # stale too. Needed on its own because a run straddling the change
+            # (both string forms) can move this count without moving any date
+            # column, and once the catalog is repaired nothing moves again, so a
+            # run missed here would publish the stale block forever.
+            google_moved = "unique_google_panos" in changed
+            if n_implausible or date_moved or radius_stale or google_moved:
                 json_repairs.append((r["run_id"], r["csv_filename"], n_implausible))
                 if date_moved:
                     n_date_moved += 1
                 if radius_stale:
                     n_radius += 1
-        if not args.regenerate_json and any(c in changed for c in DATE_COLUMNS):
+                if google_moved:
+                    n_google_moved += 1
+        # The refusal below covers every column whose move is ALSO a JSON
+        # trigger, (2) and (4): a plain --execute that writes either strands
+        # that run's published JSON, since nothing moves on a later pass.
+        if not args.regenerate_json and any(c in changed for c in JSON_TRIGGER_COLUMNS):
             dates_unrebuilt.append(f"{r['city_id']} [{r['provider']}] {r['run_date']}")
         if changed:
             updates.append((r["run_id"], changed))
@@ -741,7 +765,7 @@ def main() -> int:
         print(
             "Per-run JSONs not inspected; pass --regenerate-json to find and "
             "rebuild the ones holding an impossible capture date, a pano beyond "
-            "the query radius, or capture-date columns this pass would move"
+            "the query radius, or capture-date columns or an official-Google count this pass would move"
         )
         if dates_unrebuilt:
             # The trap the PR #422 review found: the JSON trigger keys on a date
@@ -751,13 +775,13 @@ def main() -> int:
             # before anything is written, unless the operator opts in by name.
             listing = "".join(f"\n    {run}" for run in dates_unrebuilt)
             consequence = (
-                "Their published per-run JSONs would keep the old dates, and a "
+                "Their published per-run JSONs would keep the old values, and a "
                 "later --regenerate-json pass will NOT find them (nothing moves "
                 "any more)."
             )
             if args.execute and not args.allow_unrebuilt_dates:
                 print(
-                    f"REFUSED: {len(dates_unrebuilt)} runs' capture-date columns "
+                    f"REFUSED: {len(dates_unrebuilt)} runs' capture-date or official-Google columns "
                     f"would be moved without --regenerate-json:{listing}\n"
                     f"{consequence} Nothing was written. Add --regenerate-json to "
                     "rebuild their JSONs in the same pass, or --allow-unrebuilt-dates "
@@ -766,7 +790,7 @@ def main() -> int:
                 )
                 return 64
             print(
-                f"WARNING: {len(dates_unrebuilt)} runs' capture-date columns "
+                f"WARNING: {len(dates_unrebuilt)} runs' capture-date or official-Google columns "
                 f"{'are being' if args.execute else 'would be'} moved without "
                 f"--regenerate-json:{listing}\n{consequence} "
                 + (
@@ -791,7 +815,8 @@ def main() -> int:
             f"{len(json_repairs)} runs need their per-run JSON rebuilt "
             f"({n_bad_dates} hold an impossible capture date, {total_bad} panos "
             f"in all; {n_date_moved} have capture-date columns this pass moves; "
-            f"{n_radius} hold a pano beyond the query radius); "
+            f"{n_radius} hold a pano beyond the query radius; "
+            f"{n_google_moved} have an official-Google count this pass moves); "
             f"they {'will' if args.execute else 'would'} be rebuilt"
         )
 

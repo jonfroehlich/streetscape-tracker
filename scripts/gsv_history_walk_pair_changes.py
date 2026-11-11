@@ -37,9 +37,9 @@ sys.path.insert(0, os.path.dirname(_SCRIPTS_DIR))
 
 from experiment_stats import percentile  # noqa: E402
 
+from streetscape_metadata_tracker.analysis import is_google_copyright  # noqa: E402
 from streetscape_street_analyzer.road_sampling import quantize_coord  # noqa: E402
 
-GOOGLE = "© Google"
 PRESENT = {"OK", "NO_DATE"}
 COLS = ["query_lat", "query_lon", "pano_id", "capture_date", "copyright_info", "status"]
 SCRIPT = "scripts/gsv_history_walk_pair_changes.py"
@@ -66,7 +66,11 @@ def load(path: Path) -> tuple[pd.DataFrame, int]:
     would pair one walk's sample with a different sample of the other.
     """
     df = pd.read_csv(path, usecols=COLS, dtype=str)
-    df["g"] = df["status"].isin(PRESENT) & (df["copyright_info"] == GOOGLE) & df["pano_id"].notna()
+    df["g"] = (
+        df["status"].isin(PRESENT)
+        & is_google_copyright(df["copyright_info"])
+        & df["pano_id"].notna()
+    )
     # Keys from Python floats of the text (the scorer's own reading, #425), never
     # from numpy's round(), which can land a half-way value on the other side.
     df["k"] = [

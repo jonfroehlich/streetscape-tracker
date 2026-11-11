@@ -126,7 +126,7 @@ The census pipeline itself — record → rows → grid assignment → written C
 Every provider writes the identical 9-column **core** (`config.METADATA_DTYPES`) and appends its own extras — Mapillary 16 columns in total, KartaView 18, all built by the one `census.build_image_rows`.
 So coverage rates are cross-provider comparable, but raw pano counts are census-vs-sample and are not.
 `runs.unique_google_panos` is NULL for non-gsv runs.
-Official-Google classification is an exact `© Google` match (`analysis.is_google_copyright`, shared by stats/JSON/vis and mirrored in `city.js`) — never a substring, since photographer names can contain "Google".
+Official-Google classification is a whole-string match on `© Google` or `© YYYY Google` (`analysis.is_google_copyright` / `GOOGLE_COPYRIGHT_RE`, shared by stats/JSON/vis and mirrored in `streetscape-utils.js`; Google added the year on 2026-10-21) — never a substring, since photographer names can contain "Google".
 
 ### GSV query radius (#367)
 

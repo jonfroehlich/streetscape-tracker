@@ -19,11 +19,19 @@ from .geoutils import haversine_m
 
 logger = logging.getLogger(__name__)
 
-# Official Google imagery carries exactly this copyright string; anything
-# else is a third-party photographer. Substring matching is wrong because
-# photographer names can contain 'Google' (e.g. '© MIB 360 - Google Virtual
-# Tours Agency'). Must stay in sync with the exact match in www/js/city.js.
+# Official Google imagery carries one of exactly two copyright strings:
+# '© Google' (until 2026-10-20) or '© <four-digit year> Google' (from
+# 2026-10-21, when Google began stamping the year; measured on prod, 3.97M
+# rows in a 25-run sample, no other official form). Anything else is a
+# third-party photographer. Substring or loose matching is wrong because
+# photographer names contain 'Google' and even a year: '© MIB 2023 - Google
+# Virtual Tours Agency', '© IWorkForGoogleForFree', '© A Google User'.
+# So the test is a WHOLE-STRING match, and [0-9] rather than \d so it does
+# not depend on the engine (Python's re \d matches any Unicode digit). Must stay in sync with
+# isGoogleCopyright in www/js/streetscape-utils.js
+# (tests/test_google_copyright_parity.py pins the two together).
 GOOGLE_COPYRIGHT = "© Google"
+GOOGLE_COPYRIGHT_RE = r"© (?:[0-9]{4} )?Google"
 
 # Statuses that mean "imagery is present at this grid point". A pano the
 # provider returned counts even when we could not read a usable capture date
@@ -166,9 +174,18 @@ def out_of_radius_count(df: pd.DataFrame, provider: str = "gsv") -> int:
 def is_google_copyright(copyright_info: pd.Series) -> pd.Series:
     """
     Boolean mask: rows whose copyright marks official Google imagery.
-    NaN (copyright never recorded, e.g. archival imports) compares False.
+
+    Official means the whole string is ``© Google`` or ``© YYYY Google``
+    (see ``GOOGLE_COPYRIGHT_RE``). NaN (copyright never recorded, e.g.
+    archival imports) is False.
+
+    Example::
+
+        >>> is_google_copyright(pd.Series(["© 2026 Google", "© A Google User", None])).tolist()
+        [True, False, False]
     """
-    return copyright_info == GOOGLE_COPYRIGHT
+    s = pd.Series(copyright_info)
+    return s.astype("string").str.fullmatch(GOOGLE_COPYRIGHT_RE).fillna(False).astype(bool)
 
 
 # Earliest date each provider's imagery can plausibly carry. A capture date
@@ -857,7 +874,7 @@ def calculate_pano_stats(
         df: DataFrame containing GSV metadata
         now: Timestamp to use for age calculations
         google_only: When True, restrict to official Google imagery
-            (exact '© Google' copyright; see is_google_copyright)
+            (whole-string '© [YYYY ]Google' copyright; see is_google_copyright)
         provider: imagery provider, selecting the earliest plausible capture
             date (see dated_unique_panos)
 

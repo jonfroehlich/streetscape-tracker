@@ -96,6 +96,16 @@ def test_distance_guard_rejects_far_pano():
     assert int(out["covered_samples"].sum()) == 0
 
 
+def test_year_stamped_google_copyright_covers_for_gsv():
+    """Google writes "© YYYY Google" since 2026-10-21; under the old exact
+    match every such walk scored 0% (113 of 113 on prod)."""
+    edges = _edges()
+    samples = rs.generate_samples(edges, spacing_m=15.0)
+    collected = _collected(samples, lambda r: True, copyright_="© 2026 Google")
+    out = sc.compute_streetwalk_coverage(edges, samples, collected, RUN_DATE, "gsv", 25.0)
+    assert int(out["covered_samples"].sum()) == len(samples) > 0
+
+
 def test_non_google_copyright_excluded_for_gsv():
     edges = _edges()
     samples = rs.generate_samples(edges, spacing_m=15.0)
@@ -261,7 +271,7 @@ def test_no_date_sample_contributes_coverage_but_no_age():
 def test_gsv_no_date_still_gated_by_official_copyright():
     """
     Counting NO_DATE must not widen the GSV official-imagery gate: an undated
-    third-party pano is still third-party. The exact `© Google` match is the
+    third-party pano is still third-party. The official-copyright match is the
     only difference between the two halves below.
     """
     edges = _edges()

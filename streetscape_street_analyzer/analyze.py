@@ -49,7 +49,7 @@ def _warn_no_panos(df, provider: str) -> None:
 
     The common GSV cause is a legacy pre-copyright baseline CSV: ``copyright_info``
     is missing (either absent as a column or entirely empty), so nothing matches
-    the official ``© Google`` filter. This reflects missing metadata, not missing
+    the official ``© [YYYY ]Google`` filter. This reflects missing metadata, not missing
     imagery. Otherwise the run genuinely carries no imagery this provider counts
     (e.g. only third-party GSV panos).
     """
@@ -60,7 +60,7 @@ def _warn_no_panos(df, provider: str) -> None:
         logger.warning(
             "0 panos selected: this run's CSV has no copyright_info at all (a "
             "legacy pre-copyright baseline), so nothing matches the official "
-            "'© Google' filter. The artifact will show 0% coverage — that is "
+            "'© [YYYY ]Google' filter. The artifact will show 0% coverage — that is "
             "missing metadata, NOT missing imagery. Consider re-collecting this "
             "city before publishing a streets artifact for it."
         )
@@ -68,7 +68,7 @@ def _warn_no_panos(df, provider: str) -> None:
         logger.warning(
             "0 panos selected; the coverage artifact will be entirely uncovered "
             "(0% coverage). For GSV this means the run has no official "
-            "'© Google' imagery (e.g. only third-party contributor panos)."
+            "'© [YYYY ]Google' imagery (e.g. only third-party contributor panos)."
         )
     else:
         logger.warning(
