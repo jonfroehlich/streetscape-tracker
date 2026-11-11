@@ -271,7 +271,7 @@ def test_no_date_sample_contributes_coverage_but_no_age():
 def test_gsv_no_date_still_gated_by_official_copyright():
     """
     Counting NO_DATE must not widen the GSV official-imagery gate: an undated
-    third-party pano is still third-party. The exact `© Google` match is the
+    third-party pano is still third-party. The official-copyright match is the
     only difference between the two halves below.
     """
     edges = _edges()

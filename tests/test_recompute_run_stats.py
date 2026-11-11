@@ -502,6 +502,44 @@ def test_a_moved_official_google_count_alone_triggers_the_json_rebuild(conn, dat
     assert os.path.exists(csv_path.replace(".csv.gz", ".json.gz"))
 
 
+def test_moving_only_the_official_count_without_regenerate_json_is_refused(conn, data_dir):
+    """PR #462 round 2: trigger (4) carries the PR #422 trap too. A plain
+    --execute that writes only a moved unique_google_panos strands the run's
+    published google_panos block, since a later --regenerate-json pass sees
+    nothing move. So it is refused (exit 64) before anything is written, and
+    the same run is then rebuilt by the pass that adds --regenerate-json.
+    Killed by keying the refusal on DATE_COLUMNS alone."""
+    run_date = date(2026, 10, 21)
+    cid = _bend(conn)
+    df = make_city_df(
+        [("p1", "2020-06-15"), ("p2", "2024-01-10")],
+        run_date=run_date,
+        copyright_info="© 2026 Google",
+    )
+    name = generate_run_filename(cid, 1000, 1000, 20, run_date) + ".csv.gz"
+    write_city_csv_gz(df, os.path.join(data_dir, name))
+    truth = calculate_run_stats(
+        load_city_csv_file(os.path.join(data_dir, name)), run_date, provider="gsv"
+    )
+    db.register_run(
+        conn,
+        city_id=cid,
+        run_date=run_date,
+        csv_filename=name,
+        **{**truth, "unique_google_panos": 0},
+    )
+
+    refused = _run_script(data_dir, "--execute")
+    assert refused.returncode == 64
+    assert "REFUSED: 1 runs' capture-date or official-Google columns" in refused.stderr
+    assert conn.execute("SELECT unique_google_panos FROM runs").fetchone()[0] == 0
+
+    rebuilt = _run_script(data_dir, "--execute", "--regenerate-json")
+    assert rebuilt.returncode == 0, rebuilt.stderr
+    assert "Rebuilt 1 of 1" in rebuilt.stdout
+    assert conn.execute("SELECT unique_google_panos FROM runs").fetchone()[0] == 2
+
+
 @pytest.mark.parametrize(
     "column, wrong_value, rebuilt",
     [
@@ -844,15 +882,16 @@ def test_moving_dates_without_regenerate_json_is_refused(conn, data_dir):
 
     dry = _run_script(data_dir)
     assert dry.returncode == 0, dry.stderr
-    assert "WARNING: 1 runs' capture-date columns would be moved without --regenerate-json" in (
-        dry.stdout
+    assert (
+        "WARNING: 1 runs' capture-date or official-Google columns would be moved without --regenerate-json"
+        in (dry.stdout)
     )
     assert run_label in dry.stdout
     assert "--execute will refuse this pass" in dry.stdout
 
     refused = _run_script(data_dir, "--execute")
     assert refused.returncode == 64
-    assert "REFUSED: 1 runs' capture-date columns" in refused.stderr
+    assert "REFUSED: 1 runs' capture-date or official-Google columns" in refused.stderr
     assert run_label in refused.stderr
     assert "Nothing was written" in refused.stderr
     row = conn.execute("SELECT newest_capture_date, unique_panos FROM runs").fetchone()
@@ -860,7 +899,9 @@ def test_moving_dates_without_regenerate_json_is_refused(conn, data_dir):
 
     applied = _run_script(data_dir, "--execute", "--allow-unrebuilt-dates")
     assert applied.returncode == 0, applied.stderr
-    assert "WARNING: 1 runs' capture-date columns are being moved" in applied.stdout
+    assert (
+        "WARNING: 1 runs' capture-date or official-Google columns are being moved" in applied.stdout
+    )
     assert run_label in applied.stdout
     assert conn.execute("SELECT newest_capture_date FROM runs").fetchone()[0] is not None
     # And the trap itself: the run is no longer findable by the rebuild trigger.

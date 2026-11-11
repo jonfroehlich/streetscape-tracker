@@ -325,7 +325,7 @@ def test_all_no_date_run_counts_panos_but_ages_are_none():
 def test_unique_google_panos_with_partially_null_copyright():
     """unique_google_panos is None only when copyright is entirely unrecorded;
     a MIX of null and real copyrights is a known subset — null rows simply
-    compare False, so only the exact '© Google' pano counts: 1 of 2."""
+    compare False, so only the official '© Google' pano counts: 1 of 2."""
     df = pd.DataFrame(
         [
             _row(44.000, "g", CAPTURE_4Y, "© Google", "OK"),
