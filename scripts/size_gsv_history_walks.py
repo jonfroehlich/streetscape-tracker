@@ -41,11 +41,13 @@ import pandas as pd
 
 _SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _SCRIPTS_DIR)
+sys.path.insert(0, os.path.dirname(_SCRIPTS_DIR))
 
 from experiment_stats import percentile  # noqa: E402
 
+from streetscape_metadata_tracker.analysis import is_google_copyright  # noqa: E402
+
 PRESENT = {"OK", "NO_DATE"}
-GOOGLE = "© Google"
 COLS = ["query_lat", "query_lon", "pano_id", "copyright_info", "status"]
 SCRIPT = "scripts/size_gsv_history_walks.py"
 
@@ -87,7 +89,7 @@ def load(data_dir, name):
         data_dir / name, usecols=COLS, dtype={"pano_id": str, "copyright_info": str, "status": str}
     )
     df["present"] = df["status"].isin(PRESENT) & df["pano_id"].notna()
-    df["google"] = df["present"] & (df["copyright_info"] == GOOGLE)
+    df["google"] = df["present"] & is_google_copyright(df["copyright_info"])
     return df
 
 

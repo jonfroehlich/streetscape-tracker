@@ -180,7 +180,7 @@ def select_pano_points(df: pd.DataFrame, provider: str) -> gpd.GeoDataFrame:
         # A legacy pre-copyright baseline CSV may lack the column entirely (not
         # just be all-NaN); treat that as "no official Google imagery" (empty
         # mask) rather than crashing — analyze._warn_no_panos then explains the
-        # 0% result. When present, the exact '© Google' filter applies as usual.
+        # 0% result. When present, the whole-string '© [YYYY ]Google' filter applies as usual.
         if "copyright_info" in df.columns:
             mask = mask & is_google_copyright(df["copyright_info"])
         else:
@@ -404,7 +404,7 @@ def compute_streetwalk_coverage(
 
     Each on-street sample point is "covered" when its collected metadata row is
     PRESENT (``status`` in ``PRESENT_STATUSES`` — ``OK`` or ``NO_DATE``),
-    official (for GSV, exact ``© Google``; other providers accept any present
+    official (for GSV, ``© Google`` or ``© YYYY Google``, whole string; other providers accept any present
     pano), and the returned pano lies within ``match_dist_m`` of the sample
     point — the distance guard rejects a pano that snapped to a
     parallel/neighbouring road. An edge's ``coverage_fraction`` is its covered

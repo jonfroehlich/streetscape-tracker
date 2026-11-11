@@ -1460,16 +1460,23 @@ function adaptCitiesPayload(data, provider = "gsv") {
 // ---------------------------------------------------------------------------
 
 /**
- * Exact "official Google" copyright test — the JS mirror of
- * analysis.is_google_copyright. Matches ONLY the literal `© Google`
- * string, never a substring, because third-party photographer names can
- * themselves contain "Google" (e.g. "Google Street View contributor").
+ * Whole-string match for official Google imagery: `© Google` (until
+ * 2026-10-20) or `© <four-digit year> Google` (from 2026-10-21, when Google
+ * began stamping the year). The JS mirror of analysis.GOOGLE_COPYRIGHT_RE —
+ * tests/test_google_copyright_parity.py reads this regex out of the source
+ * and pins it to the Python one. Never a substring or loose match:
+ * contributor names contain "Google" and even a year
+ * ("© MIB 2023 - Google Virtual Tours Agency", "© A Google User").
  *
  * @param {?string} copyright - A run row's copyright_info field.
  * @returns {boolean} True iff the imagery is official Google.
+ * @example
+ * isGoogleCopyright("© 2026 Google"); // true
+ * isGoogleCopyright("© A Google User"); // false
  */
+const GOOGLE_COPYRIGHT_RE = /^© (?:[0-9]{4} )?Google$/;
 function isGoogleCopyright(copyright) {
-  return copyright === "© Google";
+  return typeof copyright === "string" && GOOGLE_COPYRIGHT_RE.test(copyright);
 }
 
 /**

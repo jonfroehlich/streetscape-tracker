@@ -1297,10 +1297,18 @@ test("formatChangeSummary: full block, minimal block, and absent", () => {
     "+1.50 pct points");
 });
 
-// --- isGoogleCopyright: exact © Google match -------------------------------
+// --- isGoogleCopyright: whole-string © [YYYY ]Google match ----------------
 
-test("isGoogleCopyright: matches only the exact © Google string", () => {
+test("isGoogleCopyright: matches only the two official whole strings", () => {
   assert.equal(isGoogleCopyright("© Google"), true);
+  // From 2026-10-21 Google stamps the year into the official copyright.
+  assert.equal(isGoogleCopyright("© 2026 Google"), true);
+  // Real contributor names that contain "Google", one with a year.
+  assert.equal(isGoogleCopyright("© MIB 2023 - Google Virtual Tours Agency"), false);
+  assert.equal(isGoogleCopyright("© IWorkForGoogleForFree"), false);
+  assert.equal(isGoogleCopyright("© A Google User"), false);
+  assert.equal(isGoogleCopyright("© 26 Google"), false);
+  assert.equal(isGoogleCopyright("© 2026 Google "), false);
   // Photographer names can contain "Google" — must NOT match on substring.
   assert.equal(isGoogleCopyright("Google Street View contributor"), false);
   assert.equal(isGoogleCopyright("© Google, Inc"), false);
