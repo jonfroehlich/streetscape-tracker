@@ -207,7 +207,16 @@ OVERPASS_URL_ENV = "OVERPASS_URL"
 # matters mechanically: overpass-api.de answers HTTP 406 to the stock
 # `python-requests/x.y.z` User-Agent (measured 2026-08-15), so a probe sent
 # without these headers reads a healthy instance as refusing.
-OVERPASS_USER_AGENT = "streetscape_metadata_tracker (jonf@cs.uw.edu)"
+#
+# It names Project Sidewalk and the shared lab address because that is the
+# identity we gave the overpass.private.coffee operators when we told them, on
+# 2026-11-11, that we would use their instance as a fallback during the
+# overpass-api.de overload. Keep the two in step: a mirror that sees another
+# string has no way to match our traffic to that notice.
+OVERPASS_USER_AGENT = (
+    "StreetscapeTracker/1.0 (Project Sidewalk; "
+    "+https://github.com/jonfroehlich/streetscape-tracker; sidewalk@cs.uw.edu)"
+)
 OVERPASS_REFERER = "https://github.com/jonfroehlich/streetscape-tracker"
 
 # The project's identifying User-Agent for the tile hosts that read none of the
