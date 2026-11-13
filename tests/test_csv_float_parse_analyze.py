@@ -16,6 +16,16 @@ import pandas as pd
 import pytest
 
 from scripts import csv_float_parse_analyze as cfa
+from streetscape_metadata_tracker.fileutils import PANDAS_PARSES_FLOATS_EXACTLY
+
+# The script measures the gap between pandas' default float parser and the
+# round-trip one. pandas 3.1 closed that gap (every mode is one exact
+# converter), so on 3.1+ the two tests that count a gap have nothing to count.
+# tests/test_fileutils.py checks the claim itself on the installed pandas.
+needs_inexact_default_parser = pytest.mark.skipif(
+    PANDAS_PARSES_FLOATS_EXACTLY,
+    reason="pandas >= 3.1 parses floats exactly by default; the #425 gap cannot be reproduced",
+)
 
 # A longitude from a real walk CSV that pandas' default C parser returns one
 # ULP low, moving its 9-decimal key (the same literal tests/test_fileutils.py
@@ -42,6 +52,7 @@ def _walk_csv(tmp_path):
     return str(path)
 
 
+@needs_inexact_default_parser
 def test_a_coordinate_one_ulp_across_the_half_way_point_is_counted_as_a_key_shift(tmp_path):
     """Two longitudes the default parser misreads by one ULP across the 9-decimal
     half-way point: two coordinates off, two keys shifted, an error of one ULP.
@@ -71,6 +82,7 @@ def test_the_round_trip_premise_is_checked_not_assumed(tmp_path, monkeypatch):
         cfa.measure_walk_csv(_walk_csv(tmp_path))
 
 
+@needs_inexact_default_parser
 def test_loader_parser_restores_pandas_and_forces_the_option(tmp_path):
     """The grid and scoring measurements read through the REAL loader with the
     parser forced; the patch must not outlive the block."""
@@ -80,6 +92,16 @@ def test_loader_parser_restores_pandas_and_forces_the_option(tmp_path):
         default = pd.read_csv(path, float_precision="round_trip")["query_lon"].tolist()[0]
     assert pd.read_csv is real
     assert default != float(BOUNDARY_LON_TEXT)
+
+
+def test_main_refuses_on_a_pandas_with_nothing_to_measure(tmp_path, monkeypatch, capsys):
+    """On pandas >= 3.1 both parsers agree, so a run would overwrite the
+    committed record with zeros; main refuses before reading anything."""
+    monkeypatch.setattr(cfa, "PANDAS_PARSES_FLOATS_EXACTLY", True)
+    monkeypatch.setattr(cfa, "collect", lambda *a, **k: pytest.fail("collect ran"))
+    assert cfa.main(["--data-dir", str(tmp_path), "--docs-dir", str(tmp_path)]) == 2
+    assert "cannot be reproduced" in capsys.readouterr().err
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_generated_by_names_the_run_that_wrote_the_file():

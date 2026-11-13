@@ -15,11 +15,18 @@ from datetime import date
 
 import pytest
 
-from streetscape_metadata_tracker import db, plan_match
-from streetscape_metadata_tracker.json_summarizer import (
-    _compact_capture_years,
-    generate_driving_plan_summary,
-)
+from streetscape_metadata_tracker import db, json_summarizer, plan_match
+from streetscape_metadata_tracker.json_summarizer import _compact_capture_years
+
+# The day after the fixtures' snapshot date. Every fixture window and capture
+# date below is written relative to it; read from the real clock, IDAHO's
+# window (open through 2026-11-01) closed and its verdict flipped (issue #458).
+TODAY = date(2026, 8, 12)
+
+
+def generate_driving_plan_summary(conn, data_dir):
+    """The real generator with the clock pinned to TODAY, for every test here."""
+    return json_summarizer.generate_driving_plan_summary(conn, data_dir, today=TODAY)
 
 
 def strict_load(path):
@@ -427,6 +434,22 @@ def test_records_carry_a_stable_id_and_their_own_verdict(conn, data_dir):
     # a record, breaking every deep link.
     again = generate_driving_plan_summary(conn, data_dir)
     assert again["records"][0]["record_id"] == record["record_id"]
+
+
+def test_the_verdict_is_judged_against_the_injected_date_not_the_wall_clock(conn, data_dir):
+    # IDAHO's window is 2026-04-13..2026-11-01: the same catalog reads as
+    # upcoming before it, open inside it (both ends inclusive) and closed after
+    # it. Read from the real clock, the verdict test above began failing on
+    # 2026-11-02 (issue #458).
+    _entries(conn, _snapshot(conn), [IDAHO])
+
+    def verdict(day):
+        doc = json_summarizer.generate_driving_plan_summary(conn, data_dir, today=day)
+        return doc["records"][0]["verdict"]
+
+    assert verdict(date(2026, 4, 13)) == verdict(date(2026, 11, 1)) == "planned_open"
+    assert verdict(date(2026, 4, 12)) == plan_match.VERDICT_PLANNED_UPCOMING
+    assert verdict(date(2026, 11, 2)) == "closed"
 
 
 def test_a_record_can_never_be_drive_confirmed_since_it_has_no_imagery(conn, data_dir):

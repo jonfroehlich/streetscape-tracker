@@ -33,7 +33,10 @@ from scripts.recompute_streetwalk_stats import (
 )
 from streetscape_metadata_tracker import db
 from streetscape_metadata_tracker import download_gsv as dg
-from streetscape_metadata_tracker.fileutils import load_city_csv_file
+from streetscape_metadata_tracker.fileutils import (
+    PANDAS_PARSES_FLOATS_EXACTLY,
+    load_city_csv_file,
+)
 from streetscape_metadata_tracker.naming import (
     generate_streetwalk_diff_filename,
     network_cache_path,
@@ -562,16 +565,31 @@ def test_a_sample_the_default_parser_would_misplace_is_scored_covered_by_collect
     csv_path = os.path.join(data_dir, before["csv_filename"])
 
     # The premise, measured on this run's own CSV: its text is exact, and the
-    # DEFAULT parser moves exactly one key -- the boundary sample's.
+    # DEFAULT parser of a pandas before 3.1 moves at most one key -- the
+    # boundary sample's.
     samples = generate_samples(dsn.graph_to_edges(ox.load_graphml(graph_path)), 15)
     sample_keys = _keys(samples["lat"], samples["lon"])
     with gzip.open(csv_path, "rt") as fh:
         default = pd.read_csv(fh)
     missed_by_default = set(sample_keys) - set(_keys(default["query_lat"], default["query_lon"]))
-    assert len(missed_by_default) == 1, "pandas' default C parser now round-trips this text"
-    (boundary,) = samples[[k in missed_by_default for k in sample_keys]].itertuples()
-    assert boundary.edge_id == "1_2"
+    (boundary,) = samples[samples["edge_id"] == "1_2"].itertuples()
     assert float(repr(boundary.lat)) == boundary.lat
+    if PANDAS_PARSES_FLOATS_EXACTLY:
+        # pandas >= 3.1: the default parser is exact too, so there is no
+        # misplaced key to defend against and the loader passes no option
+        # (issue #458). The contract below still holds and is still checked.
+        assert missed_by_default == set()
+    else:
+        # Before 3.1 the default parser can move only the boundary sample's
+        # key. It does on macOS arm64, where BOUNDARY_NORTH_LAT was searched
+        # for, and it did on CI's ubuntu-24.04 image. On the ubuntu-26.04 image
+        # CI moved to between 2026-10-28 and 11-06, with identical wheels
+        # (pandas 3.0.3), no key moves, so "exactly one" is not asserted
+        # (issue #458). Why the image matters was not investigated. On that
+        # image this premise is therefore absent and dropping the loader's
+        # option would NOT fail this test; tests/test_fileutils.py's literal
+        # still fails there and is the guard.
+        assert missed_by_default <= {quantize_coord(boundary.lat, boundary.lon)}
 
     # The contract: the loader hands back every sample's own key.
     loaded = load_city_csv_file(csv_path)
