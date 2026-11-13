@@ -448,7 +448,7 @@ def test_the_verdict_is_judged_against_the_injected_date_not_the_wall_clock(conn
         return doc["records"][0]["verdict"]
 
     assert verdict(date(2026, 4, 13)) == verdict(date(2026, 11, 1)) == "planned_open"
-    assert verdict(date(2026, 4, 12)) != "planned_open"
+    assert verdict(date(2026, 4, 12)) == plan_match.VERDICT_PLANNED_UPCOMING
     assert verdict(date(2026, 11, 2)) == "closed"
 
 

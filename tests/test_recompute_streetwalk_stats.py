@@ -582,9 +582,13 @@ def test_a_sample_the_default_parser_would_misplace_is_scored_covered_by_collect
     else:
         # Before 3.1 the default parser can move only the boundary sample's
         # key. It does on macOS arm64, where BOUNDARY_NORTH_LAT was searched
-        # for; CI's Linux x86-64 runs of 2026-11-06 and 11-11 (pandas 3.0.3)
-        # measured no moved key at all, cause not investigated, so "exactly
-        # one" is not asserted here.
+        # for, and it did on CI's ubuntu-24.04 image. On the ubuntu-26.04 image
+        # CI moved to between 2026-10-28 and 11-06, with identical wheels
+        # (pandas 3.0.3), no key moves, so "exactly one" is not asserted
+        # (issue #458). Why the image matters was not investigated. On that
+        # image this premise is therefore absent and dropping the loader's
+        # option would NOT fail this test; tests/test_fileutils.py's literal
+        # still fails there and is the guard.
         assert missed_by_default <= {quantize_coord(boundary.lat, boundary.lon)}
 
     # The contract: the loader hands back every sample's own key.

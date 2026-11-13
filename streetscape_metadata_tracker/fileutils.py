@@ -3,6 +3,7 @@ import gzip
 import logging
 import os
 import platform
+import re
 import subprocess
 import webbrowser
 from pathlib import Path
@@ -27,8 +28,12 @@ def _pandas_parses_floats_exactly(version: str) -> bool:
         >>> _pandas_parses_floats_exactly("3.0.3"), _pandas_parses_floats_exactly("3.1.1")
         (False, True)
     """
-    major, minor = (int(part) for part in version.split(".")[:2])
-    return (major, minor) >= (3, 1)
+    # Leading digits only, so "3.1rc0" or a local build tag cannot raise here:
+    # this runs at import, and a ValueError would break every entry point.
+    match = re.match(r"(\d+)\.(\d+)", version)
+    if match is None:
+        return False  # unrecognised: keep passing the option, as before #458
+    return (int(match.group(1)), int(match.group(2))) >= (3, 1)
 
 
 # Whether pandas' DEFAULT float parse is already exact (pandas >= 3.1), and the

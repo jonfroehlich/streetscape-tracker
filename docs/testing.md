@@ -906,7 +906,9 @@ and `hosts_unavailable` is anchored to the blocked-host note's own `; `-delimite
   The report keeps the two counts in separate notes (#437 review): a duplicate-only walk prints no "matched only within" text, which the runbook treats as a stop signal, and a stubbed nonzero tolerance-only count prints that note with no duplicate clause.
   **The boundary sample, end to end** (`test_a_sample_the_default_parser_would_misplace_is_scored_covered_by_collector_and_recompute_alike`, gsv and mapillary, issue #425): a graph whose single-sample edge was FOUND BY SEARCH to put its sample one ULP from a half-way point that pandas' default C parser crosses.
   The test re-measures that premise on the real collector's own CSV with a default `pd.read_csv` (exactly one key missed), then asserts the round-trip loader misses none, that the collector scored the edge covered, that the recompute prints no tolerance-only match, and that it equals a `--force` collection with that edge at 1.0.
-  Removing `float_precision="round_trip"` from the loader fails it at the key set on a pandas before 3.1 where the premise holds (macOS arm64; CI's Linux x86-64 measured no missed key under pandas 3.0.3, so the test asserts at most one).
+  Removing `float_precision="round_trip"` from the loader fails it at the key set on a pandas before 3.1 where the premise holds: macOS arm64, and CI's ubuntu-24.04 image.
+  **On CI's ubuntu-26.04 image the premise does not hold** (#458): with identical wheels (pandas 3.0.3 from `requirements.lock`), the default parser moves no key of this CSV there, which is what turned `main` red between 2026-10-28 and 11-06; why the image matters was not investigated.
+  The test therefore asserts at most one moved key, and on that image it cannot fail if the option is dropped; the `tests/test_fileutils.py` literal still can, and is the guard there.
   On pandas 3.1 and later the default parser is exact, the loader passes no option, and the test asserts the default read misses no key (#458).
   The old coordinate-substitution mutation is a no-op under the fixed loader, so "samples are never moved" is pinned by the frame-match unit test above instead.
   A network renumbered over identical geometry (same samples, same coordinates) is refused by the edge-id check alone.
@@ -1369,6 +1371,7 @@ and the two flags parsing.
   Dropping `float_precision="round_trip"`, or trading it for `"high"` or `"legacy"`, fails it on a pandas before 3.1.
   The premise is asserted in the direction the installed pandas needs (#458): before 3.1 the default parser gets the literal wrong, so the option is required; from 3.1 it gets it right, which is what lets `fileutils.EXACT_FLOAT_READ_KWARGS` omit the option pandas deprecated there.
   `test_the_float_precision_gate_opens_at_pandas_3_1` pins the version gate, and `test_the_loader_raises_no_pandas_deprecation_warning` fails if the loader passes the option on 3.1 or later.
+  CI's test jobs install `requirements.lock` (pandas 3.0.3), so the 3.1 arms of these tests run only where pandas is unpinned: a `requirements.txt` install on a laptop, and the e2e job, which builds its fixture through the loader.
 
 ## The Panoramax collector (issue #316, phase 2)
 

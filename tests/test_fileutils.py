@@ -255,6 +255,8 @@ def test_the_float_precision_gate_opens_at_pandas_3_1():
     assert not _pandas_parses_floats_exactly("3.0.3")
     assert _pandas_parses_floats_exactly("3.1.0")
     assert _pandas_parses_floats_exactly("3.1.0rc0")
+    assert _pandas_parses_floats_exactly("3.1rc0")  # two components: must not raise
+    assert not _pandas_parses_floats_exactly("unknown")  # keeps the option, as before
     assert _pandas_parses_floats_exactly("3.10.2")
     assert _pandas_parses_floats_exactly("4.0.0.dev0+12.gabc")
 
