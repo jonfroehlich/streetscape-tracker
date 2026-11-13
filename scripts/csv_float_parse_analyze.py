@@ -63,7 +63,10 @@ from streetscape_metadata_tracker.analysis import (  # noqa: E402
     calculate_run_stats,
     count_grid_points,
 )
-from streetscape_metadata_tracker.fileutils import load_city_csv_file  # noqa: E402
+from streetscape_metadata_tracker.fileutils import (  # noqa: E402
+    PANDAS_PARSES_FLOATS_EXACTLY,
+    load_city_csv_file,
+)
 from streetscape_metadata_tracker.paths import get_default_data_dir  # noqa: E402
 from streetscape_street_analyzer.road_sampling import quantize_coord  # noqa: E402
 
@@ -403,6 +406,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if PANDAS_PARSES_FLOATS_EXACTLY:
+        # pandas 3.1 made every float_precision mode one exact converter, so
+        # both reads below would agree everywhere and --docs-dir would replace
+        # the committed measurement with zeros (issue #458).
+        print(
+            f"refusing: pandas {pd.__version__} parses floats exactly by default, so the "
+            "default-vs-round-trip gap this script measures (issue #425) cannot be "
+            "reproduced. Re-run under pandas < 3.1.",
+            file=sys.stderr,
+        )
+        return 2
     data_dir = args.data_dir or get_default_data_dir()
     observations = collect(data_dir, args.grid_sample)
     summary = summarize(observations)

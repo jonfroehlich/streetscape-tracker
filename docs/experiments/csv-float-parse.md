@@ -71,6 +71,10 @@ Memory is unchanged: the dtypes are the same.
   The production re-measure is the walk recompute's dry run after deploy, which lists every walk that moves.
 - pandas 3.0.1 on macOS.
   The misparse is in pandas' own C parser rather than libc, so it should not be platform-specific; the tests re-measure the premise so a pandas that fixes its parser is reported.
+- **Update 2026-11-13 (#458): pandas 3.1 fixed its parser.**
+  Its `read_csv` documentation deprecates `float_precision` from 3.1.0 ("All float precision modes now use the same converter"), and 200,000 random longitudes written with `repr` all read back exactly under pandas 3.1.1's default parser, against 75,015 off under 3.0.1, 3.0.2 and 3.0.3 (macOS arm64; 3.0.1 and 3.0.3 also on Linux x86-64 and arm64 containers, same count).
+  That check was run by hand and is not in the committed record.
+  The loader now passes the option only before 3.1, and this script refuses to run on 3.1 or later, where it would measure zero everywhere.
 - The asymmetry between columns (longitude roughly 8× latitude) is reported, not explained.
 - Parse timings are single wall-clock readings on one laptop.
 

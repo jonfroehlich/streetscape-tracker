@@ -14,6 +14,34 @@ from .analysis import apply_query_radius
 from .config import MAPILLARY_METADATA_DTYPES, PROVIDER_RUN_DTYPES
 from .paths import get_default_data_dir
 
+
+def _pandas_parses_floats_exactly(version: str) -> bool:
+    """Whether this pandas reads a float as ``float()`` of its text by default.
+
+    pandas 3.1.0 made every ``float_precision`` mode use one correctly rounded
+    converter and deprecated the argument (its ``read_csv`` docs: "All float
+    precision modes now use the same converter"). Before 3.1 only
+    ``float_precision="round_trip"`` did (issue #425).
+
+    Example:
+        >>> _pandas_parses_floats_exactly("3.0.3"), _pandas_parses_floats_exactly("3.1.1")
+        (False, True)
+    """
+    major, minor = (int(part) for part in version.split(".")[:2])
+    return (major, minor) >= (3, 1)
+
+
+# Whether pandas' DEFAULT float parse is already exact (pandas >= 3.1), and the
+# read_csv keywords that make it exact on this pandas. Passing the option on
+# 3.1+ changes nothing and raises a deprecation warning, and a later pandas
+# removes it, so it is passed only where it is needed (issue #458).
+# tests/test_fileutils.py re-measures both sides of this claim on the installed
+# pandas: the default parse is exact on 3.1+, and wrong before it.
+PANDAS_PARSES_FLOATS_EXACTLY = _pandas_parses_floats_exactly(pd.__version__)
+EXACT_FLOAT_READ_KWARGS: dict[str, str] = (
+    {} if PANDAS_PARSES_FLOATS_EXACTLY else {"float_precision": "round_trip"}
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -83,9 +111,9 @@ def load_city_csv_file(
     errors="coerce" does not suppress). Nothing can write that today —
     standardize_capture_date returns YYYY-MM-DD or None, and both census
     decoders strftime("%Y-%m-%d") — so it is stated rather than guarded.
-    Coordinates are read correctly rounded (``float_precision="round_trip"``,
-    issue #425), so a loaded ``query_lat``/``query_lon`` equals ``float()`` of
-    its text.
+    Coordinates are read correctly rounded (``float_precision="round_trip"``
+    before pandas 3.1, the default parser from 3.1 on; issue #425), so a loaded
+    ``query_lat``/``query_lon`` equals ``float()`` of its text.
 
     Args:
         csv_path: Path to the CSV file (can be either .csv or .csv.gz)
@@ -145,7 +173,9 @@ def load_city_csv_file(
         # legacy files load unchanged, while each census provider's extras are
         # coerced by ITS schema rather than by whichever module opened the file.
         #
-        # float_precision="round_trip" (issue #425): pandas' default C parser is
+        # float_precision="round_trip" (issue #425), passed only before pandas
+        # 3.1 (EXACT_FLOAT_READ_KWARGS; 3.1 parses exactly by default and
+        # deprecates the option): the older default C parser is
         # not correctly rounded and lands ~5% of latitudes and ~37% of longitudes
         # one ULP off their own text. Every walk collector reads its CSV back
         # through here and compute_streetwalk_coverage joins samples to rows on a
@@ -158,7 +188,7 @@ def load_city_csv_file(
             csv_path,
             dtype=dtypes_for_run_path(csv_path) if dtypes is None else dtypes,
             compression=compression,
-            float_precision="round_trip",
+            **EXACT_FLOAT_READ_KWARGS,
         )
 
         # Convert query_timestamp (ISO 8601 with timezone)

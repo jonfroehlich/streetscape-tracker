@@ -148,7 +148,7 @@ jobs:
       # os-keyed cache kept serving stale Chromium builds after upgrades.
       - name: Get Playwright version
         id: playwright-version
-        run: echo "version=$(python -c 'import playwright; print(playwright.__version__)')" >> "$GITHUB_OUTPUT"
+        run: echo "version=$(python -c 'import importlib.metadata as m; print(m.version("playwright"))')" >> "$GITHUB_OUTPUT"
       - name: Cache Playwright browser
         uses: actions/cache@v4
         with:
