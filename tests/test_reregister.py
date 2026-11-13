@@ -8,15 +8,23 @@ network, no DB — decide() takes the report row and current geometry directly.
 
 import importlib.util
 import os
+import sys
 
 import pytest
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_spec = importlib.util.spec_from_file_location(
-    "reregister_boundaries", os.path.join(PROJECT_ROOT, "scripts", "reregister_boundaries.py")
-)
-rr = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(rr)
+
+
+def _load_script(name):
+    spec = importlib.util.spec_from_file_location(
+        name, os.path.join(PROJECT_ROOT, "scripts", f"{name}.py")
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+rr = _load_script("reregister_boundaries")
 
 
 def row(verdict, *, osm_w=None, osm_h=None, sug_lat=None, sug_lon=None, city_id="c", name="City"):
@@ -31,8 +39,15 @@ def row(verdict, *, osm_w=None, osm_h=None, sug_lat=None, sug_lon=None, city_id=
     }
 
 
-def cur(lat, lon, w, h, step=20):
-    return rr.Current(center_lat=lat, center_lon=lon, width_m=w, height_m=h, step_m=step)
+def cur(lat, lon, w, h, step=20, manually_resized=False):
+    return rr.Current(
+        center_lat=lat,
+        center_lon=lon,
+        width_m=w,
+        height_m=h,
+        step_m=step,
+        manually_resized=manually_resized,
+    )
 
 
 def test_offset_city_recenters_without_shrinking():
@@ -103,6 +118,79 @@ def test_idempotent_after_applying_target():
     # Feed back the post-execute geometry: same center, grown dimensions.
     applied = cur(first.new_center_lat, first.new_center_lon, first.new_width_m, first.new_height_m)
     assert rr.decide(r, applied).action == "NOCHANGE"
+
+
+# --- issue #459: a hand-fitted grid is never grown back unattended ------------
+
+# Kuna, Idaho's shape (#457): a 4.9 x 5.7 km grid fitted to its streets inside
+# a boundary bbox several times that size, well under the 30 km threshold.
+_FITTED_ROW = dict(osm_w=12000, osm_h=11000, sug_lat=43.49, sug_lon=-116.42)
+
+
+def test_a_manually_resized_grid_is_deferred_not_grown_back():
+    r = row("UNDER", **_FITTED_ROW)
+    # The premise: without the note this exact city IS resized unattended.
+    assert rr.decide(r, cur(43.49753, -116.42638, 4900, 5700)).action == "RESIZE"
+
+    d = rr.decide(r, cur(43.49753, -116.42638, 4900, 5700, manually_resized=True))
+    assert d.action == "DEFER"
+    assert "manually resized" in d.reason
+    # Geometry untouched, and the review page still gets both sides.
+    assert d.new_width_m is None and d.new_height_m is None
+    assert (d.old_width_m, d.old_height_m) == (4900, 5700)
+    assert d.rec_width_m is not None
+
+
+def test_the_manual_resize_guard_diverts_only_a_would_be_resize():
+    # Already at the audit's target: nothing would change, so nothing to review.
+    at_target = cur(43.49, -116.42, 12000, 11000, manually_resized=True)
+    assert rr.decide(row("UNDER", **_FITTED_ROW), at_target).action == "NOCHANGE"
+    fitted = cur(43.49753, -116.42638, 4900, 5700, manually_resized=True)
+    assert rr.decide(row("OK"), fitted).action == "SKIP"
+    over_threshold = rr.decide(
+        row("UNDER", osm_w=194000, osm_h=153000, sug_lat=43.49, sug_lon=-116.42), fitted
+    )
+    assert over_threshold.action == "DEFER" and "threshold" in over_threshold.reason
+
+
+def test_load_current_geometry_reads_the_resize_note_resize_city_writes(tmp_path, monkeypatch):
+    """End to end across the two scripts: the note resize_city.py really writes
+    is the note reregister_boundaries.py really reads, among other notes."""
+    from streetscape_metadata_tracker import db
+
+    catalog = str(tmp_path / "catalog.db")
+    conn = db.connect(catalog)
+    ids = {}
+    for name in ("Kuna", "Boise", "Magna"):
+        ids[name] = db.register_city(
+            conn,
+            city_name=name,
+            state_name="Idaho",
+            state_code="ID",
+            country_name="United States",
+            country_code="US",
+            center_lat=43.5,
+            center_lon=-116.4,
+            grid_width_m=12000,
+            grid_height_m=11000,
+            step_m=20,
+            notes="tranche 3" if name == "Magna" else None,
+        )
+    conn.close()
+
+    resize = _load_script("resize_city")
+    for name in ("Kuna", "Magna"):
+        argv = ["resize_city.py", ids[name], "--width", "4900", "--height", "5700"]
+        monkeypatch.setattr(sys, "argv", [*argv, "--db-path", catalog, "--execute"])
+        assert resize.main() == 0
+
+    conn = db.connect(catalog)
+    current = rr.load_current_geometry(conn)
+    conn.close()
+    assert current[ids["Kuna"]].manually_resized is True
+    assert current[ids["Magna"]].manually_resized is True  # appended after another note
+    assert current[ids["Boise"]].manually_resized is False  # NULL notes
+    assert current[ids["Kuna"]].width_m == 4900
 
 
 def test_unknown_city_skipped():

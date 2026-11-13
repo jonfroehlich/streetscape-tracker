@@ -21,6 +21,11 @@ Policy (per city, driven by the audit `verdict`):
   * WRONG_PLACE / NO_POLYGON / NOT_FOUND / BBOX_SUSPECT / OVER -> MANUAL REVIEW
     (geometry left untouched — a wrong OSM match must not be applied blindly).
   * OK -> skipped silently.
+  * UNDER, but the grid was fitted by hand with scripts/resize_city.py (its
+    cities.notes carry db.MANUAL_RESIZE_NOTE) -> MANUAL REVIEW. A grid shrunk
+    to a town's streets is "UNDER" its boundary on purpose, and growing it back
+    unattended would undo the fit and, once the city has runs, break its diff
+    continuity (issue #459).
 
 Grid geometry is otherwise immutable; this is the deliberate escape hatch
 (db.update_city_geometry). Re-registration makes ZERO provider API calls — it
@@ -95,6 +100,9 @@ class Current:
     width_m: int
     height_m: int
     step_m: int
+    # True when cities.notes carry db.MANUAL_RESIZE_NOTE: someone fitted this
+    # grid by hand, so it is never resized unattended (issue #459).
+    manually_resized: bool = False
 
 
 @dataclass
@@ -307,17 +315,30 @@ def decide(row: dict, current: Current | None, threshold_m: float = REVIEW_THRES
     )
     if already:
         return d("NOCHANGE", "already at target geometry", **common)
+    if current.manually_resized:
+        # Checked last, so only a would-be RESIZE is diverted: the other
+        # branches already leave the geometry alone.
+        return defer(
+            "manually resized (scripts/resize_city.py); review by hand, "
+            "an unattended resize would undo the fit"
+        )
     return d("RESIZE", "recenter on OSM midpoint + grow to OSM bbox", **common)
 
 
 def load_current_geometry(conn) -> dict:
     """Map city_id -> Current for every city in the catalog."""
     rows = conn.execute(
-        "SELECT city_id, center_lat, center_lon, grid_width_m, grid_height_m, step_m FROM cities"
+        "SELECT city_id, center_lat, center_lon, grid_width_m, grid_height_m, step_m, notes "
+        "FROM cities"
     ).fetchall()
     return {
         r["city_id"]: Current(
-            r["center_lat"], r["center_lon"], r["grid_width_m"], r["grid_height_m"], r["step_m"]
+            r["center_lat"],
+            r["center_lon"],
+            r["grid_width_m"],
+            r["grid_height_m"],
+            r["step_m"],
+            manually_resized=db.MANUAL_RESIZE_NOTE in (r["notes"] or ""),
         )
         for r in rows
     }

@@ -782,7 +782,9 @@ Read the plan before `--execute`: a RESIZE of one of the 22 unfitted towns chang
 **4. Fit Kuna, Magna and Carmel-by-the-Sea to their streets, AFTER the audit.**
 Their boundary-derived grids are mostly farmland, lake flats and ocean.
 The order matters: `reregister_boundaries.py` grades a grid smaller than its OSM bbox `UNDER` and, below 30 km, grows it back to the bbox unattended, so a fit applied before the audit would be undone by it.
-For the same reason, **never pass these three to a later `reregister_boundaries.py --execute`.**
+For the same reason these three must never be grown back by a later `reregister_boundaries.py --execute`.
+Since #459 the script enforces that itself: `resize_city.py` stamps `cities.notes` with `db.MANUAL_RESIZE_NOTE`, and a would-be RESIZE of a city carrying that note is turned into DEFER ("manually resized; review by hand").
+The guard covers the unattended pass only; an `apply_decisions.py` decision a person made on the review page still applies.
 `resize_city.py` refuses a city with real runs unless `--force`; these have none, so no `--force` is needed, and a refusal means something collected them — stop.
 
 ```bash

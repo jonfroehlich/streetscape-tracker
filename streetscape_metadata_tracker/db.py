@@ -1436,6 +1436,13 @@ def set_city_enabled(conn: sqlite3.Connection, city_id: str, enabled: bool) -> N
     conn.commit()
 
 
+# The audit line scripts/resize_city.py appends to cities.notes. It is READ as
+# well as written: scripts/reregister_boundaries.py never auto-resizes a city
+# whose notes carry it (issue #459), so the text must not change -- production
+# rows already hold it.
+MANUAL_RESIZE_NOTE = "manual resize (scripts/resize_city.py)"
+
+
 def update_city_geometry(
     conn: sqlite3.Connection,
     *,
