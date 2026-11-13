@@ -341,6 +341,125 @@ def test_center_from_geonames_uses_first_geocoded_candidate(tmp_path, catalog, f
     conn.close()
 
 
+# --- issue #460: the dry run must show in-batch neighbours -------------------
+
+# 0.05 deg of longitude at latitude 10 is 5.48 km; 0.2 deg is 21.9 km.
+_ROW_A = dict(query_string="Aville, Testland", city="Aville", geonameid="1", lon="20.0")
+_ROW_B = dict(query_string="Bville, Testland", city="Bville", geonameid="2", lon="20.05")
+_ROW_C = dict(query_string="Cville, Testland", city="Cville", geonameid="3", lon="20.2")
+
+
+def _dry_run(tmp_path, catalog, capsys, rows, *flags):
+    manifest = tmp_path / "frame.csv"
+    write_manifest(manifest, [frame_row(**r) for r in rows])
+    assert rf.main(["--manifest", str(manifest), "--db-path", catalog, *flags]) == 0
+    return capsys.readouterr().out
+
+
+def test_dry_run_reports_the_in_batch_reuse_execute_would_perform(
+    tmp_path, catalog, fake_geocode, capsys
+):
+    """Two manifest rows 5.5 km apart, nothing in the catalog. --execute
+    registers the first and aliases the second onto it; the dry run used to
+    print NEW for both."""
+    flags = ("--overlap-km", "6", "--max-center-km", "10")
+    out = _dry_run(tmp_path, catalog, capsys, [_ROW_A, _ROW_B, _ROW_C], *flags)
+    lines = out.splitlines()
+    assert "NEW (would geocode" in lines[0] and "Aville" in lines[0]
+    assert "REUSE IN-BATCH [1] Aville, Testland (5.5 km" in lines[1]
+    assert "newly-registered=2" in out  # A and C; B is not counted as new
+    assert "1 row(s) --execute may alias" in out
+    assert fake_geocode["calls"] == 0  # still no geocoding in a dry run
+
+    # The claim itself: --execute, with each row geocoding at its own manifest
+    # point, does exactly what the preview said.
+    fake_geocode["center_by_query"] = {
+        r["query_string"]: (10.0, float(r["lon"])) for r in (_ROW_A, _ROW_B, _ROW_C)
+    }
+    manifest = str(tmp_path / "frame.csv")
+    assert rf.main(["--manifest", manifest, "--db-path", catalog, *flags, "--execute"]) == 0
+    executed = capsys.readouterr().out
+    assert "Bville, Testland -> reused existing" in executed
+    assert "newly-registered=2" in executed
+
+
+def test_dry_run_warns_when_a_geocode_drift_could_alias_a_neighbour(
+    tmp_path, catalog, fake_geocode, capsys
+):
+    """The Stanford / East Palo Alto shape (#457): 5.5 km apart at
+    --overlap-km 5, so the manifest points do not overlap, but the earlier
+    row's geocoded center may sit up to --max-center-km from its point."""
+    flags = ("--overlap-km", "5", "--max-center-km", "10")
+    out = _dry_run(tmp_path, catalog, capsys, [_ROW_A, _ROW_B], *flags)
+    assert out.count("NEW (would geocode") == 2
+    assert "REUSE IN-BATCH" not in out
+    assert "WARNING: 5.5 km from [1] Aville, Testland" in out
+    assert "0 row(s) --execute may alias" in out and "1 warning(s)" in out
+
+    # And the hazard is real: a 0.6 km drift of A's geocoded center toward B
+    # (inside the 10 km guard) makes --execute alias B.
+    fake_geocode["center_by_query"] = {
+        _ROW_A["query_string"]: (10.0, 20.0055),
+        _ROW_B["query_string"]: (10.0, 20.05),
+    }
+    manifest = str(tmp_path / "frame.csv")
+    assert rf.main(["--manifest", manifest, "--db-path", catalog, *flags, "--execute"]) == 0
+    assert "Bville, Testland -> reused existing" in capsys.readouterr().out
+
+
+def test_dry_run_is_silent_about_rows_out_of_reach_of_each_other(
+    tmp_path, catalog, fake_geocode, capsys
+):
+    """21.9 km apart with a 15 km reach (5 + 10): no drift the guard allows
+    can alias them, so nothing is printed and no summary line is added."""
+    out = _dry_run(
+        tmp_path, catalog, capsys, [_ROW_A, _ROW_C], "--overlap-km", "5", "--max-center-km", "10"
+    )
+    assert out.count("NEW (would geocode") == 2
+    assert "WARNING" not in out and "In-batch" not in out
+
+
+def test_a_row_the_dry_run_would_alias_still_warns_later_rows(
+    tmp_path, catalog, fake_geocode, capsys
+):
+    """REUSE IN-BATCH is the nominal outcome, not a certain one: if A geocodes
+    away from B, B is registered after all and can capture C. So C (16.4 km
+    from B, 21.9 km from A, reach 17 km) is warned about B (PR #466 review)."""
+    flags = ("--overlap-km", "6", "--max-center-km", "11")
+    out = _dry_run(tmp_path, catalog, capsys, [_ROW_A, _ROW_B, _ROW_C], *flags)
+    assert "REUSE IN-BATCH [1] Aville" in out
+    assert "WARNING: 16.4 km from [2] Bville, Testland" in out
+    assert "newly-registered=2" in out  # B is still not counted as new
+
+    # The hazard, run for real: A geocodes 1.1 km west (B is now 6.6 km away,
+    # so it registers), B geocodes 10.96 km east (inside its guard) and lands
+    # 5.5 km from C's manifest point.
+    fake_geocode["center_by_query"] = {
+        _ROW_A["query_string"]: (10.0, 19.99),
+        _ROW_B["query_string"]: (10.0, 20.15),
+        _ROW_C["query_string"]: (10.0, 20.2),
+    }
+    manifest = str(tmp_path / "frame.csv")
+    assert rf.main(["--manifest", manifest, "--db-path", catalog, *flags, "--execute"]) == 0
+    assert "Cville, Testland -> reused existing bville" in capsys.readouterr().out
+
+
+def test_dry_run_notes_a_batch_row_that_could_take_a_catalog_reuse(
+    tmp_path, catalog, fake_geocode, capsys
+):
+    """A row within --overlap-km of an existing catalog city is reused in both
+    modes, but --execute aliases it onto the NEAREST centre, which may be an
+    earlier row of the batch once that row is geocoded."""
+    existing_id = _register_existing(catalog, center=(10.0, 20.05))  # 5.5 km east of A
+    rows = [
+        dict(_ROW_A, lon="19.95"),  # 11 km west of the catalog city: NEW
+        _ROW_A,  # 5.5 km from each
+    ]
+    out = _dry_run(tmp_path, catalog, capsys, rows, "--overlap-km", "6", "--max-center-km", "10")
+    assert f"REUSE existing {existing_id}" in out
+    assert "NOTE: [1] Aville, Testland is 5.5 km away" in out
+
+
 def test_find_overlap_picks_nearest_within_threshold():
     class Pt:
         def __init__(self, city_id, lat, lon):

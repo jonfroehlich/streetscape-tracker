@@ -48,7 +48,9 @@ from streetscape_metadata_tracker.paths import get_default_data_dir  # noqa: E40
 
 logger = logging.getLogger("resize_city")
 
-RESIZE_NOTE = "manual resize (scripts/resize_city.py)"
+# Defined in db so reregister_boundaries.py can recognise a hand-fitted grid
+# and leave it alone (issue #459).
+RESIZE_NOTE = db.MANUAL_RESIZE_NOTE
 
 
 def _grid_points(width_m: float, height_m: float, step_m: float) -> int:
