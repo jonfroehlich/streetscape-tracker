@@ -134,11 +134,19 @@ def test_a_manually_resized_grid_is_deferred_not_grown_back():
 
     d = rr.decide(r, cur(43.49753, -116.42638, 4900, 5700, manually_resized=True))
     assert d.action == "DEFER"
-    assert "manually resized" in d.reason
-    # Geometry untouched, and the review page still gets both sides.
+    assert d.reason == rr.MANUAL_RESIZE_REASON
+    # Geometry untouched.
     assert d.new_width_m is None and d.new_height_m is None
     assert (d.old_width_m, d.old_height_m) == (4900, 5700)
-    assert d.rec_width_m is not None
+    # The review page shows rec_basis in place of the reason and offers the
+    # recommended rectangle as a one-click choice unless it equals the current
+    # one. So the recommendation must BE the current grid and say why, not
+    # recommend()'s generic "grow to full OSM bbox" (PR #466 review).
+    assert (d.rec_center_lat, d.rec_center_lon) == (43.49753, -116.42638)
+    assert (d.rec_width_m, d.rec_height_m) == (4900, 5700)
+    assert "fitted by hand" in d.rec_basis and "grow to full" not in d.rec_basis
+    generic = rr.recommend(r, cur(43.49753, -116.42638, 4900, 5700))
+    assert generic["rec_width_m"] == 12000 and "grow to full" in generic["rec_basis"]  # premise
 
 
 def test_the_manual_resize_guard_diverts_only_a_would_be_resize():

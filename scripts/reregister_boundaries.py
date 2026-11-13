@@ -228,6 +228,13 @@ def recommend(row: dict, current: Current, ceiling_m: float = REC_CEILING_M) -> 
     )
 
 
+# The DEFER reason for a hand-fitted grid (issue #459).
+MANUAL_RESIZE_REASON = (
+    "manually resized (scripts/resize_city.py); review by hand, "
+    "an unattended resize would undo the fit"
+)
+
+
 def decide(row: dict, current: Current | None, threshold_m: float = REVIEW_THRESHOLD_M) -> Decision:
     """
     Pure policy: map one audit-report row + current geometry to a Decision.
@@ -318,9 +325,26 @@ def decide(row: dict, current: Current | None, threshold_m: float = REVIEW_THRES
     if current.manually_resized:
         # Checked last, so only a would-be RESIZE is diverted: the other
         # branches already leave the geometry alone.
-        return defer(
-            "manually resized (scripts/resize_city.py); review by hand, "
-            "an unattended resize would undo the fit"
+        # The advisory recommendation is "keep current", NOT recommend()'s
+        # "grow to full OSM bbox": the review page shows rec_basis in place of
+        # the reason and offers the recommended rectangle as a one-click
+        # choice, so the generic recommendation would hide why the city is
+        # here and invite the very resize this branch exists to stop.
+        return d(
+            "DEFER",
+            MANUAL_RESIZE_REASON,
+            old_center_lat=current.center_lat,
+            old_center_lon=current.center_lon,
+            old_width_m=current.width_m,
+            old_height_m=current.height_m,
+            rec_center_lat=round(current.center_lat, 6),
+            rec_center_lon=round(current.center_lon, 6),
+            rec_width_m=current.width_m,
+            rec_height_m=current.height_m,
+            rec_basis=(
+                "keep current: this grid was fitted by hand (scripts/resize_city.py), "
+                "so it is smaller than its OSM bbox on purpose; growing it back undoes the fit"
+            ),
         )
     return d("RESIZE", "recenter on OSM midpoint + grow to OSM bbox", **common)
 
