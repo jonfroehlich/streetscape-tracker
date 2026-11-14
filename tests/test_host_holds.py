@@ -312,21 +312,27 @@ def test_the_fill_declines_a_city_whose_channel_is_on_a_held_host(conn, tmp_path
 
 
 def test_the_live_fill_is_handed_the_runs_holds(conn, monkeypatch, tmp_path):
-    """The pass-through: `_fill_admission` asks the breaker's holds, not an empty set."""
+    """The pass-through: `_fill_admission` asks the breaker's holds, not an empty set.
+
+    Since #464 (review 1, finding 4) it hands `_fill_judge` the run's
+    `HostHolds` itself, which `_fill_judge` reads per city over the channels
+    it can still launch, in place of a precomputed `held_hosts`."""
     cfg = _cfg(tmp_path, fill=True)
     city = db.resolve_city(conn, _register(conn, "Bend"))
     seen = {}
     real = sched._fill_judge
 
     def spy(*a, **kw):
-        seen["held_hosts"] = kw.get("held_hosts")
+        seen["holds"] = kw.get("holds")
         return real(*a, **kw)
 
     monkeypatch.setattr(sched, "_fill_judge", spy)
     breaker = sched.HostBreaker(holds=sched._host_holds(cfg, WEDNESDAY))
     verdict = sched._fill_admission(cfg, conn, WEDNESDAY, city, ["gsv", "mapillary"], None, breaker)
-    assert seen["held_hosts"] == {HOST_MAPILLARY_TILES}
+    assert seen["holds"] is breaker.holds
+    assert set(seen["holds"].current()) == {HOST_MAPILLARY_TILES}
     assert verdict.blocker == sched._FILL_BLOCKER_HOST_HELD
+    assert verdict.message.endswith("(mapillary): rest night or cooldown")
 
 
 # ── the breaker is untouched ─────────────────────────────────────────────

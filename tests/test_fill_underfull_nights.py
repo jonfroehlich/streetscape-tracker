@@ -1731,6 +1731,41 @@ def test_a_spent_night_allowance_leaves_kartaview_not_the_city(conn, monkeypatch
         assert verdict.host_left == ("kartaview",) and verdict.held_left == ()
 
 
+def test_fill_admission_judges_the_allowance_exemption_over_what_it_launches(conn, monkeypatch):
+    """#464 review 1, finding 4: a live `kartaview` checkpoint left to the due
+    schedule as a backlog (`held_left`) is not tonight's launch, so it cannot
+    exempt `kartaview_streets`, which has no checkpoint of its own. Admission
+    judges the exemption over the channels it can still launch -- the list the
+    launch hands `_run_city_channels` -- so the walk is left with its host
+    held, never admitted only to be held at launch. Kills: `_fill_judge`
+    calling `_city_holds` over all of `channels`."""
+    from streetscape_metadata_tracker.download_common import HOST_KARTAVIEW
+
+    cid = _city(conn, "Enrolled", {"gsv": 60, "mapillary": 60, "kartaview": 60})
+    db.set_channel_membership(conn, cid, "kartaview_streets", True, cycle_days=90)
+    city = db.resolve_city(conn, cid)
+    cfg = _opt_in_cfg()
+    cfg.providers["kartaview_streets"] = ProviderConfig(daily_request_budget=10_000)
+    monkeypatch.setattr(sched, "_walk_network_is_frozen", lambda cfg_, city_, channel: True)
+    monkeypatch.setattr(sched, "channel_census_cache_marker", lambda city_, ch, **kw: None)
+    _live_checkpoints(monkeypatch, {(cid, "kartaview")})
+    holds = sched.HostHolds(allowances_s={HOST_KARTAVIEW: 1800.0})
+    holds.charge(HOST_KARTAVIEW, 1800.0, fresh=True)
+    breaker = sched.HostBreaker(holds=holds)
+    channels = ["gsv", "mapillary", "kartaview", "kartaview_streets"]
+    verdict = sched._fill_admission(
+        cfg, conn, TODAY, city, channels, 10_000.0, breaker, held={"kartaview"}
+    )
+    assert verdict.admit is True, verdict
+    assert verdict.held_left == ("kartaview",)
+    assert verdict.host_left == ("kartaview_streets",)
+    assert verdict.run == ("gsv", "mapillary")
+    # The launch's own reading of the run it is handed agrees: no channel of
+    # it is on a host that reading holds.
+    launch_held = set(sched._city_holds(cfg, city, list(verdict.run), holds)[0])
+    assert not any(set(sched.CHANNEL_HOSTS[c]) & launch_held for c in verdict.run)
+
+
 def test_a_fill_ended_by_a_ceiling_decline_says_so(conn, monkeypatch, caplog):
     """#456 third round, finding 5: a fill whose last candidate was declined
     because nothing but an oversized KartaView crawl was left to run ends

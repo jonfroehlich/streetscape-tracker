@@ -1270,6 +1270,11 @@ Each docstring names the one-line mutation that turns it red; all were run red b
 - The reserve and the charge: `test_resumes_are_reserved_out_of_the_allowance_first` (killed by skipping the reserve); `test_a_resume_does_not_spend_the_fresh_allowance` (killed by charging every launch as fresh); `test_a_launch_on_the_pool_path_is_charged` (two lanes, as prod; killed by dropping `end_charge`).
 - Reporting: `test_the_done_clause_carries_the_numbers_and_never_the_held_token` (the exact clause, and `mapillary_night_report._HELD_RE` matches nothing); `test_a_rest_night_beside_a_spent_allowance_keeps_the_held_count_mapillarys` (the regex's `n` is the Mapillary launches alone); `test_the_dry_run_holds_what_the_night_would_hold`; `test_status_names_the_night_allowance`; `test_ignore_host_holds_lifts_the_night_allowance`.
 - `test_a_spent_night_allowance_leaves_kartaview_not_the_city` (`tests/test_fill_underfull_nights.py`) — through `_fill_admission`: `held_left` on a real night's backlog, `host_left` on the edge path, and a live checkpoint never left.
+- Review 1 of the PR added four more.
+  - `test_a_kartaview_rest_or_cooldown_outranks_its_spent_allowance` (rest and cooldown arms): the same host carries both holds, its reserve spends the allowance, and the live checkpoint is neither exempted nor launched. It is killed by reordering `HostHolds.active`.
+  - `test_an_exempt_city_run_twice_is_counted_once`: the exempt tally is distinct cities.
+  - `test_the_fill_names_a_spent_allowance_only_where_it_is_the_reason`: the unset test also pins the fill's decline line to the #444 text, byte for byte.
+  - `test_fill_admission_judges_the_allowance_exemption_over_what_it_launches` (in the fill file): a backlogged `kartaview` checkpoint does not exempt a `kartaview_streets` that has none.
 
 ## The Mapillary night report (issue #444)
 

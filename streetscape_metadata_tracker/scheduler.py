@@ -44,7 +44,7 @@ import time
 import tomllib
 import traceback
 from collections import Counter, defaultdict
-from collections.abc import Callable, Collection, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -803,12 +803,13 @@ class HostBreaker(set):
         # `held_launches` on purpose: those feed the Done line's HELD clause,
         # which `scripts/mapillary_night_report.py` reads as the tile CDN's
         # rest-night series, and hundreds of KartaView allowance holds there
-        # would corrupt it. host -> the LATEST sighting (so the Done line shows
-        # final usage), launches left for a later night, and cities that ran
-        # past a spent allowance as paid-for work.
-        self.allowance_held: dict[str, HostHold] = {}
+        # would corrupt it. The usage itself lives in `holds.usage()`, the one
+        # source of truth; here are host -> launches left for a later night,
+        # and host -> the DISTINCT city ids that ran past a spent allowance as
+        # paid-for work (a set, so a city the #380 retry or the fill runs
+        # again is counted once).
         self.allowance_skipped: Counter[str] = Counter()
-        self.allowance_exempt: Counter[str] = Counter()
+        self.allowance_exempt: dict[str, set[str]] = {}
         # (host, channel) -> (launch instant, charged as fresh) for each launch
         # in flight that the allowance charges. Keyed by channel too, so a
         # stale entry is replaced by the next launch of that channel rather
@@ -991,8 +992,8 @@ class HostBreaker(set):
         Records each hold in ``held`` the first time it is seen, so the
         ``Done:`` line can name it. Counting the launch it costs is the
         caller's, because only the caller knows whether a launch was asked.
-        A spent night allowance (issue #464) is recorded in
-        ``allowance_held`` instead, latest sighting, and NEVER in ``held``.
+        A spent night allowance (issue #464) is returned but NEVER recorded
+        in ``held``; ``holds.usage()`` is what the ``Done:`` line reads.
 
         ``snapshot`` (``holds.current()`` taken once per city) answers instead
         of the wall clock, so a cooldown that ends between a city's grid
@@ -1003,9 +1004,7 @@ class HostBreaker(set):
             hold = self.holds.active(host) if snapshot is None else snapshot.get(host)
             if hold is not None:
                 found[host] = hold
-                if hold.reason == HOLD_ALLOWANCE:
-                    self.allowance_held[host] = hold
-                else:
+                if hold.reason != HOLD_ALLOWANCE:
                     self.held.setdefault(host, hold)
         return found
 
@@ -11522,7 +11521,7 @@ def _run_city_channels(
     # from a spent allowance: `_city_holds` drops that hold for it.
     city_holds, allowance_exempt = _city_holds(cfg, city, providers, blocked_hosts.holds)
     for host in sorted(allowance_exempt):
-        blocked_hosts.allowance_exempt[host] += 1
+        blocked_hosts.allowance_exempt.setdefault(host, set()).add(city.city_id)
         logger.info(
             f"{city.city_id}: {HOST_LABELS.get(host, host)} night allowance is spent, but "
             f"this city resumes a live checkpoint or reuses a cached census there, so it "
@@ -11733,7 +11732,7 @@ def _run_city_channels(
                         if held and all(h.reason == HOLD_ALLOWANCE for h in held.values()):
                             # A spent night allowance (issue #464). Its own
                             # counters, never `held_skipped`/`held_launches`
-                            # (see HostBreaker.allowance_held). No attempt is
+                            # (see HostBreaker.allowance_skipped). No attempt is
                             # recorded and no cap slot is taken; it stays due.
                             if _city_channel_unfinishable(cfg, conn, city, provider) is not None:
                                 allowance_fallthrough = True
@@ -13978,12 +13977,31 @@ def _fill_leaves_to_due_schedule(
     return est
 
 
+def _fill_held_reason(on_hold: set[str], held_hosts: Collection[str]) -> str:
+    """Why the fill's held hosts are held, for the decline line.
+
+    "rest night or cooldown" -- the #444 wording, byte for byte -- unless
+    ``held_hosts`` maps a host in ``on_hold`` to a spent night allowance
+    (issue #464), so a host with no allowance is never said to have one.
+    """
+    reasons = (
+        {held_hosts[h].reason for h in on_hold if h in held_hosts}
+        if isinstance(held_hosts, Mapping)
+        else set()
+    )
+    if HOLD_ALLOWANCE not in reasons:
+        return "rest night or cooldown"
+    if reasons == {HOLD_ALLOWANCE}:
+        return "night allowance spent"
+    return "rest night or cooldown, or night allowance spent"
+
+
 def _fill_prebudget_refusal(
     cfg: "SchedulerConfig",
     city: db.CityRow,
     channels: Sequence[str],
     latched: set[str],
-    held_hosts: set[str] | frozenset[str] = frozenset(),
+    held_hosts: Collection[str] = frozenset(),
 ) -> FillVerdict | None:
     """The two refusals that precede the budget rule, or None (issue #404).
 
@@ -13996,7 +14014,9 @@ def _fill_prebudget_refusal(
     A channel on a HELD host (issue #444, ``held_hosts``: a rest night or a
     refusal cooldown) is refused for the same reason -- the launch gate would
     hold it, and the city would land without it. The dry run passes the same
-    holds the night would see.
+    holds the night would see. ``held_hosts`` may be a mapping of host to
+    its :class:`HostHold` (what :func:`_city_holds` returns); a spent night
+    allowance (issue #464) is then named as the reason, and only then.
     """
     for channel in channels:
         wanted = set(CHANNEL_HOSTS.get(channel, ()))
@@ -14009,13 +14029,13 @@ def _fill_prebudget_refusal(
                     f"Overpass; the fill never adds Overpass traffic",
                 )
             wanted.discard(HOST_OVERPASS)
-        on_hold = wanted & held_hosts
+        on_hold = wanted & set(held_hosts)
         if on_hold:
             return FillVerdict(
                 False,
                 _FILL_BLOCKER_HOST_HELD,
-                f"{_host_names(on_hold)} is held tonight ({channel}): rest night, cooldown "
-                f"or spent night allowance",
+                f"{_host_names(on_hold)} is held tonight ({channel}): "
+                f"{_fill_held_reason(on_hold, held_hosts)}",
                 hosts=frozenset(on_hold),
             )
         refused = wanted & latched
@@ -14042,7 +14062,8 @@ def _fill_judge(
     reserve: dict[str, int] | None = None,
     fill_spent: dict[str, int] | None = None,
     held: set[str] | frozenset[str] = frozenset(),
-    held_hosts: set[str] | frozenset[str] = frozenset(),
+    held_hosts: Collection[str] = frozenset(),
+    holds: HostHolds | None = None,
 ) -> tuple[FillVerdict, dict[str, int]]:
     """Every admission question in order, against ledgers already read (#404).
 
@@ -14066,6 +14087,12 @@ def _fill_judge(
     ``backlog`` / the host refusal when that is what emptied it. Every other
     channel is still whole-or-nothing: the hold check and the pre-budget
     refusals are asked of ``run`` alone.
+
+    ``holds``, when given, replaces ``held_hosts`` with this city's own
+    reading (:func:`_city_holds`, issue #464), judged over the channels the
+    city could still launch once the ceiling and backlog have left theirs --
+    the same list the launch then hands ``_run_city_channels``, so admission
+    and launch cannot disagree about a paid-for exemption.
     """
     ceiling_left = {
         c: e
@@ -14078,6 +14105,9 @@ def _fill_judge(
         if c not in ceiling_left and _ceiling_window(c, (cfg.providers or {}).get(c)) is not None
     ]
     held_left = tuple(c for c in ceiled if c in held)
+    if holds is not None:
+        launchable = [c for c in channels if c not in ceiling_left and c not in held_left]
+        held_hosts = _city_holds(cfg, city, launchable, holds)[0]
     # Only a HOST refusal leaves the channel; an unfrozen walk still declines
     # the city, since that refusal is about Overpass traffic, not KartaView.
     host_left = tuple(
@@ -14196,7 +14226,7 @@ def _fill_admission(
         latched=set(blocked_hosts.latched),
         # Per city (issue #464): a spent night allowance holds the host for a
         # fresh KartaView crawl but not for paid-for work, the due phase's rule.
-        held_hosts=set(_city_holds(cfg, city, channels, blocked_hosts.holds)[0]),
+        holds=blocked_hosts.holds,
         channel_room=channel_room,
         used_by_host=used,
         remaining_s=remaining_s,
@@ -14396,11 +14426,8 @@ def _print_fill_preview(
             city,
             city_channels,
             latched=set(),
-            held_hosts=(
-                held_hosts
-                if holds is None
-                else set(_city_holds(cfg, city, city_channels, holds)[0])
-            ),
+            held_hosts=held_hosts,
+            holds=holds,
             channel_room={c: budget_left[c] for c in city_channels},
             used_by_host={h: window_used[h] + host_spent[h] for h in hosts},
             remaining_s=None,
@@ -14968,7 +14995,7 @@ def _allowance_summary_note(breaker: HostBreaker, sep: str = "; ") -> str:
         usage = breaker.holds.usage(host)
         assert usage is not None
         skipped = breaker.allowance_skipped[host]
-        exempt = breaker.allowance_exempt[host]
+        exempt = len(breaker.allowance_exempt.get(host, ()))
         if not (usage.fresh_n or usage.paid_n or skipped or exempt):
             continue
         parts.append(

@@ -58,6 +58,7 @@ def _cfg(
     mapillary=False,
     mapillary_rest=False,
     schedule="",
+    kv_extra="",
 ):
     """gsv + the named KartaView channels (+ the Mapillary pair), THROUGH the loader."""
     path = tmp_path / "allowance.toml"
@@ -82,7 +83,7 @@ def _cfg(
     if mapillary_rest:
         text += '[hosts.mapillary_tiles]\nrest_weekdays = ["Wed"]\n\n'
     if minutes is not None:
-        text += f"[hosts.kartaview]\nmax_night_minutes = {minutes}\n"
+        text += f"[hosts.kartaview]\nmax_night_minutes = {minutes}\n{kv_extra}"
     path.write_text(text)
     return load_scheduler_config(str(path))
 
@@ -340,6 +341,36 @@ def test_an_unset_allowance_probes_nothing_and_leaves_the_night_as_it_was(
         in (done)
     )
     assert "ALLOWANCE" not in done
+    # The fill's decline line for a held host is #444's text, byte for byte:
+    # with no allowance configured it never names one (review 1, finding 2).
+    holds = sched._host_holds(cfg, WEDNESDAY)
+    city = db.resolve_city(conn, a)
+    refusal = sched._fill_prebudget_refusal(
+        cfg, city, ["mapillary"], set(), sched._city_holds(cfg, city, ["mapillary"], holds)[0]
+    )
+    assert refusal is not None
+    assert refusal.message == (
+        "Mapillary's tile CDN (tiles.mapillary.com) is held tonight (mapillary): "
+        "rest night or cooldown"
+    )
+
+
+def test_the_fill_names_a_spent_allowance_only_where_it_is_the_reason(conn, monkeypatch, tmp_path):
+    """A KartaView host held by its spent allowance is declined as
+    "night allowance spent"; the same Mapillary rest night on the same run
+    still reads "rest night or cooldown". Mutation: `_fill_held_reason`
+    returning one fixed string for both."""
+    _live(monkeypatch, set())
+    _cached(monkeypatch, set())
+    cfg = _cfg(tmp_path, 30, mapillary=True, mapillary_rest=True)
+    city = db.resolve_city(conn, _register(conn, "Albany"))
+    holds = sched._host_holds(cfg, WEDNESDAY)
+    holds.charge(HOST_KARTAVIEW, 30 * 60, fresh=True)
+    reading = sched._city_holds(cfg, city, ["mapillary", "kartaview"], holds)[0]
+    kv = sched._fill_prebudget_refusal(cfg, city, ["kartaview"], set(), reading)
+    mly = sched._fill_prebudget_refusal(cfg, city, ["mapillary"], set(), reading)
+    assert kv is not None and kv.message.endswith("(kartaview): night allowance spent")
+    assert mly is not None and mly.message.endswith("(mapillary): rest night or cooldown")
 
 
 # ── the night ────────────────────────────────────────────────────────────
@@ -460,7 +491,7 @@ def test_a_resumed_grid_that_completes_is_followed_by_its_free_walk(conn, monkey
     usage = breaker.holds.usage(HOST_KARTAVIEW)
     assert (usage.paid_n, usage.fresh_n) == (1, 1), "grid paid; the pre-spend is the one fresh"
     assert usage.paid_s == 20 * 60
-    assert breaker.allowance_exempt[HOST_KARTAVIEW] == 1
+    assert breaker.allowance_exempt == {HOST_KARTAVIEW: {a}}
     assert counters["deferred_channels"] == Counter()
 
 
@@ -654,6 +685,61 @@ def test_a_rest_night_beside_a_spent_allowance_keeps_the_held_count_mapillarys(
     match = report._HELD_RE.search(done)
     assert match is not None and int(match["n"]) == 4, done
     assert "1 launch(es) left for a later night" in done
+
+
+@pytest.mark.parametrize("hold", ["rest", "cooldown"])
+def test_a_kartaview_rest_or_cooldown_outranks_its_spent_allowance(
+    conn, monkeypatch, tmp_path, hold
+):
+    """Review 1, finding 1: on ONE host, a rest night or a refusal cooldown
+    outranks a spent allowance. The allowance here is spent by its own reserve
+    (10 min against one resumer's ~24.7), so its hold is in force too. Were the
+    allowance reported first, `_city_holds` would exempt the live checkpoint and
+    launch KartaView on its rest night or inside its cooldown. Nothing
+    launches, the launch is counted as a #444 hold, and no city is exempt.
+    Mutation: `HostHolds.active` returning `allowance or rest or cooldown`."""
+    extra = 'rest_weekdays = ["Thu"]\n' if hold == "rest" else "refusal_cooldown_h = 36\n"
+    cfg = _cfg(tmp_path, 10, kv_extra=extra)
+    a = _kv_only(conn, cfg, "Albany")
+    _live(monkeypatch, {(a, "kartaview")})
+    _cached(monkeypatch, set())
+    if hold == "cooldown":
+        db.record_host_verdict(
+            conn,
+            HOST_KARTAVIEW,
+            db.HOST_REFUSED,
+            source="run-due",
+            channel="kartaview",
+            at=NIGHT - timedelta(hours=1),
+        )
+    holds = sched._host_holds(cfg, THURSDAY, conn)
+    holds.reserve(HOST_KARTAVIEW, sched._allowance_launch_s(cfg, HOST_KARTAVIEW), 1)
+    assert holds.allowance(HOST_KARTAVIEW) is not None, "premise: the allowance is spent"
+    reason = sched.HOLD_REST if hold == "rest" else sched.HOLD_COOLDOWN
+    assert holds.active(HOST_KARTAVIEW).reason == reason
+    breaker = sched.HostBreaker(holds=holds)
+    launches, _ = _city_channels(monkeypatch, conn, cfg, a, KV_GRID, breaker)
+    assert launches == []
+    assert breaker.held_launches == 1
+    assert breaker.allowance_exempt == {}
+    assert breaker.allowance_skipped[HOST_KARTAVIEW] == 0
+
+
+def test_an_exempt_city_run_twice_is_counted_once(conn, monkeypatch, tmp_path):
+    """Review 1, finding 5: the Done clause counts CITIES exempt as paid-for
+    work, so a city the due loop ran and the #380 retry or the fill runs again
+    is one city, not two. Mutation: a list (`setdefault(host, []).append`) in
+    place of the set."""
+    cfg = _cfg(tmp_path, 30, channels=KV_PAIR)
+    a = _kv_only(conn, cfg, "Albany", ("kartaview_streets",))
+    _live(monkeypatch, set())
+    _cached(monkeypatch, {(a, "kartaview_streets")})
+    breaker = _spent_breaker(cfg, 30)
+    for _ in range(2):
+        launches, _ = _city_channels(monkeypatch, conn, cfg, a, ["kartaview_streets"], breaker)
+        assert launches == ["kartaview_streets"]
+    assert breaker.allowance_exempt == {HOST_KARTAVIEW: {a}}
+    assert "1 city(ies) exempt as paid-for work" in sched._allowance_summary_note(breaker)
 
 
 def test_a_launch_on_the_pool_path_is_charged(conn, monkeypatch, tmp_path, caplog):
