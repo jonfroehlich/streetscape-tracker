@@ -82,16 +82,24 @@ def test_the_round_trip_premise_is_checked_not_assumed(tmp_path, monkeypatch):
         cfa.measure_walk_csv(_walk_csv(tmp_path))
 
 
-@needs_inexact_default_parser
-def test_loader_parser_restores_pandas_and_forces_the_option(tmp_path):
+def test_loader_parser_restores_pandas_and_forces_the_option(tmp_path, monkeypatch):
     """The grid and scoring measurements read through the REAL loader with the
     parser forced; the patch must not outlive the block."""
     path = _walk_csv(tmp_path)
+    seen = []
     real = pd.read_csv
+
+    def recording(*args, **kwargs):
+        seen.append(kwargs.get("float_precision", "absent"))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(pd, "read_csv", recording)
     with cfa.loader_parser(None):
         default = pd.read_csv(path, float_precision="round_trip")["query_lon"].tolist()[0]
-    assert pd.read_csv is real
-    assert default != float(BOUNDARY_LON_TEXT)
+    assert pd.read_csv is recording  # restored to what it found
+    assert seen == [None]  # the caller's "round_trip" was overridden
+    if not PANDAS_PARSES_FLOATS_EXACTLY:
+        assert default != float(BOUNDARY_LON_TEXT)
 
 
 def test_main_refuses_on_a_pandas_with_nothing_to_measure(tmp_path, monkeypatch, capsys):

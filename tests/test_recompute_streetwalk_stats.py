@@ -108,7 +108,11 @@ def _graph(extra_edge=False, footway=False, node_offset=0):
 # C float parser puts the CSV's copy of it on the OTHER side, while Python's
 # correctly rounded float() of the same text reproduces the sample exactly --
 # which is why fileutils.load_city_csv_file reads round-trip (#425). The test
-# re-measures this premise.
+# re-measures this premise, and it does NOT hold everywhere: the sample's own
+# float depends on the platform's projection maths, and the parser moves its
+# key only at this exact float (one ULP either way and it does not). It holds
+# on macOS arm64 and held on CI's ubuntu-24.04 image; on ubuntu-26.04 it does
+# not, and the test then reports SKIPPED after its other assertions (#458).
 BOUNDARY_NORTH_LAT = 44.0501200169994
 
 
@@ -549,8 +553,9 @@ def test_a_sample_the_default_parser_would_misplace_is_scored_covered_by_collect
     tmp_path, monkeypatch, capsys, provider
 ):
     """A REAL collector run whose one boundary sample pandas' default C float
-    parser would read one ULP across quantize_coord's half-way point (issue
-    #425). The loader reads round-trip, so the collector's key join hits it and
+    parser (before pandas 3.1, and where the searched premise holds) would read
+    one ULP across quantize_coord's half-way point (issue #425). The loader
+    reads round-trip, so the collector's key join hits it and
     scores that edge covered; the recompute agrees, needing no tolerance-only
     match, and equals a --force collection under the same definition.
 
@@ -581,14 +586,9 @@ def test_a_sample_the_default_parser_would_misplace_is_scored_covered_by_collect
         assert missed_by_default == set()
     else:
         # Before 3.1 the default parser can move only the boundary sample's
-        # key. It does on macOS arm64, where BOUNDARY_NORTH_LAT was searched
-        # for, and it did on CI's ubuntu-24.04 image. On the ubuntu-26.04 image
-        # CI moved to between 2026-10-28 and 11-06, with identical wheels
-        # (pandas 3.0.3), no key moves, so "exactly one" is not asserted
-        # (issue #458). Why the image matters was not investigated. On that
-        # image this premise is therefore absent and dropping the loader's
-        # option would NOT fail this test; tests/test_fileutils.py's literal
-        # still fails there and is the guard.
+        # key, and moves it only where the searched premise holds (see
+        # BOUNDARY_NORTH_LAT). Where it does not, the assertions below still
+        # run, and the test ends SKIPPED so the lost guard is visible.
         assert missed_by_default <= {quantize_coord(boundary.lat, boundary.lon)}
 
     # The contract: the loader hands back every sample's own key.
@@ -617,6 +617,17 @@ def test_a_sample_the_default_parser_would_misplace_is_scored_covered_by_collect
     assert recomputed_artifact == _artifact(data_dir, D1, provider=provider)
     edge = next(f for f in recomputed_artifact["features"] if f["properties"]["edge_id"] == "1_2")
     assert edge["properties"]["coverage_fraction"] == 1.0
+
+    if not PANDAS_PARSES_FLOATS_EXACTLY and not missed_by_default:
+        # Everything above passed, but on this platform it would also pass
+        # with the loader's float_precision option removed, so do not report
+        # it as a guard that ran. tests/test_fileutils.py's literal still
+        # guards the option here.
+        pytest.skip(
+            "the boundary sample's key is not moved by the default parser on this "
+            "platform (issue #458), so this run cannot detect a loader that drops "
+            "float_precision; assertions above all passed"
+        )
 
 
 def test_duplicate_csv_rows_are_accepted_and_counted(tmp_path, monkeypatch, capsys):

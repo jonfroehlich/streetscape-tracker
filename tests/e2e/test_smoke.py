@@ -372,8 +372,15 @@ def test_city_page_shows_the_harvested_capture_history(page: Page, base_url):
 
     canvas = page.locator("#capture-history-chart")
     expect(canvas).to_be_visible()
-    box = canvas.bounding_box()
-    assert box and box["width"] > 0 and box["height"] > 0
+    # Polled in the page, not read once through the locator: updateLegend swaps
+    # the legend's innerHTML on repaint, and a canvas replaced between the
+    # visibility check and a one-shot bounding_box() reads as None (issue #458).
+    page.wait_for_function(
+        """() => {
+            const r = document.querySelector("#capture-history-chart")?.getBoundingClientRect();
+            return !!r && r.width > 0 && r.height > 0;
+        }"""
+    )
 
     legend = page.locator(".legend")
     expect(legend).to_contain_text("across 4 years")
