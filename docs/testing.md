@@ -1256,6 +1256,21 @@ A hold keeps a host's channels from launching without anything having refused us
   - `test_the_production_fetch_never_follows_a_redirect` (`allow_redirects=False` reaches `requests.get`) and `test_the_token_comes_from_the_existing_loader`.
 - `test_the_done_line_names_each_metered_hosts_presence_and_the_gap_before_it` — first launch to last finish on the tile CDN, the gap back to the newest ledger stamp from BEFORE the run (tonight's own stamps are seeded and must be ignored), and neither GSV nor Overpass named; killed by marking the launch after the inline child, by dropping the finish mark, by reading tonight's stamps, and by letting Overpass in.
 
+## The KartaView night allowance (issue #464)
+
+`tests/test_kartaview_night_allowance.py`.
+Its fake child MOVES the frozen UTC clock by the minutes a launch should take, which is what the allowance charges, and it fakes checkpoints and cached censuses at their two readers (`_sweep_checkpoint_progress`, `channel_census_cache_marker`).
+Each docstring names the one-line mutation that turns it red; all were run red before the PR.
+
+- Config: `test_a_night_allowance_loads_for_the_kartaview_host`; `test_an_invalid_night_allowance_fails_closed` (0, −5, a bool, a string, 1441, and a valid value on the tile CDN and on Panoramax: exit 64 before connecting); `test_makelab1_ships_the_allowance_commented_out` (prod unset, the commented line present).
+- `test_an_unset_allowance_probes_nothing_and_leaves_the_night_as_it_was` — both probes RAISE for a census channel on a Mapillary rest night with the key unset, and the launches and the HELD clause are the pre-change values; killed by computing the paid-for set before the short-circuit.
+- The hold: `test_a_spent_allowance_leaves_fresh_crawls_due_and_takes_no_slot` (no attempt, no failure, no alert, still due, one crossing WARNING; the unset control launches the city); `test_a_spent_allowance_is_never_counted_as_attempted` (a two-city night where the held city must not take the gsv city's slot; the hoist order is asserted).
+- Pairing and paid-for work: `test_an_allowance_spent_mid_city_never_splits_the_grid_from_its_walk` (killed by a per-launch read); `test_a_resumed_grid_that_completes_is_followed_by_its_free_walk` and `test_a_resumed_grid_that_pauses_still_defers_its_walk` (the fake grid clears its checkpoint and promotes the census, or exits 83); `test_a_cached_walk_is_exempt_and_a_fresh_one_is_not`; `test_the_stranded_walk_retry_is_exempt_through_the_retry_pass` (driven through `_retry_stranded_walks` itself); `test_an_unhoisted_resumer_still_runs_when_the_reserve_fills_the_allowance`.
+- `test_an_unfinishable_city_is_skipped_as_unfinishable_never_held` — the #456 WARNING and `ceiling_skipped`, and `allowance_skipped` stays 0.
+- The reserve and the charge: `test_resumes_are_reserved_out_of_the_allowance_first` (killed by skipping the reserve); `test_a_resume_does_not_spend_the_fresh_allowance` (killed by charging every launch as fresh); `test_a_launch_on_the_pool_path_is_charged` (two lanes, as prod; killed by dropping `end_charge`).
+- Reporting: `test_the_done_clause_carries_the_numbers_and_never_the_held_token` (the exact clause, and `mapillary_night_report._HELD_RE` matches nothing); `test_a_rest_night_beside_a_spent_allowance_keeps_the_held_count_mapillarys` (the regex's `n` is the Mapillary launches alone); `test_the_dry_run_holds_what_the_night_would_hold`; `test_status_names_the_night_allowance`; `test_ignore_host_holds_lifts_the_night_allowance`.
+- `test_a_spent_night_allowance_leaves_kartaview_not_the_city` (`tests/test_fill_underfull_nights.py`) — through `_fill_admission`: `held_left` on a real night's backlog, `host_left` on the edge path, and a live checkpoint never left.
+
 ## The Mapillary night report (issue #444)
 
 `tests/test_mapillary_night_report.py` pins `scripts/mapillary_night_report.py`, the read-only Stage 1 read-out.
