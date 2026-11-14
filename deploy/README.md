@@ -271,9 +271,11 @@ It is bounded by `TimeoutStopSec=30min`. Reaching that is a SIGKILL with no tail
 
 Two cautions:
 
-- **Do not type `stop` twice.** The tail runs outside the SIGTERM handler's
-  scope, so a second stop during it kills the publish with the default
-  disposition. systemd itself only sends SIGTERM once, so one `stop` is safe.
+- **A SIGTERM during the tail is logged and ignored** (#389), so a `stop`
+  typed while the tail runs, or the unit's `TimeoutStartSec` landing there, no
+  longer kills the aggregate and the backup. It still reaches a publish rsync
+  in flight at that instant (the cgroup gets the signal), so if the night
+  reports `PUBLISH FAILED`, run `regenerate-aggregate --publish` by hand.
 - **A stop mid-city releases the Mapillary and Overpass host locks**, so it is a
   reasonable prelude to the manual work described in the next section.
 - **A stop also starts the chained prefreeze pass** the moment the unit goes
@@ -295,7 +297,10 @@ systemctl --user show streetscape-tracker.service -p TimeoutStopUSec
 #   want: TimeoutStopUSec=30min      NOT: TimeoutStopUSec=1min 30s
 ```
 
-`daemon-reload` is safe during a live batch; `stop` obviously is not.
+`daemon-reload` is safe during a live batch for this unit's other directives;
+`stop` obviously is not. A copy that changes `TimeoutStartSec` goes in between
+nights (whether a running oneshot keeps the timeout it started with is
+unverified either way; see "Raising the night's length").
 
 The same copy-and-reload is what makes `Environment=STREETSCAPE_NIGHTLY=1`
 (issue #412) live. It is one of two independent ways `run-due` recognises the
@@ -985,6 +990,29 @@ systemctl --user list-timers --all | grep streetscape                          #
 ```
 
 The first chained pass is the next night's end; a tranche enabled the afternoon of the deploy needs the manual `--nights 1 --limit 40 --execute` pass.
+
+#### Raising the night's length
+
+`[schedule].max_batch_hours` is read from the checkout, so **`git pull` makes a new value live at the next 02:00 whether or not the unit was re-copied**; the unit is a copy and changes nothing until the `cp` and the `daemon-reload`.
+So the unit goes first, deployed and verified on its own, and the `max_batch_hours` raise is a later, config-only pull.
+If the order is ever got wrong the night is not lost: a nightly whose installed unit cannot hold the window is shortened to fit and mails `night shortened to N h` (#389), and `timer-status` reports the collection unit `VIOLATED` until the unit is fixed.
+Read `docs/scheduler.md`, "The night's length", first: it lists what a raise must settle before the unit is the only thing left.
+
+```bash
+pgrep -af '[s]cheduler .*run-due' || echo idle                     # never mid-batch
+systemctl --user is-active streetscape-prefreeze.service            # want: inactive
+systemctl --user show streetscape-tracker.service -p DropInPaths    # want: empty; a drop-in outranks the unit file
+diff ~/.config/systemd/user/streetscape-tracker.service deploy/systemd/streetscape-tracker.service   # carry over any local edit
+cp deploy/systemd/streetscape-tracker.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user show streetscape-tracker.service -p TimeoutStartUSec -p TimeoutStopUSec -p Environment
+#   want: the unit's TimeoutStartSec, 30min, and STREETSCAPE_UNIT_TIMEOUT_START_S equal to it in seconds
+.venv-makelab2/bin/python -m streetscape_metadata_tracker.scheduler --config config/scheduler.makelab1.toml timer-status
+#   want: "collection unit (loaded): ... : ok"
+```
+
+"Never mid-batch" stands on its own: whether a running oneshot keeps the start timeout it began with across a `daemon-reload` is unverified either way, so no step here relies on it.
+`systemctl --user set-property` cannot set a timeout, so the stale `user.control` drop-in of 2026-08 is not this failure; a hand-written `streetscape-tracker.service.d/*.conf` is, which is what the `DropInPaths` line and `timer-status` are for.
 
 ### Turning an opt-in channel on in production (KartaView, #248; the same shape for every opt-in channel since)
 

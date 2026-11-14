@@ -79,7 +79,7 @@ The status call keeps `Error` and `Traceback` lines, because a filter for the bu
 ### 2. Read what the batch is doing
 
 - **Is a `run-due` in flight?** Any line under "run-due in flight" means yes, whether it is the nightly unit (`streetscape-tracker.service` active) or a hand-started catch-up.
-  The timer fires at 02:00 Pacific and `max_batch_hours = 12` stops it launching cities at ~14:00; the bounded tail (aggregate, manifests, backup, publish) runs past that, so read `ps`, never the clock.
+  The timer fires at 02:00 Pacific (up to 16 min late) and stops launching cities `max_batch_hours` later (12 h, so ~14:16), or earlier on a night shortened to fit its unit (#389); the tail (aggregate, manifests, backup, publish) runs past that, so read `ps`, never the clock.
 - **Which channels can it still reach?** Read the in-flight `run-due`'s args.
   The nightly unit passes no `--provider`, so it collects **every** enabled channel; a hand catch-up's `--provider` list is the whole of what it can touch.
   The batch is **city-major**: it walks its due cities in order and runs each city's due channels (two at once, in host-disjoint lanes, on prod), so the channel that is live this minute says little about the next one, and an unfiltered night is back on `gsv` with the next city.
