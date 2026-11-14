@@ -161,6 +161,30 @@ def test_the_manual_resize_guard_diverts_only_a_would_be_resize():
     assert over_threshold.action == "DEFER" and "threshold" in over_threshold.reason
 
 
+@pytest.mark.parametrize(
+    "audit_row",
+    [
+        row("UNDER", osm_w=40000, osm_h=35000, sug_lat=43.49, sug_lon=-116.42),  # over 30 km
+        row("NO_POLYGON", **_FITTED_ROW),
+        row("WRONG_PLACE", **_FITTED_ROW),
+    ],
+    ids=["over-threshold", "no-polygon", "wrong-place"],
+)
+def test_every_deferral_of_a_hand_fitted_grid_recommends_keeping_it(audit_row):
+    """A town fitted by hand usually sits inside a huge boundary, which is the
+    over-threshold branch, not the would-be RESIZE one. Whatever defers it, the
+    review page must not be handed a recommendation to grow it (PR #466
+    review round 2). The branch's own reason is kept."""
+    plain = rr.decide(audit_row, cur(43.49753, -116.42638, 4900, 5700))
+    fitted = rr.decide(audit_row, cur(43.49753, -116.42638, 4900, 5700, manually_resized=True))
+    assert plain.action == fitted.action == "DEFER"
+    assert fitted.reason == plain.reason
+    assert (fitted.rec_width_m, fitted.rec_height_m) == (4900, 5700)
+    assert (fitted.rec_center_lat, fitted.rec_center_lon) == (43.49753, -116.42638)
+    assert "fitted by hand" in fitted.rec_basis
+    assert "fitted by hand" not in plain.rec_basis  # premise: the generic advice differs
+
+
 def test_load_current_geometry_reads_the_resize_note_resize_city_writes(tmp_path, monkeypatch):
     """End to end across the two scripts: the note resize_city.py really writes
     is the note reregister_boundaries.py really reads, among other notes."""

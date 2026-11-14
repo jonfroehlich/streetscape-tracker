@@ -452,12 +452,57 @@ def test_dry_run_notes_a_batch_row_that_could_take_a_catalog_reuse(
     earlier row of the batch once that row is geocoded."""
     existing_id = _register_existing(catalog, center=(10.0, 20.05))  # 5.5 km east of A
     rows = [
-        dict(_ROW_A, lon="19.95"),  # 11 km west of the catalog city: NEW
+        dict(_ROW_C, lon="19.95"),  # 11 km west of the catalog city: NEW
         _ROW_A,  # 5.5 km from each
     ]
     out = _dry_run(tmp_path, catalog, capsys, rows, "--overlap-km", "6", "--max-center-km", "10")
     assert f"REUSE existing {existing_id}" in out
-    assert "NOTE: [1] Aville, Testland is 5.5 km away" in out
+    assert "NOTE: [1] Cville, Testland is 5.5 km away" in out
+    assert "1 note(s) on catalog reuses" in out
+
+
+def test_dry_run_reports_rows_execute_would_resolve_by_name(
+    tmp_path, catalog, fake_geocode, capsys
+):
+    """Two rows 110 km apart are no distance overlap, but --execute still
+    makes one city of them when they share a query, or a city/admin/country
+    under different queries. The dry run printed NEW for both and
+    newly-registered=2 (PR #466 review round 2)."""
+    far = dict(lon="21.0")  # 110 km east of _ROW_A
+    rows = [
+        _ROW_A,
+        dict(_ROW_A, **far),  # same query
+        dict(_ROW_A, **far, query_string="Aville (east), Testland"),  # same identity only
+    ]
+    flags = ("--overlap-km", "5", "--max-center-km", "10")
+    out = _dry_run(tmp_path, catalog, capsys, rows, *flags)
+    lines = out.splitlines()
+    assert "NEW (would geocode" in lines[0]
+    assert "SAME CITY IN-BATCH as [1] Aville, Testland (same query" in lines[1]
+    assert "SAME CITY IN-BATCH as [1] Aville, Testland (same city/admin/country" in lines[2]
+    assert "newly-registered=1" in out
+    assert "2 that share an earlier row's query" in out
+
+    # --execute agrees: one city, the other two rows reported as already there,
+    # and only ONE geocode spent.
+    manifest = str(tmp_path / "frame.csv")
+    assert rf.main(["--manifest", manifest, "--db-path", catalog, *flags, "--execute"]) == 0
+    executed = capsys.readouterr().out
+    assert "already-registered=2" in executed and "newly-registered=1" in executed
+    assert "same city/admin/country; query aliased" in executed
+    assert fake_geocode["calls"] == 1
+    conn = db.connect(catalog)
+    assert len(db.get_all_cities(conn)) == 1
+    assert db.resolve_city(conn, "Aville (east), Testland") is not None
+    conn.close()
+
+
+def test_in_batch_neighbour_reach_is_inclusive_like_find_overlap():
+    exact_km = rf._haversine_km(10.0, 20.0, 10.0, 20.05)
+    earlier = [("[1] A", 10.0, 20.0)]
+    assert rf.in_batch_neighbour(earlier, 10.0, 20.05, exact_km) == ("[1] A", exact_km)
+    assert rf.in_batch_neighbour(earlier, 10.0, 20.05, exact_km - 1e-9) is None
+    assert rf.in_batch_neighbour([], 10.0, 20.05, 100.0) is None
 
 
 def test_find_overlap_picks_nearest_within_threshold():
