@@ -207,10 +207,13 @@ function mortonAtLevel(code, fromLevel, toLevel) {
  * Growable typed columns for the run's dated pano markers, appended in marker
  * order so a pano's id is its index here and in city.js's marker array.
  *
- * About 19 bytes per pano: lat and lon as Float64, the capture YEAR as Uint16
- * (the year filter's key), and whether the pano is official imagery (the
- * Google-only mode's key) as Uint8. The selected capture DATE is deliberately
- * not a column: it only restyles dots and never decides which are drawn.
+ * 19 bytes of data per pano: lat and lon as Float64, the capture YEAR as
+ * Uint16 (the year filter's key), and whether the pano is official imagery
+ * (the Google-only mode's key) as Uint8. The buffers grow by doubling and
+ * `finish()` returns views rather than copies, so up to twice that is
+ * retained: 19 to 38 bytes per pano, depending on how far the count sits past
+ * a power of two. The selected capture DATE is deliberately not a column: it
+ * only restyles dots and never decides which are drawn.
  *
  * @example
  *   const cols = createPanoColumns();
@@ -627,6 +630,17 @@ function isViewDependent({ populationSize, budget, renderAll }) {
  * panos are unioned in, as before #77, so the map cannot under-show the
  * date the chart reports, and city.js only dims the rest.
  *
+ * An open popup's pano (`pinnedItem`) is kept drawn on EVERY re-plan, whatever
+ * caused it (a move, a date, the flat toggle, Render all), because removing a
+ * Leaflet marker closes its popup. It is dropped only when it has left the
+ * population (`inPopulation` is false: a year or imagery mode that excludes
+ * it), which is a filter the reader chose, and when the layer is off.
+ *
+ * A re-plan that lands in the sampled tier again, on the same sample
+ * (`sampleKey`), date (`dateKey`) and pin, reuses the previous plan's set
+ * (`reused: true`) rather than rebuilding and re-diffing the same 40,000
+ * markers on every pan; `sampleItems` and `dateItems` are then not called.
+ *
  * Flat-only points are not pano dots and never enter `desired`; `flatShown`
  * is the flat layer's own switch and ignores the Panoramas layer.
  *
@@ -656,14 +670,27 @@ function isViewDependent({ populationSize, budget, renderAll }) {
  * @param {?function(): Iterable} s.dateItems - The selected date's in-mode
  *   panos, or null when no date is selected.
  * @param {*} [s.pinnedItem] - An open popup's pano, kept drawn; or null.
+ * @param {function(*): boolean} [s.inPopulation] - Whether the pinned pano is
+ *   still in the population (mode and year); absent = always.
+ * @param {?Object} [s.prevPlan] - The plan the map shows now, or null.
+ * @param {string} [s.sampleKey] - Names the sample `sampleItems` returns (the
+ *   filter, and which build of the caches); equal keys mean the same sample.
+ * @param {?string} [s.dateKey] - Names the selected date, or null.
  * @returns {{mode: string, tier: ?string, desired: Set, inViewCount: ?number,
- *   announce: ?string, flatShown: boolean}}
+ *   announce: ?string, flatShown: boolean, reused: boolean, sampleKey: ?string,
+ *   dateKey: ?string, pinnedItem: *}}
  */
 function planMapView(s) {
   const flatShown = Boolean(s.flatOn);
+  const dateKey = s.dateKey ?? null;
   if (s.panosHidden) {
-    return { mode: "hidden", tier: s.prevTier, desired: new Set(), inViewCount: null, announce: null, flatShown };
+    return {
+      mode: "hidden", tier: s.prevTier, desired: new Set(), inViewCount: null, announce: null,
+      flatShown, reused: false, sampleKey: null, dateKey, pinnedItem: null,
+    };
   }
+  const pinnedItem = s.pinnedItem != null && (!s.inPopulation || s.inPopulation(s.pinnedItem))
+    ? s.pinnedItem : null;
 
   let mode;
   let tier;
@@ -682,11 +709,22 @@ function planMapView(s) {
       tier = inViewCount <= limit ? "complete" : "sampled";
     }
     mode = tier === "complete" ? "view" : "sample";
-    desired = new Set(tier === "complete" ? s.viewItems() : s.sampleItems());
   }
 
-  if (s.dateItems) for (const item of s.dateItems()) desired.add(item);
-  if (s.pinnedItem != null) desired.add(s.pinnedItem);
+  const sampleKey = mode === "sample" ? (s.sampleKey ?? null) : null;
+  const p = s.prevPlan;
+  const reused = Boolean(
+    mode === "sample" && p && p.mode === "sample" && sampleKey != null
+      && p.sampleKey === sampleKey && p.dateKey === dateKey && p.pinnedItem === pinnedItem
+  );
+  if (reused) {
+    desired = p.desired;
+  } else {
+    if (mode === "view") desired = new Set(s.viewItems());
+    else if (mode === "sample") desired = new Set(s.sampleItems());
+    if (s.dateItems) for (const item of s.dateItems()) desired.add(item);
+    if (pinnedItem != null) desired.add(pinnedItem);
+  }
 
   const changed = s.prevTier != null && tier !== s.prevTier && !s.freezeTier;
   return {
@@ -696,6 +734,10 @@ function planMapView(s) {
     inViewCount,
     announce: changed ? TIER_ANNOUNCEMENTS[tier] : null,
     flatShown,
+    reused,
+    sampleKey,
+    dateKey,
+    pinnedItem,
   };
 }
 
@@ -705,9 +747,9 @@ function planMapView(s) {
  *
  * @example
  *   drawnNoticeText({ mode: "sample", drawn: 40000, population: 250000,
- *                     visible: null, budget: 40000, yearFiltered: false });
+ *                     visible: null, yearFiltered: false });
  *   // "Showing a spatial sample: 40,000 of 250,000 panoramas. Zoom in to see
- *   //  every panorama; all are drawn once 40,000 or fewer are in view."
+ *   //  every panorama."
  *
  * @param {Object} s
  * @param {string} s.mode - A plan's mode.
@@ -715,7 +757,6 @@ function planMapView(s) {
  * @param {number} s.population - Panos in the current mode and year.
  * @param {?number} s.visible - Population panos inside the visible map (not
  *   the padded drawn area), for the "view" mode.
- * @param {number} s.budget
  * @param {boolean} s.yearFiltered - A year filter is active.
  * @param {boolean} [s.renderAll]
  * @returns {string}
@@ -731,8 +772,11 @@ function drawnNoticeText(s) {
     const n = s.visible ?? s.drawn;
     return `Showing all ${f(n)} panorama${n === 1 ? "" : "s"} in view.`;
   }
+  // No threshold is quoted: the tier is counted over the drawn area (the view
+  // plus a margin) with hysteresis, so "N or fewer in view" would be false for
+  // a view holding fewer than N that is still sampled.
   return `Showing a spatial sample: ${f(s.drawn)} of ${f(s.population)} panoramas. `
-    + `Zoom in to see every panorama; all are drawn once ${f(s.budget)} or fewer are in view.`;
+    + "Zoom in to see every panorama.";
 }
 
 if (typeof module !== "undefined" && module.exports) {

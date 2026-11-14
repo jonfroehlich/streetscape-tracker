@@ -267,6 +267,12 @@ def main():
             f"{out_arg}"
         ),
         "commit": _git("rev-parse", "HEAD"),
+        # The content hash of the committed www/ the "after" copy was served
+        # from, so a record committed together with that www/ can be checked
+        # (`git rev-parse <commit>:www`) whatever commit it lands in; and
+        # whether the working tree's www/ differed from it.
+        "www_tree": _git("rev-parse", "HEAD:www"),
+        "www_dirty": bool(_git("status", "--porcelain", "--", "www")),
         "main_commit": _git("rev-parse", "origin/main"),
         "platform": f"{platform.system()} {platform.release()} {platform.machine()}",
         "viewport": VIEWPORT,

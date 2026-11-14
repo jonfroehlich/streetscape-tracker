@@ -275,14 +275,19 @@ The dot tier is now **view-dependent** for such a city.
 `planMapView` (`www/js/pano-overview.js`, pure and node-tested) decides on every `moveend`:
 
 - **complete** — the map's area padded 10% each side (`DRAWN_AREA_PAD`) holds at most `RENDER_CAP` in-mode panoramas, so every one of them is drawn, and the legend says "Showing all N panoramas in view." with N counted over the visible map, not the padded area.
-- **sampled** — more than that, so the old global stride sample is drawn, and the legend says how many of how many and that zooming in shows every one.
+- **sampled** — more than that, so the old global stride sample is drawn, and the legend says how many of how many and "Zoom in to see every panorama."
+  It quotes **no threshold**: the tier is counted over the padded area (1.44 × the visible one) with hysteresis, so "every pano once 40,000 or fewer are in view" was false for any view holding about 28,000 to 40,000 that is still sampled (review 1 of the PR).
 - A city at or under the cap is never view-dependent (`isViewDependent`): it draws everything, never counts a view and never builds the index, exactly as before.
 
 Rules that must survive without a read:
 
 - **Hysteresis.** Leaving complete needs `TIER_LEAVE_FACTOR` (1.25) × the budget; entering needs the budget. Without the band a view near 40,000 flips tier on every small pan.
-- **An open popup's auto-pan never re-tiers** (`autopanstart` freezes the tier for that move), and the open popup's pano is kept in the drawn set while it is open, or the auto-pan that brings a popup into view could delete the marker the popup belongs to.
+- **An open popup's auto-pan never re-tiers** (`autopanstart` freezes the tier for that move), and the open popup's pano is kept in the drawn set on **every** re-plan while it is open — a move, a date, the flat toggle, Render all — because removing a Leaflet marker closes its popup.
+  The planner drops it only when it leaves the population (a year or imagery mode that excludes it) or the Panoramas layer goes off.
   Only pano markers are pinned (`options.panoIdx`), never a flat-only point.
+- **Legend clicks stop at the legend** (`L.DomEvent.on(div, "click", stopPropagation)`), not only through `disableClickPropagation`: most legend buttons rebuild the legend in their own handler, so the click reached the map with a detached target, Leaflet's walk up to the legend's mark failed, and it read as a background click that closes popups.
+- **A pan that stays sampled reuses the drawn set** (`plan.reused`): same sample (`sampleKey`, which names the filter and the mode caches' build), same date, same pin, so nothing is rebuilt or re-diffed.
+- **Nothing is planned until the run has streamed** (`mapReady`): a background click mid-stream once recorded a tier for an empty population, and the dense city then announced a change on load.
 - **A selected date only adds.** Its in-mode panoramas are unioned into the drawn set in every tier, as before #77; it never decides the tier and never narrows the set.
 - **A tier change is announced once** through the polite live region `#map-tier-status` (`TIER_ANNOUNCEMENTS`), never on the first plan, and never on a frozen move; the legend's notice `#map-drawn-notice` is patched in place on every move, without rebuilding the legend.
 - **The first plan runs after `fitBounds`** (non-animated) on the fitted view, so a dense city is never counted at Leaflet's default view and re-tiered a frame later.
@@ -297,6 +302,7 @@ The index is built lazily on the first view-dependent plan and measured as the `
 
 **What this does not do.**
 Every pano is still an eager Leaflet marker built during streaming, so a large city loads no faster and takes no less memory than before; only what is drawn per view changed.
+The index adds to it: 19 bytes of columns per pano, retained as 19 to 38 (the buffers grow by doubling and `finish()` keeps views), one marker reference per pano in `panoMarkersById`, and the index's own arrays (8 MB at 1,000,000 panos).
 The overview layer for wide views, lazy markers and a pipeline-emitted index are named follow-ups on #77.
 
 **The control is `collapsed: false`.**

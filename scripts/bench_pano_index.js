@@ -119,6 +119,8 @@ function benchSize(n, repeats) {
   for (const key of Object.keys(runs[0])) summary[key] = median(runs.map((x) => x[key]));
   return {
     n,
+    // Exact here (19 bytes a pano), because the builder is sized to n; the
+    // page's builder grows by doubling and so retains 19 to 38.
     columns_bytes: c.lat.byteLength + c.lon.byteLength + c.year.byteLength + c.official.byteLength,
     runs,
     median: summary,

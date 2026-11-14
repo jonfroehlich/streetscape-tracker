@@ -434,6 +434,75 @@ test("planner: a selected date only adds its panos; it never decides the tier or
   assert.deepEqual([...under.desired].sort(), ["d1", "p1", "p2", "p3"]);
 });
 
+test("planner: an open popup's pano is kept on every re-plan, and dropped only when it leaves the population", () => {
+  // The planner takes no "cause": a move, a date key, the flat toggle and a
+  // Render-all round trip all re-plan through it, and each must keep the pin.
+  const causes = {
+    move: {},
+    date: { dateItems: () => ["d1"], dateKey: "Mon Apr 13 2026" },
+    flatToggle: { flatOn: true },
+    renderAllOn: { renderAll: true },
+    renderAllOff: { renderAll: false },
+  };
+  for (const [prevTier, count] of [["complete", 5], ["sampled", 10 ** 6]]) {
+    for (const [cause, extra] of Object.entries(causes)) {
+      const plan = planMapView(state({
+        prevTier, countInView: () => count, pinnedItem: "popup", inPopulation: () => true, ...extra,
+      }));
+      assert.ok(plan.desired.has("popup"), `${cause} in ${prevTier}`);
+      assert.equal(plan.pinnedItem, "popup");
+    }
+  }
+  // A year or imagery mode the reader chose that excludes the pano drops it.
+  const excluded = planMapView(state({ countInView: () => 5, pinnedItem: "popup", inPopulation: () => false }));
+  assert.equal(excluded.desired.has("popup"), false);
+  assert.equal(excluded.pinnedItem, null);
+  // So does turning the Panoramas layer off.
+  assert.equal(planMapView(state({ panosHidden: true, pinnedItem: "popup" })).desired.size, 0);
+});
+
+test("planner: a re-plan in the same sample reuses its set and builds nothing", () => {
+  const first = planMapView(state({ prevTier: "sampled", countInView: () => 10 ** 6, sampleKey: "g0|true|null" }));
+  assert.equal(first.reused, false);
+  // A pan that stays sampled: the same Set object, and neither list is asked for.
+  const pan = planMapView(state({
+    prevTier: "sampled", prevPlan: first, countInView: () => 10 ** 6 + 7, sampleKey: "g0|true|null",
+    sampleItems: boom("sampleItems"), dateItems: null,
+  }));
+  assert.equal(pan.reused, true);
+  assert.equal(pan.desired, first.desired);
+  assert.equal(pan.mode, "sample");
+  // Anything that changes the set rebuilds it: another sample, a date, a pin.
+  for (const extra of [
+    { sampleKey: "g0|true|2019" },
+    { sampleKey: "g1|true|null" },
+    { dateItems: () => ["d1"], dateKey: "Mon Apr 13 2026" },
+    { pinnedItem: "popup" },
+  ]) {
+    const plan = planMapView(state({
+      prevTier: "sampled", prevPlan: first, countInView: () => 10 ** 6, sampleKey: "g0|true|null", ...extra,
+    }));
+    assert.equal(plan.reused, false, JSON.stringify(extra));
+    assert.notEqual(plan.desired, first.desired);
+  }
+  // The complete tier never reuses: its set depends on the view.
+  const view = planMapView(state({ prevTier: "complete", prevPlan: { ...first, mode: "view" }, countInView: () => 5 }));
+  assert.equal(view.reused, false);
+});
+
+test("drawnNoticeText makes no claim the sampled tier's own band falsifies", () => {
+  // Review 1's reproduction: 1,791 panos in the visible map, 2,577 in the padded
+  // area the tier is counted on, budget 2,000. The tier stays sampled, so any
+  // "every pano once N or fewer are in view" would be false in this state.
+  const budget = 2000;
+  const plan = planMapView(state({ budget, populationSize: 59316, prevTier: "sampled", countInView: () => 2577 }));
+  assert.equal(plan.tier, "sampled");
+  const text = drawnNoticeText({ mode: plan.mode, drawn: budget, population: 59316, visible: null, budget });
+  assert.doesNotMatch(text, /in view/);
+  assert.doesNotMatch(text, /or fewer/);
+  assert.equal(text, "Showing a spatial sample: 2,000 of 59,316 panoramas. Zoom in to see every panorama.");
+});
+
 test("drawnNoticeText says, in words, which state the dots are in", () => {
   const n = (v) => v.toLocaleString();
   const sample = drawnNoticeText({ mode: "sample", drawn: 40000, population: 250000, visible: null, budget: BUDGET });

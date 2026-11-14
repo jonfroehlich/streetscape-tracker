@@ -3184,11 +3184,18 @@ def test_zooming_into_a_dense_city_draws_every_pano_in_view(page: Page, base_url
     in_mode = 60_000 - dense_cities["gsv"]["n_contributor"]  # Google-only by default
     assert (s["tier"], s["mode"], s["onMap"]) == ("sampled", "sample", 40_000)
     assert s["notice"] == (
-        f"Showing a spatial sample: 40,000 of {in_mode:,} panoramas. "
-        "Zoom in to see every panorama; all are drawn once 40,000 or fewer are in view."
+        f"Showing a spatial sample: 40,000 of {in_mode:,} panoramas. Zoom in to see every panorama."
     )
     assert s["drawnInView"] < s["inViewTotal"]
     assert s["status"] == "", "the first plan must not announce anything"
+
+    # A pan that stays sampled reuses the drawn set rather than rebuilding it
+    # (review 1, finding 4): the same Set object, nothing added or removed.
+    page.evaluate("window.__set = desiredShown; void map.panBy([200, 0], {animate: false})")
+    assert page.evaluate(
+        "mapTier === 'sampled' && lastPlan.reused && desiredShown === window.__set"
+    )
+    assert _dense_state(page)["onMap"] == 40_000
 
     # Two levels in: every in-mode pano in the drawn area, exactly.
     _zoom_by(page, 2, "complete")
@@ -3262,6 +3269,20 @@ def test_an_open_popup_survives_its_auto_pan_and_a_pan_away(page: Page, base_url
     )
     assert page.evaluate("window.__pinTest.isPopupOpen() && map.hasLayer(window.__pinTest)")
 
+    # A re-plan that is not a move keeps it too (review 1, finding 2): the
+    # legend's "Render all" and back, which redraws everything twice.
+    # Real clicks, because a legend button rebuilds the legend inside its own
+    # handler, and that once let the click through to the map as a background
+    # click, which closes popups (Leaflet's preclick).
+    page.locator("#render-all-btn").click()
+    page.wait_for_function("lastPlan.mode === 'all'")
+    page.locator("#render-all-btn").click()
+    page.wait_for_function("lastPlan.mode === 'view'")
+    assert page.evaluate("window.__pinTest.isPopupOpen() && map.hasLayer(window.__pinTest)")
+    assert page.evaluate(
+        "!map.getBounds().pad(DRAWN_AREA_PAD).contains(window.__pinTest.getLatLng())"
+    ), "precondition: the pin is all that keeps this pano drawn"
+
     # Closed, it is an ordinary dot again: the next move drops it.
     page.evaluate("map.closePopup(); void map.panBy([0, 5], {animate: false})")
     assert page.evaluate("!map.hasLayer(window.__pinTest)")
@@ -3327,4 +3348,175 @@ def test_a_city_under_the_cap_never_counts_a_view(page: Page, base_url):
     assert page.evaluate("lastPlan.mode") == "all"
     assert page.evaluate("onMap.size === inModeAll.length && onMap.size > 0")
     expect(page.locator("#map-drawn-notice")).to_have_count(0)
+    assert errors == []
+
+
+# The drawn set city.js SHOULD hold, re-derived from its own caches by brute
+# force rather than through the index or the planner: the population (mode and
+# year), then the whole of it, the part inside the padded drawn area, or the
+# stride sample, by the plan's mode; plus a selected date's panos and an open
+# popup's. Also how many drawn markers carry the wrong date style, and the
+# padded-area count the tier rule must agree with.
+_DENSE_EXPECTED_FN = """() => {
+  const year = activeYears.size ? [...activeYears][0] : null;
+  const pop = year == null ? inModeAll : (inModeByYear.get(year) ?? []);
+  const padded = map.getBounds().pad(DRAWN_AREA_PAD);
+  const inPadded = pop.filter((m) => padded.contains(m.getLatLng()));
+  const mode = lastPlan.mode;
+  const want = new Set(mode === "all" ? pop : mode === "view" ? inPadded : sampledPopulation(year));
+  const dk = selectedDate ? selectedDate.toDateString() : null;
+  if (dk) for (const m of inModeByDateStr.get(dk) ?? []) want.add(m);
+  if (pinnedMarker && pop.includes(pinnedMarker)) want.add(pinnedMarker);
+  let missing = 0, extra = 0, badStyle = 0;
+  for (const m of want) if (!onMap.has(m)) missing++;
+  for (const m of onMap) {
+    if (!want.has(m)) extra++;
+    const s = markerDateStyle(m.options.captureDate.toDateString(), dk);
+    if (m.options.fillOpacity !== s.fillOpacity || m.options.radius !== s.radius) badStyle++;
+  }
+  return { mode, tier: mapTier, cap: RENDER_CAP, popSize: pop.length, padded: inPadded.length,
+           onMap: onMap.size, want: want.size, missing, extra, badStyle, renderAll: renderAllOverride };
+}"""
+
+
+def _assert_drawn_as_expected(page: Page, what: str) -> dict:
+    """The drawn set equals the brute-force one, every dot is styled for the
+    selected date, and the tier agrees with the padded count."""
+    s = page.evaluate(_DENSE_EXPECTED_FN)
+    assert (s["missing"], s["extra"], s["badStyle"]) == (0, 0, 0), f"{what}: {s}"
+    if s["mode"] == "all":
+        assert s["renderAll"] or s["popSize"] <= s["cap"], f"{what}: {s}"
+    elif s["padded"] <= s["cap"]:
+        assert s["tier"] == "complete", f"{what}: {s}"
+    elif s["padded"] > s["cap"] * 1.25:
+        assert s["tier"] == "sampled", f"{what}: {s}"
+    return s
+
+
+def _route_render_cap(page: Page, cap: int):
+    """Serve streetscape-utils.js with RENDER_CAP lowered, so a single year of the
+    60,000-pano dense city is over the cap (a year holds about 3,400 of it)."""
+
+    def handler(route):
+        response = route.fetch()
+        body = response.text().replace("const RENDER_CAP = 40000;", f"const RENDER_CAP = {cap};")
+        route.fulfill(response=response, body=body)
+
+    page.route("**/js/streetscape-utils.js", handler)
+
+
+def test_the_dot_tier_wiring_follows_year_date_mode_and_render_all(
+    page: Page, base_url, dense_cities
+):
+    """city.js feeds the planner the right population for every filter (review 1, finding 3).
+
+    The planner's rules are node-tested; this pins the wiring that feeds them —
+    the per-cell counts keyed on the year, the date union and its dimming on a
+    move, the Google/all mode, and a Render-all round trip — against a brute-force
+    drawn set after every step. RENDER_CAP is lowered to 2,000 so a year is over it.
+    """
+    errors = _capture_errors(page)
+    _route_render_cap(page, 2_000)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    page.goto(f"{base_url}/city.html?file={dense_cities['gsv']['csv']}")
+    expect(page.locator("#map-drawn-notice")).to_be_visible()
+    assert page.evaluate("RENDER_CAP") == 2_000, "precondition: the lowered cap was served"
+    assert _assert_drawn_as_expected(page, "load")["tier"] == "sampled"
+
+    centre = page.evaluate("[map.getCenter().lat, map.getCenter().lng]")
+    page.evaluate(f"void map.setView({centre}, 18, {{animate: false}})")
+    assert _assert_drawn_as_expected(page, "z18")["tier"] == "complete"
+
+    # A year over the cap: view-dependent under the year's own counts.
+    year = page.evaluate("""() => {
+      const y = map.getCenter();
+      let best = null;
+      for (const m of onMap) if (!best || m.getLatLng().distanceTo(y) < best.getLatLng().distanceTo(y)) best = m;
+      return best.options.captureDate.getFullYear();
+    }""")
+    page.evaluate(f"toggleYear({year})")
+    s = _assert_drawn_as_expected(page, "year at z18")
+    assert s["popSize"] > 2_000 and s["mode"] in ("view", "sample"), s
+    page.evaluate("void map.setZoom(13, {animate: false})")  # the whole year in view
+    assert _assert_drawn_as_expected(page, "year at z13")["tier"] == "sampled"
+    # Where the year alone fits the cap and the whole run does not, with whole
+    # index cells inside the view: the per-cell counts must be the year's.
+    page.evaluate(f"void map.setView({centre}, 16, {{animate: false}})")
+    s = _assert_drawn_as_expected(page, "year at z16")
+    every_year = page.evaluate(
+        "inModeAll.filter((m) => map.getBounds().pad(DRAWN_AREA_PAD).contains(m.getLatLng())).length"
+    )
+    assert s["padded"] <= 2_000 < every_year, (s, every_year)
+    assert s["tier"] == "complete"
+    page.evaluate(f"void map.setView({centre}, 18, {{animate: false}})")
+    page.evaluate("void map.panBy([300, 200], {animate: false})")
+    assert _assert_drawn_as_expected(page, "year, panned")["tier"] == "complete"
+
+    # A selected date: its panos are added and the rest dimmed; never re-tiered.
+    tier = page.evaluate("mapTier")
+    page.evaluate("""() => {
+      selectedDate = [...onMap][0].options.captureDate;
+      applyDesired();
+    }""")
+    assert _assert_drawn_as_expected(page, "date")["tier"] == tier
+    page.evaluate("void map.panBy([-500, 0], {animate: false})")
+    _assert_drawn_as_expected(page, "date, panned")  # newly added dots dimmed too
+    page.evaluate("void map.setZoom(15, {animate: false})")
+    _assert_drawn_as_expected(page, "date, sampled")
+    page.evaluate(f"selectedDate = null; toggleYear({year})")
+    _assert_drawn_as_expected(page, "filters cleared")
+
+    # All GSV: the contributor district joins the population.
+    page.evaluate("setGsvMode(true)")
+    s = _assert_drawn_as_expected(page, "all GSV")
+    assert s["popSize"] == 60_000
+    page.evaluate(f"void map.setView({centre}, 18, {{animate: false}})")
+    _assert_drawn_as_expected(page, "all GSV, z18")
+    page.evaluate("setGsvMode(false)")
+    _assert_drawn_as_expected(page, "Google only again")
+
+    # Render all and back.
+    page.evaluate("void map.setZoom(15, {animate: false})")
+    page.locator("#render-all-btn").click()
+    s = _assert_drawn_as_expected(page, "render all")
+    assert (s["mode"], s["onMap"]) == ("all", s["popSize"])
+    page.locator("#render-all-btn").click()
+    assert _assert_drawn_as_expected(page, "limit to view")["tier"] == "sampled"
+    # Render all under a year draws that year whole, not the run.
+    page.evaluate(f"toggleYear({year})")
+    page.locator("#render-all-btn").click()
+    s = _assert_drawn_as_expected(page, "render all, one year")
+    assert (s["mode"], s["onMap"]) == ("all", s["popSize"]) and s["popSize"] < 60_000
+    page.locator("#render-all-btn").click()
+    _assert_drawn_as_expected(page, "limit to view, one year")
+    assert errors == []
+
+
+def test_a_click_while_the_run_streams_decides_no_tier(page: Page, base_url, dense_cities):
+    """No tier is decided and nothing announced before the load completes (review 1, finding 6).
+
+    A background click mid-stream used to plan an empty population, record
+    "complete", and so give the first real plan a previous tier: a dense city
+    then announced "Too many panoramas…" on load. The CSV is held until after
+    the click.
+    """
+    errors = _capture_errors(page)
+    held = []
+    page.route(
+        f"**/streetscape-tracker/data/{dense_cities['gsv']['csv']}",
+        lambda route: held.append(route),
+    )
+    page.goto(f"{base_url}/city.html?file={dense_cities['gsv']['csv']}")
+    for _ in range(200):
+        if held:
+            break
+        page.wait_for_timeout(50)
+    assert held, "precondition: the run's CSV was requested"
+    page.evaluate("map.fire('click', {originalEvent: {target: map._container}})")
+    assert page.evaluate("mapTier === null && lastPlan === null")
+    held[0].fallback()
+    expect(page.locator("#map-drawn-notice")).to_be_visible()
+    s = _dense_state(page)
+    assert s["tier"] == "sampled"
+    assert s["status"] == "", "the load itself must announce nothing"
     assert errors == []

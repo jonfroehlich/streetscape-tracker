@@ -145,6 +145,7 @@ let inModeByDateStr = new Map();   // captureDate.toDateString() -> in-mode mark
 let totalInMode = 0;
 let globalCapped = [];          // spatial-stride subsample of inModeAll (<= RENDER_CAP)
 let cappedByYear = new Map();   // year -> stride subsample (lazy)
+let modeCacheGeneration = 0;    // bumped by rebuildModeCaches: names which samples are current
 let allMarkerCount = 0;         // both modes; fixed per run (legend "All GSV" count)
 let googleMarkerCount = 0;      // official-Google markers; fixed per run
 
@@ -205,7 +206,8 @@ map.on("moveend", () => {
 // Fired by a popup just before it pans the map to fit; the moveend that pan
 // causes must not re-tier, or a dot near the edge could close its own popup.
 map.on("autopanstart", () => { popupAutoPanning = true; });
-// An open popup's pano stays drawn while the map moves. Only DATED pano
+// An open popup's pano stays drawn on every re-plan (a move, a date, a toggle)
+// while it stays in the population; see planMapView. Only DATED pano
 // markers are pinned: a flat-only or diff-overlay marker must never reach
 // `onMap`, whose restyle reads a capture date they do not carry.
 map.on("popupopen", (e) => {
@@ -282,6 +284,7 @@ function rebuildModeCaches() {
   totalInMode = inModeAll.length;
   globalCapped = strideSubset(inModeAll);
   cappedByYear = new Map();
+  modeCacheGeneration++; // a new sample: no plan may reuse one built before it
 }
 
 /**
@@ -404,18 +407,26 @@ function setFlatShown(show) {
  * The single entry point every interaction uses: plan the drawn set
  * (planMapView), reconcile the map to it, restyle, and say what changed.
  *
- * A pan or zoom (`fromMove`) restyles only the markers it added, and keeps an
- * open popup's pano drawn; every other caller restyles everything drawn, since
- * it may have changed the selected date.
+ * A pan or zoom (`fromMove`) restyles only the markers it added; every other
+ * caller restyles everything drawn, since it may have changed the selected
+ * date. Every caller keeps an open popup's pano drawn while it stays in the
+ * population (planMapView's `pinnedItem`). Does nothing until the run has
+ * finished streaming (`mapReady`).
  *
  * @param {{fromMove?: boolean, freeze?: boolean}} [opts] - `freeze` keeps the
  *   previous tier (the move was a popup's own auto-pan).
  */
 function applyDesired({ fromMove = false, freeze = false } = {}) {
+  // Nothing is planned while the run streams: the population is still growing
+  // and the map is not yet fitted, so a plan now would record a tier (and give
+  // the first real plan a "previous" one to announce a change against). The
+  // streamed dots are drawn directly; finalize makes the first plan.
+  if (!mapReady) return;
   const year = activeYearOrNull();
   const filter = { officialOnly: !showAllGsv, year };
-  const accept = panoCols ? populationFilter(panoCols, filter) : null;
+  const accept = populationFilter(panoCols, filter);
   const drawnArea = () => boxOf(map.getBounds().pad(DRAWN_AREA_PAD));
+  const dateKey = selectedDate ? selectedDate.toDateString() : null;
   const plan = planMapView({
     budget: RENDER_CAP,
     populationSize: currentPopulationSize(),
@@ -430,8 +441,12 @@ function applyDesired({ fromMove = false, freeze = false } = {}) {
       countInBounds(ensurePanoIndex(), panoCols, cellCountsFor(filter, accept), drawnArea(), accept),
     viewItems: () =>
       idsInBounds(ensurePanoIndex(), panoCols, drawnArea(), accept).map((id) => panoMarkersById[id]),
-    dateItems: selectedDate ? () => inModeByDateStr.get(selectedDate.toDateString()) ?? [] : null,
-    pinnedItem: fromMove && pinnedMarker && markerInMode(pinnedMarker) ? pinnedMarker : null,
+    dateItems: dateKey ? () => inModeByDateStr.get(dateKey) ?? [] : null,
+    dateKey,
+    pinnedItem: pinnedMarker,
+    inPopulation: (m) => accept(m.options.panoIdx),
+    prevPlan: lastPlan,
+    sampleKey: `${modeCacheGeneration}|${filter.officialOnly}|${year}`,
   });
   // The legend's "in view" figure counts the VISIBLE map, not the padded area.
   plan.visible = plan.mode === "view"
@@ -441,7 +456,10 @@ function applyDesired({ fromMove = false, freeze = false } = {}) {
   lastPlan = plan;
   mapTier = plan.tier;
   desiredShown = plan.desired;
-  const added = reconcile();
+  // A reused plan is the set already on the map, so there is no delta to find;
+  // a non-move caller still restyles (it may have been the date that changed,
+  // though then the plan is not reused).
+  const added = plan.reused ? [] : reconcile();
   restyleMarkers(fromMove ? added : onMap);
   setFlatShown(plan.flatShown);
   if (plan.announce) {
@@ -464,7 +482,6 @@ function drawnNotice() {
     drawn: lastPlan.desired.size,
     population: currentPopulationSize(),
     visible: lastPlan.visible,
-    budget: RENDER_CAP,
     yearFiltered: activeYears.size > 0,
     renderAll: renderAllOverride,
   });
@@ -504,6 +521,12 @@ legendControl.onAdd = () => {
   // the map underneath it.
   L.DomEvent.disableClickPropagation(div);
   L.DomEvent.disableScrollPropagation(div);
+  // disableClickPropagation alone is not enough here: it marks the div and
+  // Leaflet walks up from the click's target to find the mark, but most legend
+  // buttons rebuild the legend (innerHTML) in their own handler, so by the time
+  // the click reaches the map the target is detached, the walk never finds the
+  // mark, and Leaflet reads it as a map click and closes any open popup.
+  L.DomEvent.on(div, "click", L.DomEvent.stopPropagation);
   return div;
 };
 legendControl.addTo(map);

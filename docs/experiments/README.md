@@ -52,8 +52,8 @@ That is why the detection path is differential (keyed bytes vs keyless bytes) ra
 
 Issue #77 — what the city map's dot tier draws, and what it costs, before and after drawing every pano in view on a city over the 40,000 render cap.
 Synthetic dense cities (a street lattice, 60,000 to 1,000,000 panoramas) in headless Chromium, plus a Node benchmark of the index alone at up to 15,000,000 points; no network beyond the page's own libraries.
-At street level on a 1,000,000-pano city, 288 of 7,195 panoramas in view were drawn before and all of them after; a pan costs 18–27 ms more to paint at the median, about flat across city size.
-The finding that generalizes: **the change fixes what a street-level view shows and leaves load and memory as they were** (load +9% at 1,000,000, the index 0.1 s of it), because both are dominated by building one Leaflet marker per pano during streaming — so the next step on #77 is lazy markers, not a faster index.
+At street level on a 1,000,000-pano city, 288 of 7,195 panoramas in view were drawn before and all of them after; a pan costs 19–26 ms more to paint at the median, about flat across city size, and a move that stays sampled costs what it did before.
+The finding that generalizes: **the change fixes what a street-level view shows and leaves load and memory as they were** (load +5% at 1,000,000, +9% in a first run, the index 0.1 s of it), because both are dominated by building one Leaflet marker per pano during streaming — so the next step on #77 is lazy markers, not a faster index.
 It is a one-off protocol, so it cannot catch a later regression; the e2e tests are what guard the behaviour.
 
 ### `csv-float-parse.md`
