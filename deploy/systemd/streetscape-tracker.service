@@ -56,6 +56,13 @@ Environment=STREETSCAPE_PUBLISH_LOCAL=1
 # independent signals; the other is the cgroup path (scheduler._is_nightly_unit).
 # Set it here only -- never in .env, which hand runs read too.
 Environment=STREETSCAPE_NIGHTLY=1
+# TimeoutStartSec below, in seconds (issue #389). The scheduler cannot read the
+# installed unit from inside this sandbox, so the unit tells it: a nightly caps
+# its window at this less the tail, in-flight and margin allowances
+# (scheduler.night_window_seconds), and one that does not see the variable
+# assumes the pre-#389 14 h. Must equal TimeoutStartSec (a test pins the pair);
+# set it here only.
+Environment=STREETSCAPE_UNIT_TIMEOUT_START_S=50400
 # Where the per-IP host locks live (issue #208). Set EXPLICITLY, and to the real
 # path rather than %h, for two independent reasons — either alone would make the
 # lock a silent no-op against a detached operator process:
@@ -73,13 +80,17 @@ Environment=STREETSCAPE_LOCK_DIR=/projects/makeabilitylab/streetscape-tracker/lo
 # config file is named makelab1 for historical reasons but is the single shared
 # production config (paths are identical on both boxes via the shared ZFS).
 ExecStart=%h/streetscape-tracker/.venv-makelab2/bin/python -m streetscape_metadata_tracker.scheduler --config %h/streetscape-tracker/config/scheduler.makelab1.toml run-due
-# A full day of cities can legitimately take hours. This must stay ABOVE
-# [schedule].max_batch_hours (10h) so the scheduler's own deadline is what ends
-# a long night: it stops starting cities and still regenerates the aggregate and
-# publishes. Reaching THIS limit instead means a SIGKILL mid-loop, which throws
-# away the publish for every city already collected that night (issue #167 —
-# observed 2026-07-29, when a batch died at exactly 12h and the public site went
-# two days stale while the catalog kept advancing).
+# A full day of cities can legitimately take hours. The scheduler's own
+# deadline ([schedule].max_batch_hours) must end a long night, with its tail,
+# before THIS limit: max_batch_hours + 0.583 h (tail and in-flight child) + 1 h
+# (margin) <= TimeoutStartSec, pinned by tests/test_night_window.py and enforced
+# at runtime through STREETSCAPE_UNIT_TIMEOUT_START_S above (docs/scheduler.md,
+# "The night's length"). Reaching this limit sends SIGTERM, then SIGKILL after
+# TimeoutStopSec. Mid-loop that is the ordinary wind-down; in the tail the
+# scheduler ignores it (#389), but an in-flight publish rsync still dies with
+# it, and before #389 the whole publish did -- 2026-07-29, when a batch died at
+# exactly 12h and the public site went two days stale while the catalog kept
+# advancing (issue #167).
 TimeoutStartSec=14h
 # Stopping is a WIND-DOWN request, not a kill: the SIGTERM handler sets a flag,
 # the loop stops launching work, and the tail still runs so the night's collected
@@ -106,7 +117,9 @@ TimeoutStartSec=14h
 #                                        N.N s" line
 # 30min is roughly 2x the worst tail we have measured, and a test pins
 # TimeoutStopSec above the SUM of the three bounded/measured terms above
-# (600 + 435 + 600 = 1635 s) and below max_batch_hours. That sum is also the
+# (600 + 435 + 600 = 1635 s) and below max_batch_hours. TimeoutStopSec is also
+# the scheduler's NIGHT_TAIL_ALLOWANCE_S, the tail term of the night's bracket
+# (a test pins the two equal). That sum is also the
 # constraint from the other direction: PUBLISH_TIMEOUT_S cannot be raised past
 # ~765 s without this directive moving first, or the publish bound gets
 # SIGKILLed before it can report its own timeout — which is the pre-#230

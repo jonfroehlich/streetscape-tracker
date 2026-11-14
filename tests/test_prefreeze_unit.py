@@ -235,27 +235,33 @@ def test_the_pass_covers_tonight_and_stays_inside_overpass_policy(args, prod_cfg
     assert args.pause_s >= pf.DEFAULT_PAUSE_S
 
 
-def _night_done(units, prod_cfg) -> float:
-    """Minutes after local midnight by which the night has certainly ended.
+def _night_length_minutes(prod_cfg) -> float:
+    """Minutes from a nightly unit's scheduled fire to the latest end of its night.
 
-    The nightly fires by 02:00 + its randomized delay and stops launching at
-    max_batch_hours; then its tail runs -- backup, aggregate + manifest, publish.
-    Only two of those three terms are importable constants, so the bound used
-    here is the collection unit's TimeoutStopSec: a number in a FILE that was
-    sized against those same components, and the more conservative of the two
-    (30 min against their ~27 min sum). A stop is NOT involved in a normal
-    night; it is a stand-in, and the assertion here keeps it an over-estimate."""
-    stop_min = _span_minutes(_one(units["collect"], "Service", "TimeoutStopSec"))
-    # The stand-in must stay an over-estimate of the tail terms that ARE
-    # importable, or it has stopped standing in for anything.
-    assert stop_min * 60 >= catalog_backup.BACKUP_TIMEOUT_S + scheduler.PUBLISH_TIMEOUT_S
-    night_start, _ = _daily_pacific(units["nightly"])
-    return (
-        night_start
-        + _span_minutes(_one(units["nightly"], "Timer", "RandomizedDelaySec"))
-        + prod_cfg.max_batch_hours * 60
-        + stop_min
+    The SAME terms the runtime uses (issue #389), so a follower is bounded by
+    the night the scheduler actually runs, not by a private estimate of it:
+    the fire's slack (``NIGHTLY_FIRE_SLACK``: RandomizedDelaySec plus systemd's
+    default AccuracySec, pinned to the timer by
+    test_the_scripts_fire_slack_is_the_nightly_timers), max_batch_hours, then
+    ``scheduler.NIGHT_OVERRUN_S`` -- the tail allowance (the collection unit's
+    TimeoutStopSec, pinned equal in tests/test_night_window.py) plus one
+    in-flight child clamped to the deadline. A stop is NOT involved in a normal
+    night; TimeoutStopSec is a stand-in for the tail, and the assertion here
+    keeps it an over-estimate of the tail terms that are importable."""
+    assert scheduler.NIGHT_TAIL_ALLOWANCE_S >= (
+        catalog_backup.BACKUP_TIMEOUT_S + scheduler.PUBLISH_TIMEOUT_S
     )
+    return (
+        pf.NIGHTLY_FIRE_SLACK.total_seconds() / 60
+        + prod_cfg.max_batch_hours * 60
+        + scheduler.NIGHT_OVERRUN_S / 60
+    )
+
+
+def _night_done(units, prod_cfg) -> float:
+    """Minutes after local midnight by which an ON-TIME night has certainly ended."""
+    night_start, _ = _daily_pacific(units["nightly"])
+    return night_start + _night_length_minutes(prod_cfg)
 
 
 def test_the_weekly_screen_fires_after_the_night_and_ends_before_the_next(units, prod_cfg):

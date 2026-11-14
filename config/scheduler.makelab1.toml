@@ -91,18 +91,34 @@ opt_in_cities_per_day = 20
 max_consecutive_failures = 5
 city_timeout_minutes = 180
 # Stop STARTING cities after this many hours so the aggregate/manifest/publish
-# tail still runs. Must stay below the unit's TimeoutStartSec (14h) — before
-# this existed, a 12h systemd kill discarded a whole night's publish (#167).
+# tail still runs before the unit's TimeoutStartSec. That limit sends SIGTERM:
+# mid-loop it is the ordinary wind-down, but before #389 one that landed in the
+# tail lost the publish (#167's outcome), and an in-flight publish rsync still
+# dies with it.
 #
-# Raised from 10 to 12 on 2026-09-02. 10 was a "comfortably below 14h" figure
-# with nothing measured behind it; the real bracket is TimeoutStopSec (30 min)
-# < max_batch_hours < TimeoutStartSec (14 h) less the bounded tail (600 + 435 +
-# 600 s = 0.45 h). 12 clears both with 1.55 h spare and needs NO change to the
-# unit. Going past ~13.5 h would require raising TimeoutStartSec first, and
-# costs two things worth naming: the publish lands later in the working day,
-# and a longer nightly window is more sustained hours against the per-IP
-# metered hosts — the axis Mapillary's blocks are currently suspected on
-# (docs/provider-access.md).
+# The derivation (issue #389; docs/scheduler.md, "The night's length"), with
+# h = this value, the tail allowance 0.5 h (= the unit's TimeoutStopSec), one
+# in-flight child clamped to >= 5 min, a 1 h margin, and the 02:00 Pacific fire
+# late by up to 16 min (RandomizedDelaySec 15 min + AccuracySec 1 min):
+#   floor : TimeoutStopSec (0.5 h) < h
+#   unit  : h + 0.583 h + 1 h <= TimeoutStartSec (14 h)  -> 13.583 h, holds
+#   ops   : 24 h - 16 min - h - 0.583 h >= 6 h of daytime ops window -> 11.15 h, holds
+#           (the window is from ~14:51 to 02:00 Pacific: deploys, hand catch-ups,
+#           assess-city, import-bundle; the chained prefreeze holds the Overpass
+#           lock for a further ~1.5 to 3 h of it after the night)
+#   utc   : an ON-TIME night's last child ends inside its UTC date in both seasons
+#           (02:16 PST is 10:16 UTC; + 12 h + the 5 min in-flight clamp = 22:21 UTC);
+#           a catch-up start (Persistent=, the 08:30 watchdog re-arm, a hand start)
+#           already crosses it, which costs census re-reads (docs/scheduler.md)
+# The unit line is enforced at runtime too: a nightly whose installed unit cannot
+# hold this value is shortened to fit and alerts (scheduler.night_window_seconds).
+# tests/test_night_window.py pins all four against this file and the unit files.
+#
+# Raised from 10 to 12 on 2026-09-02; 10 was a "comfortably below 14h" figure
+# with nothing measured behind it. What a raise past this must settle first is
+# listed in docs/scheduler.md: the census cache's UTC date line, the tail measured
+# per night, the city cap, the KartaView bound (#464), TimeoutStartSec, and the
+# GSV budgets below, which are wall-clock proxies sized from this number.
 max_batch_hours = 12
 # How many of a capped night's city slots go to cities that will gain a SECOND
 # dated interval (issue #308). Unset it derives max_cities_per_day // 4, which

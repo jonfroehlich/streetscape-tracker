@@ -120,21 +120,17 @@ city_timeout_minutes = 180
 # stalest-first queue.
 #
 # This exists because the tail is what makes a night VISIBLE. run-due is a
-# oneshot systemd unit under TimeoutStartSec, and before this a batch that
-# overran was SIGKILLed mid-loop — every city it had already collected sat in
-# the catalog, correct but unpublished, until an operator noticed and ran
-# regenerate-aggregate by hand (issue #167). Keep it comfortably under the
-# unit's TimeoutStartSec so this deadline, not systemd, ends a long night.
+# oneshot systemd unit under TimeoutStartSec, whose SIGTERM is a wind-down in
+# the city loop but, before #389, killed the publish when it landed in the
+# tail: every city the night had collected sat in the catalog, correct but
+# unpublished, until an operator ran regenerate-aggregate by hand (issue #167).
 #
-# Raised from 10 to 12 on 2026-09-02. 10 was chosen as "comfortably below
-# TimeoutStartSec" with nothing measured behind it. The real bracket is
-# TimeoutStopSec (30 min) < max_batch_hours < TimeoutStartSec (14 h) less the
-# bounded tail (PUBLISH_TIMEOUT_S + _MEASURED_TAIL_AGGREGATE_S +
-# BACKUP_TIMEOUT_S = 1,635 s ~ 0.45 h). 12 clears both with 1.55 h spare and
-# needs no change to the systemd unit. Past ~13.5 h TimeoutStartSec has to move
-# first, and two costs come with it: the publish lands later in the working
-# day, and a longer nightly window means more sustained hours against the
-# per-IP metered hosts (docs/provider-access.md).
+# The bracket (issue #389; docs/scheduler.md, "The night's length"):
+# TimeoutStopSec (30 min) < max_batch_hours, and max_batch_hours + 0.583 h
+# (tail and in-flight child) + 1 h (margin) <= TimeoutStartSec (14 h in the
+# shipped unit), so 12 fits with 0.42 h spare. A nightly whose installed unit
+# cannot hold this value is shortened to fit and alerts. A raise past it costs
+# more than the unit: see that section's "What a raise must settle first".
 max_batch_hours = 12
 
 # How many of ONE city's channels may be in flight at once (issue #240). The

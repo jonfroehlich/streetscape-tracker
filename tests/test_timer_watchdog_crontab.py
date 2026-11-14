@@ -22,7 +22,12 @@ import pytest  # noqa: E402
 
 from streetscape_metadata_tracker import scheduler  # noqa: E402
 from streetscape_metadata_tracker.scheduler import load_scheduler_config  # noqa: E402
-from tests.test_prefreeze_unit import _daily_pacific, _one, _parse_unit, _span_minutes  # noqa: E402
+from tests.test_prefreeze_unit import (  # noqa: E402
+    _daily_pacific,
+    _night_length_minutes,
+    _one,
+    _parse_unit,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 CRONTAB = ROOT / "deploy" / "cron" / "streetscape-tracker.crontab"
@@ -117,7 +122,8 @@ def test_the_daily_slot_precedes_the_backup_check_and_lets_a_catch_up_night_fini
     """08:30 must (1) precede the noon backup-check timer, so a re-armed check
     still fires that day, and (2) leave a Persistent catch-up night the re-arm
     starts time to end before the next 02:00 — bounded as in the prefreeze
-    tests, by delay + max_batch_hours + the collection unit's TimeoutStopSec."""
+    tests, by the fire slack + max_batch_hours + the runtime's NIGHT_OVERRUN_S
+    (issue #389: one overrun, the runtime's)."""
     minute, hour = (int(x) for x in _jobs()["daily_fields"].split()[:2])
     ours = hour * 60 + minute
     night_start, tz = _daily_pacific(units["nightly"])
@@ -125,12 +131,7 @@ def test_the_daily_slot_precedes_the_backup_check_and_lets_a_catch_up_night_fini
     assert _env_lines()["CRON_TZ"] == tz == backup_tz == "America/Los_Angeles"
     assert ours < backup_start
     prod = load_scheduler_config(str(ROOT / "config" / "scheduler.makelab1.toml"))
-    catch_up_end = (
-        ours
-        + _span_minutes(_one(units["nightly"], "Timer", "RandomizedDelaySec"))
-        + prod.max_batch_hours * 60
-        + _span_minutes(_one(units["collect"], "Service", "TimeoutStopSec"))
-    )
+    catch_up_end = ours + _night_length_minutes(prod)
     assert catch_up_end <= 24 * 60 + night_start
 
 

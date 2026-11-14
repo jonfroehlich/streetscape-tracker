@@ -46,6 +46,20 @@ def _show(name):
     return ["show", name, *SHOW_PROPS]
 
 
+# The collection unit's bracket read (issue #389), made once per check that
+# reached the manager, before the timers are classified.
+UNIT_SHOW = [
+    "show",
+    "streetscape-tracker.service",
+    "-p",
+    "LoadState",
+    "-p",
+    "TimeoutStartUSec",
+    "-p",
+    "TimeoutStopUSec",
+]
+
+
 class FakeSystemctl:
     """A `Runner`: records every call and answers from `state`."""
 
@@ -58,6 +72,13 @@ class FakeSystemctl:
                 "NextElapseUSecRealtime": "Sat 2026-09-26 02:07:00 PDT",
             }
             for n in TIMERS
+        }
+        # The collection SERVICE, which timer-status reads for its bracket line
+        # (issue #389) and never starts. Not in TIMERS: it is not a timer.
+        self.state[ut.HOST_UNIT] = {
+            "LoadState": "loaded",
+            "TimeoutStartUSec": "14h",
+            "TimeoutStopUSec": "30min",
         }
         self.manager = manager
         self.start_flips = start_flips
@@ -185,7 +206,7 @@ def test_enabled_but_inactive_timers_exit_nonzero_and_are_not_started_without_re
     out = capsys.readouterr().out
     assert all(f"{n}" in out for n in TIMERS)
     assert "Verdict: INACTIVE: " + ", ".join(TIMERS) in out
-    assert fake.calls == [["is-system-running"]] + [_show(n) for n in TIMERS]
+    assert fake.calls == [["is-system-running"], UNIT_SHOW] + [_show(n) for n in TIMERS]
 
 
 def test_rearm_reloads_once_then_starts_only_the_inactive_timers(cfg, unit_files, sent):
@@ -196,6 +217,7 @@ def test_rearm_reloads_once_then_starts_only_the_inactive_timers(cfg, unit_files
     assert _run(cfg, fake, rearm=True) == 0
     assert fake.calls == [
         ["is-system-running"],
+        UNIT_SHOW,
         *[_show(n) for n in TIMERS],
         ["daemon-reload"],
         ["start", a],
@@ -356,7 +378,8 @@ def test_wait_polls_until_the_manager_and_the_unit_files_are_both_visible(cfg, u
     assert rc == 0
     assert fake.verbs().count("is-system-running") == 4
     assert fc.sleeps == [10, 10, 10]
-    assert fake.verbs()[4:] == ["show"] * len(TIMERS)
+    # The collection unit's bracket read, then one per timer (issue #389).
+    assert fake.verbs()[4:] == ["show"] * (1 + len(TIMERS))
 
 
 def test_wait_gives_up_after_the_budget_and_still_writes_the_heartbeat(cfg, unit_files, sent):
@@ -544,3 +567,58 @@ def test_main_forwards_every_timer_status_flag(monkeypatch, cfg, argv, expected)
     monkeypatch.setattr(sched, "cmd_timer_status", lambda c, **kw: seen.update(kw) or 0)
     assert sched.main() == 0
     assert seen == expected
+
+
+# --- the collection unit's bracket (issue #389) -------------------------------
+
+
+@pytest.mark.parametrize(
+    "text,seconds",
+    [
+        ("14h", 50_400),
+        ("30min", 1_800),
+        ("1min 30s", 90),
+        ("1d 2h", 93_600),
+        ("500ms", 0.5),
+        ("infinity", None),
+        ("", None),
+        ("fourteen hours", None),
+    ],
+)
+def test_systemd_time_spans_parse_and_infinity_is_unknown(text, seconds):
+    assert ut.parse_timespan_s(text) == seconds
+
+
+@pytest.mark.parametrize(
+    "load,start,word",
+    [
+        ("loaded", "18h", "ok"),
+        ("loaded", "14h", "VIOLATED"),
+        ("loaded", "infinity", "unknown"),
+        ("not-found", "18h", "unknown"),
+    ],
+    ids=["holds", "too-short", "infinity", "not-loaded"],
+)
+def test_timer_status_reports_the_collection_units_bracket_without_changing_its_verdict(
+    tmp_path, unit_files, sent, capsys, load, start, word
+):
+    """A 16 h night needs 16 + 0.583 + 1 h: an installed 18 h unit holds it, a
+    14 h one does not, and a timeout that cannot be read is `unknown` -- mailed
+    like a violation, never passed as `ok`. Whatever the line says, the timers
+    are healthy here, so the exit status and the heartbeat must not move: they
+    measure the timers and whether cron runs, and backup-status gates on them."""
+    cfg = SchedulerConfig(log_dir=str(tmp_path / "logs"), max_batch_hours=16)
+    fake = FakeSystemctl()
+    fake.set(ut.HOST_UNIT, LoadState=load, TimeoutStartUSec=start)
+    assert _run(cfg, fake, alert=True) == 0
+    out = capsys.readouterr().out
+    assert f"TimeoutStartSec={start}" in out
+    assert "needs >= 17.58 h" in out
+    [line] = [ln for ln in out.splitlines() if "collection unit" in ln]
+    assert line.endswith(f": {word}")
+    assert ut.read_heartbeat(cfg.log_dir)["healthy"] is True
+    if word == "ok":
+        assert sent == []
+    else:
+        assert len(sent) == 1 and "collection unit bracket NOT ok" in sent[0][0]
+        assert "daemon-reload" in sent[0][1]
