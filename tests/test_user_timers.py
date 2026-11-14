@@ -206,7 +206,7 @@ def test_enabled_but_inactive_timers_exit_nonzero_and_are_not_started_without_re
     out = capsys.readouterr().out
     assert all(f"{n}" in out for n in TIMERS)
     assert "Verdict: INACTIVE: " + ", ".join(TIMERS) in out
-    assert fake.calls == [["is-system-running"], UNIT_SHOW] + [_show(n) for n in TIMERS]
+    assert fake.calls == [["is-system-running"]] + [_show(n) for n in TIMERS] + [UNIT_SHOW]
 
 
 def test_rearm_reloads_once_then_starts_only_the_inactive_timers(cfg, unit_files, sent):
@@ -217,13 +217,13 @@ def test_rearm_reloads_once_then_starts_only_the_inactive_timers(cfg, unit_files
     assert _run(cfg, fake, rearm=True) == 0
     assert fake.calls == [
         ["is-system-running"],
-        UNIT_SHOW,
         *[_show(n) for n in TIMERS],
         ["daemon-reload"],
         ["start", a],
         ["start", b],
         _show(a),
         _show(b),
+        UNIT_SHOW,
     ]
     beat = ut.read_heartbeat(cfg.log_dir)
     assert beat["rearmed"] == [a, b]
@@ -273,7 +273,7 @@ def test_a_not_found_timer_is_unhealthy_and_a_reload_can_recover_it(cfg, unit_fi
 
     fake = fake_for(True)
     assert _run(cfg, fake, rearm=True, alert=True) == 0
-    assert fake.calls[-3:] == [["daemon-reload"], ["start", name], _show(name)]
+    assert fake.calls[-4:] == [["daemon-reload"], ["start", name], _show(name), UNIT_SHOW]
     assert f"REARMED: {name}" in sent[-1][0]
 
     fake = fake_for(False)
@@ -378,7 +378,7 @@ def test_wait_polls_until_the_manager_and_the_unit_files_are_both_visible(cfg, u
     assert rc == 0
     assert fake.verbs().count("is-system-running") == 4
     assert fc.sleeps == [10, 10, 10]
-    # The collection unit's bracket read, then one per timer (issue #389).
+    # One per timer, then the collection unit's bracket read (issue #389).
     assert fake.verbs()[4:] == ["show"] * (1 + len(TIMERS))
 
 
@@ -619,6 +619,40 @@ def test_timer_status_reports_the_collection_units_bracket_without_changing_its_
     assert ut.read_heartbeat(cfg.log_dir)["healthy"] is True
     if word == "ok":
         assert sent == []
+    elif word == "VIOLATED":
+        [(subject, body)] = sent
+        assert "collection unit bracket VIOLATED" in subject
+        assert "reads VIOLATED" in body and "daemon-reload" in body
     else:
-        assert len(sent) == 1 and "collection unit bracket NOT ok" in sent[0][0]
-        assert "daemon-reload" in sent[0][1]
+        # An unreadable timeout is not a violation, and the nightly clamp reads
+        # the environment variable rather than this, so the mail must claim
+        # neither (issue #389 review).
+        [(subject, body)] = sent
+        assert "collection unit timeout unreadable" in subject
+        assert "VIOLATED" not in subject + body
+        assert "shortened" not in body and "cannot hold" not in body
+        assert "could not be read" in body and "systemctl --user show" in body
+
+
+def test_timer_status_reads_the_bracket_after_the_rearms_daemon_reload(
+    tmp_path, unit_files, sent, capsys
+):
+    """The #369 reboot shape: the manager came up before the home mounted, so
+    until check_and_rearm's one daemon-reload every unit, the collection
+    service included, is not-found. Read before that reload the bracket line
+    is a false `unknown` riding on the REARMED mail; read after it, the
+    re-loaded 14 h unit holds the 12 h night and nothing about the bracket is
+    mailed."""
+    cfg = SchedulerConfig(log_dir=str(tmp_path / "logs"), max_batch_hours=12)
+    fake = FakeSystemctl(reload_installs=True)
+    for name in [*TIMERS, ut.HOST_UNIT]:
+        fake.set(name, LoadState="not-found")
+    for n in TIMERS:
+        fake.set(n, ActiveState="inactive")
+    assert _run(cfg, fake, rearm=True, alert=True) == 0
+    calls = fake.calls
+    assert calls.index(["daemon-reload"]) < calls.index(UNIT_SHOW)
+    [line] = [ln for ln in capsys.readouterr().out.splitlines() if "collection unit" in ln]
+    assert line.endswith(": ok")
+    [(subject, body)] = sent  # the REARMED mail, and only it
+    assert "collection unit" not in subject and "collection unit line" not in body

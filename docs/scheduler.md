@@ -235,7 +235,9 @@ Note also what a stop does **not** suppress: the three unconditional alerts (hos
 **The installed unit on makelab2 is a copy, not a symlink**, so all of this stays inert until someone re-copies it and runs `daemon-reload`
 — verify with `systemctl --user show streetscape-tracker.service -p TimeoutStopUSec`, which must read `30min` rather than `1min 30s`.
 `_finish_batch` runs *outside* the `_stop_on_sigterm` context, and until #389 that was a real gap: a SIGTERM during the tail killed the publish with the default handler.
-It was filed as "do not type `stop` twice", but the likelier sender is the unit's own `TimeoutStartSec`, whose SIGTERM is the first one and lands in the tail whenever the deadline fired just before it; that is how 2026-07-29 collected most of a night and published none of it (#167).
+It was filed as "do not type `stop` twice", but the likelier sender is the unit's own `TimeoutStartSec`, whose SIGTERM is the first one and would land in the tail whenever the deadline fired just before it.
+That band is derived, not observed.
+On 2026-07-29 the unit's `TimeoutStartSec` was 12 h and neither a deadline nor a SIGTERM handler existed (both arrived the next day with #170, which also raised the timeout to 14 h), so that night's timeout killed the batch in the city loop and the publish after it never ran (#167); the tail band is the remaining path to the same outcome.
 The tail now logs and ignores it (`_tail_survives_sigterm`; an in-flight publish rsync still dies with the cgroup), and the deadline is held below the unit's `TimeoutStartSec` with its tail, in-flight and margin terms, pinned and enforced at runtime: see "The night's length" at the end of this file.
 A child that exits with a `HOST_EXIT_CODES` status trips the per-IP **host breaker** (`HostBreaker`, and see the host-lock section of [`provider-access.md`](provider-access.md)): that host's channels are skipped, no city is marked failed, and the night alerts unconditionally and exits nonzero while still publishing.
 **The latch is no longer all-night for Overpass (issue #341).**
@@ -1092,10 +1094,12 @@ Reaching the collection unit's `TimeoutStartSec` sends **SIGTERM**, then SIGKILL
 Where that SIGTERM lands decides what it costs:
 
 - **In the city loop or the fill** it is the #206 wind-down: `_stop_on_sigterm` turns it into a stop request, the in-flight child dies with the cgroup and is not counted as a failure, and the tail still runs and publishes.
-- **In the tail** (`_finish_batch`: aggregate, manifests, driving-plan summary, census and ledger prunes, catalog backup, publish, alert) it used to run under the default disposition and kill the process before the publish, which is #167's outcome.
+- **In the tail** (`_finish_batch`: aggregate, manifests, driving-plan summary, census and ledger prunes, catalog backup, publish, alert) it used to run under the default disposition and would kill the process before the publish, the outcome #167 recorded.
+  That is derived, not observed: #167's own night (2026-07-29) was the timeout killing the city loop before any deadline or SIGTERM handler existed (both arrived with #170).
   That band is `TimeoutStartSec - (tail + in-flight child) < h < TimeoutStartSec`: the deadline fires, the tail starts, and the start timeout's SIGTERM, the **first** one systemd sends, lands in it.
 
 Since #389, `_tail_survives_sigterm` logs a SIGTERM that arrives during `_finish_batch` once at WARNING and ignores it, so the in-process steps finish inside `TimeoutStopSec`.
+It is entered **on the nightly unit only** (`_is_nightly_unit`): ignoring a SIGTERM is safe because systemd follows it with a SIGKILL, and a hand `run-due` from a shell has no SIGKILL behind it and an unbounded tail, so there the default disposition stays and a `kill` still ends it.
 What it cannot save, stated rather than implied:
 
 - `KillMode` is the default `control-group`, so systemd signals every process in the unit: **a publish rsync in flight at that instant still dies**.
@@ -1151,11 +1155,16 @@ So the bracket is enforced in three places.
   A nightly that does not see the variable, or sees junk in it (`nan`, `inf`, too small to leave a window), is under a pre-#389 copy and assumes 14 h.
   The window is capped at that less `NIGHT_OVERRUN_S`, `NIGHT_MARGIN_S` and the time the process spent before the loop's clock started (`_PROCESS_STARTED_MONOTONIC`, captured at module import, because `TimeoutStartSec` counts from the unit's start and a catalog migration on connect spends it).
   A night that does not fit is **shortened, not refused**: refusing loses the whole night, shortening loses only the hours the unit could not have held.
-  It logs `Night shortened:` at WARNING, mails `night shortened to N h on <host>`, and replaces `max_batch_hours` in the night's config, so the deadline, the `Done:` line's `deadline (N h)`, the #373 never-fits test and the #290 census-reuse window all agree.
-  A hand run and a `--dry-run` are never shortened.
+  It logs `Night shortened:` at WARNING, mails `night shortened to N h on <host>: <cause>`, and replaces `max_batch_hours` in the night's config, so the deadline, the `Done:` line's `deadline (N h)`, the #373 never-fits test and the #290 census-reuse window all agree.
+  The cause is named, because only one of the two is fixed in the unit: `the installed unit cannot hold max_batch_hours` when the configured window would not fit even with no time before the loop (the note then gives the unit fix), and `a slow start before the city loop, not the unit` when the unit holds it and the elapsed pre-loop time alone broke it (a slow connect, migration or mount; the note says the unit needs no change).
+  Either note names the pre-loop time.
+  A hand run and a `--dry-run` are never shortened, and neither alerts.
   The opening line now ends `; max_batch_hours=N`, the value the night actually ran under.
 - **`timer-status`** prints the collection unit's bracket as systemd LOADED it (`systemctl --user show streetscape-tracker.service -p TimeoutStartUSec -p TimeoutStopUSec`), the only check that sees a hand-written drop-in or an un-reloaded copy: `ok`, `VIOLATED`, or `unknown` (an `infinity` or unparseable timeout, or a unit not loaded), which is never read as `ok`.
-  With `--alert` it mails on `VIOLATED` or `unknown`; it changes neither `healthy`, the heartbeat nor the exit status.
+  It is read **after** the watchdog's re-arm, so after its one `daemon-reload`: on the #369 reboot path the manager can hold the empty unit map of a scan that raced the mount until then, and a read before it would report the unit not-found.
+  With `--alert` it mails on `VIOLATED` or `unknown`, each with its own wording: `unknown` says the timeout could not be read and what to run, and never that the bracket is violated or that a night is shortened.
+  Neither word claims a night IS shortened, because the clamp reads `STREETSCAPE_UNIT_TIMEOUT_START_S`, not the loaded timeout.
+  It changes neither `healthy`, the heartbeat nor the exit status.
   The clamp's alert says so, because a stale unit then mails twice a day: the nightly clamp and the 08:30 watchdog.
 
 ### The UTC date line, and an existing defect it exposes

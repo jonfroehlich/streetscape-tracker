@@ -88,9 +88,11 @@ ExecStart=%h/streetscape-tracker/.venv-makelab2/bin/python -m streetscape_metada
 # "The night's length"). Reaching this limit sends SIGTERM, then SIGKILL after
 # TimeoutStopSec. Mid-loop that is the ordinary wind-down; in the tail the
 # scheduler ignores it (#389), but an in-flight publish rsync still dies with
-# it, and before #389 the whole publish did -- 2026-07-29, when a batch died at
-# exactly 12h and the public site went two days stale while the catalog kept
-# advancing (issue #167).
+# it, and before #389 the whole publish would have (a band derived, never
+# observed). On 2026-07-29 this limit was 12h and neither the deadline nor a
+# SIGTERM handler existed yet (both came with #170): the timeout killed the
+# batch mid-loop and the public site went two days stale while the catalog
+# kept advancing (issue #167).
 TimeoutStartSec=14h
 # Stopping is a WIND-DOWN request, not a kill: the SIGTERM handler sets a flag,
 # the loop stops launching work, and the tail still runs so the night's collected

@@ -232,13 +232,30 @@ def test_time_spent_before_the_loop_comes_out_of_the_window():
         hours, is_nightly=True, unit_timeout_env="50400", pre_loop_s=600
     )
     assert window == 50400 - sched.NIGHT_OVERRUN_S - sched.NIGHT_MARGIN_S - 600
-    assert note is not None and "600 s spent before the city loop" in note
+    # The unit holds 12.3 h; only the slow start broke it, so the note names the
+    # elapsed time and does NOT send the operator to the unit (issue #389 review).
+    assert note is not None and "600 s (10.0 min) passed before the city loop" in note
+    assert "fits the installed unit" in note and "The unit needs no change" in note
+    assert "Fix the unit" not in note and "daemon-reload" not in note
+
+
+def test_a_window_the_unit_cannot_hold_even_without_a_pre_loop_blames_the_unit():
+    """16 h under 14 h would not fit with no pre-loop at all: the unit (or the
+    hours) is the fix, and the elapsed pre-loop time is still named."""
+    window, note = night_window_seconds(
+        16, is_nightly=True, unit_timeout_env="50400", pre_loop_s=600
+    )
+    assert window == 50400 - sched.NIGHT_OVERRUN_S - sched.NIGHT_MARGIN_S - 600
+    assert note is not None and "does not fit the installed unit" in note
+    assert "It would not fit even with no time before the loop" in note
+    assert "Fix the unit" in note and "600 s (10.0 min) passed before the city loop" in note
+    assert "needs no change" not in note
 
 
 # --- the clamp, end to end through cmd_run_due --------------------------------
 
 
-def _drive_one_city_night(conn, monkeypatch, cfg, *, on_aggregate=None):
+def _drive_one_city_night(conn, monkeypatch, cfg, *, on_aggregate=None, dry_run=False):
     """Run cmd_run_due over one due city with the collection and the publish
     stubbed; return (rc, the loop's window in seconds, the tail steps run)."""
     db.register_city(
@@ -282,8 +299,8 @@ def _drive_one_city_night(conn, monkeypatch, cfg, *, on_aggregate=None):
         sched, "generate_streetwalk_manifest", lambda c, d: tail.append("manifest") or {}
     )
     monkeypatch.setattr(sched, "_publish", lambda cfg_, summary, **kw: tail.append("publish") or 0)
-    rc = sched.cmd_run_due(cfg, today=date(2026, 7, 2))
-    return rc, seen["window_s"], tail
+    rc = sched.cmd_run_due(cfg, dry_run=dry_run, today=date(2026, 7, 2))
+    return rc, seen.get("window_s"), tail
 
 
 def test_a_shortened_night_alerts_and_runs_to_the_shorter_deadline(conn, monkeypatch, caplog):
@@ -307,9 +324,54 @@ def test_a_shortened_night_alerts_and_runs_to_the_shorter_deadline(conn, monkeyp
     assert abs(window_s - expected_s) < 30, (window_s, expected_s)
     shortened = [s for s, _b in alerts if "night shortened" in s]
     assert len(shortened) == 1, alerts
+    assert shortened[0].endswith("the installed unit cannot hold max_batch_hours")
     logged = re.search(r"; max_batch_hours=([\d.]+)", caplog.text)
     assert logged and math.isclose(float(logged.group(1)) * 3600, expected_s, abs_tol=30)
     assert rc == 0 and tail == ["aggregate", "manifest", "publish"]
+
+
+def test_a_night_shortened_by_a_slow_start_does_not_blame_the_unit(conn, monkeypatch):
+    """12.3 h fits the 14 h unit with 420 s to spare; a ten-minute start eats
+    that, so the night is shortened, but the mail says it was the start, and
+    does not send the operator to the unit or promise a VIOLATED timer-status."""
+    alerts: list[tuple[str, str]] = []
+    monkeypatch.setattr(sched, "_is_nightly_unit", lambda: True)
+    monkeypatch.setenv(sched.UNIT_TIMEOUT_ENV_VAR, "50400")
+    monkeypatch.setattr(sched, "_PROCESS_STARTED_MONOTONIC", time.monotonic() - 600)
+    monkeypatch.setattr(sched, "send_alert", lambda a, s, b: alerts.append((s, b)) or True)
+    cfg = SchedulerConfig(max_batch_hours=12.3, publish_enabled=True, max_cities_per_day=5)
+
+    rc, window_s, _tail = _drive_one_city_night(conn, monkeypatch, cfg)
+
+    assert abs(window_s - (50400 - sched.NIGHT_OVERRUN_S - sched.NIGHT_MARGIN_S - 600)) < 30
+    [(subject, body)] = [(s, b) for s, b in alerts if "night shortened" in s]
+    assert subject.endswith("a slow start before the city loop, not the unit")
+    assert "VIOLATED" not in body and "Fix the unit" not in body
+    assert rc == 0
+
+
+def test_a_dry_run_is_never_clamped_and_never_alerts(conn, monkeypatch):
+    """`run-due --dry-run` under the nightly's own environment and a unit that
+    cannot hold the window: a dry run plans, it does not run to a deadline, so
+    it is never shortened and never mails (the `if not dry_run` guard)."""
+    alerts: list[tuple[str, str]] = []
+    fitted: list[float] = []
+    monkeypatch.setattr(sched, "_is_nightly_unit", lambda: True)
+    monkeypatch.delenv(sched.UNIT_TIMEOUT_ENV_VAR, raising=False)
+    monkeypatch.setattr(sched, "send_alert", lambda a, s, b: alerts.append((s, b)) or True)
+    real_fit = sched._fit_night_to_unit
+    monkeypatch.setattr(
+        sched,
+        "_fit_night_to_unit",
+        lambda c, **kw: fitted.append(c.max_batch_hours) or real_fit(c, **kw),
+    )
+    cfg = SchedulerConfig(max_batch_hours=16, publish_enabled=True, max_cities_per_day=5)
+
+    rc, _window_s, _tail = _drive_one_city_night(conn, monkeypatch, cfg, dry_run=True)
+
+    assert rc == 0
+    assert fitted == []
+    assert [s for s, _b in alerts if "night shortened" in s] == []
 
 
 # --- the tail survives a SIGTERM ----------------------------------------------
@@ -360,10 +422,31 @@ def test_a_sigterm_in_the_nights_tail_does_not_cost_the_publish(conn, monkeypatc
     manifest and the publish still run, and the handler the night started with
     is back afterwards. The loop's own SIGTERM handling is untouched: its tests
     are in tests/test_scheduler.py (named in this module's docstring)."""
+    monkeypatch.setattr(sched, "_is_nightly_unit", lambda: True)
     cfg = SchedulerConfig(publish_enabled=True, max_cities_per_day=5)
     rc, _window_s, tail = _drive_one_city_night(
         conn, monkeypatch, cfg, on_aggregate=lambda: os.kill(os.getpid(), signal.SIGTERM)
     )
     assert tail == ["aggregate", "manifest", "publish"]
     assert rc == 0
+    assert signal.getsignal(signal.SIGTERM) is default_sigterm
+
+
+def test_a_hand_runs_tail_keeps_the_default_sigterm(conn, monkeypatch, default_sigterm, caplog):
+    """A hand `run-due` from a shell has no systemd SIGKILL behind an ignored
+    SIGTERM, so the guard is the nightly's only: an operator's `kill` during a
+    hand run's tail still reaches the default disposition. (The stand-in
+    disposition raises, and the tail reports a raising step rather than
+    propagating, so what shows here is the aggregate step failing, the night
+    unhealthy, and no guard WARNING; the real default would end the process.)"""
+    monkeypatch.setattr(sched, "_is_nightly_unit", lambda: False)
+    cfg = SchedulerConfig(publish_enabled=True, max_cities_per_day=5)
+    with caplog.at_level(logging.WARNING):
+        rc, _window_s, tail = _drive_one_city_night(
+            conn, monkeypatch, cfg, on_aggregate=lambda: os.kill(os.getpid(), signal.SIGTERM)
+        )
+    assert tail[0] == "aggregate"
+    assert "aggregate index failed" in caplog.text
+    assert "SIGTERM received during the night's tail" not in caplog.text
+    assert rc != 0
     assert signal.getsignal(signal.SIGTERM) is default_sigterm

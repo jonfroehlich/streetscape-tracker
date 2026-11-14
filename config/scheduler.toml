@@ -121,9 +121,12 @@ city_timeout_minutes = 180
 #
 # This exists because the tail is what makes a night VISIBLE. run-due is a
 # oneshot systemd unit under TimeoutStartSec, whose SIGTERM is a wind-down in
-# the city loop but, before #389, killed the publish when it landed in the
-# tail: every city the night had collected sat in the catalog, correct but
-# unpublished, until an operator ran regenerate-aggregate by hand (issue #167).
+# the city loop but, before #389, would have killed the publish had it landed
+# in the tail (derived, not observed). Issue #167 is that outcome by the older
+# path: on 2026-07-29, before any deadline or SIGTERM handler existed, the
+# timeout killed the loop and every city the night had collected sat in the
+# catalog, correct but unpublished, until an operator ran regenerate-aggregate
+# by hand.
 #
 # The bracket (issue #389; docs/scheduler.md, "The night's length"):
 # TimeoutStopSec (30 min) < max_batch_hours, and max_batch_hours + 0.583 h

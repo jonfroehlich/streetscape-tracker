@@ -271,9 +271,11 @@ It is bounded by `TimeoutStopSec=30min`. Reaching that is a SIGKILL with no tail
 
 Two cautions:
 
-- **A SIGTERM during the tail is logged and ignored** (#389), so a `stop`
-  typed while the tail runs, or the unit's `TimeoutStartSec` landing there, no
-  longer kills the aggregate and the backup. It still reaches a publish rsync
+- **A SIGTERM during the nightly unit's tail is logged and ignored** (#389),
+  so a `stop` typed while the tail runs, or the unit's `TimeoutStartSec`
+  landing there, no longer kills the aggregate and the backup. A hand
+  `run-due` from a shell is not covered: no systemd SIGKILL follows there, so
+  a `kill` still ends it. It still reaches a publish rsync
   in flight at that instant (the cgroup gets the signal), so if the night
   reports `PUBLISH FAILED`, run `regenerate-aggregate --publish` by hand.
 - **A stop mid-city releases the Mapillary and Overpass host locks**, so it is a

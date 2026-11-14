@@ -1258,8 +1258,9 @@ class SchedulerConfig:
     # manifest, catalog backup, publish) room to run inside whatever budget the
     # supervisor allows. The unit is Type=oneshot under TimeoutStartSec, whose
     # SIGTERM is a wind-down in the loop but loses an in-flight publish in the
-    # tail (issue #167; on 2026-07-29 a batch died at exactly 12 h having
-    # collected most of the night and published none of it). The bracket this
+    # tail. (Issue #167's 2026-07-29 night was the then-12 h timeout killing
+    # the loop before this deadline or any SIGTERM handler existed; the tail
+    # band is derived, not observed.) The bracket this
     # must fit is defined once, beside NIGHT_OVERRUN_S, and a nightly whose
     # installed unit cannot hold it is shortened by night_window_seconds
     # (issue #389).
@@ -2990,8 +2991,10 @@ def _tail_survives_sigterm():
     the default disposition, and a SIGTERM there killed the process before the
     publish. The usual sender is the unit's ``TimeoutStartSec``, whose SIGTERM is
     the FIRST one systemd sends: a night whose deadline fired just before it
-    received that signal mid-tail and published nothing (#167's outcome). An
-    operator's ``systemctl stop`` typed during the tail was the other.
+    would receive that signal mid-tail and publish nothing, the outcome #167
+    recorded (by a different path: its night was killed mid-loop before any
+    handler existed). An operator's ``systemctl stop`` typed during the tail
+    was the other sender.
 
     Ignoring it is safe because the tail is bounded: systemd follows with
     SIGKILL after ``TimeoutStopSec``, which the tail is sized to fit. Two things
@@ -3002,6 +3005,11 @@ def _tail_survives_sigterm():
       publish reports the failure, the night alerts, and
       ``regenerate-aggregate --publish`` recovers it.
     - A SIGKILL after ``TimeoutStopSec`` is unchanged: nothing survives it.
+
+    ``cmd_run_due`` enters it only on the nightly unit (``_is_nightly_unit``),
+    because that safety argument is systemd's: a hand run from a shell has no
+    SIGKILL behind an ignored SIGTERM and an unbounded tail, so there the
+    default disposition stays and an operator's ``kill`` still ends it.
 
     Nothing about the city loop or the fill changes: they are inside
     ``_stop_on_sigterm``, whose handler replaces this one and restores it on
@@ -4351,7 +4359,8 @@ PUBLISH_TIMEOUT_S = 600.0
 # SIGKILL after TimeoutStopSec. A SIGTERM that lands in the CITY LOOP is the
 # #206 wind-down and the night still publishes. One that lands in the TAIL
 # (_finish_batch) is the cliff: before #389 the tail ran under the default
-# disposition and the publish was lost (#167's outcome). _tail_survives_sigterm
+# disposition and the publish would be lost (#167's outcome, derived for this
+# band rather than observed in it). _tail_survives_sigterm
 # now logs and ignores it there, but an in-flight publish rsync is in the same
 # cgroup and still dies, so the deadline is still sized to keep every night out
 # of the band  TimeoutStartSec - (tail + in-flight child) < h < TimeoutStartSec.
@@ -6843,17 +6852,21 @@ def cmd_timer_status(
     )
     # The collection unit's bracket as systemd LOADED it (issue #389), read only
     # when the timers are (an unmounted home already alerts, and the manager
-    # would report the unit not-found). Reported and mailed on its own; it never
-    # touches `healthy`, the heartbeat or the exit status, which measure the
-    # timers and whether cron runs.
-    bracket_line, bracket_bad = None, False
+    # would report the unit not-found), and only AFTER check_and_rearm: on the
+    # #369 reboot path the manager may hold the empty unit map of a scan that
+    # raced the mount until that call's daemon-reload, and read before it the
+    # unit is not-found and the line a false `unknown`. Reported and mailed on
+    # its own; it never touches `healthy`, the heartbeat or the exit status,
+    # which measure the timers and whether cron runs.
+    bracket_line, bracket_word = None, "ok"
     if reachable and visible:
-        bracket_line, bracket_bad = _collection_unit_bracket(
+        result = user_timers.check_and_rearm(run, names, rearm=rearm)
+        bracket_line, bracket_word = _collection_unit_bracket(
             user_timers.collection_unit_timeouts(run), cfg.max_batch_hours
         )
-        result = user_timers.check_and_rearm(run, names, rearm=rearm)
     else:
         result = user_timers.WatchdogResult()
+    bracket_bad = bracket_word != "ok"
     result.reachable, result.files_visible = reachable, visible
     result.waited_s, result.wait_budget_s = waited, wait_s
 
@@ -6885,35 +6898,56 @@ def cmd_timer_status(
     if alert and (not result.healthy or result.rearmed or bracket_bad):
         send_alert(
             cfg.alerts,
-            f"user timers on {host} — {result.verdict}"
-            + ("; collection unit bracket NOT ok" if bracket_bad else ""),
+            f"user timers on {host} — {result.verdict}" + _BRACKET_SUBJECT.get(bracket_word, ""),
             "The user-timer watchdog (issue #369) found or fixed something.\n\n"
             + report
             + "\n\nAfter a REARMED mail, check whether the night before published "
             "(regenerate-aggregate --publish recovers it). See deploy/README.md, "
-            '"After a reboot: the timer watchdog".'
-            + (
-                "\n\nThe collection unit line means the installed streetscape-tracker.service "
-                "cannot hold [schedule].max_batch_hours with its tail (issue #389): each "
-                "nightly is shortened to fit and mails, until the unit is re-copied and "
-                "daemon-reloaded between nights (deploy/README.md, \"Raising the night's "
-                'length").'
-                if bracket_bad
-                else ""
-            ),
+            '"After a reboot: the timer watchdog".' + _BRACKET_BODY.get(bracket_word, ""),
         )
     return 0 if result.healthy else 1
 
 
+# timer-status's mail wording per bracket word (issue #389). `unknown` gets its
+# own: an unreadable timeout is not evidence of a violation, and the nightly
+# clamp reads STREETSCAPE_UNIT_TIMEOUT_START_S, not the loaded timeout, so
+# neither word may claim a night IS being shortened.
+_BRACKET_SUBJECT = {
+    "VIOLATED": "; collection unit bracket VIOLATED",
+    "unknown": "; collection unit timeout unreadable",
+}
+_BRACKET_BODY = {
+    "VIOLATED": (
+        "\n\nThe collection unit line reads VIOLATED: the installed "
+        "streetscape-tracker.service's TimeoutStartSec cannot hold "
+        "[schedule].max_batch_hours with its tail and margin (issue #389), so a night "
+        "that runs to its deadline can be SIGTERMed in its tail. A nightly shortens "
+        "itself only when the unit's STREETSCAPE_UNIT_TIMEOUT_START_S reports the "
+        "shorter timeout. Re-copy the unit and daemon-reload between nights "
+        '(deploy/README.md, "Raising the night\'s length").'
+    ),
+    "unknown": (
+        "\n\nThe collection unit line reads unknown: systemd's TimeoutStartSec for "
+        "streetscape-tracker.service could not be read (the unit is not loaded, or the "
+        "value is infinity or a form this check does not parse), so the bracket was not "
+        "checked (issue #389). This is not a finding that the bracket is violated. Run "
+        "`systemctl --user show streetscape-tracker.service -p LoadState "
+        "-p TimeoutStartUSec -p TimeoutStopUSec` and compare it with "
+        "deploy/systemd/streetscape-tracker.service."
+    ),
+}
+
+
 def _collection_unit_bracket(
     timeouts: user_timers.UnitTimeouts, max_batch_hours: float
-) -> tuple[str, bool]:
-    """``timer-status``'s line for the collection unit's bracket, and whether it is bad (#389).
+) -> tuple[str, str]:
+    """``timer-status``'s line for the collection unit's bracket, and its word (#389).
 
     The unit's loaded ``TimeoutStartSec`` must hold ``max_batch_hours`` plus
     ``NIGHT_OVERRUN_S`` and ``NIGHT_MARGIN_S``: ``ok`` when it does,
-    ``VIOLATED`` when it does not, and ``unknown`` -- bad, never ``ok`` -- when
-    the timeout could not be read (``infinity``, junk, a unit not loaded).
+    ``VIOLATED`` when it does not, and ``unknown`` -- mailed, never ``ok``,
+    but never worded as a violation -- when the timeout could not be read
+    (``infinity``, junk, a unit not loaded).
     """
     need_s = max_batch_hours * 3600.0 + NIGHT_OVERRUN_S + NIGHT_MARGIN_S
     if timeouts.start_s is None:
@@ -6927,7 +6961,7 @@ def _collection_unit_bracket(
         f"TimeoutStartSec={timeouts.start_raw or '?'}, TimeoutStopSec={timeouts.stop_raw or '?'}; "
         f"max_batch_hours={max_batch_hours:g} needs >= {need_s / 3600:.2f} h: {word}"
     )
-    return line, word != "ok"
+    return line, word
 
 
 def cmd_restore_backup(cfg: SchedulerConfig, backup_path: str, dest: str | None) -> int:
@@ -10124,9 +10158,13 @@ def night_window_seconds(
 
     Returns ``(window_s, None)`` when the configured window fits, else
     ``(ceiling_s, note)``; the note names the configured hours, the timeout it
-    read and the fix. A window that fits exactly is left alone. The ceiling is
-    floored at 0: a night whose pre-loop alone used the unit's clock runs no
-    cities and goes straight to the tail.
+    read and the elapsed pre-loop time, and says which of the two broke the
+    window: the unit (the configured window would not fit even with no
+    pre-loop at all, so the fix is the unit or the hours) or the pre-loop
+    alone (a slow connect, migration or mount; the unit needs no change). A
+    window that fits exactly is left alone. The ceiling is floored at 0: a
+    night whose pre-loop alone used the unit's clock runs no cities and goes
+    straight to the tail.
 
     Example (prod: 12 h under the 14 h unit, 30 s before the loop)::
 
@@ -10138,6 +10176,41 @@ def night_window_seconds(
     configured_s = max_batch_hours * 3600.0
     if not is_nightly:
         return configured_s, None
+    unit_s, source = _installed_unit_timeout_s(unit_timeout_env)
+    unit_room_s = _unit_room_s(unit_s)
+    ceiling_s = max(0.0, unit_room_s - pre_loop_s)
+    if configured_s <= ceiling_s:
+        return configured_s, None
+    elapsed = f"{pre_loop_s:.0f} s ({pre_loop_s / 60:.1f} min) passed before the city loop started"
+    if configured_s <= unit_room_s:
+        note = (
+            f"max_batch_hours = {max_batch_hours:g} h fits the installed unit ({source}, less "
+            f"the tail and in-flight allowance of {NIGHT_OVERRUN_S:.0f} s and the margin of "
+            f"{NIGHT_MARGIN_S:.0f} s), but {elapsed}, so tonight ends at "
+            f"{ceiling_s / 3600:.2f} h (issue #389). The unit needs no change: look in this "
+            f"night's log for what delayed the start (a slow catalog connect or migration, "
+            f"a slow mount)."
+        )
+    else:
+        note = (
+            f"max_batch_hours = {max_batch_hours:g} h does not fit the installed unit, so tonight "
+            f"ends at {ceiling_s / 3600:.2f} h: {source}, less the tail and in-flight allowance "
+            f"({NIGHT_OVERRUN_S:.0f} s) and the margin ({NIGHT_MARGIN_S:.0f} s), and {elapsed} "
+            f"(issue #389). It would not fit even with no time before the loop. Fix the unit, "
+            f"not the night: `diff ~/.config/systemd/user/streetscape-tracker.service "
+            f"deploy/systemd/streetscape-tracker.service`, then copy it over and "
+            f"`systemctl --user daemon-reload` between nights (deploy/README.md), or lower "
+            f"[schedule].max_batch_hours."
+        )
+    return ceiling_s, note
+
+
+def _installed_unit_timeout_s(unit_timeout_env: str | None) -> tuple[float, str]:
+    """The nightly unit's ``TimeoutStartSec`` in seconds, and where it came from (#389).
+
+    ``UNIT_TIMEOUT_ENV_VAR``'s value when it is a usable number, else
+    ``LEGACY_UNIT_TIMEOUT_START_S``; see :func:`night_window_seconds`.
+    """
     try:
         unit_s = float(unit_timeout_env) if unit_timeout_env is not None else None
     except ValueError:
@@ -10147,23 +10220,13 @@ def night_window_seconds(
             f"{UNIT_TIMEOUT_ENV_VAR} is {'not set' if unit_timeout_env is None else repr(unit_timeout_env)}, "
             f"so assuming the pre-#389 unit's {LEGACY_UNIT_TIMEOUT_START_S / 3600:g} h"
         )
-        unit_s = LEGACY_UNIT_TIMEOUT_START_S
-    else:
-        source = f"{UNIT_TIMEOUT_ENV_VAR}={unit_s:g} s ({unit_s / 3600:g} h)"
-    ceiling_s = max(0.0, unit_s - NIGHT_OVERRUN_S - NIGHT_MARGIN_S - pre_loop_s)
-    if configured_s <= ceiling_s:
-        return configured_s, None
-    note = (
-        f"max_batch_hours = {max_batch_hours:g} h does not fit the installed unit, so tonight "
-        f"ends at {ceiling_s / 3600:.2f} h: {source}, less the tail and in-flight allowance "
-        f"({NIGHT_OVERRUN_S:.0f} s), the margin ({NIGHT_MARGIN_S:.0f} s) and the "
-        f"{pre_loop_s:.0f} s spent before the city loop (issue #389). Fix the unit, not the "
-        f"night: `diff ~/.config/systemd/user/streetscape-tracker.service "
-        f"deploy/systemd/streetscape-tracker.service`, then copy it over and "
-        f"`systemctl --user daemon-reload` between nights (deploy/README.md), or lower "
-        f"[schedule].max_batch_hours."
-    )
-    return ceiling_s, note
+        return LEGACY_UNIT_TIMEOUT_START_S, source
+    return unit_s, f"{UNIT_TIMEOUT_ENV_VAR}={unit_s:g} s ({unit_s / 3600:g} h)"
+
+
+def _unit_room_s(unit_s: float) -> float:
+    """The window a unit of ``unit_s`` holds with no time before the loop (#389)."""
+    return max(0.0, unit_s - NIGHT_OVERRUN_S - NIGHT_MARGIN_S)
 
 
 def _fit_night_to_unit(cfg: SchedulerConfig, *, batch_started: float) -> SchedulerConfig:
@@ -10175,29 +10238,41 @@ def _fit_night_to_unit(cfg: SchedulerConfig, *, batch_started: float) -> Schedul
     does not fit, logs a WARNING, mails an alert, and returns a copy of
     ``cfg`` so every reader of the window agrees -- the deadline, the
     ``Done:`` line's ``deadline (N h)``, the #373 never-fits test, the #290
-    census-reuse window. Returns ``cfg`` itself when nothing changes.
+    census-reuse window. Returns ``cfg`` itself when nothing changes. The
+    alert's subject says which cause it was, the unit or a slow start, since
+    only the first is fixed in the unit.
 
     A clamp rather than a refusal: refusing to start would lose the whole
     night, while a shortened night loses only the hours it could not have
     held and still publishes.
     """
+    unit_timeout_env = os.environ.get(UNIT_TIMEOUT_ENV_VAR)
     window_s, note = night_window_seconds(
         cfg.max_batch_hours,
         is_nightly=_is_nightly_unit(),
-        unit_timeout_env=os.environ.get(UNIT_TIMEOUT_ENV_VAR),
+        unit_timeout_env=unit_timeout_env,
         pre_loop_s=max(0.0, batch_started - _PROCESS_STARTED_MONOTONIC),
     )
     if note is None:
         return cfg
+    unit_s, _ = _installed_unit_timeout_s(unit_timeout_env)
+    unit_is_the_cause = cfg.max_batch_hours * 3600.0 > _unit_room_s(unit_s)
     logger.warning("Night shortened: " + note)
+    if unit_is_the_cause:
+        cause = "the installed unit cannot hold max_batch_hours"
+        tail = (
+            "\n\nThe night runs to the shorter deadline and still publishes. If the installed "
+            "unit is the cause, the daily `timer-status --alert` (deploy/cron/) reports the "
+            "collection unit's bracket as VIOLATED until the unit is fixed, so expect that "
+            "mail too."
+        )
+    else:
+        cause = "a slow start before the city loop, not the unit"
+        tail = "\n\nThe night runs to the shorter deadline and still publishes."
     send_alert(
         cfg.alerts,
-        f"night shortened to {window_s / 3600:.2f} h on {socket.gethostname()}: "
-        f"the installed unit cannot hold max_batch_hours",
-        note + "\n\nThe night runs to the shorter deadline and still publishes. If the installed "
-        "unit is the cause, the daily `timer-status --alert` (deploy/cron/) reports the "
-        "collection unit's bracket as VIOLATED until the unit is fixed, so expect that "
-        "mail too.",
+        f"night shortened to {window_s / 3600:.2f} h on {socket.gethostname()}: {cause}",
+        note + tail,
     )
     return dataclasses.replace(cfg, max_batch_hours=window_s / 3600.0)
 
@@ -11015,9 +11090,11 @@ def cmd_run_due(
         + (f"; {plan_error}" if plan_error else "")
     )
     logger.info("Done: " + summary)
-    # A SIGTERM from here on is logged and ignored rather than killing the
-    # publish (issue #389); see _tail_survives_sigterm for what it cannot save.
-    with _tail_survives_sigterm():
+    # On the nightly unit, a SIGTERM from here on is logged and ignored rather
+    # than killing the publish (issue #389); see _tail_survives_sigterm for what
+    # it cannot save. A hand run keeps the default disposition: no systemd
+    # SIGKILL follows there, so an operator's `kill` must still end it.
+    with _tail_survives_sigterm() if _is_nightly_unit() else contextlib.nullcontext():
         return _finish_batch(
             cfg,
             conn,

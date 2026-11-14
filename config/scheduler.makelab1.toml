@@ -93,8 +93,9 @@ city_timeout_minutes = 180
 # Stop STARTING cities after this many hours so the aggregate/manifest/publish
 # tail still runs before the unit's TimeoutStartSec. That limit sends SIGTERM:
 # mid-loop it is the ordinary wind-down, but before #389 one that landed in the
-# tail lost the publish (#167's outcome), and an in-flight publish rsync still
-# dies with it.
+# tail would have lost the publish (derived, not observed; #167's 2026-07-29
+# night was killed mid-loop before any deadline or handler existed), and an
+# in-flight publish rsync still dies with it.
 #
 # The derivation (issue #389; docs/scheduler.md, "The night's length"), with
 # h = this value, the tail allowance 0.5 h (= the unit's TimeoutStopSec), one
