@@ -12,7 +12,8 @@
  * STREETSCAPE_DATA_BASE_URL. The imagery provider (GSV vs Mapillary) is derived
  * from the data filename's provider token.
  *
- * Also depends on the page's other scripts: street-coverage.js
+ * Also depends on the page's other scripts: pano-overview.js (the
+ * viewport-true dot tier's index and planner, issue #77), street-coverage.js
  * (renderStreetCoverage), diff-overlay.js (renderDiffOverlay) and
  * capture-history.js (captureHistoryLegendHtml, rebuildCaptureHistoryChart --
  * the harvested capture-history section, issue #109).
@@ -99,12 +100,38 @@ const FLAT_ONLY_COLOR = "#9aa0a6"; // muted gray — visibly not a dated pano
 // ── Render-cap / visibility model (issues #77, #58) ─────────────
 // `markersByYear` holds every streamed pano marker (both GSV modes). What is
 // actually *drawn* is reconciled through a single desired→onMap delta so no
-// interaction re-touches all N markers, and so dense cities can draw only a
-// spatial subsample. Reported stats/counts/plot always use the full set.
+// interaction re-touches all N markers. Which markers are desired is decided
+// by the pure planner `planMapView` (pano-overview.js): a population at or
+// under RENDER_CAP is drawn whole, as before #77; a larger one draws EVERY pano
+// in the drawn area when they fit the budget, and the spatial-stride sample
+// only when they do not. Reported stats/counts/plot always use the full set.
 let onMap = new Set();          // markers currently added to the Leaflet map
 let desiredShown = new Set();   // markers that SHOULD be drawn right now
 let renderAllOverride = false;  // user opted out of the cap ("Render all")
 let panoDotsHidden = false;     // streets overlay hid the pano layer
+
+// The viewport-true tier's state (issue #77). Ids are push order: a dated pano
+// marker's `options.panoIdx` is its index in `panoMarkersById` and in the
+// columns, for both GSV modes. Flat-only markers are NOT here: they are not
+// pano dots, never enter `onMap` (restyleMarkers reads `captureDate`, which a
+// flat marker does not carry) and keep their own switch (setFlatShown).
+const panoColumnsBuilder = createPanoColumns(4096);
+let panoMarkersById = [];       // id -> dated pano marker
+let panoCols = null;            // finished columns, set at finalize
+let panoIndex = null;           // built on first need: only above RENDER_CAP
+let cellCountsCache = { key: null, counts: null }; // per-cell counts, ONE filter at a time
+let mapTier = null;             // "complete" | "sampled"; null before the first plan
+let lastPlan = null;            // the plan the map currently shows
+let pinnedMarker = null;        // a pano marker whose popup is open
+let popupAutoPanning = false;   // set by Leaflet's autopanstart, read by the next moveend
+let mapReady = false;           // the stream is done and the map fitted
+let flatOnMap = false;          // flat-only markers are currently added
+
+// Fraction the drawn area extends past the visible map on each side. Leaflet's
+// canvas renderer clips to the same padding (its default `padding: 0.1`), so
+// a pan of up to that much never reveals an undrawn edge, and the tier is
+// counted over exactly this area rather than the smaller visible one.
+const DRAWN_AREA_PAD = 0.1;
 let streetUi = null;            // StreetUiState (street-coverage.js), or null: no street artifact
 let streetController = null;    // what renderStreetCoverage resolved to, or null
 
@@ -162,6 +189,33 @@ map.on("click", (e) => {
   updateLegend(Object.keys(markersByYear).map(Number));
 });
 
+// The viewport-true tier (issue #77): a pan or zoom re-plans only for a
+// population over the cap. A city at or under it never counts a view, never
+// builds the index, and so keeps its pre-#77 behaviour exactly.
+map.on("moveend", () => {
+  if (!mapReady) return;
+  const freeze = popupAutoPanning; // this move was a popup making room for itself
+  popupAutoPanning = false;
+  if (panoDotsHidden) return;
+  if (!isViewDependent({
+    populationSize: currentPopulationSize(), budget: RENDER_CAP, renderAll: renderAllOverride,
+  })) return;
+  applyDesired({ fromMove: true, freeze });
+});
+// Fired by a popup just before it pans the map to fit; the moveend that pan
+// causes must not re-tier, or a dot near the edge could close its own popup.
+map.on("autopanstart", () => { popupAutoPanning = true; });
+// An open popup's pano stays drawn while the map moves. Only DATED pano
+// markers are pinned: a flat-only or diff-overlay marker must never reach
+// `onMap`, whose restyle reads a capture date they do not carry.
+map.on("popupopen", (e) => {
+  const source = e.popup?._source;
+  pinnedMarker = source?.options?.panoIdx != null ? source : null;
+});
+map.on("popupclose", (e) => {
+  if (e.popup?._source === pinnedMarker) pinnedMarker = null;
+});
+
 /**
  * Whether a marker belongs in the current GSV display mode. Contributor
  * (non-official-Google) GSV markers are shown only in "All GSV" mode; every
@@ -178,10 +232,12 @@ function markerInMode(m) {
 
 // ── Reconcile model (issues #77, #58) ──────────────────────────
 //
-// One path decides what is drawn: compute the desired set (mode ∧ year ∧ cap,
-// plus the honesty union for a selected date), then add/remove only the delta
-// against what is already on the map. Every interaction routes through
-// applyDesired(), so no click ever re-touches all N markers.
+// One path decides what is drawn: planMapView computes the desired set (mode ∧
+// year, then the whole population, every pano in the drawn area, or the stride
+// sample, plus the honesty union for a selected date), then only the delta
+// against what is already on the map is added/removed. Every interaction, and
+// every pan or zoom of a city over the cap, routes through applyDesired(), so
+// nothing ever re-touches all N markers.
 
 /**
  * Spatially-strided subsample of a marker list, or the list itself when it is
@@ -229,55 +285,103 @@ function rebuildModeCaches() {
 }
 
 /**
- * The set of markers that should currently be drawn. Base membership is the
- * in-mode set, narrowed to an active year and capped (unless the user chose
- * "Render all"); a selected date additionally unions in EVERY in-mode marker of
- * that date at full opacity, so the map never under-shows a date relative to the
- * temporal plot's count (the render-cap honesty trap).
+ * The spatial-stride sample of the current population: the whole-run sample,
+ * or the selected year's (cached per year). What a city over the cap drew at
+ * every zoom before #77, and still draws when the drawn area holds more panos
+ * than the budget.
  *
- * @returns {Set<L.CircleMarker>}
+ * @param {?number} year - The active year filter, or null.
+ * @returns {L.CircleMarker[]}
  */
-function computeDesiredShown() {
-  let base;
-  if (activeYears.size) {
-    const y = [...activeYears][0];
-    const yearMarkers = inModeByYear.get(y) ?? [];
-    if (renderAllOverride) {
-      base = yearMarkers;
-    } else {
-      if (!cappedByYear.has(y)) cappedByYear.set(y, strideSubset(yearMarkers));
-      base = cappedByYear.get(y);
-    }
-  } else {
-    base = renderAllOverride ? inModeAll : globalCapped;
-  }
-  const set = new Set(base);
-  if (selectedDate) {
-    for (const m of (inModeByDateStr.get(selectedDate.toDateString()) ?? [])) set.add(m);
-  }
-  return set;
+function sampledPopulation(year) {
+  if (year == null) return globalCapped;
+  if (!cappedByYear.has(year)) cappedByYear.set(year, strideSubset(inModeByYear.get(year) ?? []));
+  return cappedByYear.get(year);
+}
+
+/** The active year filter, or null (the legend allows at most one year). */
+function activeYearOrNull() {
+  return activeYears.size ? [...activeYears][0] : null;
 }
 
 /**
- * Reconcile the map to `desiredShown` (or nothing, when the streets overlay has
- * hidden the pano layer) by adding/removing only the delta. Bounded by the
- * symmetric difference, i.e. ≤ RENDER_CAP work, never O(N).
+ * How many panos the map draws from right now: in the current imagery mode
+ * and, under a year filter, of that year. The same population the pre-#77 cap
+ * was applied to, so a city at or under RENDER_CAP is never view-dependent.
+ * Flat-only points are not counted: they are not pano dots.
+ *
+ * @returns {number}
+ */
+function currentPopulationSize() {
+  const year = activeYearOrNull();
+  return year == null ? totalInMode : (inModeCountByYear.get(year) ?? 0);
+}
+
+/**
+ * Build the spatial index the first time a view has to be counted. Timed as
+ * the `pano-index` performance measure, which the #77 measurement reads.
+ *
+ * @returns {Object} The PanoIndex (pano-overview.js).
+ */
+function ensurePanoIndex() {
+  if (!panoIndex) {
+    performance.mark("pano-index-start");
+    panoIndex = buildPanoIndex(panoCols);
+    performance.measure("pano-index", "pano-index-start");
+  }
+  return panoIndex;
+}
+
+/**
+ * Per-cell counts for one population filter, recomputed only when the mode or
+ * year changes. One Uint32 per non-empty index cell, and only one filter's
+ * worth is ever held, so its memory is bounded by the cell count.
+ *
+ * @param {{officialOnly: boolean, year: ?number}} filter
+ * @param {function(number): boolean} accept - populationFilter(panoCols, filter).
+ * @returns {Uint32Array}
+ */
+function cellCountsFor(filter, accept) {
+  const key = `${filter.officialOnly}|${filter.year}`;
+  if (cellCountsCache.key !== key) {
+    cellCountsCache = { key, counts: countPerCell(ensurePanoIndex(), accept) };
+  }
+  return cellCountsCache.counts;
+}
+
+/**
+ * A Leaflet LatLngBounds as the plain box pano-overview.js takes.
+ *
+ * @param {L.LatLngBounds} b
+ * @returns {{south: number, west: number, north: number, east: number}}
+ */
+function boxOf(b) {
+  return { south: b.getSouth(), west: b.getWest(), north: b.getNorth(), east: b.getEast() };
+}
+
+/**
+ * Reconcile the map to `desiredShown` by adding/removing only the delta.
+ * Bounded by the symmetric difference, never O(N).
+ *
+ * @returns {L.CircleMarker[]} The markers it added.
  */
 function reconcile() {
-  const target = panoDotsHidden ? new Set() : desiredShown;
-  const { toAdd, toRemove } = computeVisibilityDelta(onMap, target);
+  const { toAdd, toRemove } = computeVisibilityDelta(onMap, desiredShown);
   for (const m of toRemove) { m.remove(); onMap.delete(m); }
   for (const m of toAdd) { m.addTo(map); onMap.add(m); }
+  return toAdd;
 }
 
 /**
- * Style every on-map marker for the current date filter (default when no date
- * is selected). Iterates only what is drawn (≤ cap), so it stays cheap; a
- * re-added marker that carried a stale dimmed style is corrected here.
+ * Style pano markers for the current date filter (default when no date is
+ * selected). A re-added marker that carried a stale dimmed style is corrected
+ * here.
+ *
+ * @param {Iterable<L.CircleMarker>} markers - Dated pano markers only.
  */
-function restyleOnMap() {
+function restyleMarkers(markers) {
   const selKey = selectedDate ? selectedDate.toDateString() : null;
-  for (const m of onMap) {
+  for (const m of markers) {
     const s = markerDateStyle(m.options.captureDate.toDateString(), selKey);
     m.setStyle({ fillOpacity: s.fillOpacity });
     m.setRadius(s.radius);
@@ -285,17 +389,101 @@ function restyleOnMap() {
 }
 
 /**
- * The single entry point every interaction uses: recompute the desired set,
- * reconcile the map to it, and restyle what is drawn.
+ * Show or hide the flat-only layer (issue #116) as a whole, on its own path:
+ * never through `onMap`, and independent of the Panoramas layer.
+ *
+ * @param {boolean} show
  */
-function applyDesired() {
-  desiredShown = computeDesiredShown();
-  reconcile();
-  restyleOnMap();
+function setFlatShown(show) {
+  if (show === flatOnMap) return;
+  flatOnlyMarkers.forEach((m) => (show ? m.addTo(map) : m.remove()));
+  flatOnMap = show;
 }
 
 /**
- * Toggle the render cap off ("Render all") or back on ("Show subset").
+ * The single entry point every interaction uses: plan the drawn set
+ * (planMapView), reconcile the map to it, restyle, and say what changed.
+ *
+ * A pan or zoom (`fromMove`) restyles only the markers it added, and keeps an
+ * open popup's pano drawn; every other caller restyles everything drawn, since
+ * it may have changed the selected date.
+ *
+ * @param {{fromMove?: boolean, freeze?: boolean}} [opts] - `freeze` keeps the
+ *   previous tier (the move was a popup's own auto-pan).
+ */
+function applyDesired({ fromMove = false, freeze = false } = {}) {
+  const year = activeYearOrNull();
+  const filter = { officialOnly: !showAllGsv, year };
+  const accept = panoCols ? populationFilter(panoCols, filter) : null;
+  const drawnArea = () => boxOf(map.getBounds().pad(DRAWN_AREA_PAD));
+  const plan = planMapView({
+    budget: RENDER_CAP,
+    populationSize: currentPopulationSize(),
+    renderAll: renderAllOverride,
+    panosHidden: panoDotsHidden,
+    prevTier: mapTier,
+    freezeTier: freeze,
+    flatOn: showFlatOnly,
+    populationItems: () => (year == null ? inModeAll : (inModeByYear.get(year) ?? [])),
+    sampleItems: () => sampledPopulation(year),
+    countInView: () =>
+      countInBounds(ensurePanoIndex(), panoCols, cellCountsFor(filter, accept), drawnArea(), accept),
+    viewItems: () =>
+      idsInBounds(ensurePanoIndex(), panoCols, drawnArea(), accept).map((id) => panoMarkersById[id]),
+    dateItems: selectedDate ? () => inModeByDateStr.get(selectedDate.toDateString()) ?? [] : null,
+    pinnedItem: fromMove && pinnedMarker && markerInMode(pinnedMarker) ? pinnedMarker : null,
+  });
+  // The legend's "in view" figure counts the VISIBLE map, not the padded area.
+  plan.visible = plan.mode === "view"
+    ? countInBounds(panoIndex, panoCols, cellCountsFor(filter, accept), boxOf(map.getBounds()), accept)
+    : null;
+
+  lastPlan = plan;
+  mapTier = plan.tier;
+  desiredShown = plan.desired;
+  const added = reconcile();
+  restyleMarkers(fromMove ? added : onMap);
+  setFlatShown(plan.flatShown);
+  if (plan.announce) {
+    const status = document.getElementById("map-tier-status");
+    if (status) status.textContent = plan.announce;
+  }
+  const notice = document.getElementById("map-drawn-notice");
+  if (notice) notice.textContent = drawnNotice();
+}
+
+/**
+ * The legend's line about what the dots show, for the current plan.
+ *
+ * @returns {string}
+ */
+function drawnNotice() {
+  if (!lastPlan) return "";
+  return drawnNoticeText({
+    mode: lastPlan.mode,
+    drawn: lastPlan.desired.size,
+    population: currentPopulationSize(),
+    visible: lastPlan.visible,
+    budget: RENDER_CAP,
+    yearFiltered: activeYears.size > 0,
+    renderAll: renderAllOverride,
+  });
+}
+
+/**
+ * The Panoramas layer's switch (the street overlay's layer control drives it
+ * through panoVisibilityLayer). Hides or re-shows every pano dot through the
+ * planner; flat-only points are not pano dots and keep their own switch.
+ *
+ * @param {boolean} visible
+ */
+function setPanoLayerVisible(visible) {
+  panoDotsHidden = !visible;
+  applyDesired();
+}
+
+/**
+ * Toggle the render cap off ("Render all") or back on ("Limit to view").
  * Shown only for cities above the cap; see updateLegend's cap notice.
  *
  * @param {boolean} on - true = draw all in-mode panos; false = re-apply the cap.
@@ -492,24 +680,24 @@ function updateLegend(years) {
       counts include all panoramas</em></p>`;
   }
 
-  // ── Cap notice (issues #77/#58) ───────────────────────────
-  // Only for cities above the render cap. The stat table above always shows the
-  // full count; this line is the one place the *drawn* count is exposed, plus
-  // the opt-in override. A year filter usually drops below the cap (full detail
-  // for that year), so the notice is framed around the whole-run picture.
+  // ── Drawn-dots notice (issues #77/#58) ────────────────────
+  // Only for cities above the render cap (in-mode panos, flat-only excluded).
+  // The stat table above always shows the full count; this line is the one
+  // place that says what the dots are: every pano in view, or a spatial sample
+  // because the view holds too many (pano-overview.js, drawnNoticeText). A pan
+  // or zoom patches its text in place (applyDesired) rather than rebuilding
+  // the legend, which would rebuild two charts.
   if (totalInMode > RENDER_CAP) {
-    const shown = renderAllOverride ? totalInMode : Math.min(RENDER_CAP, totalInMode);
     html += `
       <div class="legend-divider"></div>
       <div class="legend-cap-notice">
-        <p class="legend-meta">Drawing ${shown.toLocaleString()} of
-          ${totalInMode.toLocaleString()} panos${renderAllOverride ? "" : "; filter or zoom for detail"}.</p>
-        <button type="button" class="gsv-mode-btn"
+        <p class="legend-meta" id="map-drawn-notice">${escapeHtml(drawnNotice())}</p>
+        <button type="button" class="gsv-mode-btn" id="render-all-btn"
                 title="${renderAllOverride
-                  ? "Return to the capped spatial subsample (faster on dense cities)"
-                  : "Draw every panorama dot — can be slow on dense cities"}"
+                  ? "Return to drawing what is in view: every panorama when they fit, a spatial sample when they do not (faster on dense cities)"
+                  : "Draw every panorama dot at every zoom — can be slow on dense cities"}"
                 onclick="setRenderAll(${!renderAllOverride})">
-          ${renderAllOverride ? `Show ~${RENDER_CAP.toLocaleString()}` : "Render all"}
+          ${renderAllOverride ? "Limit to view" : "Render all"}
         </button>
       </div>`;
   }
@@ -748,13 +936,14 @@ function toggleStreetGaps(on) {
 }
 
 /**
- * Show or hide the flat-only imagery layer (issue #116, Mapillary only).
- * These points carry no capture date, so they sit outside the year/pano
- * machinery — a simple add/remove of the marker set.
+ * Show or hide the flat-only imagery layer (issue #116), for any provider
+ * whose rows carry FLAT_ONLY. These points carry no capture date, so they sit
+ * outside the year/pano machinery: the plan only passes the switch through to
+ * setFlatShown, which adds or removes the whole set, never via `onMap`.
  */
 function toggleFlatOnly() {
   showFlatOnly = !showFlatOnly;
-  flatOnlyMarkers.forEach((m) => (showFlatOnly ? m.addTo(map) : m.remove()));
+  applyDesired();
   updateLegend(Object.keys(markersByYear).map(Number));
 }
 
@@ -1465,8 +1654,8 @@ function setupCollapsiblePanel({ containerId, toggleId, storageKey, what, onExpa
 }
 
 // ── Marker / chart style helpers ───────────────────────────────
-// Map-marker styling for the date filter now lives in restyleOnMap() (which
-// iterates only the drawn set, ≤ cap) via the pure markerDateStyle() helper;
+// Map-marker styling for the date filter now lives in restyleMarkers() (which
+// iterates only the drawn set) via the pure markerDateStyle() helper;
 // the chart-color helpers below are unchanged.
 
 /**
@@ -1968,7 +2157,11 @@ async function loadData() {
           captureDate,
           captureDateStr: String(row.capture_date),
           isGoogle,
+          // This pano's id in the viewport-true tier's columns (issue #77).
+          panoIdx: panoMarkersById.length,
         });
+        panoMarkersById.push(marker);
+        panoColumnsBuilder.push(row.pano_lat, row.pano_lon, year, isGoogle);
         if (markerInMode(marker)) {
           validPoints.push([row.pano_lat, row.pano_lon]);
           if (!streamCapReached) {
@@ -2077,12 +2270,23 @@ async function loadData() {
     allMarkerCount = flatMarkers.length;
     googleMarkerCount = flatMarkers.filter((m) => m.options.isGoogle).length;
 
-    // Build the in-mode caches, then reconcile the drawn set to the honest
-    // spatial subsample (a no-op for cities under the cap, which already filled
-    // in progressively during streaming). Stats/count/plot use the FULL in-mode
-    // set, so the cap never changes a reported number.
+    // Build the in-mode caches, fit the map, then plan the drawn set (a no-op
+    // for cities under the cap, which already filled in progressively during
+    // streaming). Stats/count/plot use the FULL in-mode set, so the cap never
+    // changes a reported number.
+    //
+    // The fit comes BEFORE the first plan (issue #77): a city over the cap is
+    // planned from the view, and the view before the fit is [0, 0], which
+    // holds nothing — planned there, it would open "complete" with no dots and
+    // then announce a switch to the sample the moment the fit landed.
+    panoCols = panoColumnsBuilder.finish();
     rebuildModeCaches();
     totalPanosGlobal = totalInMode;
+    // Unanimated, so the view the first plan counts is the fitted one.
+    if (validPoints.length > 0) {
+      map.fitBounds(L.latLngBounds(validPoints), { animate: false });
+    }
+    mapReady = true;
     applyDesired();
 
     // Long since settled in practice (it raced the whole CSV stream).
@@ -2090,10 +2294,6 @@ async function loadData() {
     updateLegend(Object.keys(markersByYear).map(Number));
 
     createTemporalPlot(document.getElementById("temporal-plot"));
-
-    if (validPoints.length > 0) {
-      map.fitBounds(L.latLngBounds(validPoints));
-    }
 
     // Optional street-coverage overlay; a no-op when the city has no artifact.
     // Prefer the road-walk (streetwalk) coverage artifact when the manifest
@@ -2112,7 +2312,8 @@ async function loadData() {
     // through onChange), a top-left layer control (Panoramas + Streets) and the
     // street-type chart stacked above the capture-date chart. "Panoramas" is a
     // proxy layer whose add/remove goes through the reconcile model, so
-    // re-showing respects the mode/year/date/cap and hiding stays ≤ cap work.
+    // re-showing respects the mode, year, date and the view's tier (#77), and
+    // hiding stays bounded by what is drawn.
     //
     // Deliberately NOT awaited: an overlay failure must not turn into "Failed
     // to load city data" for a page that has already rendered.
@@ -2124,10 +2325,8 @@ async function loadData() {
           streetNetworkType
         )
       : null;
-    const panoLayer = panoVisibilityLayer((visible) => {
-      panoDotsHidden = !visible;
-      applyDesired();
-    }).addTo(map); // on the map from the start, so its checkbox starts checked
+    const panoLayer = panoVisibilityLayer(setPanoLayerVisible)
+      .addTo(map); // on the map from the start, so its checkbox starts checked
     renderStreetCoverage(map, targetFile, providerGlobal, {
       streetwalkFile: streetwalk?.coverage_filename,
       networkType: streetwalk ? streetNetworkType : null,
