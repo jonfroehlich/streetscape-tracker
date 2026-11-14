@@ -245,7 +245,7 @@ catalog backups to `backups/` (see below).
 
 ```bash
 systemctl --user stop streetscape-tracker.service     # graceful wind-down
-systemctl --user kill streetscape-tracker.service     # immediate death, no tail
+systemctl --user kill -s SIGKILL streetscape-tracker.service   # immediate death, no tail
 ```
 
 **`stop` is a wind-down, not a kill.** The in-flight collection child dies with
@@ -267,7 +267,10 @@ working, not failing — read the subject before assuming otherwise.
 It is bounded by `TimeoutStopSec=30min`. Reaching that is a SIGKILL with no tail
 — the 2026-08-13 shape, where a night's runs sat unpublished until someone ran
 `regenerate-aggregate --publish` by hand. If you need the batch dead *now*, use
-`kill` and expect to publish by hand afterwards.
+`kill -s SIGKILL` and expect to publish by hand afterwards. A bare
+`systemctl kill` sends SIGTERM, which the loop winds down on and the
+nightly's tail ignores (#389), and it queues no stop job, so nothing
+escalates it to a SIGKILL.
 
 Two cautions:
 

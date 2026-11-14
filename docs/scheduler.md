@@ -1162,7 +1162,7 @@ So the bracket is enforced in three places.
   The opening line now ends `; max_batch_hours=N`, the value the night actually ran under.
 - **`timer-status`** prints the collection unit's bracket as systemd LOADED it (`systemctl --user show streetscape-tracker.service -p TimeoutStartUSec -p TimeoutStopUSec`), the only check that sees a hand-written drop-in or an un-reloaded copy: `ok`, `VIOLATED`, or `unknown` (an `infinity` or unparseable timeout, or a unit not loaded), which is never read as `ok`.
   It is read **after** the watchdog's re-arm, so after its one `daemon-reload`: on the #369 reboot path the manager can hold the empty unit map of a scan that raced the mount until then, and a read before it would report the unit not-found.
-  With `--alert` it mails on `VIOLATED` or `unknown`, each with its own wording: `unknown` says the timeout could not be read and what to run, and never that the bracket is violated or that a night is shortened.
+  With `--alert` it mails on `VIOLATED` or `unknown`, each with its own wording: `unknown` says the timeout gave no bound to check (not loaded, `infinity`, or unparseable) and what to run, and never that the bracket is violated or that a night is shortened.
   Neither word claims a night IS shortened, because the clamp reads `STREETSCAPE_UNIT_TIMEOUT_START_S`, not the loaded timeout.
   It changes neither `healthy`, the heartbeat nor the exit status.
   The clamp's alert says so, because a stale unit then mails twice a day: the nightly clamp and the 08:30 watchdog.
@@ -1219,7 +1219,7 @@ In this order, each with its evidence.
 | `[providers.gsv].daily_request_budget` | 35,000,000 | 40,000,000 | 47,000,000 | h × 60 × 48,000 = 34.56M / 38.88M / 46.08M (ratio 1.013 / 1.029 / 1.020) |
 | `[providers.gsv_streets].daily_request_budget` | 35,000,000 | 40,000,000 | 47,000,000 | the same, at that block's own 48,000/min |
 | Collection `TimeoutStartSec` | 14 h | 18 h | 18 h | h + 1.583 h (item 5) |
-| Prefreeze `TimeoutStartSec=6h` ends | 20:51 | 22:21 | 00:51, 9 min inside the hour before the fire | the night's end + 6 h |
+| Prefreeze `TimeoutStartSec=6h` ends | 20:51 | 22:21 | 00:51, 9 min clear of the hour before the fire | the night's end + 6 h |
 | Screen timer, Mon 23:00 | 8.15 h after the night | 6.65 h | 4.15 h | fails past h ≈ 20.15 h |
 | Watchdog 08:30 catch-up ends | 21:21 | 22:51 | 01:21 | 08:30 + 16 min + h + 35 min |
 | KartaView pace ceiling per night | 1,080 | 1,215 | 1,440 | h × 60 × 1.5 |

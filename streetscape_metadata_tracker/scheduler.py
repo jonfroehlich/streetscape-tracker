@@ -2996,8 +2996,12 @@ def _tail_survives_sigterm():
     handler existed). An operator's ``systemctl stop`` typed during the tail
     was the other sender.
 
-    Ignoring it is safe because the tail is bounded: systemd follows with
-    SIGKILL after ``TimeoutStopSec``, which the tail is sized to fit. Two things
+    Ignoring it is safe for the two senders above because the tail is bounded:
+    for a start timeout or a ``systemctl stop``, systemd follows with SIGKILL
+    after ``TimeoutStopSec``, which the tail is sized to fit. A bare
+    ``systemctl kill`` (SIGTERM by default) queues no stop job, so nothing
+    escalates it: it is ignored and the tail runs to its end, which is why the
+    documented emergency kill is ``systemctl --user kill -s SIGKILL``. Two things
     this cannot do, stated rather than implied:
 
     - Under ``KillMode=control-group`` the same SIGTERM reaches every process in
@@ -6920,17 +6924,19 @@ _BRACKET_BODY = {
     "VIOLATED": (
         "\n\nThe collection unit line reads VIOLATED: the installed "
         "streetscape-tracker.service's TimeoutStartSec cannot hold "
-        "[schedule].max_batch_hours with its tail and margin (issue #389), so a night "
-        "that runs to its deadline can be SIGTERMed in its tail. A nightly shortens "
-        "itself only when the unit's STREETSCAPE_UNIT_TIMEOUT_START_S reports the "
-        "shorter timeout. Re-copy the unit and daemon-reload between nights "
+        "[schedule].max_batch_hours with its tail and margin (issue #389). A nightly "
+        "shortens itself to the timeout its STREETSCAPE_UNIT_TIMEOUT_START_S states, "
+        "or to 14 h when the variable is absent; if the timeout loaded here is shorter "
+        "than that, a night that runs to its deadline can be SIGTERMed in its tail. "
+        "Re-copy the unit and daemon-reload between nights "
         '(deploy/README.md, "Raising the night\'s length").'
     ),
     "unknown": (
         "\n\nThe collection unit line reads unknown: systemd's TimeoutStartSec for "
-        "streetscape-tracker.service could not be read (the unit is not loaded, or the "
-        "value is infinity or a form this check does not parse), so the bracket was not "
-        "checked (issue #389). This is not a finding that the bracket is violated. Run "
+        "streetscape-tracker.service gave no bound to check (the unit is not loaded, the "
+        "value is infinity, or it is in a form this check does not parse), so the "
+        "bracket was not checked (issue #389). This is not a finding that the bracket "
+        "is violated. Run "
         "`systemctl --user show streetscape-tracker.service -p LoadState "
         "-p TimeoutStartUSec -p TimeoutStopUSec` and compare it with "
         "deploy/systemd/streetscape-tracker.service."
@@ -6946,8 +6952,8 @@ def _collection_unit_bracket(
     The unit's loaded ``TimeoutStartSec`` must hold ``max_batch_hours`` plus
     ``NIGHT_OVERRUN_S`` and ``NIGHT_MARGIN_S``: ``ok`` when it does,
     ``VIOLATED`` when it does not, and ``unknown`` -- mailed, never ``ok``,
-    but never worded as a violation -- when the timeout could not be read
-    (``infinity``, junk, a unit not loaded).
+    but never worded as a violation -- when the timeout gives no bound to
+    check (``infinity``, junk, a unit not loaded).
     """
     need_s = max_batch_hours * 3600.0 + NIGHT_OVERRUN_S + NIGHT_MARGIN_S
     if timeouts.start_s is None:

@@ -127,8 +127,9 @@ TimeoutStartSec=14h
 # SIGKILLed before it can report its own timeout — which is the pre-#230
 # behaviour under a different name. Reaching this timeout at all is still a
 # SIGKILL — i.e. the pre-#206 behaviour — so this can only improve on it. An
-# operator who needs the batch dead immediately should `systemctl --user kill`
-# rather than wait this out.
+# operator who needs the batch dead immediately should `systemctl --user kill
+# -s SIGKILL` rather than wait this out: a bare `kill` sends SIGTERM, which the
+# loop winds down on and the nightly's tail ignores (#389), unescalated.
 TimeoutStopSec=30min
 
 # Anything not already captured by the scheduler's own rotating log or a child's

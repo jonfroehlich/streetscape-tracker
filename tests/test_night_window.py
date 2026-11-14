@@ -416,18 +416,26 @@ def test_the_tail_guard_restores_the_handler_when_a_tail_step_raises(default_sig
     assert signal.getsignal(signal.SIGTERM) is default_sigterm
 
 
-def test_a_sigterm_in_the_nights_tail_does_not_cost_the_publish(conn, monkeypatch, default_sigterm):
+def test_a_sigterm_in_the_nights_tail_does_not_cost_the_publish(
+    conn, monkeypatch, default_sigterm, caplog
+):
     """End to end: the signal arrives during the aggregate rebuild, the first
     tail step, as a TimeoutStartSec landing just after the deadline would; the
-    manifest and the publish still run, and the handler the night started with
-    is back afterwards. The loop's own SIGTERM handling is untouched: its tests
+    aggregate step itself does not fail (without the guard the stand-in
+    disposition raises inside it, and the tail reports that rather than
+    stopping, so the step list alone cannot tell), the guard's WARNING is
+    logged once, the manifest and the publish still run, and the handler the
+    night started with is back afterwards. The loop's own SIGTERM handling is untouched: its tests
     are in tests/test_scheduler.py (named in this module's docstring)."""
     monkeypatch.setattr(sched, "_is_nightly_unit", lambda: True)
     cfg = SchedulerConfig(publish_enabled=True, max_cities_per_day=5)
-    rc, _window_s, tail = _drive_one_city_night(
-        conn, monkeypatch, cfg, on_aggregate=lambda: os.kill(os.getpid(), signal.SIGTERM)
-    )
+    with caplog.at_level(logging.WARNING):
+        rc, _window_s, tail = _drive_one_city_night(
+            conn, monkeypatch, cfg, on_aggregate=lambda: os.kill(os.getpid(), signal.SIGTERM)
+        )
     assert tail == ["aggregate", "manifest", "publish"]
+    assert "aggregate index failed" not in caplog.text
+    assert caplog.text.count("SIGTERM received during the night's tail") == 1
     assert rc == 0
     assert signal.getsignal(signal.SIGTERM) is default_sigterm
 

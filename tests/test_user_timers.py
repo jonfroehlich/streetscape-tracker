@@ -47,7 +47,8 @@ def _show(name):
 
 
 # The collection unit's bracket read (issue #389), made once per check that
-# reached the manager, before the timers are classified.
+# reached the manager, after the timers are classified and any re-arm's
+# daemon-reload.
 UNIT_SHOW = [
     "show",
     "streetscape-tracker.service",
@@ -594,15 +595,17 @@ def test_systemd_time_spans_parse_and_infinity_is_unknown(text, seconds):
     [
         ("loaded", "18h", "ok"),
         ("loaded", "14h", "VIOLATED"),
+        ("loaded", "17h 35min", "ok"),
         ("loaded", "infinity", "unknown"),
         ("not-found", "18h", "unknown"),
     ],
-    ids=["holds", "too-short", "infinity", "not-loaded"],
+    ids=["holds", "too-short", "exact", "infinity", "not-loaded"],
 )
 def test_timer_status_reports_the_collection_units_bracket_without_changing_its_verdict(
     tmp_path, unit_files, sent, capsys, load, start, word
 ):
     """A 16 h night needs 16 + 0.583 + 1 h: an installed 18 h unit holds it, a
+    17h 35min one holds it exactly (the boundary is `<=`), a
     14 h one does not, and a timeout that cannot be read is `unknown` -- mailed
     like a violation, never passed as `ok`. Whatever the line says, the timers
     are healthy here, so the exit status and the heartbeat must not move: they
@@ -623,6 +626,10 @@ def test_timer_status_reports_the_collection_units_bracket_without_changing_its_
         [(subject, body)] = sent
         assert "collection unit bracket VIOLATED" in subject
         assert "reads VIOLATED" in body and "daemon-reload" in body
+        # True with the variable absent too: the clamp then assumes 14 h and
+        # does shorten (issue #389 review), so never "only when".
+        assert "or to 14 h when the variable is absent" in body
+        assert "only when" not in body
     else:
         # An unreadable timeout is not a violation, and the nightly clamp reads
         # the environment variable rather than this, so the mail must claim
@@ -631,7 +638,7 @@ def test_timer_status_reports_the_collection_units_bracket_without_changing_its_
         assert "collection unit timeout unreadable" in subject
         assert "VIOLATED" not in subject + body
         assert "shortened" not in body and "cannot hold" not in body
-        assert "could not be read" in body and "systemctl --user show" in body
+        assert "gave no bound to check" in body and "systemctl --user show" in body
 
 
 def test_timer_status_reads_the_bracket_after_the_rearms_daemon_reload(
