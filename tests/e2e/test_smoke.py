@@ -115,9 +115,27 @@ def base_url():
         httpd.server_close()
 
 
+@pytest.fixture(scope="session")
+def dense_cities(tmp_path_factory):
+    """Two cities over the city map's RENDER_CAP (issue #77), written once per session.
+
+    Too big to commit, so ``build_fixture.write_dense_city`` writes them into a temp
+    dir that the route handler below serves after the committed fixture. Neither is
+    in the committed aggregate: each is opened by ``?file=`` alone.
+    """
+    from tests.e2e.build_fixture import write_dense_city
+
+    out = str(tmp_path_factory.mktemp("dense-cities"))
+    return {
+        "dir": out,
+        "gsv": write_dense_city(out, 60_000),
+        "census": write_dense_city(out, 45_000, provider="mapillary", n_flat_only=2_000),
+    }
+
+
 @pytest.fixture(autouse=True)
-def route_fixture_data(page: Page):
-    """Fulfill every data fetch from the committed fixture.
+def route_fixture_data(page: Page, dense_cities):
+    """Fulfill every data fetch from the committed fixture (or the dense cities).
 
     The frontend hardcodes the production data host (STREETSCAPE_DATA_BASE_URL); rather
     than change prod code, we intercept ``**/streetscape-tracker/data/**`` and serve the
@@ -128,6 +146,8 @@ def route_fixture_data(page: Page):
     def handler(route):
         filename = route.request.url.split("/data/")[-1].split("?")[0]
         path = os.path.join(FIXTURE_DIR, filename)
+        if not os.path.isfile(path):
+            path = os.path.join(dense_cities["dir"], filename)
         if not os.path.isfile(path):
             route.fulfill(status=404, body=b"not in fixture")
             return
@@ -3100,4 +3120,211 @@ def test_grid_default_view_shows_when_each_provider_last_collected(page: Page, b
     collected = page.locator("#grid-tbody td", has_text=re.compile(r"^\d{4}-\d{2}-\d{2}$"))
     assert collected.count() > 0, "Last collected header is present but no cell renders a date"
 
+    assert errors == []
+
+
+# ── The viewport-true dot tier (issue #77) ──────────────────────────────────
+
+# What the pano layer is drawing against what it could, read from the page's
+# own state. Leaflet's bounds are inclusive, as pano-overview.js's are, so a
+# brute-force count over the in-mode markers is the exact answer the index
+# must give. `DRAWN_AREA_PAD` is city.js's own constant, so the padded count is
+# over the very area the tier is counted on.
+_DENSE_STATE_FN = """() => {
+  const visible = map.getBounds();
+  const padded = visible.pad(DRAWN_AREA_PAD);
+  const count = (b, ms) => { let n = 0; for (const m of ms) if (b.contains(m.getLatLng())) n++; return n; };
+  return {
+    tier: mapTier,
+    mode: lastPlan.mode,
+    onMap: onMap.size,
+    inViewTotal: count(visible, inModeAll),
+    paddedTotal: count(padded, inModeAll),
+    drawnInView: count(visible, onMap),
+    flatsOnMap: flatOnlyMarkers.filter((m) => map.hasLayer(m)).length,
+    flatInOnMap: [...onMap].some((m) => m.options.panoIdx == null),
+    notice: document.getElementById("map-drawn-notice")?.textContent ?? null,
+    status: document.getElementById("map-tier-status").textContent,
+  };
+}"""
+
+_COMPLETE = "Every panorama in view is now drawn."
+_SAMPLED = (
+    "Too many panoramas in view to draw them all: the map now shows a spatial sample. "
+    "Zoom in to see every panorama."
+)
+
+
+def _dense_state(page: Page) -> dict:
+    return page.evaluate(_DENSE_STATE_FN)
+
+
+def _zoom_by(page: Page, dz: int, tier: str):
+    """Zoom about the centre without animation and wait for the planned tier."""
+    page.evaluate(f"void map.setZoom(map.getZoom() + ({dz}), {{animate: false}})")
+    page.wait_for_function(f"mapTier === '{tier}'")
+
+
+def test_zooming_into_a_dense_city_draws_every_pano_in_view(page: Page, base_url, dense_cities):
+    """Issue #77: above RENDER_CAP, zooming in brings back every dropped pano.
+
+    Before #77 the cap was one GLOBAL spatial sample, so at street level a fully
+    covered street still drew about two panos in three here (40,000 of 59,316)
+    and the legend's "filter or zoom for detail" was untrue. Asserted as exact
+    equality against a brute-force count, so a dot tier that kept sampling goes red.
+    """
+    errors = _capture_errors(page)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    url = f"{base_url}/city.html?file={dense_cities['gsv']['csv']}"
+    page.goto(url)
+    expect(page.locator("#map-drawn-notice")).to_be_visible()
+
+    # Fitted to the whole city: too many in view, so the sample, said in words.
+    s = _dense_state(page)
+    in_mode = 60_000 - dense_cities["gsv"]["n_contributor"]  # Google-only by default
+    assert (s["tier"], s["mode"], s["onMap"]) == ("sampled", "sample", 40_000)
+    assert s["notice"] == (
+        f"Showing a spatial sample: 40,000 of {in_mode:,} panoramas. "
+        "Zoom in to see every panorama; all are drawn once 40,000 or fewer are in view."
+    )
+    assert s["drawnInView"] < s["inViewTotal"]
+    assert s["status"] == "", "the first plan must not announce anything"
+
+    # Two levels in: every in-mode pano in the drawn area, exactly.
+    _zoom_by(page, 2, "complete")
+    s = _dense_state(page)
+    assert s["mode"] == "view"
+    assert s["inViewTotal"] > 0
+    assert s["onMap"] == s["paddedTotal"]
+    assert s["drawnInView"] == s["inViewTotal"]
+    assert s["notice"] == f"Showing all {s['inViewTotal']:,} panoramas in view."
+    assert s["status"] == _COMPLETE
+
+    # A pan inside the tier keeps it complete and draws the new area whole.
+    page.evaluate("void map.panBy([400, 250], {animate: false})")
+    s = _dense_state(page)
+    assert s["tier"] == "complete"
+    assert s["drawnInView"] == s["inViewTotal"]
+    assert s["onMap"] == s["paddedTotal"]
+
+    # Back out: the sample again, announced once.
+    _zoom_by(page, -2, "sampled")
+    s = _dense_state(page)
+    assert s["onMap"] == 40_000
+    assert s["status"] == _SAMPLED
+
+    # The page never scrolls sideways, and nothing touched the URL.
+    assert page.evaluate(
+        "document.documentElement.scrollWidth <= document.documentElement.clientWidth"
+    )
+    assert page.url == url
+    assert errors == []
+
+
+def test_an_open_popup_survives_its_auto_pan_and_a_pan_away(page: Page, base_url, dense_cities):
+    """A dot near the edge must not close its own popup (#77 review C6).
+
+    Leaflet closes a layer's popup when the layer is removed, and in the
+    every-pano tier a pan removes what leaves the drawn area. The open popup's
+    pano is therefore pinned while the map moves, and released on close.
+    """
+    errors = _capture_errors(page)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    page.goto(f"{base_url}/city.html?file={dense_cities['gsv']['csv']}")
+    expect(page.locator("#map-drawn-notice")).to_be_visible()
+    _zoom_by(page, 2, "complete")
+
+    # The drawn pano nearest the top edge: its popup opens above it, off-screen,
+    # so Leaflet auto-pans to make room.
+    before = page.evaluate("""() => {
+      const b = map.getBounds();
+      let best = null;
+      for (const m of onMap) {
+        const ll = m.getLatLng();
+        if (b.contains(ll) && (!best || ll.lat > best.getLatLng().lat)) best = m;
+      }
+      window.__pinTest = best;
+      const c = map.getCenter();
+      best.openPopup();
+      return [c.lat, c.lng];
+    }""")
+    expect(page.locator(".leaflet-popup-content")).to_be_visible()
+    page.wait_for_timeout(600)  # the auto-pan animates for 0.25 s
+    after = page.evaluate("[map.getCenter().lat, map.getCenter().lng]")
+    assert after != before, "precondition: the popup auto-panned the map"
+    assert page.evaluate("window.__pinTest.isPopupOpen() && map.hasLayer(window.__pinTest)")
+    assert page.evaluate("mapTier") == "complete"
+
+    # Pan far enough south that the pano is outside the drawn area.
+    page.evaluate("void map.panBy([0, 2500], {animate: false})")
+    assert page.evaluate(
+        "!map.getBounds().pad(DRAWN_AREA_PAD).contains(window.__pinTest.getLatLng())"
+    )
+    assert page.evaluate("window.__pinTest.isPopupOpen() && map.hasLayer(window.__pinTest)")
+
+    # Closed, it is an ordinary dot again: the next move drops it.
+    page.evaluate("map.closePopup(); void map.panBy([0, 5], {animate: false})")
+    assert page.evaluate("!map.hasLayer(window.__pinTest)")
+    assert errors == []
+
+
+def test_flat_only_points_stay_independent_of_the_panoramas_layer(
+    page: Page, base_url, dense_cities
+):
+    """Flat-only points keep their own path in a city over the cap (#77 review C4).
+
+    They are not pano dots: they never enter the reconcile set (whose restyle
+    reads a capture date a flat marker does not carry, which would throw), and
+    the Panoramas layer never hides them. A census city with 2,000 flat points.
+    """
+    errors = _capture_errors(page)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    page.goto(f"{base_url}/city.html?file={dense_cities['census']['csv']}")
+    expect(page.locator("#map-drawn-notice")).to_be_visible()
+    assert _dense_state(page)["tier"] == "sampled"
+
+    flat_toggle = page.get_by_role("button", name=re.compile(r"Toggle flat-only imagery markers"))
+    flat_toggle.click()
+    page.evaluate("setPanoLayerVisible(false)")
+    s = _dense_state(page)
+    assert (s["flatsOnMap"], s["onMap"]) == (2_000, 0)
+    assert s["notice"] == "Panorama dots are hidden (the Panoramas layer is off)."
+
+    # Moves with the pano layer off, and a flat popup open while they happen.
+    page.evaluate("void flatOnlyMarkers[0].openPopup()")
+    for dz in (2, -2):
+        page.evaluate(f"void map.setZoom(map.getZoom() + ({dz}), {{animate: false}})")
+        page.evaluate("void map.panBy([120, 80], {animate: false})")
+    assert _dense_state(page)["flatsOnMap"] == 2_000
+
+    # Panoramas back on: dots return, flats stay, and no flat marker is a dot,
+    # even with a flat popup open while the map moves.
+    page.evaluate("setPanoLayerVisible(true)")
+    page.evaluate("void flatOnlyMarkers[1].openPopup()")
+    _zoom_by(page, 2, "complete")
+    page.evaluate("void map.panBy([60, 40], {animate: false})")
+    s = _dense_state(page)
+    assert s["onMap"] > 0 and s["flatsOnMap"] == 2_000
+    assert s["flatInOnMap"] is False
+
+    flat_toggle.click()
+    s = _dense_state(page)
+    assert s["flatsOnMap"] == 0 and s["onMap"] > 0
+    assert errors == []
+
+
+def test_a_city_under_the_cap_never_counts_a_view(page: Page, base_url):
+    """A city at or under RENDER_CAP keeps its pre-#77 path exactly (#77 review C7).
+
+    No index, no drawn-dots notice, every pano drawn whatever the zoom.
+    """
+    errors = _capture_errors(page)
+    page.goto(f"{base_url}/city.html?file={ALPHA_LATEST}")
+    expect(page.locator("#temporal-plot")).to_be_visible()
+    for dz in (2, -3):
+        page.evaluate(f"void map.setZoom(map.getZoom() + ({dz}), {{animate: false}})")
+    assert page.evaluate("panoIndex === null")
+    assert page.evaluate("lastPlan.mode") == "all"
+    assert page.evaluate("onMap.size === inModeAll.length && onMap.size > 0")
+    expect(page.locator("#map-drawn-notice")).to_have_count(0)
     assert errors == []

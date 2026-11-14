@@ -553,6 +553,160 @@ def _normalize_for_commit():
                 gz.write(raw)
 
 
+# ── The dense city (issue #77) ──────────────────────────────────────────────
+#
+# A city over the city map's RENDER_CAP (40,000), which the committed fixture
+# cannot hold: its CSV alone would be megabytes. It is therefore written on
+# demand into a directory the caller owns (the e2e session's temp dir, or the
+# measurement script's), served by ``?file=`` alone, and never named in the
+# committed aggregate — so the provider gate in ``tests/test_e2e_fixture.py``
+# is unaffected.
+
+#: Metres between parallel streets of the dense city's lattice.
+DENSE_BLOCK_M = 100
+#: Metres between consecutive panoramas along a street (GSV's official spacing
+#: is about 10 m, ``docs/experiments/pano-spacing.md``).
+DENSE_PANO_SPACING_M = 10
+#: Blocks per side of a district; capture year is constant within one.
+DENSE_DISTRICT_BLOCKS = 6
+#: The district (column, row) whose panoramas are contributor imagery (gsv).
+DENSE_CONTRIBUTOR_DISTRICT = (1, 1)
+#: The district with no imagery at all: its lattice points are ZERO_RESULTS.
+DENSE_EMPTY_DISTRICT = (2, 0)
+#: Extra ZERO_RESULTS grid points, south of the lattice.
+DENSE_N_ZERO_RESULTS = 300
+
+_DENSE_CITY = {
+    "gsv": ("dense-city--densestate--testland", "Dense City"),
+    "mapillary": ("dense-census-city--densestate--testland", "Dense Census City"),
+}
+
+
+def write_dense_city(
+    out_dir,
+    n_panos=60_000,
+    *,
+    provider="gsv",
+    run_date=date(2026, 4, 15),
+    origin=(44.0, -121.0),
+    n_flat_only=0,
+):
+    """Write a dense synthetic city run (csv.gz + json.gz) into ``out_dir``.
+
+    The layout is a street lattice: streets every ``DENSE_BLOCK_M`` in both
+    directions, a panorama every ``DENSE_PANO_SPACING_M`` along each (19 per
+    block), filled block by block in rows until ``n_panos`` dated panoramas
+    exist. Capture year is constant within each ``DENSE_DISTRICT_BLOCKS``
+    district and varies between them; one district carries contributor
+    imagery (gsv only), one holds no imagery (its points are ZERO_RESULTS),
+    and ``DENSE_N_ZERO_RESULTS`` further empty points sit south of the city.
+    ``n_flat_only`` (census providers) adds FLAT_ONLY points 5 m off the first
+    lattice points.
+
+    The frame comes from the shared conftest builders, so it has the real
+    column set for the provider; the filename comes from
+    ``naming.generate_run_filename``; and the run JSON comes from the real
+    summarizer.
+
+    Returns a dict: ``csv`` (filename), ``n_panos``, ``n_contributor``,
+    ``n_flat_only``, ``bounds`` (south, west, north, east of the dated panos).
+    """
+    import math
+
+    import numpy as np
+
+    if provider not in _DENSE_CITY:
+        raise ValueError(f"no dense city for provider {provider!r}")
+    city_id, city_name = _DENSE_CITY[provider]
+    lat0, lon0 = origin
+    m_per_deg_lat = 111_320.0
+    m_per_deg_lon = 111_320.0 * math.cos(math.radians(lat0))
+    per_block = 2 * (DENSE_BLOCK_M // DENSE_PANO_SPACING_M) - 1
+    side = max(1, math.ceil(math.sqrt(n_panos * 1.1 / per_block)))
+
+    lats, lons, years, official, empties = [], [], [], [], []
+    steps = DENSE_BLOCK_M // DENSE_PANO_SPACING_M
+
+    def lattice():
+        for by in range(side + 1):
+            for bx in range(side + 1):
+                district = (bx // DENSE_DISTRICT_BLOCKS, by // DENSE_DISTRICT_BLOCKS)
+                x0, y0 = bx * DENSE_BLOCK_M, by * DENSE_BLOCK_M
+                for k in range(steps):
+                    yield district, x0 + k * DENSE_PANO_SPACING_M, y0
+                for k in range(1, steps):
+                    yield district, x0, y0 + k * DENSE_PANO_SPACING_M
+
+    for district, x_m, y_m in lattice():
+        if len(lats) == n_panos:
+            break
+        lat, lon = lat0 + y_m / m_per_deg_lat, lon0 + x_m / m_per_deg_lon
+        if district == DENSE_EMPTY_DISTRICT:
+            empties.append((lat, lon))
+            continue
+        lats.append(lat)
+        lons.append(lon)
+        years.append(2008 + (district[0] * 7 + district[1] * 3) % 17)
+        official.append(provider != "gsv" or district != DENSE_CONTRIBUTOR_DISTRICT)
+    if len(lats) < n_panos:
+        raise AssertionError(f"lattice too small: {len(lats)} < {n_panos}")
+    for j in range(DENSE_N_ZERO_RESULTS):
+        empties.append(
+            (lat0 - (1 + j // 50) * 30 / m_per_deg_lat, lon0 + (j % 50) * 30 / m_per_deg_lon)
+        )
+
+    panos = [(f"dense{i}", f"{y}-{1 + i % 12:02d}-{1 + i % 28:02d}") for i, y in enumerate(years)]
+    n_empty = len(empties)
+    if provider == "gsv":
+        df = make_city_df(panos, run_date=run_date, grid_origin=origin, n_empty=n_empty)
+        df.loc[: n_panos - 1, "copyright_info"] = np.where(official, "© Google", "© A Contributor")
+        coord_rows = list(zip(lats, lons, strict=True)) + empties
+        pano_rows = n_panos
+    else:
+        df = make_mapillary_city_df(
+            panos, run_date=run_date, grid_origin=origin, n_empty=n_empty, n_flat_only=n_flat_only
+        )
+        flats = [(lats[k] + 5 / m_per_deg_lat, lons[k]) for k in range(n_flat_only)]
+        coord_rows = list(zip(lats, lons, strict=True)) + flats + empties
+        pano_rows = n_panos + n_flat_only
+    qlat = np.array([r[0] for r in coord_rows])
+    qlon = np.array([r[1] for r in coord_rows])
+    df["query_lat"] = qlat
+    df["query_lon"] = qlon
+    # A pano a metre off its grid point: well inside GSV's 50 m query radius.
+    df.loc[: pano_rows - 1, "pano_lat"] = qlat[:pano_rows] + 1 / m_per_deg_lat
+    df.loc[: pano_rows - 1, "pano_lon"] = qlon[:pano_rows]
+
+    width = height = (side + 1) * DENSE_BLOCK_M
+    name = (
+        naming.generate_run_filename(city_id, width, height, STEP, run_date, provider=provider)
+        + ".csv.gz"
+    )
+    csv_path = os.path.join(out_dir, name)
+    write_city_csv_gz(df, csv_path)
+    generate_city_metadata_summary_as_json(
+        csv_path,
+        load_city_csv_file(csv_path),
+        city_name,
+        "Densestate",
+        "Testland",
+        width,
+        height,
+        STEP,
+        force_recreate_file=True,
+        run_date=run_date,
+        provider=provider,
+    )
+    pano_lats = np.array(lats) + 1 / m_per_deg_lat
+    return {
+        "csv": name,
+        "n_panos": n_panos,
+        "n_contributor": int(len(official) - sum(official)),
+        "n_flat_only": n_flat_only,
+        "bounds": (float(pano_lats.min()), min(lons), float(pano_lats.max()), max(lons)),
+    }
+
+
 def build():
     # Start from a clean fixture dir so re-runs are deterministic.
     if os.path.isdir(FIXTURE_DIR):
