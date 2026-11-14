@@ -1693,6 +1693,44 @@ def test_a_kartaview_host_refused_or_held_tonight_leaves_the_channel_not_the_cit
     )
 
 
+@pytest.mark.parametrize("arm", ["due-backlog", "edge-host-held", "live-checkpoint"])
+def test_a_spent_night_allowance_leaves_kartaview_not_the_city(conn, monkeypatch, arm):
+    """#464, through `_fill_admission`: a spent KartaView night allowance holds
+    the host for a FRESH KartaView crawl, so the fill leaves that channel to its
+    due schedule and refreshes the rest of the city. On a real night the due
+    phase's held KartaView pairs are unattempted, so they are a backlog and the
+    channel is `held_left` (realistic arm). `host_left` is the edge path, when
+    no held pair is left to count (`held` empty). A city with a live KartaView
+    checkpoint is paid-for work and is never left for the allowance. Kills:
+    `_fill_admission` filtering allowance holds out of `held_hosts` (edge arm),
+    or passing the bare `holds.current()` (checkpoint arm)."""
+    from streetscape_metadata_tracker.download_common import HOST_KARTAVIEW
+
+    cid = _city(conn, "Enrolled", {"gsv": 60, "mapillary": 60, "kartaview": 60})
+    city = db.resolve_city(conn, cid)
+    cfg = _opt_in_cfg()
+    assert sched._channel_estimate(cfg, city, "kartaview", conn) <= 37, "premise: one launch"
+    _live_checkpoints(monkeypatch, {(cid, "kartaview")} if arm == "live-checkpoint" else set())
+    holds = sched.HostHolds(allowances_s={HOST_KARTAVIEW: 1800.0})
+    holds.charge(HOST_KARTAVIEW, 1800.0, fresh=True)
+    breaker = sched.HostBreaker(holds=holds)
+    held = {"kartaview"} if arm == "due-backlog" else set()
+    verdict = sched._fill_admission(
+        cfg, conn, TODAY, city, ["gsv", "mapillary", "kartaview"], 10_000.0, breaker, held=held
+    )
+    if arm == "live-checkpoint":
+        assert "kartaview" not in verdict.left, verdict
+        assert verdict.host_left == ()
+        return
+    assert verdict.admit is True, verdict
+    assert verdict.run == ("gsv", "mapillary")
+    assert verdict.left == ("kartaview",)
+    if arm == "due-backlog":
+        assert verdict.held_left == ("kartaview",) and verdict.host_left == ()
+    else:
+        assert verdict.host_left == ("kartaview",) and verdict.held_left == ()
+
+
 def test_a_fill_ended_by_a_ceiling_decline_says_so(conn, monkeypatch, caplog):
     """#456 third round, finding 5: a fill whose last candidate was declined
     because nothing but an oversized KartaView crawl was left to run ends
