@@ -1,4 +1,4 @@
-"""The night's length: its bracket and the runtime clamp (issue #389).
+"""The night's length: its bracket, the runtime clamp, and the tail's SIGTERM guard (issue #389).
 
 `[schedule].max_batch_hours = 12` was inherited, not derived, and the only pin
 on it compared it with the unit's `TimeoutStartSec` in whole hours with no tail
@@ -11,6 +11,13 @@ term, so 13.9 h passed. These tests define the bracket once, from the files:
 - a daytime ops window, a policy figure kept here rather than in config;
 - an ON-TIME night ending inside its UTC date, in both seasons.
 
+And the tail: `TimeoutStartSec` sends SIGTERM, which mid-loop is the #206
+wind-down but in `_finish_batch` used to kill the publish. It is now logged and
+ignored there (`_tail_survives_sigterm`). The loop's own wind-down is pinned
+elsewhere and not duplicated: tests/test_scheduler.py's
+`test_sigterm_winds_the_batch_down_instead_of_killing_the_publish` and
+`test_sigterm_stops_the_city_mid_channel_instead_of_finishing_its_channels`.
+
 Every figure is read out of the unit files and the production TOML, so a change
 on either side of a cross-file agreement fails here rather than on prod.
 """
@@ -19,6 +26,7 @@ import logging
 import math
 import os
 import re
+import signal
 import sys
 import time
 from datetime import date, datetime, timedelta
@@ -302,3 +310,60 @@ def test_a_shortened_night_alerts_and_runs_to_the_shorter_deadline(conn, monkeyp
     logged = re.search(r"; max_batch_hours=([\d.]+)", caplog.text)
     assert logged and math.isclose(float(logged.group(1)) * 3600, expected_s, abs_tol=30)
     assert rc == 0 and tail == ["aggregate", "manifest", "publish"]
+
+
+# --- the tail survives a SIGTERM ----------------------------------------------
+
+
+class _DefaultDisposition(Exception):
+    """Stands in for the default SIGTERM disposition, which would end pytest."""
+
+
+@pytest.fixture
+def default_sigterm():
+    """Install a handler that raises, as the default disposition would kill.
+
+    Without the guard a SIGTERM in the tail reaches this handler and aborts the
+    tail; with it, the guard's handler is the one installed. Restored after."""
+
+    def die(signum, frame):
+        raise _DefaultDisposition()
+
+    previous = signal.signal(signal.SIGTERM, die)
+    yield die
+    signal.signal(signal.SIGTERM, previous)
+
+
+def test_a_sigterm_during_the_tail_is_logged_once_and_the_tail_runs_on(default_sigterm, caplog):
+    steps = []
+    with caplog.at_level(logging.WARNING), sched._tail_survives_sigterm() as seen:
+        steps.append("aggregate")
+        os.kill(os.getpid(), signal.SIGTERM)
+        os.kill(os.getpid(), signal.SIGTERM)  # a second stop, or the timeout's after a stop
+        steps.append("backup")
+        steps.append("publish")
+    assert steps == ["aggregate", "backup", "publish"]
+    assert seen.is_set()
+    assert caplog.text.count("SIGTERM received during the night's tail") == 1
+    assert signal.getsignal(signal.SIGTERM) is default_sigterm
+
+
+def test_the_tail_guard_restores_the_handler_when_a_tail_step_raises(default_sigterm):
+    with pytest.raises(RuntimeError), sched._tail_survives_sigterm():
+        raise RuntimeError("the tail backup raised")
+    assert signal.getsignal(signal.SIGTERM) is default_sigterm
+
+
+def test_a_sigterm_in_the_nights_tail_does_not_cost_the_publish(conn, monkeypatch, default_sigterm):
+    """End to end: the signal arrives during the aggregate rebuild, the first
+    tail step, as a TimeoutStartSec landing just after the deadline would; the
+    manifest and the publish still run, and the handler the night started with
+    is back afterwards. The loop's own SIGTERM handling is untouched: its tests
+    are in tests/test_scheduler.py (named in this module's docstring)."""
+    cfg = SchedulerConfig(publish_enabled=True, max_cities_per_day=5)
+    rc, _window_s, tail = _drive_one_city_night(
+        conn, monkeypatch, cfg, on_aggregate=lambda: os.kill(os.getpid(), signal.SIGTERM)
+    )
+    assert tail == ["aggregate", "manifest", "publish"]
+    assert rc == 0
+    assert signal.getsignal(signal.SIGTERM) is default_sigterm

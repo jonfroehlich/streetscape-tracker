@@ -2980,6 +2980,67 @@ def _stop_on_sigterm():
         signal.signal(signal.SIGTERM, previous)
 
 
+@contextlib.contextmanager
+def _tail_survives_sigterm():
+    """Log and ignore a SIGTERM that arrives while the night's tail runs (issue #389).
+
+    ``_stop_on_sigterm`` covers the city loop and the fill and nothing else, so
+    before #389 the tail (``_finish_batch``: aggregate, manifests, driving-plan
+    summary, census and ledger prunes, catalog backup, publish, alert) ran under
+    the default disposition, and a SIGTERM there killed the process before the
+    publish. The usual sender is the unit's ``TimeoutStartSec``, whose SIGTERM is
+    the FIRST one systemd sends: a night whose deadline fired just before it
+    received that signal mid-tail and published nothing (#167's outcome). An
+    operator's ``systemctl stop`` typed during the tail was the other.
+
+    Ignoring it is safe because the tail is bounded: systemd follows with
+    SIGKILL after ``TimeoutStopSec``, which the tail is sized to fit. Two things
+    this cannot do, stated rather than implied:
+
+    - Under ``KillMode=control-group`` the same SIGTERM reaches every process in
+      the unit, so a publish rsync in flight at that instant still dies; the
+      publish reports the failure, the night alerts, and
+      ``regenerate-aggregate --publish`` recovers it.
+    - A SIGKILL after ``TimeoutStopSec`` is unchanged: nothing survives it.
+
+    Nothing about the city loop or the fill changes: they are inside
+    ``_stop_on_sigterm``, whose handler replaces this one and restores it on
+    exit. This one is entered after that context has closed, so the few
+    in-process statements between the two (the ``Done:`` summary and the
+    quarantine claim, well under a second) still run under the default handler.
+
+    The WARNING is logged from the handler itself, once, so it is on disk even if
+    the SIGKILL comes before the tail ends. That is safe here: a handler runs on
+    the main thread between bytecodes, logging's handler locks are re-entrant,
+    and a re-entrant write to an interrupted stream raises inside
+    ``Handler.emit``, which catches it (``handleError``) rather than letting it
+    reach the tail. Restores the previous handler on every exit path, and
+    no-ops off the main thread, like ``_stop_on_sigterm``.
+    """
+    seen = threading.Event()
+
+    def handler(signum, frame):
+        if seen.is_set():
+            return
+        seen.set()
+        logger.warning(
+            "SIGTERM received during the night's tail; ignoring it so the aggregate, "
+            "backup and publish can finish (issue #389). A publish rsync running at this "
+            "instant was signalled too and may fail; systemd SIGKILLs the unit if the tail "
+            "outlasts TimeoutStopSec."
+        )
+
+    try:
+        previous = signal.signal(signal.SIGTERM, handler)
+    except ValueError:
+        yield seen
+        return
+    try:
+        yield seen
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
 def _tile_census_timeout_seconds(
     city: db.CityRow, provider: str, pc: ProviderConfig | None, floor: int
 ) -> int:
@@ -4290,8 +4351,9 @@ PUBLISH_TIMEOUT_S = 600.0
 # SIGKILL after TimeoutStopSec. A SIGTERM that lands in the CITY LOOP is the
 # #206 wind-down and the night still publishes. One that lands in the TAIL
 # (_finish_batch) is the cliff: before #389 the tail ran under the default
-# disposition and the publish was lost (#167's outcome), so the deadline is
-# sized to keep every night out
+# disposition and the publish was lost (#167's outcome). _tail_survives_sigterm
+# now logs and ignores it there, but an in-flight publish rsync is in the same
+# cgroup and still dies, so the deadline is still sized to keep every night out
 # of the band  TimeoutStartSec - (tail + in-flight child) < h < TimeoutStartSec.
 #
 # The bracket, in seconds, with h = max_batch_hours * 3600:
@@ -10953,23 +11015,26 @@ def cmd_run_due(
         + (f"; {plan_error}" if plan_error else "")
     )
     logger.info("Done: " + summary)
-    return _finish_batch(
-        cfg,
-        conn,
-        summary,
-        succeeded,
-        attempted,
-        today,
-        errored=stop_reason in (_STOP_REASON_ERROR, _STOP_REASON_FILL_ERROR),
-        crashed="FILL" if stop_reason == _STOP_REASON_FILL_ERROR else "LOOP",
-        backup_error=backup_error,
-        plan_error=plan_error,
-        blocked_hosts=blocked_hosts,
-        busy_hosts=busy_hosts,
-        rejected_argv=rejected_argv,
-        quarantine_alerts=quarantine_alerts,
-        quarantine_error=quarantine_error or None,
-    )
+    # A SIGTERM from here on is logged and ignored rather than killing the
+    # publish (issue #389); see _tail_survives_sigterm for what it cannot save.
+    with _tail_survives_sigterm():
+        return _finish_batch(
+            cfg,
+            conn,
+            summary,
+            succeeded,
+            attempted,
+            today,
+            errored=stop_reason in (_STOP_REASON_ERROR, _STOP_REASON_FILL_ERROR),
+            crashed="FILL" if stop_reason == _STOP_REASON_FILL_ERROR else "LOOP",
+            backup_error=backup_error,
+            plan_error=plan_error,
+            blocked_hosts=blocked_hosts,
+            busy_hosts=busy_hosts,
+            rejected_argv=rejected_argv,
+            quarantine_alerts=quarantine_alerts,
+            quarantine_error=quarantine_error or None,
+        )
 
 
 def _host_budget_note(deferred_host_budget: Counter[str], sep: str = "; ") -> str:
