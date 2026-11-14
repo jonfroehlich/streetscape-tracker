@@ -309,6 +309,34 @@ HOST_RECHECKS: dict[str, Callable[[], bool]] = {
 # records a failure or changes the exit status. The cities stay due.
 HOLD_REST = "rest night"
 HOLD_COOLDOWN = "cooling down"
+# The third kind (issue #464): the host's nightly wall-clock allowance for
+# FRESH crawls is spent. Unlike the other two it STARTS mid-run, which is why
+# it is read once per city (`_city_holds`) and never per launch: a city that
+# starts under the allowance runs its grid and its walk together.
+HOLD_ALLOWANCE = "night allowance spent"
+
+
+class AllowanceUsage(NamedTuple):
+    """One host's night allowance and what this run has charged to it (issue #464).
+
+    Every figure is seconds of wall clock, except the two launch counts and
+    ``reserved_n`` (cities). ``fresh_s`` is what FRESH crawls used, the only
+    term the hold compares; ``paid_s`` is resumes of a live checkpoint,
+    reported but never limited.
+    """
+
+    allowance_s: float
+    reserved_s: float
+    reserved_n: int
+    fresh_s: float
+    fresh_n: int
+    paid_s: float
+    paid_n: int
+
+    @property
+    def fresh_allowance_s(self) -> float:
+        """What is left for fresh crawls once tonight's resumes are reserved."""
+        return max(0.0, self.allowance_s - self.reserved_s)
 
 
 @dataclass(frozen=True)
@@ -352,6 +380,17 @@ class HostHolds:
     it counts from were all recorded before the run began, and a refusal
     tonight is the breaker's to handle.
 
+    The NIGHT ALLOWANCE (issue #464, ``[hosts.kartaview].max_night_minutes``)
+    is the third kind, and the only one that STARTS mid-run: it holds once the
+    wall clock FRESH crawls have used on the host this run reaches the
+    allowance less tonight's resume reserve (:meth:`reserve`, set once before
+    the night). The launch site charges each launch's measured wall clock
+    (:meth:`charge`, through ``HostBreaker.start_charge``/``end_charge``); a
+    resume of a live checkpoint is charged as paid and never spends the fresh
+    allowance. Because it starts mid-run it is read once per city like a
+    cooldown, through :func:`_city_holds`, which also exempts a city that is
+    paid-for work. It is per run and in memory: every ``run-due`` starts at 0.
+
     The empty instance (no arguments) holds nothing, which is what every caller
     that predates #444 gets.
     """
@@ -361,6 +400,7 @@ class HostHolds:
         rest: dict[str, str] | None = None,
         cooldowns: dict[str, tuple[datetime, datetime]] | None = None,
         now: Callable[[], datetime] | None = None,
+        allowances_s: dict[str, float] | None = None,
     ):
         # host -> the weekday name it rests on tonight. Only hosts resting
         # TONIGHT are here; the config's full weekday list is not needed.
@@ -370,10 +410,79 @@ class HostHolds:
         # Read at call time, never bound at import, so a frozen test clock
         # (`clock._utc_clock`) reaches it.
         self._now = now or (lambda: clock.utc_now())
+        # host -> the night allowance in seconds (issue #464), and what this
+        # run has reserved and charged against it.
+        self._allowance_s = dict(allowances_s or {})
+        self._reserved: dict[str, tuple[float, int]] = {}
+        self._fresh: dict[str, tuple[float, int]] = {}
+        self._paid: dict[str, tuple[float, int]] = {}
 
     def active(self, host: str) -> HostHold | None:
-        """The hold on ``host`` right now, or None. A rest night outranks a cooldown."""
-        return self.rest(host) or self.cooldown(host)
+        """The hold on ``host`` right now, or None.
+
+        A rest night outranks a cooldown, and both outrank a spent allowance.
+        """
+        return self.rest(host) or self.cooldown(host) or self.allowance(host)
+
+    def has_allowance(self) -> bool:
+        """Is a night allowance configured on any host? (issue #464)"""
+        return bool(self._allowance_s)
+
+    def allowance_hosts(self) -> set[str]:
+        """The hosts with a night allowance this run."""
+        return set(self._allowance_s)
+
+    def reserve(self, host: str, seconds: float, cities: int) -> None:
+        """Reserve ``seconds`` of ``host``'s allowance for tonight's resumes (issue #464).
+
+        Set once per run, before the night. A no-op on a host with no allowance.
+        """
+        if host in self._allowance_s:
+            self._reserved[host] = (max(0.0, float(seconds)), int(cities))
+
+    def charge(self, host: str, seconds: float, *, fresh: bool) -> bool:
+        """Charge one finished launch's wall clock to ``host`` (issue #464).
+
+        Returns True when this charge is the one that SPENT the fresh
+        allowance, so the caller can log the crossing once. A no-op (False)
+        on a host with no allowance.
+        """
+        if host not in self._allowance_s:
+            return False
+        was_spent = self.allowance(host) is not None
+        book = self._fresh if fresh else self._paid
+        used, n = book.get(host, (0.0, 0))
+        book[host] = (used + max(0.0, float(seconds)), n + 1)
+        return fresh and not was_spent and self.allowance(host) is not None
+
+    def usage(self, host: str) -> AllowanceUsage | None:
+        """``host``'s allowance and this run's charges, or None with no allowance."""
+        if host not in self._allowance_s:
+            return None
+        reserved_s, reserved_n = self._reserved.get(host, (0.0, 0))
+        fresh_s, fresh_n = self._fresh.get(host, (0.0, 0))
+        paid_s, paid_n = self._paid.get(host, (0.0, 0))
+        return AllowanceUsage(
+            self._allowance_s[host], reserved_s, reserved_n, fresh_s, fresh_n, paid_s, paid_n
+        )
+
+    def fresh_allowance_s(self, host: str) -> float | None:
+        """Seconds left for fresh crawls once resumes are reserved, or None."""
+        usage = self.usage(host)
+        return None if usage is None else usage.fresh_allowance_s
+
+    def allowance(self, host: str) -> HostHold | None:
+        """The spent-allowance hold on ``host`` right now, or None (issue #464)."""
+        usage = self.usage(host)
+        if usage is None or usage.fresh_s < usage.fresh_allowance_s:
+            return None
+        return HostHold(
+            host,
+            HOLD_ALLOWANCE,
+            f"fresh crawls used {usage.fresh_s / 60:.0f} of {usage.fresh_allowance_s / 60:.0f} "
+            f"min: {usage.allowance_s / 60:g} min allowance less {usage.reserved_s / 60:.0f} "
+            f"reserved for {usage.reserved_n} resume(s)",
+        )
 
     def rest(self, host: str) -> HostHold | None:
         """The rest-night hold on ``host`` for this run's date, or None."""
@@ -399,7 +508,7 @@ class HostHolds:
 
     def hosts(self) -> set[str]:
         """Every host this instance could hold (an expired cooldown included)."""
-        return set(self._rest) | set(self._cooldowns)
+        return set(self._rest) | set(self._cooldowns) | set(self._allowance_s)
 
     def current(self) -> dict[str, HostHold]:
         """Every hold in force right now, by host."""
@@ -431,8 +540,11 @@ def _host_holds(
     it: one positive probe is evidence the wall is down, not that full volume
     is safe again. No ``conn``, or no refusal on record, means no cooldown.
 
-    ``ignore`` (``run-due --ignore-host-holds``) returns the empty instance;
-    the caller logs that it did so.
+    A night allowance (``[hosts.kartaview].max_night_minutes``, issue #464)
+    is passed through in seconds; nothing is reserved or charged yet.
+
+    ``ignore`` (``run-due --ignore-host-holds``) returns the empty instance,
+    which lifts the night allowance too; the caller logs that it did so.
     """
     if ignore:
         return HostHolds()
@@ -448,7 +560,152 @@ def _host_holds(
             if refused_at.tzinfo is None:
                 refused_at = refused_at.replace(tzinfo=UTC)
             cooldowns[host] = (refused_at, refused_at + timedelta(hours=hours))
-    return HostHolds(rest=rest, cooldowns=cooldowns)
+    return HostHolds(
+        rest=rest,
+        cooldowns=cooldowns,
+        allowances_s={host: minutes * 60.0 for host, minutes in cfg.host_night_minutes.items()},
+    )
+
+
+def _paid_for_on_host(
+    cfg: "SchedulerConfig", city: db.CityRow, channels: Sequence[str], host: str
+) -> bool:
+    """Is ``city`` PAID-FOR work on ``host`` tonight? (issue #464)
+
+    True when any of ``channels`` touching ``host`` has a live checkpoint
+    (a sweep tonight resumes) or a cached census (a walk that collects for 0
+    requests, #290). Judged per city and host, never per channel, so a city's
+    two KartaView channels are always held or exempted together.
+    """
+    window_s = _census_reuse_window_s(cfg)
+    for channel in channels:
+        if host not in CHANNEL_HOSTS.get(channel, ()):
+            continue
+        if _sweep_checkpoint_progress(cfg, city, channel) is not None:
+            return True
+        if channel_census_cache_marker(city, channel, max_age_s=window_s) is not None:
+            return True
+    return False
+
+
+def _city_holds(
+    cfg: "SchedulerConfig", city: db.CityRow, channels: Sequence[str], holds: HostHolds
+) -> tuple[dict[str, HostHold], set[str]]:
+    """The holds in force for ONE city, and the hosts it is exempt on (issue #464).
+
+    ``holds.current()``, less a spent night allowance on a host where the
+    city is paid-for work (:func:`_paid_for_on_host`): a live checkpoint must
+    be resumed on consecutive nights or it ages out at the 7-day wall as a
+    recorded failure, and a cached census costs no requests at all. THE ONE
+    reading the launch gate, the dry run and the fill all take, so none of
+    them can disagree about which city is held.
+
+    With no allowance configured this is ``(holds.current(), set())`` and
+    reads nothing from disk, so an unset key leaves the night as it was.
+    The checkpoint and cache probes run only when an allowance is SPENT.
+    """
+    current = holds.current()
+    if not holds.has_allowance():
+        return current, set()
+    exempt = {
+        host
+        for host, hold in current.items()
+        if hold.reason == HOLD_ALLOWANCE and _paid_for_on_host(cfg, city, channels, host)
+    }
+    return {host: hold for host, hold in current.items() if host not in exempt}, exempt
+
+
+def _allowance_charge(
+    cfg: "SchedulerConfig", city: db.CityRow, provider: str, est: int, holds: HostHolds
+) -> bool | None:
+    """How one LAUNCH is charged to the night allowance (issue #464).
+
+    None: not charged at all -- the channel touches no allowance host, or
+    ``est == 0`` (a cached census sends no KartaView requests, and its wall
+    clock may be an Overpass fetch). False: paid-for, a resume of a live
+    checkpoint on THIS channel. True: a fresh crawl. Judged from the
+    channel's own state at launch, not the city's, so a fresh grid behind a
+    walk-only checkpoint is still charged as fresh.
+    """
+    if not holds.allowance_hosts() & set(CHANNEL_HOSTS.get(provider, ())):
+        return None
+    if est <= 0:
+        return None
+    return _sweep_checkpoint_progress(cfg, city, provider) is None
+
+
+def _channel_pace_per_min(cfg: "SchedulerConfig", channel: str) -> float | None:
+    """A resumable channel's configured pace in requests a minute, or None if unpaced."""
+    pc = (cfg.providers or {}).get(channel)
+    configured = pc.max_requests_per_minute if pc else None
+    rate = _crawl_pricing(channel).default_rate if configured is None else configured
+    return rate if rate > 0 else None
+
+
+def _allowance_launch_s(cfg: "SchedulerConfig", host: str) -> float:
+    """One paced launch on ``host``, in seconds: what the resume reserve prices (issue #464).
+
+    ``min(ceiling, per_night x 60 / rate)`` from the per-city ceiling window,
+    over the configured channels on the host (the larger, should they
+    differ). At prod's 1.5/min: ``min(3600, 37 x 60 / 1.5) = 1480`` s, about
+    24.7 min, against 23.3 min measured for one 37-request launch. 0 when no
+    channel on the host has a ceiling or a pace.
+    """
+    longest = 0.0
+    for channel, hosts in CHANNEL_HOSTS.items():
+        if host not in hosts or channel not in (cfg.providers or {}):
+            continue
+        window = _ceiling_window(channel, cfg.providers[channel])
+        rate = _channel_pace_per_min(cfg, channel)
+        if window is None or rate is None:
+            continue
+        longest = max(longest, min(float(window.ceiling_s), window.per_night * 60.0 / rate))
+    return longest
+
+
+def _reserve_allowance_resumes(
+    cfg: "SchedulerConfig",
+    holds: HostHolds,
+    due: Sequence[db.CityRow],
+    providers_for_city: dict[str, list[str]],
+) -> None:
+    """Reserve tonight's resumes out of each night allowance, once per run (issue #464).
+
+    A paused sweep must be resumed on consecutive nights or its checkpoint
+    ages out at the 7-day wall, a recorded failure. So the cities on the slate
+    with a live checkpoint on any due channel touching the host are counted
+    (cities, not channels: a walk behind its grid's checkpoint defers, so the
+    pair is one launch), priced at one paced launch each
+    (:func:`_allowance_launch_s`), and only the remainder goes to fresh crawls.
+    The slate is never truncated, so this counts resumers past the city cap
+    too: an over-estimate, in the safe direction. Reads nothing with no
+    allowance configured.
+    """
+    for host in sorted(holds.allowance_hosts()):
+        resumers = sum(
+            1
+            for city in due
+            if any(
+                host in CHANNEL_HOSTS.get(c, ())
+                and _sweep_checkpoint_progress(cfg, city, c) is not None
+                for c in providers_for_city.get(city.city_id, ())
+            )
+        )
+        launch_s = _allowance_launch_s(cfg, host)
+        holds.reserve(host, resumers * launch_s, resumers)
+        usage = holds.usage(host)
+        assert usage is not None
+        logger.info(
+            f"{HOST_LABELS.get(host, host)} night allowance {usage.allowance_s / 60:g} min: "
+            f"{resumers} city(ies) resume a live checkpoint tonight "
+            f"(~{usage.reserved_s / 60:.0f} min reserved); "
+            + (
+                "the reserve meets the allowance, so fresh crawls are held from the start"
+                if usage.fresh_allowance_s <= 0
+                else f"{usage.fresh_allowance_s / 60:.0f} min left for fresh crawls"
+            )
+            + " (issue #464)."
+        )
 
 
 class HostBreaker(set):
@@ -542,6 +799,21 @@ class HostBreaker(set):
         # ledger's per-child stamps cannot say (each child stamps once, at its
         # end). Wall-clock UTC instants.
         self.presence: dict[str, list[datetime]] = {}
+        # The night allowance (issue #464), kept apart from `held` and
+        # `held_launches` on purpose: those feed the Done line's HELD clause,
+        # which `scripts/mapillary_night_report.py` reads as the tile CDN's
+        # rest-night series, and hundreds of KartaView allowance holds there
+        # would corrupt it. host -> the LATEST sighting (so the Done line shows
+        # final usage), launches left for a later night, and cities that ran
+        # past a spent allowance as paid-for work.
+        self.allowance_held: dict[str, HostHold] = {}
+        self.allowance_skipped: Counter[str] = Counter()
+        self.allowance_exempt: Counter[str] = Counter()
+        # (host, channel) -> (launch instant, charged as fresh) for each launch
+        # in flight that the allowance charges. Keyed by channel too, so a
+        # stale entry is replaced by the next launch of that channel rather
+        # than ever being charged as one long launch.
+        self._open_charges: dict[tuple[str, str], tuple[datetime, bool]] = {}
         self.cooldown_s = HOST_RECHECK_COOLDOWN_S if cooldown_s is None else cooldown_s
         self.max_rechecks = HOST_RECHECKS_PER_NIGHT if max_rechecks is None else max_rechecks
         self._clock = clock
@@ -680,12 +952,47 @@ class HostBreaker(set):
                 span[0] = min(span[0], now)
             span[1] = max(span[1], now)
 
+    def start_charge(self, provider: str, *, fresh: bool) -> None:
+        """Open a launch of ``provider`` the night allowance charges (issue #464).
+
+        ``fresh`` says which tally its wall clock goes to at
+        :meth:`end_charge`. A no-op for a channel touching no allowance host.
+        """
+        now = clock.utc_now()
+        for host in CHANNEL_HOSTS.get(provider, ()):
+            if host in self.holds.allowance_hosts():
+                self._open_charges[(host, provider)] = (now, fresh)
+
+    def end_charge(self, provider: str) -> None:
+        """Charge the finished launch of ``provider`` opened by :meth:`start_charge`.
+
+        Logs ONE WARNING on the charge that spends the fresh allowance.
+        Nothing happens for a launch that was never opened (not charged).
+        """
+        now = clock.utc_now()
+        for host in CHANNEL_HOSTS.get(provider, ()):
+            opened = self._open_charges.pop((host, provider), None)
+            if opened is None:
+                continue
+            started, fresh = opened
+            if self.holds.charge(host, (now - started).total_seconds(), fresh=fresh):
+                hold = self.holds.allowance(host)
+                channels = sorted(c for c, hs in CHANNEL_HOSTS.items() if host in hs)
+                logger.warning(
+                    f"{hold.describe() if hold else HOST_LABELS.get(host, host)} -- fresh "
+                    f"{', '.join(channels)} crawls are left for a later night. Live "
+                    f"checkpoints and cached censuses still run. Not a refusal and not a "
+                    f"failure: no alert, no breaker trip, and the cities stay due (issue #464)."
+                )
+
     def holding(self, hosts, snapshot: dict[str, HostHold] | None = None) -> dict[str, HostHold]:
         """The hosts among ``hosts`` held right now (issue #444), each with its hold.
 
         Records each hold in ``held`` the first time it is seen, so the
         ``Done:`` line can name it. Counting the launch it costs is the
         caller's, because only the caller knows whether a launch was asked.
+        A spent night allowance (issue #464) is recorded in
+        ``allowance_held`` instead, latest sighting, and NEVER in ``held``.
 
         ``snapshot`` (``holds.current()`` taken once per city) answers instead
         of the wall clock, so a cooldown that ends between a city's grid
@@ -696,7 +1003,10 @@ class HostBreaker(set):
             hold = self.holds.active(host) if snapshot is None else snapshot.get(host)
             if hold is not None:
                 found[host] = hold
-                self.held.setdefault(host, hold)
+                if hold.reason == HOLD_ALLOWANCE:
+                    self.allowance_held[host] = hold
+                else:
+                    self.held.setdefault(host, hold)
         return found
 
     def note_holds(self, hosts) -> dict[str, HostHold]:
@@ -708,6 +1018,10 @@ class HostBreaker(set):
         """
         found = self.holding(hosts)
         for host, hold in found.items():
+            if hold.reason == HOLD_ALLOWANCE:
+                # "holding X for this run" would be false: resumes and cached
+                # censuses still run. The reserve's own INFO line says it.
+                continue
             held_channels = sorted(c for c, hs in CHANNEL_HOSTS.items() if host in hs)
             logger.warning(
                 f"{hold.describe()} -- holding {', '.join(held_channels)} for this run. "
@@ -1388,6 +1702,11 @@ class SchedulerConfig:
     # launches. Empty (the default) means no cooldown: a host refused last night
     # is asked again tonight, exactly as before #444.
     host_refusal_cooldown_h: dict[str, float] = field(default_factory=dict)
+    # [hosts.kartaview].max_night_minutes (issue #464): host -> minutes of
+    # launches one run-due may spend starting FRESH crawls on it, tonight's
+    # resumes reserved first. Empty (the default) means no allowance: the
+    # night is exactly what it was before #464.
+    host_night_minutes: dict[str, float] = field(default_factory=dict)
     # [alerts] — operator email on unhealthy runs (off by default)
     alerts: AlertConfig = field(default_factory=AlertConfig)
     # [resource_guard] — load/RAM-aware concurrency backoff on shared hosts
@@ -1721,7 +2040,19 @@ _HOST_REST_KEY = "rest_weekdays"
 # into a block. Bounded at a week, so a units typo (minutes, seconds) is caught.
 _HOST_COOLDOWN_KEY = "refusal_cooldown_h"
 _HOST_COOLDOWN_MAX_H = 7 * 24
-_HOST_KEYS = (_HOST_BUDGET_KEY, _HOST_REST_KEY, _HOST_COOLDOWN_KEY)
+# Minutes of KartaView launches one `run-due` may spend starting FRESH crawls
+# (issue #464). Named beside `[providers.kartaview*].max_city_minutes`, its
+# per-launch sibling. Bounded at a day, so a units typo (seconds) is caught.
+_HOST_ALLOWANCE_KEY = "max_night_minutes"
+_HOST_ALLOWANCE_MAX_MIN = 24 * 60
+_HOST_KEYS = (_HOST_BUDGET_KEY, _HOST_REST_KEY, _HOST_COOLDOWN_KEY, _HOST_ALLOWANCE_KEY)
+# The hosts a night allowance may be set on: KartaView's only, for the reason
+# `_CEILING_CHANNELS` is KartaView's only. A spent allowance reaches the fill
+# as a held host, and the fill's leave-to-due exception (#456 review) exists
+# only for KartaView, the least important provider. An allowance on the tile
+# CDN would end the fill for every Mapillary-member city (#443), and one on
+# Panoramax would decline every Panoramax member's fill city whole.
+_ALLOWANCE_HOSTS = frozenset({HOST_KARTAVIEW})
 # Indexed by `date.weekday()`: Monday is 0.
 WEEKDAY_NAMES = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 
@@ -1732,6 +2063,7 @@ class _HostSettings(NamedTuple):
     budgets: dict[str, int]
     rest_weekdays: dict[str, tuple[str, ...]]
     cooldown_h: dict[str, float]
+    night_minutes: dict[str, float]
     errors: list[str]
 
 
@@ -1802,6 +2134,12 @@ def _host_settings(table: Any, config_path) -> _HostSettings:
     at most a week, refused rather than dropped, since dropping it would let the
     nightly re-probe a blocked IP the cooldown exists to leave alone.
 
+    ``max_night_minutes`` (issue #464) likewise: a positive number of minutes,
+    at most a day, and only on a host in ``_ALLOWANCE_HOSTS``. Refused rather
+    than dropped, since dropping it would run the unbounded night -- the
+    fail-OPEN direction for a key whose only effect is less traffic. Zero is
+    refused too: to stop the channels, set ``enabled = false``.
+
     A section must hold at least one known key and nothing else, and every key
     in a section must be valid for ANY of it to load: a half-applied section is
     harder to reason about than a refused one.
@@ -1810,12 +2148,13 @@ def _host_settings(table: Any, config_path) -> _HostSettings:
     budgets: dict[str, int] = {}
     rest: dict[str, tuple[str, ...]] = {}
     cooldown: dict[str, float] = {}
+    night_minutes: dict[str, float] = {}
     errors: list[str] = []
     if table is None:
-        return _HostSettings(budgets, rest, cooldown, errors)
+        return _HostSettings(budgets, rest, cooldown, night_minutes, errors)
     if not isinstance(table, dict):
         errors.append(f"[hosts] in {config_path} is not a table of [hosts.<token>] sections.")
-        return _HostSettings(budgets, rest, cooldown, errors)
+        return _HostSettings(budgets, rest, cooldown, night_minutes, errors)
     for token, section in table.items():
         where = f"[hosts.{token}] in {config_path}"
         if token not in metered:
@@ -1852,6 +2191,25 @@ def _host_settings(table: Any, config_path) -> _HostSettings:
                 f"{where}: {_HOST_COOLDOWN_KEY}={hours!r} is not a number of hours in "
                 f"(0, {_HOST_COOLDOWN_MAX_H}]."
             )
+        minutes = section.get(_HOST_ALLOWANCE_KEY)
+        if _HOST_ALLOWANCE_KEY in section:
+            if token not in _ALLOWANCE_HOSTS:
+                section_errors.append(
+                    f"{where}: {_HOST_ALLOWANCE_KEY} is accepted only on "
+                    f"{', '.join(sorted(_ALLOWANCE_HOSTS))}: a spent allowance holds the "
+                    f"host for the fill, whose leave-to-due exception is KartaView's alone "
+                    f"(issue #464)."
+                )
+            elif (
+                isinstance(minutes, bool)
+                or not isinstance(minutes, int | float)
+                or not 0 < minutes <= _HOST_ALLOWANCE_MAX_MIN
+            ):
+                section_errors.append(
+                    f"{where}: {_HOST_ALLOWANCE_KEY}={minutes!r} is not a number of minutes "
+                    f"in (0, {_HOST_ALLOWANCE_MAX_MIN}]; to stop the host's channels set "
+                    f"[providers.<channel>].enabled = false instead."
+                )
         if section_errors:
             errors.extend(section_errors)
             continue
@@ -1861,7 +2219,9 @@ def _host_settings(table: Any, config_path) -> _HostSettings:
             rest[token] = days
         if _HOST_COOLDOWN_KEY in section:
             cooldown[token] = float(hours)
-    return _HostSettings(budgets, rest, cooldown, errors)
+        if _HOST_ALLOWANCE_KEY in section:
+            night_minutes[token] = float(minutes)
+    return _HostSettings(budgets, rest, cooldown, night_minutes, errors)
 
 
 def _config_refusals(cfg: SchedulerConfig) -> list[str]:
@@ -2025,6 +2385,7 @@ def load_scheduler_config(path: str | None = None) -> SchedulerConfig:
         fill_host_ceilings=fill_host_ceilings,
         host_rest_weekdays=host_settings.rest_weekdays,
         host_refusal_cooldown_h=host_settings.cooldown_h,
+        host_night_minutes=host_settings.night_minutes,
         timer_watchdog_max_age_h=float(sched.get("timer_watchdog_max_age_h", 0.0)),
         batch_size=dl.get("batch_size", 100),
         connection_limit=dl.get("connection_limit", 50),
@@ -4706,6 +5067,14 @@ def _host_hold_status_lines(cfg: SchedulerConfig, conn, today: date) -> list[str
         lines.append(
             f"{HOST_LABELS.get(host, host)} rests on {', '.join(days)} (UTC snapshot date); "
             f"today ({today}, {weekday}) is {state}."
+        )
+    for host, minutes in sorted(cfg.host_night_minutes.items()):
+        # Usage is per run and in memory, so status can only name the setting.
+        lines.append(
+            f"{HOST_LABELS.get(host, host)} night allowance: {minutes:g} min of launches per "
+            f"run-due for fresh crawls, tonight's resumes reserved first; live checkpoints "
+            f"and cached censuses are never held (issue #464). Usage is on each night's "
+            f"Done: line."
         )
     return lines
 
@@ -10133,6 +10502,16 @@ def cmd_run_due(
                 if would_hold
                 else " (none would have been held)"
             )
+            + (
+                "; the night allowance ("
+                + ", ".join(
+                    f"{HOST_LABELS.get(h, h)} {m:g} min"
+                    for h, m in sorted(cfg.host_night_minutes.items())
+                )
+                + ") is lifted too (issue #464)"
+                if cfg.host_night_minutes
+                else ""
+            )
             + ". An operator override; the nightly unit never passes it (issue #444)."
         )
     batch_started = time.monotonic()
@@ -10192,6 +10571,10 @@ def cmd_run_due(
         only_city_ids=only_city_ids,
     )
     due, providers_for_city = slate.cities, slate.providers_for_city
+    # The night allowance's resume reserve (issue #464), from the slate,
+    # before the dry-run branch so the preview prices the same reserve.
+    if holds.has_allowance():
+        _reserve_allowance_resumes(cfg, holds, due, providers_for_city)
     if only_city_ids is not None:
         for city_id in sorted(only_city_ids - set(providers_for_city)):
             # Said out loud, because a named city that silently collected
@@ -10337,13 +10720,36 @@ def cmd_run_due(
         print(f"DRY RUN — would process (budget remaining {left_str}):")
         run_hosts = {h for p in providers for h in CHANNEL_HOSTS.get(p, ())}
         for host, hold in holds.current().items():
-            if host in run_hosts:
+            if host in run_hosts and hold.reason != HOLD_ALLOWANCE:
                 print(f"  HELD tonight — {hold.describe()} (issue #444)")
-        current_holds = holds.current()
+        for host in sorted(holds.allowance_hosts() & run_hosts):
+            usage = holds.usage(host)
+            assert usage is not None
+            print(
+                f"  ALLOWANCE — {HOST_LABELS.get(host, host)}: {usage.allowance_s / 60:g} min "
+                f"of launches; {usage.reserved_n} city(ies) resume a live checkpoint "
+                f"(~{usage.reserved_s / 60:.0f} min reserved), "
+                f"{usage.fresh_allowance_s / 60:.0f} min left for fresh crawls. Priced here at "
+                f"the configured pace; the night charges measured wall clock, so it can hold "
+                f"cities this preview lists (issue #464)"
+            )
+        # Read per CITY (issue #464): the preview charges its own `holds` as it
+        # goes, so a night allowance can be spent part-way down the slate, and
+        # a city that is paid-for work is exempt from it -- the live rule.
+        city_holds: dict[str, HostHold] = {}
 
-        def _held_by(provider: str) -> list[HostHold]:
+        def _held_by(provider: str, city: db.CityRow | None = None) -> list[HostHold]:
             hosts = CHANNEL_HOSTS.get(provider, ())
-            return [hold for host, hold in current_holds.items() if host in hosts]
+            found = [hold for host, hold in city_holds.items() if host in hosts]
+            if (
+                found
+                and city is not None
+                and all(h.reason == HOLD_ALLOWANCE for h in found)
+                and _city_channel_unfinishable(cfg, conn, city, provider) is not None
+            ):
+                # The live gate lets the #456 unfinishable skip take it.
+                return []
+            return found
 
         # Walk the queue the way the live loop does (issue #444 review): a city
         # whose every due channel is HELD launches nothing, so the night counts
@@ -10358,7 +10764,8 @@ def cmd_run_due(
             if previewed >= day_cap:
                 break
             city_channels = providers_for_city[city.city_id]
-            if city_channels and all(_held_by(p) for p in city_channels):
+            city_holds = _city_holds(cfg, city, city_channels, holds)[0]
+            if city_channels and all(_held_by(p, city) for p in city_channels):
                 passed_over += 1
                 for provider in city_channels:
                     preview_unfinished[provider] += 1
@@ -10369,14 +10776,14 @@ def cmd_run_due(
             # move, so the night reaches the next city. Its rows still print
             # below, as the live loop logs the skips.
             if city_channels and all(
-                _held_by(p) or _city_channel_unfinishable(cfg, conn, city, p) is not None
+                _held_by(p, city) or _city_channel_unfinishable(cfg, conn, city, p) is not None
                 for p in city_channels
             ):
                 passed_over_unfinishable += 1
             else:
                 previewed += 1
             for provider in city_channels:
-                held_by = _held_by(provider)
+                held_by = _held_by(provider, city)
                 if held_by:
                     # The live gate's answer, asked of the same instance: a held
                     # channel launches nothing and spends nothing. It is due
@@ -10476,6 +10883,14 @@ def cmd_run_due(
                         else f"{fits} (cached census from {payer})"
                     )
                 print(f"  {city.city_id:60s} {provider:16s} ~{est:>9,} req  {fits}")
+                # The night allowance (issue #464), charged the preview's way:
+                # the requests at the configured pace, where the night charges
+                # measured wall clock. A cached census is never charged.
+                charge = _allowance_charge(cfg, city, provider, spend, holds)
+                if charge is not None:
+                    pace = _channel_pace_per_min(cfg, provider)
+                    for host in holds.allowance_hosts() & wanted:
+                        holds.charge(host, spend * 60.0 / pace if pace else 0.0, fresh=charge)
                 budget_left[provider] -= spend
                 for host in wanted:
                     host_spent[host] += spend
@@ -10516,6 +10931,7 @@ def cmd_run_due(
                 unfinished=preview_unfinished,
                 window_start=preview_now - HOST_BUDGET_WINDOW,
                 held_hosts=set(holds.current()),
+                holds=holds,
             )
         if cfg.driving_plan.enabled:
             print("Would also snapshot the GSV driving-plan feed (issue #176).")
@@ -10688,6 +11104,9 @@ def cmd_run_due(
         # Apart from the refusal clause above (issue #444): nothing refused us
         # and nothing failed; a rest night or a cooldown held the host.
         + _held_summary_note(blocked_hosts)
+        # Apart from the HELD clause (issue #464): the night allowance is not a
+        # rest night, and its counts must never reach the #444 series.
+        + _allowance_summary_note(blocked_hosts)
         + _presence_note(conn, blocked_hosts, batch_started_iso)
         # The COUNT here and the names in the [alerts] mail (issue #341): a
         # stranded city has no route back for ~83 days, and "1 host(s)
@@ -11097,7 +11516,18 @@ def _run_city_channels(
     # read per launch could lift between the grid run and its walk, and the
     # walk would then run alone and pay a full census instead of the paired
     # cache hit. A hold that lifts mid-city takes effect from the next city.
-    city_holds = blocked_hosts.holds.current()
+    # A night allowance spent between a city's grid and its walk likewise
+    # takes effect from the next city (issue #464), and a city that is
+    # paid-for work on the host (a live checkpoint, a cached census) is exempt
+    # from a spent allowance: `_city_holds` drops that hold for it.
+    city_holds, allowance_exempt = _city_holds(cfg, city, providers, blocked_hosts.holds)
+    for host in sorted(allowance_exempt):
+        blocked_hosts.allowance_exempt[host] += 1
+        logger.info(
+            f"{city.city_id}: {HOST_LABELS.get(host, host)} night allowance is spent, but "
+            f"this city resumes a live checkpoint or reuses a cached census there, so it "
+            f"runs as paid-for work (issue #464)."
+        )
     # ...and the walks the batch deadline deferred (issue #373), stranded
     # below when their grid sibling landed in this same call.
     lost_to_deadline: list[str] = []
@@ -11253,6 +11683,12 @@ def _run_city_channels(
                     # paid for, rather than propagating past a `finally` that
                     # would only wait for those children and then discard them.
                     try:
+                        # Set when a spent night allowance holds this channel but
+                        # the channel is unfinishable under the per-city ceiling
+                        # anyway (issue #464): it falls through to the #456 skip,
+                        # which names the operator's levers, rather than being
+                        # called "left for a later night" when no night can run it.
+                        allowance_fallthrough = False
                         # A host this channel needs already refused us during this
                         # run. A final skip (not a deferral): the other channels of
                         # this and later cities are still worth running. Deliberately
@@ -11294,6 +11730,23 @@ def _run_city_channels(
                         # same host is held too. A final skip with no
                         # `record_attempt` -- the city stays due.
                         held = blocked_hosts.holding(wanted, city_holds)
+                        if held and all(h.reason == HOLD_ALLOWANCE for h in held.values()):
+                            # A spent night allowance (issue #464). Its own
+                            # counters, never `held_skipped`/`held_launches`
+                            # (see HostBreaker.allowance_held). No attempt is
+                            # recorded and no cap slot is taken; it stays due.
+                            if _city_channel_unfinishable(cfg, conn, city, provider) is not None:
+                                allowance_fallthrough = True
+                                held = {}
+                            else:
+                                for host in held:
+                                    blocked_hosts.allowance_skipped[host] += 1
+                                logger.info(
+                                    f"{city.city_id} [{provider}]: left for a later night — "
+                                    + "; ".join(h.describe() for h in held.values())
+                                    + ". Not a failure; it stays due (issue #464)."
+                                )
+                                continue
                         if held:
                             for host in held:
                                 blocked_hosts.held_skipped[host] += 1
@@ -11654,8 +12107,25 @@ def _run_city_channels(
                             # what the whole batch is doing. A resumable channel took
                             # its own branch further up, where its cap needed the answer.
                             timeout_s = city_timeout_seconds(cfg, city, provider, conn=conn)
+                        if allowance_fallthrough:
+                            # Defensive (issue #464): the slate's unfinishable
+                            # predicate said the #456 skip would take this channel,
+                            # and it did not. A spent allowance still holds it.
+                            for host in blocked_hosts.holds.allowance_hosts() & wanted:
+                                blocked_hosts.allowance_skipped[host] += 1
+                            logger.info(
+                                f"{city.city_id} [{provider}]: left for a later night — "
+                                f"night allowance spent. Not a failure; it stays due (issue #464)."
+                            )
+                            continue
                         # Before the call, which runs the child INLINE at one lane.
                         blocked_hosts.mark_present(CHANNEL_HOSTS.get(provider, ()), launched=True)
+                        # The night allowance's tally (issue #464), judged from
+                        # THIS channel's own state: a cached census is not
+                        # charged, a resume is paid-for, anything else is fresh.
+                        charge = _allowance_charge(cfg, city, provider, est, blocked_hosts.holds)
+                        if charge is not None:
+                            blocked_hosts.start_charge(provider, fresh=charge)
                         future = _start(
                             provider,
                             connection_limit=conn_limit,
@@ -11721,6 +12191,7 @@ def _run_city_channels(
             for future in sorted(done, key=lambda f: providers.index(in_flight[f])):
                 provider = in_flight.pop(future)
                 blocked_hosts.mark_present(CHANNEL_HOSTS.get(provider, ()), launched=False)
+                blocked_hosts.end_charge(provider)
 
                 # One channel's outcome, classified in full or not at all.
                 # The `try` covers BOTH the worker's own exception and
@@ -13543,7 +14014,8 @@ def _fill_prebudget_refusal(
             return FillVerdict(
                 False,
                 _FILL_BLOCKER_HOST_HELD,
-                f"{_host_names(on_hold)} is held tonight ({channel}): rest night or cooldown",
+                f"{_host_names(on_hold)} is held tonight ({channel}): rest night, cooldown "
+                f"or spent night allowance",
                 hosts=frozenset(on_hold),
             )
         refused = wanted & latched
@@ -13722,7 +14194,9 @@ def _fill_admission(
         city,
         channels,
         latched=set(blocked_hosts.latched),
-        held_hosts=set(blocked_hosts.holds.current()),
+        # Per city (issue #464): a spent night allowance holds the host for a
+        # fresh KartaView crawl but not for paid-for work, the due phase's rule.
+        held_hosts=set(_city_holds(cfg, city, channels, blocked_hosts.holds)[0]),
         channel_room=channel_room,
         used_by_host=used,
         remaining_s=remaining_s,
@@ -13864,8 +14338,14 @@ def _print_fill_preview(
     unfinished: Counter[str],
     window_start: datetime,
     held_hosts: set[str] | frozenset[str] = frozenset(),
+    holds: HostHolds | None = None,
 ) -> None:
     """``run-due --dry-run``'s fill section (issue #404), through the live rule.
+
+    ``holds``, when given, is read per city through :func:`_city_holds` in
+    place of ``held_hosts``, so a spent night allowance (issue #464) leaves a
+    fresh KartaView crawl to its due schedule and exempts paid-for work, as
+    the night's fill does.
 
     Admission is :func:`_fill_judge` against the preview's SIMULATED ledgers
     (the due cities above already drew them down, and each admitted fill city
@@ -13916,7 +14396,11 @@ def _print_fill_preview(
             city,
             city_channels,
             latched=set(),
-            held_hosts=held_hosts,
+            held_hosts=(
+                held_hosts
+                if holds is None
+                else set(_city_holds(cfg, city, city_channels, holds)[0])
+            ),
             channel_room={c: budget_left[c] for c in city_channels},
             used_by_host={h: window_used[h] + host_spent[h] for h in hosts},
             remaining_s=None,
@@ -14461,6 +14945,42 @@ def _held_summary_note(breaker: HostBreaker, sep: str = "; ") -> str:
         return ""
     held = ", ".join(hold.describe() for _host, hold in sorted(breaker.held.items()))
     return f"{sep}HELD {held}, {breaker.held_launches} launch(es) held, cities stay due"
+
+
+def _allowance_summary_note(breaker: HostBreaker, sep: str = "; ") -> str:
+    """The ``Done:`` line's night-allowance clause (issue #464), or ``""``.
+
+    ``; ALLOWANCE the KartaView API (api.kartaview.org): 372 of 360 min in
+    launches (fresh 157 of 138 min over 6 launch(es); resumes 215 min over 9;
+    9 resume(s) 222 min reserved), 212 launch(es) left for a later night, 3
+    city(ies) exempt as paid-for work, cities stay due``.
+
+    The minutes are the MEASURED wall clock of the launches charged to the
+    allowance -- not the host-presence span the ``on ...`` clause prints,
+    which runs from the first launch to the last finish and still reads long
+    when exempt resumes run late. Never the token ``HELD`` and never starting
+    with ``on ``, so ``scripts/mapillary_night_report.py`` reads none of it.
+    Empty with no allowance configured, or when the host neither launched nor
+    held anything tonight.
+    """
+    parts = []
+    for host in sorted(breaker.holds.allowance_hosts()):
+        usage = breaker.holds.usage(host)
+        assert usage is not None
+        skipped = breaker.allowance_skipped[host]
+        exempt = breaker.allowance_exempt[host]
+        if not (usage.fresh_n or usage.paid_n or skipped or exempt):
+            continue
+        parts.append(
+            f"ALLOWANCE {HOST_LABELS.get(host, host)}: "
+            f"{(usage.fresh_s + usage.paid_s) / 60:.0f} of {usage.allowance_s / 60:g} min in "
+            f"launches (fresh {usage.fresh_s / 60:.0f} of {usage.fresh_allowance_s / 60:.0f} "
+            f"min over {usage.fresh_n} launch(es); resumes {usage.paid_s / 60:.0f} min over "
+            f"{usage.paid_n}; {usage.reserved_n} resume(s) {usage.reserved_s / 60:.0f} min "
+            f"reserved), {skipped} launch(es) left for a later night, {exempt} city(ies) "
+            f"exempt as paid-for work, cities stay due"
+        )
+    return "".join(f"{sep}{part}" for part in parts)
 
 
 def _presence_note(conn, breaker: HostBreaker, run_started_iso: str) -> str:
@@ -15601,8 +16121,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--ignore-host-holds",
         action="store_true",
         help="Launch on hosts this run would otherwise HOLD: a [hosts.*].rest_weekdays "
-        "rest night or a refusal_cooldown_h cooldown (issue #444). Logged at WARNING; "
-        "an operator override the nightly unit never passes.",
+        "rest night or a refusal_cooldown_h cooldown (issue #444), or a spent "
+        "[hosts.kartaview].max_night_minutes night allowance (issue #464). Logged at "
+        "WARNING; an operator override the nightly unit never passes.",
     )
     p_probe = sub.add_parser(
         "probe-host",
