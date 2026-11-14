@@ -1633,6 +1633,27 @@ Every assertion above was mutation-checked; the table is in the PR body.
 `streetscape-utils.test.js` pins `adaptCityRecord.capture_history`: the gsv block's own pointer, null for the same city's Mapillary view (a record-level read fails it), and null — never undefined — on v1 and unharvested records; and that a harvest filename resolves to no provider and is not a valid run.
 The Python half of that last pin is `test_a_history_artifact_is_not_a_run_file_in_either_language` in `tests/test_naming.py`, which runs the JS `RUN_FILENAME_RE` itself (widening its token class to `[a-z_]+` fails it).
 
+### The viewport-true dot tier (issue #77)
+
+`pano-overview.test.js` pins the index and the planner; every assertion below was mutation-checked, and the table is in the PR body.
+
+- **The cell is the slippy-map tile.**
+  `mercatorCell` is held to `www/js/__tests__/pano-cell-golden.json` at twelve levels (a transposed x/y fails it), and `tests/test_pano_cell_golden.py` holds the same file to `download_common.lonlat_to_tile_frac`, so the two languages are pinned to one table rather than to each other's source (flipping the Python y fails it).
+  The golden includes a 3×3 cluster around a zoom-8 tile corner, so a point on each side of a coarse boundary is in it.
+  `mercatorCell keeps x and y inside 0..2^z-1` fails when `unitToCell` drops its clamp; "every point's index cell IS the slippy-map cell" fails on a transposed `mortonEncode` or `mortonDecode`, and on `mortonAtLevel` forgetting that a JS shift is mod 32.
+- **The sort key is exact.** `indexLayout` must leave every packed key under 2^52 (claiming 54 bits fails it), and the comparator fallback, forced with `forceComparatorSort`, must order exactly as the packed sort does (comparing ids only fails it).
+- **Counting is exact, not cell-whole.** `countInBounds` equals a brute-force count on seeded random views under every mode and year filter (counting an edge cell whole fails it); `idsInBounds` is exactly the points in view with the view's edges included (returning whole cell ranges, or exclusive edges, fails it); a pano at the Mercator limit is counted where it really is (trusting a limit cell fails it).
+- **`populationFilter` is the mode and year rule** (ignoring Google-only fails it).
+- **The planner.**
+  A city at or under the budget never counts a view (`>=` instead of `>` fails it); a view within the budget draws every pano in it (entering strictly below fails it); the hysteresis band (no band fails it).
+  One announcement per real tier change, never on the first plan (announcing the first fails it); an auto-pan never re-tiers and keeps the open popup's pano (ignoring the freeze, or dropping the pinned item, fails it).
+  Flat-only points follow their own switch (gating them on the Panoramas layer fails it); the layer off keeps the tier so turning it on is silent (forgetting it fails it); a selected date only adds (filtering by it fails it).
+  `drawnNoticeText` names the state in words (giving the complete tier the sample's text fails it).
+
+The browser half is four e2e tests in `tests/e2e/test_smoke.py` over a 60,000-pano dense synthetic GSV city and a 45,000-pano Mapillary one with 2,000 flat-only points (`build_fixture.write_dense_city`, written per session, never committed).
+`test_zooming_into_a_dense_city_draws_every_pano_in_view` fails when the dot tier keeps the stride sample, when the first plan counts Leaflet's default view and the fit re-tiers, when the notice is not patched, and when the live region is never written; `test_an_open_popup_survives_its_auto_pan_and_a_pan_away` fails when `city.js` never pins; `test_flat_only_points_stay_independent_of_the_panoramas_layer` fails when a flat marker can be pinned or the layer gates them; `test_a_city_under_the_cap_never_counts_a_view` fails when every city counts its view.
+`test_the_dense_city_is_named_by_the_generator_and_holds_what_it_says` (fast suite, `tests/test_e2e_fixture.py`) fails on a hand-built filename and on a city with no contributor district.
+
 ## The pivoted data tables (issue #250)
 
 **The pivoted data tables (issue #250) are covered on both sides.**

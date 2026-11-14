@@ -337,6 +337,7 @@ The raw feed archive lives outside `data/` (mirroring a vendor's file is not our
 **Web frontend → [`docs/frontend.md`](docs/frontend.md).**
 Static vanilla JS + Leaflet + Chart.js 4 in `www/`, no build step, fetching the published `data/`.
 `city.html` has ONE legend (the top-right Leaflet control) and ONE layer control (top-left `L.control.layers`); street coverage renders into them and into the bottom-right chart stack, never into a second control cluster (#104).
+Over `RENDER_CAP` the pano dots are view-dependent (#77): a view holding at most the cap draws every pano in it, a wider one the stride sample; the planner and the slippy-map-aligned index are `www/js/pano-overview.js`, and the diff overlay still stride-samples at every zoom.
 `www/js/streetscape-utils.js` holds the provider registry and `adaptCityRecord`, which flattens v1/v2/v3 aggregate records into one normalized shape.
 It also holds `addBasemapLayer` and the CARTO key, which is **the one place a tile URL is built** — because CARTO enforces its key by watermarking the tile rather than by refusing the request: a keyless request, a wrong key and the right key under the wrong parameter name all return HTTP 200 and a byte-identical PNG stamped "API KEY REQUIRED", so no error handling anywhere can see it and a duplicated call site renders perfectly, watermarked.
 The key is bearer-style (the issuing domain is measurably not enforced), so exposure is unavoidable but abuse is not; the detection path is `tests/e2e/test_basemap_key.py`, which compares a keyed tile against a keyless one by bytes.
@@ -383,6 +384,7 @@ Keep any list a doc enumerates **alphabetical**, so two branches adding an entry
   - `belgium-screen.md`
   - `capture-date-precision.md`
   - `carto-basemap-key.md`
+  - `city-map-viewport-dots.md`
   - `csv-float-parse.md`
   - `grid-density.md`
   - `gsv-history-pilot.md`

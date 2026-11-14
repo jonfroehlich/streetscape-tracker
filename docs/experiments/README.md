@@ -48,6 +48,14 @@ That is why the detection path is differential (keyed bytes vs keyless bytes) ra
 **The domain CARTO collects at issue time is not enforced** — issued origin, foreign origin and no `Referer` return identical bytes — so the key is bearer-style, which separates unavoidable *exposure* from mitigable *abuse* and makes "same as any Mapbox client key" the wrong analogy.
 **Vector is not a way off the key** (same key, same 5M/month ceiling), so it is purely a rendering-stack decision: maplibre-gl is 6.19x Leaflet's gzipped weight, plus a WebGL flake class and no basemap at all where WebGL is unavailable. Decision: stay on raster.
 
+### `city-map-viewport-dots.md`
+
+Issue #77 — what the city map's dot tier draws, and what it costs, before and after drawing every pano in view on a city over the 40,000 render cap.
+Synthetic dense cities (a street lattice, 60,000 to 1,000,000 panoramas) in headless Chromium, plus a Node benchmark of the index alone at up to 15,000,000 points; no network beyond the page's own libraries.
+At street level on a 1,000,000-pano city, 288 of 7,195 panoramas in view were drawn before and all of them after; a pan costs 18–27 ms more to paint at the median, about flat across city size.
+The finding that generalizes: **the change fixes what a street-level view shows and leaves load and memory as they were** (load +9% at 1,000,000, the index 0.1 s of it), because both are dominated by building one Leaflet marker per pano during streaming — so the next step on #77 is lazy markers, not a faster index.
+It is a one-off protocol, so it cannot catch a later regression; the e2e tests are what guard the behaviour.
+
 ### `csv-float-parse.md`
 
 Issue #425 — how often pandas' default C float parser misreads a run CSV's coordinates (one ULP, ~5 % of latitudes and ~37 % of longitudes on the dev catalog), and what that cost the road-walk scorer's 9-decimal key join (Seattle: 5 of 247,292 samples scored uncovered, +0.075 km once fixed).
