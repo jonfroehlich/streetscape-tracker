@@ -888,9 +888,11 @@ refusal_cooldown_h = 36
 #     mean is 12,180 grid requests / 313 cities = 38.9 (the RESUMED 2026-11-09
 #     note above). At ~853 enrolled: ~400 requests/day = ~267 min at 1.5/min.
 #   R, live checkpoints tonight, from `run-due --dry-run`'s ALLOWANCE line.
-# Nights to drain = backlog requests / (1.5 x A - S - resume share). Below S
-# (in minutes) the backlog NEVER drains and KartaView refreshes miss their
-# cycle: permanent holes. 360 is ~1.35 x S and drains in ~2 months; cities
+# Nights to drain = backlog requests / (1.5 x A - S); S already counts resumed
+# launches. Below S (in minutes) the backlog NEVER drains and KartaView
+# refreshes miss their cycle: permanent holes. 360 is ~1.35 x S: 540 - 400 =
+# 140 requests a night, ~2 months; if R x ~24.7 min exceeds A, fresh crawls
+# get nothing and the drain stalls until the resumers finish. Cities
 # first collected from 2026-08-28 come due again from ~2026-11-19, so S
 # arrives during the drain. Recommended: S plus a backlog margin, ~420-480 on
 # today's numbers; if R x ~24.7 min is at or above the candidate, leave it

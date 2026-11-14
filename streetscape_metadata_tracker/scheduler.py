@@ -567,6 +567,17 @@ def _host_holds(
     )
 
 
+def _allowance_checkpoint(cfg: "SchedulerConfig", city: db.CityRow, channel: str) -> bool:
+    """Does ``channel`` have a checkpoint tonight's launch would RESUME? (issue #464)
+
+    :func:`_sweep_checkpoint_progress`, less one aged past
+    ``CHECKPOINT_MAX_AGE_S``: the child discards that and crawls fresh, so it
+    is neither reserved, exempt nor charged as paid.
+    """
+    progress = _sweep_checkpoint_progress(cfg, city, channel)
+    return progress is not None and progress.get("age_s", 0.0) < CHECKPOINT_MAX_AGE_S
+
+
 def _paid_for_on_host(
     cfg: "SchedulerConfig", city: db.CityRow, channels: Sequence[str], host: str
 ) -> bool:
@@ -581,7 +592,7 @@ def _paid_for_on_host(
     for channel in channels:
         if host not in CHANNEL_HOSTS.get(channel, ()):
             continue
-        if _sweep_checkpoint_progress(cfg, city, channel) is not None:
+        if _allowance_checkpoint(cfg, city, channel):
             return True
         if channel_census_cache_marker(city, channel, max_age_s=window_s) is not None:
             return True
@@ -631,7 +642,25 @@ def _allowance_charge(
         return None
     if est <= 0:
         return None
-    return _sweep_checkpoint_progress(cfg, city, provider) is None
+    return not _allowance_checkpoint(cfg, city, provider)
+
+
+def _charge_preview_allowance(
+    cfg: "SchedulerConfig", city: db.CityRow, provider: str, spend: int, holds: HostHolds
+) -> None:
+    """Charge one PREVIEWED launch to the night allowance (issue #464).
+
+    The dry run's way of :func:`_allowance_charge`: the requests at the
+    configured pace, where the night charges measured wall clock. Shared by
+    the due rows and the fill section, so the preview spends the allowance
+    where the night does. A no-op with no allowance configured.
+    """
+    charge = _allowance_charge(cfg, city, provider, spend, holds)
+    if charge is None:
+        return
+    pace = _channel_pace_per_min(cfg, provider)
+    for host in holds.allowance_hosts() & set(CHANNEL_HOSTS.get(provider, ())):
+        holds.charge(host, spend * 60.0 / pace if pace else 0.0, fresh=charge)
 
 
 def _channel_pace_per_min(cfg: "SchedulerConfig", channel: str) -> float | None:
@@ -668,6 +697,7 @@ def _reserve_allowance_resumes(
     holds: HostHolds,
     due: Sequence[db.CityRow],
     providers_for_city: dict[str, list[str]],
+    providers: Sequence[str],
 ) -> None:
     """Reserve tonight's resumes out of each night allowance, once per run (issue #464).
 
@@ -679,15 +709,16 @@ def _reserve_allowance_resumes(
     (:func:`_allowance_launch_s`), and only the remainder goes to fresh crawls.
     The slate is never truncated, so this counts resumers past the city cap
     too: an over-estimate, in the safe direction. Reads nothing with no
-    allowance configured.
+    allowance configured, and neither reserves nor logs for a host none of
+    the run's ``providers`` touches (a ``--provider mapillary`` hand run).
     """
-    for host in sorted(holds.allowance_hosts()):
+    run_hosts = {h for p in providers for h in CHANNEL_HOSTS.get(p, ())}
+    for host in sorted(holds.allowance_hosts() & run_hosts):
         resumers = sum(
             1
             for city in due
             if any(
-                host in CHANNEL_HOSTS.get(c, ())
-                and _sweep_checkpoint_progress(cfg, city, c) is not None
+                host in CHANNEL_HOSTS.get(c, ()) and _allowance_checkpoint(cfg, city, c)
                 for c in providers_for_city.get(city.city_id, ())
             )
         )
@@ -10573,7 +10604,7 @@ def cmd_run_due(
     # The night allowance's resume reserve (issue #464), from the slate,
     # before the dry-run branch so the preview prices the same reserve.
     if holds.has_allowance():
-        _reserve_allowance_resumes(cfg, holds, due, providers_for_city)
+        _reserve_allowance_resumes(cfg, holds, due, providers_for_city, providers)
     if only_city_ids is not None:
         for city_id in sorted(only_city_ids - set(providers_for_city)):
             # Said out loud, because a named city that silently collected
@@ -10882,14 +10913,8 @@ def cmd_run_due(
                         else f"{fits} (cached census from {payer})"
                     )
                 print(f"  {city.city_id:60s} {provider:16s} ~{est:>9,} req  {fits}")
-                # The night allowance (issue #464), charged the preview's way:
-                # the requests at the configured pace, where the night charges
-                # measured wall clock. A cached census is never charged.
-                charge = _allowance_charge(cfg, city, provider, spend, holds)
-                if charge is not None:
-                    pace = _channel_pace_per_min(cfg, provider)
-                    for host in holds.allowance_hosts() & wanted:
-                        holds.charge(host, spend * 60.0 / pace if pace else 0.0, fresh=charge)
+                # The night allowance (issue #464), charged the preview's way.
+                _charge_preview_allowance(cfg, city, provider, spend, holds)
                 budget_left[provider] -= spend
                 for host in wanted:
                     host_spent[host] += spend
@@ -14449,6 +14474,9 @@ def _print_fill_preview(
                 left_to_due[channel] += 1
         for channel in city_channels if verdict.run is None else verdict.run:
             print(f"  {city.city_id:60s} {channel:16s} ~{est[channel]:>9,} req  {label}")
+            if holds is not None:
+                # As the due rows above: the night charges a fill launch too.
+                _charge_preview_allowance(cfg, city, channel, est[channel], holds)
             budget_left[channel] -= est[channel]
             host = CHANNEL_METERED_HOST.get(channel)
             if host is not None:

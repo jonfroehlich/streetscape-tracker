@@ -691,7 +691,9 @@ The pace was not violated; what changed was the length of the daily presence on 
 The span is first launch to last finish, so it overstates KartaView's own time; the request column divided by the pace is the better reading of it.
 One 37-request launch measured 23.3 min (Elko, Nevada, 2026-11-13), so launches reach about the full pace.
 #464 adds an OPTIONAL `[hosts.kartaview].max_night_minutes`, a nightly wall-clock allowance for FRESH KartaView crawls (`docs/scheduler.md`), and ships it **unset**: with the key unset nothing about how, how often, how fast or from where KartaView is called changes.
-**When an operator sets it, it LOWERS KartaView's nightly request volume and launch minutes**, to at most about 1.5 × the allowance in fresh-crawl requests plus tonight's reserved resumes, and it leaves the rate at 1.5/min with one talker.
+**When an operator sets it, it LOWERS KartaView's nightly request volume and launch minutes**, and it leaves the rate at 1.5/min with one talker.
+What it bounds is the due phase's FRESH crawls, at about 1.5 × the allowance less tonight's reserve, plus the city in flight when it is spent.
+Two kinds of launch run outside that bound, as paid-for work: every resume of a live checkpoint, including the fill's resumes of its own paused crawls, which are not in the reserve; and a fresh grid in a city exempt only because its walk has a checkpoint.
 It does not shorten the presence span: exempt resumes, cached walks, the stranded-walk retry and the fill's KartaView launches still run late in the night.
 The minutes it frees go to the other channels within their existing budgets and holds: Mapillary stays bounded by the tile CDN's rolling-24h pool, Panoramax only by its daily budgets, so its nightly volume can rise inside #405's staged-raise window, and Overpass has no budget at all.
 Set it outside #405's measurement window, or record it there as a confounder.

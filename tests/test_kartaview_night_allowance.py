@@ -558,6 +558,60 @@ def test_an_unfinishable_city_is_skipped_as_unfinishable_never_held(
     assert "left for a later night" not in caplog.text
 
 
+def test_the_reserve_counts_cities_not_channels(conn, monkeypatch, tmp_path):
+    """Review 2, finding 4: a city with live checkpoints on BOTH KartaView
+    channels is one resume launch (its walk defers behind its grid), so it
+    reserves one paced launch, ~24.7 min, not two. Mutation: count channels
+    (`for c in ...` in place of `any(...)`) in `_reserve_allowance_resumes`."""
+    cfg = _cfg(tmp_path, 120, channels=KV_PAIR)
+    a = _kv_only(conn, cfg, "Albany", KV_PAIR)
+    _live(monkeypatch, {(a, "kartaview"), (a, "kartaview_streets")})
+    holds = sched._host_holds(cfg, THURSDAY)
+    sched._reserve_allowance_resumes(
+        cfg, holds, [db.resolve_city(conn, a)], {a: list(KV_PAIR)}, list(KV_PAIR)
+    )
+    usage = holds.usage(HOST_KARTAVIEW)
+    assert usage.reserved_n == 1
+    assert usage.reserved_s == pytest.approx(1480.0)
+
+
+def test_the_reserve_is_silent_on_a_run_that_touches_no_kartaview_channel(conn, tmp_path, caplog):
+    """Review 2, nit: a `--provider mapillary` hand run neither reserves nor
+    logs the KartaView allowance; a run with kartaview does. Mutation: drop
+    `& run_hosts` from the reserve's host loop."""
+    cfg = _cfg(tmp_path, 120)
+    holds = sched._host_holds(cfg, THURSDAY)
+    with caplog.at_level(logging.INFO, logger="streetscape_scheduler"):
+        sched._reserve_allowance_resumes(cfg, holds, [], {}, ["gsv"])
+        assert _messages(caplog, "night allowance") == []
+        sched._reserve_allowance_resumes(cfg, holds, [], {}, ["gsv", "kartaview"])
+    assert len(_messages(caplog, f"{LABEL} night allowance 120 min: 0 city(ies)")) == 1
+
+
+def test_a_checkpoint_past_the_age_wall_is_not_paid_for_work(conn, monkeypatch, tmp_path):
+    """Review 2, nit: a checkpoint aged past `CHECKPOINT_MAX_AGE_S` is
+    discarded by the child, which crawls fresh, so it exempts nothing from a
+    spent allowance. Mutation: `_allowance_checkpoint` returning
+    `progress is not None` (no age test)."""
+    cfg = _cfg(tmp_path, 30)
+    a = _kv_only(conn, cfg, "Albany")
+    _cached(monkeypatch, set())
+    monkeypatch.setattr(
+        sched,
+        "_sweep_checkpoint_progress",
+        lambda cfg_, city, channel: (
+            {"age_s": sched.CHECKPOINT_MAX_AGE_S + 1.0, "units_done": 1, "unit_count": 2}
+            if channel == "kartaview"
+            else None
+        ),
+    )
+    breaker = _spent_breaker(cfg, 30)
+    launches, _ = _city_channels(monkeypatch, conn, cfg, a, KV_GRID, breaker)
+    assert launches == []
+    assert breaker.allowance_skipped[HOST_KARTAVIEW] == 1
+    assert breaker.allowance_exempt == {}
+
+
 def test_resumes_are_reserved_out_of_the_allowance_first(conn, monkeypatch, tmp_path, caplog):
     """30 min at 1.5/min, one resumer (Bend): ~24.7 min reserved, ~5.3 left for
     fresh crawls. Every launch takes 25 min. Bend runs paid; one fresh city
@@ -827,6 +881,24 @@ def test_the_dry_run_holds_what_the_night_would_hold(conn, monkeypatch, tmp_path
         ln for ln in out.splitlines() if ln.startswith(f"  {d}") and "kartaview" in ln
     ]
     assert "(2 due city(ies) HELD on every channel passed over" in out
+
+
+def test_the_dry_run_never_lists_a_spent_allowance_as_held_tonight(
+    conn, monkeypatch, tmp_path, capsys
+):
+    """Review 2, nit: a reserve that meets the allowance holds fresh crawls
+    from the start, but the preview's `HELD tonight` lines are #444's rest
+    nights and cooldowns; the allowance has its own ALLOWANCE line. Mutation:
+    drop `hold.reason != HOLD_ALLOWANCE` from the `HELD tonight` filter."""
+    cfg = _cfg(tmp_path, 10)
+    r = _kv_only(conn, cfg, "Albany")
+    _kv_only(conn, cfg, "Bend")
+    _live(monkeypatch, {(r, "kartaview")})
+    rc, _launches, _ = _night(monkeypatch, conn, cfg, dry_run=True)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert f"  ALLOWANCE — {LABEL}: 10 min of launches; 1 city(ies) resume" in out
+    assert "HELD tonight" not in out
 
 
 def test_status_names_the_night_allowance(conn, tmp_path):

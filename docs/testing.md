@@ -1275,6 +1275,12 @@ Each docstring names the one-line mutation that turns it red; all were run red b
   - `test_an_exempt_city_run_twice_is_counted_once`: the exempt tally is distinct cities.
   - `test_the_fill_names_a_spent_allowance_only_where_it_is_the_reason`: the unset test also pins the fill's decline line to the #444 text, byte for byte.
   - `test_fill_admission_judges_the_allowance_exemption_over_what_it_launches` (in the fill file): a backlogged `kartaview` checkpoint does not exempt a `kartaview_streets` that has none.
+- Review 2 added five more.
+  - `test_the_fill_preview_charges_the_night_allowance` (in the fill file, with an unset control): the dry run's fill section charges the allowance as its due rows do.
+  - `test_the_reserve_counts_cities_not_channels`: a city with checkpoints on both channels reserves one launch.
+  - `test_the_reserve_is_silent_on_a_run_that_touches_no_kartaview_channel`.
+  - `test_a_checkpoint_past_the_age_wall_is_not_paid_for_work`.
+  - `test_the_dry_run_never_lists_a_spent_allowance_as_held_tonight`.
 
 ## The Mapillary night report (issue #444)
 

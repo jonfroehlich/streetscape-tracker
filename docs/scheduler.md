@@ -697,9 +697,10 @@ A value that is not a number of minutes in (0, 1440], or the key on any other ho
   At about 853 enrolled cities that is about 400 requests a day, about 267 min at 1.5/min, for the grid alone (a paired walk is free, an unpaired one adds).
 - **R, tonight's live checkpoints**, from the `ALLOWANCE` line of a prod `run-due --dry-run`.
 
-Nights to drain a backlog are `backlog_requests / (1.5 × A − S − resume share)`.
+Nights to drain a backlog are `backlog_requests / (1.5 × A − S)`, A in minutes; S already counts every crawl's resumed launches, and the reserve is carved out of A, not added to it.
 **Any value below S never drains**, and KartaView refreshes then miss their cycle, which this project counts as permanent holes.
-360 min is about 1.35 × S: it leaves about 140 requests a night for a backlog of about 9,000, so it drains in roughly two months.
+360 min is about 1.35 × S: 1.5 × 360 − 400 = 140 requests a night against a backlog of about 9,000, so it drains in roughly two months.
+When R × 24.7 min exceeds A, fresh crawls get nothing at all and the drain stalls until the resumers finish.
 Cities first collected from 2026-08-28 start coming due again on their 83-day wall around 2026-11-19, so S arrives during the drain.
 The recommendation recorded with #464 is at least S plus a backlog margin, about 420 to 480 min on today's numbers; if R × 24.7 min is at or above the candidate value, leave the key unset and measure KartaView minutes from the child logs first.
 

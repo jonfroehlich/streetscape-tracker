@@ -1766,6 +1766,41 @@ def test_fill_admission_judges_the_allowance_exemption_over_what_it_launches(con
     assert not any(set(sched.CHANNEL_HOSTS[c]) & launch_held for c in verdict.run)
 
 
+@pytest.mark.parametrize("minutes", [1.0, None], ids=["allowance", "unset-control"])
+def test_the_fill_preview_charges_the_night_allowance(conn, monkeypatch, capsys, minutes):
+    """#464 review 2, finding 1: the live fill's KartaView launches are
+    charged to the night allowance, so the dry run's fill section charges
+    them too, as its due rows do. With a 1-minute allowance the first fill
+    city's kartaview crawl spends it and the second's is left to its due
+    schedule; unset, both are listed. Kills: dropping the
+    `_charge_preview_allowance` call from `_print_fill_preview.consider`."""
+    import dataclasses
+
+    from streetscape_metadata_tracker.download_common import HOST_KARTAVIEW
+
+    cities = []
+    for name in ("Albany", "Bend"):
+        cid = _city(conn, name, {"gsv": 60, "mapillary": 60, "kartaview": 60})
+        db.set_channel_membership(conn, cid, "kartaview", True, cycle_days=90)
+        cities.append(cid)
+    _live_checkpoints(monkeypatch, set())
+    cfg = _opt_in_cfg()
+    if minutes is not None:
+        cfg = dataclasses.replace(cfg, host_night_minutes={HOST_KARTAVIEW: minutes})
+    est = sched._channel_estimate(cfg, db.resolve_city(conn, cities[0]), "kartaview", conn)
+    assert 2 <= est <= 37, "premise: one launch, priced past 1 minute at 1.5/min"
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+    capsys.readouterr()
+    sched.cmd_run_due(cfg, dry_run=True, today=TODAY)
+    out = capsys.readouterr().out
+    rows = [
+        ln.split()[0]
+        for ln in out.splitlines()
+        if ln.startswith("  ") and " kartaview " in ln and ln.rstrip().endswith("fill")
+    ]
+    assert rows == (cities[:1] if minutes is not None else cities), out
+
+
 def test_a_fill_ended_by_a_ceiling_decline_says_so(conn, monkeypatch, caplog):
     """#456 third round, finding 5: a fill whose last candidate was declined
     because nothing but an oversized KartaView crawl was left to run ends
