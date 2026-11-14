@@ -80,7 +80,10 @@ jobs:
       # makelab1 deploy installs (see deploy/README.md).
       - run: pip install -r requirements.lock
       - name: pytest
-        run: pytest
+        # -rs prints each skip's reason: one canary reports a guard it cannot
+        # exercise on this image as a skip (issue #458), and a bare count
+        # would hide which.
+        run: pytest -rs
 
   frontend:
     name: Frontend (ESLint + unit tests)
