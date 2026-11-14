@@ -145,6 +145,7 @@ def test_a_manually_resized_grid_is_deferred_not_grown_back():
     assert (d.rec_center_lat, d.rec_center_lon) == (43.49753, -116.42638)
     assert (d.rec_width_m, d.rec_height_m) == (4900, 5700)
     assert "fitted by hand" in d.rec_basis and "grow to full" not in d.rec_basis
+    assert rr.MANUAL_RESIZE_REASON in d.rec_basis  # the page shows the basis, not the reason
     generic = rr.recommend(r, cur(43.49753, -116.42638, 4900, 5700))
     assert generic["rec_width_m"] == 12000 and "grow to full" in generic["rec_basis"]  # premise
 
@@ -181,8 +182,13 @@ def test_every_deferral_of_a_hand_fitted_grid_recommends_keeping_it(audit_row):
     assert fitted.reason == plain.reason
     assert (fitted.rec_width_m, fitted.rec_height_m) == (4900, 5700)
     assert (fitted.rec_center_lat, fitted.rec_center_lon) == (43.49753, -116.42638)
-    assert "fitted by hand" in fitted.rec_basis
+    assert fitted.rec_basis.startswith("keep current: this grid was fitted by hand")
     assert "fitted by hand" not in plain.rec_basis  # premise: the generic advice differs
+    # The review page shows rec_basis IN PLACE OF the reason, so the deferral's
+    # own explanation and the generic branch advice must both be in the basis
+    # (round 3): a WRONG_PLACE city still has to say "verify geocode first".
+    assert plain.reason in fitted.rec_basis
+    assert plain.rec_basis in fitted.rec_basis
 
 
 def test_load_current_geometry_reads_the_resize_note_resize_city_writes(tmp_path, monkeypatch):

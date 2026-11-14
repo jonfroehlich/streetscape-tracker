@@ -785,6 +785,7 @@ The order matters: `reregister_boundaries.py` grades a grid smaller than its OSM
 For the same reason these three must never be grown back by a later `reregister_boundaries.py --execute`.
 Since #459 the script enforces that itself: `resize_city.py` stamps `cities.notes` with `db.MANUAL_RESIZE_NOTE`, and a would-be RESIZE of a city carrying that note is turned into DEFER (`reregister_boundaries.MANUAL_RESIZE_REASON`).
 Every deferral of such a city, by this branch or by any other (an OSM bbox over the 30 km threshold, `NO_POLYGON`, `WRONG_PLACE`), carries a "keep current" recommendation that names the hand fit, so the review page never offers growing it back as the recommended choice.
+That recommendation's text also carries the audit's own reason and advice, because the page shows the recommendation's basis in place of the reason.
 The guard covers the unattended pass only; an `apply_decisions.py` decision a person made on the review page still applies.
 The note is never removed, since `cities.notes` is append-only: a city fitted by hand once is deferred by every later audit, even after a reviewed geometry is applied to it.
 `resize_city.py` refuses a city with real runs unless `--force`; these have none, so no `--force` is needed, and a refusal means something collected them — stop.

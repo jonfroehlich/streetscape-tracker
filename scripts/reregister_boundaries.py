@@ -228,8 +228,14 @@ def recommend(row: dict, current: Current, ceiling_m: float = REC_CEILING_M) -> 
     )
 
 
-def _keep_hand_fit(current: Current) -> dict:
-    """The rec_* fields for a hand-fitted grid: its own geometry, and why."""
+def _keep_hand_fit(current: Current, why_deferred: str) -> dict:
+    """The rec_* fields for a hand-fitted grid: its own geometry, and why.
+
+    ``why_deferred`` is appended to the basis because the review page shows
+    rec_basis IN PLACE OF the reason, so a deferral's own explanation
+    ("verify geocode first", the 30 km threshold) would otherwise never reach
+    the reviewer.
+    """
     return dict(
         rec_center_lat=round(current.center_lat, 6),
         rec_center_lon=round(current.center_lon, 6),
@@ -237,7 +243,7 @@ def _keep_hand_fit(current: Current) -> dict:
         rec_height_m=current.height_m,
         rec_basis=(
             "keep current: this grid was fitted by hand (scripts/resize_city.py), "
-            "so it is smaller than its OSM bbox on purpose; growing it back undoes the fit"
+            f"so do not resize it without checking that fit. Audit: {why_deferred}"
         ),
     )
 
@@ -245,7 +251,7 @@ def _keep_hand_fit(current: Current) -> dict:
 # The DEFER reason for a hand-fitted grid (issue #459).
 MANUAL_RESIZE_REASON = (
     "manually resized (scripts/resize_city.py); review by hand, "
-    "an unattended resize would undo the fit"
+    "the audit would have grown it back to its OSM bbox unattended"
 )
 
 
@@ -273,7 +279,12 @@ def decide(row: dict, current: Current | None, threshold_m: float = REVIEW_THRES
         # reason and offers the recommended rectangle as a one-click choice
         # unless it equals the current one, so a generic "grow to full OSM
         # bbox" would hide the fit and invite undoing it.
-        rec = _keep_hand_fit(current) if current.manually_resized else recommend(row, current)
+        rec = recommend(row, current)
+        if current.manually_resized:
+            # recommend()'s basis carries branch advice the reason lacks
+            # (WRONG_PLACE: "verify geocode first"), so keep both in the text.
+            audit = reason if reason == MANUAL_RESIZE_REASON else f"{reason}; {rec['rec_basis']}"
+            rec = _keep_hand_fit(current, audit)
         return d(
             "DEFER",
             reason,
