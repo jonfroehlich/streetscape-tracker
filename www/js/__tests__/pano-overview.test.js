@@ -516,6 +516,10 @@ test("drawnNoticeText says, in words, which state the dots are in", () => {
     "Showing all 1 panorama in view.");
   assert.equal(drawnNoticeText({ mode: "all", drawn: 9, population: 9, budget: BUDGET, yearFiltered: true }),
     "Showing all 9 panoramas of this year.");
+  // Under a year filter the in-view count is that year's, so the words say so
+  // (review 2: "all 498 in view" while 7,195 dated panoramas were in view).
+  assert.equal(drawnNoticeText({ mode: "view", drawn: 520, population: 3420, visible: 498, yearFiltered: true }),
+    "Showing all 498 panoramas of this year in view.");
   assert.match(drawnNoticeText({ mode: "all", population: 50001, renderAll: true }), /all 50,001.*slow/);
   assert.match(drawnNoticeText({ mode: "hidden" }), /hidden/);
 });

@@ -3322,6 +3322,10 @@ def test_flat_only_points_stay_independent_of_the_panoramas_layer(
     # even with a flat popup open while the map moves.
     page.evaluate("setPanoLayerVisible(true)")
     page.evaluate("void flatOnlyMarkers[1].openPopup()")
+    # A flat popup is never pinned (`popupopen` checks `panoIdx`). Asserted on
+    # the pin itself: the planner's population check would drop a pinned flat
+    # marker anyway under this run's filter, so the drawn set cannot show it.
+    assert page.evaluate("flatOnlyMarkers[1].isPopupOpen() && pinnedMarker === null")
     _zoom_by(page, 2, "complete")
     page.evaluate("void map.panBy([60, 40], {animate: false})")
     s = _dense_state(page)
@@ -3501,22 +3505,54 @@ def test_a_click_while_the_run_streams_decides_no_tier(page: Page, base_url, den
     the click.
     """
     errors = _capture_errors(page)
+    release = _open_with_the_run_held(page, base_url, dense_cities["gsv"]["csv"])
+    page.evaluate("map.fire('click', {originalEvent: {target: map._container}})")
+    assert page.evaluate("mapTier === null && lastPlan === null")
+    release()
+    expect(page.locator("#map-drawn-notice")).to_be_visible()
+    s = _dense_state(page)
+    assert s["tier"] == "sampled"
+    assert s["status"] == "", "the load itself must announce nothing"
+    assert errors == []
+
+
+def _open_with_the_run_held(page: Page, base_url, csv):
+    """Open a run whose CSV is held until the returned callable releases it, so
+    the test can act while the page is still loading."""
     held = []
-    page.route(
-        f"**/streetscape-tracker/data/{dense_cities['gsv']['csv']}",
-        lambda route: held.append(route),
-    )
-    page.goto(f"{base_url}/city.html?file={dense_cities['gsv']['csv']}")
+    page.route(f"**/streetscape-tracker/data/{csv}", lambda route: held.append(route))
+    page.goto(f"{base_url}/city.html?file={csv}")
     for _ in range(200):
         if held:
             break
         page.wait_for_timeout(50)
     assert held, "precondition: the run's CSV was requested"
-    page.evaluate("map.fire('click', {originalEvent: {target: map._container}})")
-    assert page.evaluate("mapTier === null && lastPlan === null")
-    held[0].fallback()
+    return lambda: held[0].fallback()
+
+
+def test_a_popup_auto_pan_while_the_run_streams_freezes_no_later_move(
+    page: Page, base_url, dense_cities
+):
+    """The auto-pan flag belongs to one move and never outlives it (review 2, finding 1).
+
+    `moveend` returned on `!mapReady` before consuming the flag, so a popup
+    that auto-panned while the run streamed left it set, and the first real
+    move after load was planned as frozen: at street level it kept the sample
+    (4,849 of 7,195 in view) under "Zoom in to see every panorama."
+    """
+    errors = _capture_errors(page)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    release = _open_with_the_run_held(page, base_url, dense_cities["gsv"]["csv"])
+    # What Leaflet does for a popup that does not fit: autopanstart, then a pan.
+    page.evaluate("map.fire('autopanstart'); void map.panBy([40, 30], {animate: false})")
+    release()
     expect(page.locator("#map-drawn-notice")).to_be_visible()
+    assert page.evaluate("popupAutoPanning") is False
+    assert _dense_state(page)["tier"] == "sampled"
+
+    centre = page.evaluate("[map.getCenter().lat, map.getCenter().lng]")
+    page.evaluate(f"void map.setView({centre}, 16, {{animate: false}})")
     s = _dense_state(page)
-    assert s["tier"] == "sampled"
-    assert s["status"] == "", "the load itself must announce nothing"
+    assert s["tier"] == "complete", s
+    assert s["drawnInView"] == s["inViewTotal"] > 0
     assert errors == []

@@ -194,9 +194,13 @@ map.on("click", (e) => {
 // population over the cap. A city at or under it never counts a view, never
 // builds the index, and so keeps its pre-#77 behaviour exactly.
 map.on("moveend", () => {
-  if (!mapReady) return;
+  // Consumed by EVERY moveend, before any early return: the flag belongs to
+  // the one move a popup's auto-pan causes. Read after the `mapReady` check,
+  // an auto-pan while the run streamed left it set, and the first real move
+  // after load was then frozen in the previous tier (review 2 of the PR).
   const freeze = popupAutoPanning; // this move was a popup making room for itself
   popupAutoPanning = false;
+  if (!mapReady) return;
   if (panoDotsHidden) return;
   if (!isViewDependent({
     populationSize: currentPopulationSize(), budget: RENDER_CAP, renderAll: renderAllOverride,

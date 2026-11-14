@@ -275,6 +275,7 @@ The dot tier is now **view-dependent** for such a city.
 `planMapView` (`www/js/pano-overview.js`, pure and node-tested) decides on every `moveend`:
 
 - **complete** — the map's area padded 10% each side (`DRAWN_AREA_PAD`) holds at most `RENDER_CAP` in-mode panoramas, so every one of them is drawn, and the legend says "Showing all N panoramas in view." with N counted over the visible map, not the padded area.
+  Under a year filter it says "Showing all N panoramas of this year in view.", because N then counts only that year's panoramas and the bare form would read as every panorama there (review 2 of the PR).
 - **sampled** — more than that, so the old global stride sample is drawn, and the legend says how many of how many and "Zoom in to see every panorama."
   It quotes **no threshold**: the tier is counted over the padded area (1.44 × the visible one) with hysteresis, so "every pano once 40,000 or fewer are in view" was false for any view holding about 28,000 to 40,000 that is still sampled (review 1 of the PR).
 - A city at or under the cap is never view-dependent (`isViewDependent`): it draws everything, never counts a view and never builds the index, exactly as before.
@@ -285,6 +286,8 @@ Rules that must survive without a read:
 - **An open popup's auto-pan never re-tiers** (`autopanstart` freezes the tier for that move), and the open popup's pano is kept in the drawn set on **every** re-plan while it is open — a move, a date, the flat toggle, Render all — because removing a Leaflet marker closes its popup.
   The planner drops it only when it leaves the population (a year or imagery mode that excludes it) or the Panoramas layer goes off.
   Only pano markers are pinned (`options.panoIdx`), never a flat-only point.
+  **The freeze flag is consumed before the `mapReady` guard** in the `moveend` handler: an auto-pan while the run still streams returns early, and a flag consumed after that return would survive to freeze the first real move once the run had loaded, leaving a street-level view sampled (review 2 of the PR).
+  This is event-order wiring in `city.js`, not planner logic, so it is guarded by an e2e test, not a node one.
 - **Legend clicks stop at the legend** (`L.DomEvent.on(div, "click", stopPropagation)`), not only through `disableClickPropagation`: most legend buttons rebuild the legend in their own handler, so the click reached the map with a detached target, Leaflet's walk up to the legend's mark failed, and it read as a background click that closes popups.
 - **A pan that stays sampled reuses the drawn set** (`plan.reused`): same sample (`sampleKey`, which names the filter and the mode caches' build), same date, same pin, so nothing is rebuilt or re-diffed.
 - **Nothing is planned until the run has streamed** (`mapReady`): a background click mid-stream once recorded a tier for an empty population, and the dense city then announced a change on load.

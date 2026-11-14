@@ -1,7 +1,7 @@
 # The city map's dot tier, before and after drawing every pano in view
 
 Issue #77.
-Measured 2026-11-14 on synthetic dense cities, before and after the change that makes a city over `RENDER_CAP` (40,000) draw every panorama in a view that holds at most the cap (`docs/frontend.md`, "Every pano in view is drawn on a city over the render cap").
+Measured 2026-11-14 on synthetic dense cities, before and after the change that makes a city over `RENDER_CAP` (40,000) draw every panorama in a view whose padded drawn area (the visible map plus a 10% margin each side, `DRAWN_AREA_PAD`, with hysteresis) holds at most the cap (`docs/frontend.md`, "Every pano in view is drawn on a city over the render cap").
 Two questions: does a street-level view now show what is there, and what does that cost.
 
 Numbers here come from two committed files:
@@ -86,11 +86,13 @@ Node, seeded uniform points, medians of 3:
 |---|---|---|---|---|---|---|---|
 | 1,000,000 | 16 | 8,160 | 159 | 1.0 | 0.38 | 0.18 | 8.4 MB |
 | 2,700,000 | 15 | 2,064 | 435 | 6.3 | 0.22 | 0.38 | 21.7 MB |
-| 15,000,000 | 14 (comparator sort) | 528 | 2,762 | 58.5 | 3.8 | 7.3 | 120.0 MB |
+| 15,000,000 | 14 (packed) | 528 | 2,762 | 58.5 | 3.8 | 7.3 | 120.0 MB |
 
 The per-pano columns the index reads add 19 bytes a panorama here (285 MB at 15,000,000), exactly, because the benchmark sizes its builder to the point count; the page's builder grows by doubling and retains 19 to 38 (up to 570 MB at that size).
 Uniform points fill more cells than a real city's streets do, so these are not the in-page figures above (1,000,000 lattice points built in 94 ms over 2,856 cells).
-15,000,000 is past `indexLayout`'s packed-key range (2^24), so it exercises the comparator fallback; a city that large could not load in this page anyway, since its markers alone would need tens of gigabytes.
+All three sizes take the packed-key sort: 15,000,000 is under 2^24 (16,777,216), and `indexLayout(15e6)` returns level 14, 24 id bits, packed.
+The comparator fallback, which only a city over 2^24 panoramas takes, is not benchmarked here; the node suite holds it to the packed sort's order (`forceComparatorSort`), not to a time.
+A city of 15,000,000 could not load in this page anyway, since its markers alone would need tens of gigabytes (about 1.3 KB each, section 3).
 
 ## Caveats
 

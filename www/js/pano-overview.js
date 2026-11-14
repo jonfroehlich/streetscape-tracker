@@ -770,7 +770,7 @@ function drawnNoticeText(s) {
   }
   if (s.mode === "view") {
     const n = s.visible ?? s.drawn;
-    return `Showing all ${f(n)} panorama${n === 1 ? "" : "s"} in view.`;
+    return `Showing all ${f(n)} panorama${n === 1 ? "" : "s"}${s.yearFiltered ? " of this year" : ""} in view.`;
   }
   // No threshold is quoted: the tier is counted over the drawn area (the view
   // plus a margin) with hysteresis, so "N or fewer in view" would be false for
