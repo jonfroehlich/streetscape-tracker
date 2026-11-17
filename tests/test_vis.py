@@ -427,3 +427,39 @@ def test_the_js_registry_guards_its_id_addressed_viewers_too():
     assert "panoId\n        ? `https://www.google.com/maps/@" in js
     assert "panoId ? `https://www.mapillary.com/app/?pKey=" in js
     assert "panoId\n        ? `https://api.panoramax.xyz/?focus=pic&pic=" in js
+
+
+# ── CARTO basemap key ───────────────────────────────────────────────────────
+# CARTO answers a keyless tile request with HTTP 200 and a PNG stamped
+# "API KEY REQUIRED", so a map built with folium's bare tiles="CartoDB ..."
+# name renders the watermark and nothing errors. The --check-boundary preview
+# shipped that way after the frontend was fixed; both vis maps must carry the
+# key read from the one place it lives.
+
+
+def _tile_urls(folium_map):
+    return [
+        child.tiles
+        for child in folium_map._children.values()
+        if isinstance(child, folium.raster_layers.TileLayer)
+    ]
+
+
+def _assert_every_carto_layer_is_keyed(folium_map):
+    from streetscape_metadata_tracker.basemap import carto_basemap_key
+
+    urls = _tile_urls(folium_map)
+    assert urls, "the map has no tile layer at all"
+    for url in urls:
+        assert "basemaps.cartocdn.com" in url
+        assert url.endswith(f"?key={carto_basemap_key()}"), url
+
+
+def test_search_area_preview_basemap_carries_the_carto_key():
+    m = vis.display_search_area("Niterói, Rio de Janeiro, Brazil", -22.92, -43.04, 2000, 1500)
+    _assert_every_carto_layer_is_keyed(m)
+
+
+def test_coverage_map_basemap_carries_the_carto_key():
+    rows = [_row("p1", 47.60, -122.33), _row("p2", 47.62, -122.35), _row("p3", 47.64, -122.31)]
+    _assert_every_carto_layer_is_keyed(vis.create_visualization_map(_frame(rows), "Seattle, WA"))

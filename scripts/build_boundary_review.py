@@ -38,13 +38,16 @@ import csv
 import json
 import logging
 import os
-import re
 import sys
 from urllib.parse import quote
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from streetscape_metadata_tracker import db  # noqa: E402
+
+# The key is read from the frontend module by the shared helper (one key, one
+# reader); re-exported here because the tests and callers address it as bbr.*.
+from streetscape_metadata_tracker.basemap import carto_basemap_key  # noqa: E402, F401
 from streetscape_metadata_tracker.boundary_audit import (  # noqa: E402
     frozen_rect_bounds,
     rect_polygon_coverage,
@@ -60,13 +63,6 @@ DATA_PLACEHOLDER = "/*__DATA__*/"
 META_PLACEHOLDER = "/*__META__*/"
 CARTO_KEY_PLACEHOLDER = "__CARTO_KEY__"
 
-# The CARTO basemap key lives in exactly one place, the frontend module that
-# also serves it to the public site. This viewer is generated HTML that
-# cannot load that module, so the key is read out of it here rather than
-# pasted into the template -- a second copy is how one map silently keeps
-# rendering CARTO's "API KEY REQUIRED" watermark after the other is fixed.
-BASEMAP_KEY_SOURCE = os.path.join(_PROJECT_ROOT, "www", "js", "streetscape-utils.js")
-_CARTO_KEY_RE = re.compile(r'CARTO_BASEMAP_KEY\s*=\s*"([^"]+)"')
 
 # Coordinate precision for embedded polygons: ~1 m at the equator, small file.
 _COORD_DECIMALS = 5
@@ -425,21 +421,6 @@ def build_payloads(
 def _json_for_script(obj) -> str:
     """Compact JSON safe to inline in a <script> (no premature tag close)."""
     return json.dumps(obj, separators=(",", ":"), allow_nan=False).replace("</", "<\\/")
-
-
-def carto_basemap_key(source_path: str = BASEMAP_KEY_SOURCE) -> str:
-    """Read the CARTO basemap key out of the frontend module that owns it.
-
-    Raises rather than degrading: a missing or renamed const would otherwise
-    leave the viewer requesting tiles with a literal placeholder for a key,
-    and CARTO answers a bad key with HTTP 200 and a watermarked tile, so the
-    failure would reach a reviewer as a cosmetic oddity instead of an error.
-    """
-    with open(source_path, encoding="utf-8") as f:
-        match = _CARTO_KEY_RE.search(f.read())
-    if not match:
-        raise ValueError(f"no CARTO_BASEMAP_KEY const found in {source_path}")
-    return match.group(1)
 
 
 def render_html(
