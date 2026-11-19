@@ -1372,8 +1372,9 @@ and the two flags parsing.
   Dropping `float_precision="round_trip"`, or trading it for `"high"` or `"legacy"`, fails it on a pandas before 3.1.
   The premise is asserted in the direction the installed pandas needs (#458): before 3.1 the default parser gets the literal wrong, so the option is required; from 3.1 it gets it right, which is what lets `fileutils.EXACT_FLOAT_READ_KWARGS` omit the option pandas deprecated there.
   `test_the_float_precision_gate_opens_at_pandas_3_1` pins the version gate, and `test_the_loader_raises_no_pandas_deprecation_warning` fails if the loader passes the option on 3.1 or later.
-  CI's test jobs install `requirements.lock` (pandas 3.0.3), so the 3.1 arms of these tests run nowhere in CI: only on an unpinned install such as a laptop venv built from `requirements.txt`.
-  (The e2e job does install an unpinned pandas, but it runs only `tests/e2e` against the committed fixture.)
+  CI's test jobs install `requirements.lock` (pandas 3.0.3), so they only ever run the pre-3.1 arms of these tests.
+  The 3.1 arms run in the advisory e2e job, which installs `requirements-dev.txt` unpinned (pandas 3.1.1 on 2026-11-19): after its smoke test, one step runs `tests/test_fileutils.py`, `tests/test_csv_float_parse_analyze.py` and `tests/test_recompute_streetwalk_stats.py` and prints the pandas version it ran them on (#458 review).
+  That job is `continue-on-error`, so a failure there is a red advisory check and blocks nothing; and it follows whatever pandas is newest, so the arm it exercises is not fixed.
 
 ## The Panoramax collector (issue #316, phase 2)
 
@@ -1817,7 +1818,8 @@ So the predicates are now functions of their inputs (`_omission_problems`, `_row
 `test_every_committed_run_csv_writes_its_integer_columns_as_integers` reads every committed run CSV as TEXT and requires each `Int64` column to be written as one, then reloads it through `fileutils.load_city_csv_file` and compares the declared dtypes; `test_every_census_builder_writes_its_integer_columns_as_integers` asks the same of the three census builders directly, which is what catches the edit before anyone regenerates.
 Deleting the `sequence_index` cast used to leave the whole fast suite green — only the browser job, the non-blocking one, could see it.
 `test_every_committed_artifact_is_byte_reproducible` requires a zero gzip mtime, no FNAME header and a frozen `generated_at` on every artifact: `build_fixture` stamped the clock into all 24 files, so a regeneration rewrote every blob whether or not any content moved, and on a commit whose whole substance is regenerated artifacts "which of these actually changed" is the review.
-`_normalize_for_commit` is what does it; what stays clock-dependent, deliberately, is `driving_plan.json.gz`'s `years_since_newest_capture`, because the fixture runs the real summarizer and the real summarizer reads `date.today()`.
+`_normalize_for_commit` is what does it; `driving_plan.json.gz` was the exception until #458: the fixture runs the real summarizer, which read `date.today()`, so a rebuild rewrote every `years_since_newest_capture` and, from 2026-11-02, flipped Zerostate's verdict from `planned_open` to `closed`.
+The builder now passes `today=build_fixture.FIXTURE_TODAY` (2026-09-21, the day the committed artifact was generated), which reproduces the committed bytes.
 
 **The Mapillary builder was on the bare nine columns.**
 `make_kartaview_city_df` and `make_panoramax_city_df` are written against `KARTAVIEW_METADATA_DTYPES` and `PANORAMAX_METADATA_DTYPES`, and the comment above them said so — "a fixture cannot disagree with a real run file about the column set" — while `make_mapillary_city_df`, in the same file, carried the shared core and none of `MAPILLARY_EXTRA_DTYPES`.

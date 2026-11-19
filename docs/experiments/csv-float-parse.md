@@ -75,6 +75,13 @@ Memory is unchanged: the dtypes are the same.
   Its `read_csv` documentation deprecates `float_precision` from 3.1.0: "All float precision modes now use the same converter."
   Nothing in the committed record was re-measured under 3.1; `tests/test_fileutils.py` checks on whatever pandas is installed that the #425 literal reads back exactly from 3.1 on and wrongly before it.
   The loader now passes the option only before 3.1, and this script refuses to run on 3.1 or later, where it would measure zero everywhere.
+- **Update 2026-11-19 (#458): whether one given key moves is platform-dependent, on the same pandas.**
+  This contradicts the "should not be platform-specific" caveat above for a single sample, though not for the parser.
+  The end-to-end canary (`tests/test_recompute_streetwalk_stats.py`, the boundary-sample test) writes a walk CSV whose one boundary sample was found by search, on macOS arm64, to have its 9-decimal key moved by the default parser.
+  On CI it held on the `ubuntu-24.04` image (20261025.353, CPython 3.12.15; run 40725635999, 2026-10-28) and failed on `ubuntu-26.04` (20261101.186, CPython 3.12.16; run 42259570882, 2026-11-06) with the same `requirements.lock` wheels (pandas 3.0.3): on the newer image the default parser moved no key of that CSV, on all four Python legs.
+  The parser itself still misreads there: the `tests/test_fileutils.py` literal, a fixed text rather than a computed coordinate, kept passing on the same runs.
+  On macOS the default parser moves that sample's key only at its exact float, not one ULP either side, so the likely cause is the sample's computed coordinate landing a ULP away under the image's maths library; that was **not confirmed** on the image, and nothing here measures how many production keys differ by platform.
+  n = 1 sample on 2 images, so this bounds nothing about rates; the counts in Findings are macOS readings, and the loader fix does not depend on them.
 - The asymmetry between columns (longitude roughly 8× latitude) is reported, not explained.
 - Parse timings are single wall-clock readings on one laptop.
 

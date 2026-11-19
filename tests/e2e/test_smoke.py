@@ -372,13 +372,16 @@ def test_city_page_shows_the_harvested_capture_history(page: Page, base_url):
 
     canvas = page.locator("#capture-history-chart")
     expect(canvas).to_be_visible()
-    # Polled in the page, not read once through the locator: updateLegend swaps
-    # the legend's innerHTML on repaint, and a canvas replaced between the
-    # visibility check and a one-shot bounding_box() reads as None (issue #458).
+    # A Chart.js instance on the canvas, not a nonzero box: a bare <canvas>
+    # lays out at 300x150 whether or not anything drew on it, which the
+    # visibility check above already covers. Polled in the page rather than
+    # read once through the locator, because updateLegend swaps the legend's
+    # innerHTML on repaint and a canvas replaced between two one-shot reads is
+    # gone by the second (issue #458).
     page.wait_for_function(
         """() => {
-            const r = document.querySelector("#capture-history-chart")?.getBoundingClientRect();
-            return !!r && r.width > 0 && r.height > 0;
+            const canvas = document.querySelector("#capture-history-chart");
+            return !!canvas && !!Chart.getChart(canvas);
         }"""
     )
 

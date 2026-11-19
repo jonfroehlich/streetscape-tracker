@@ -19,10 +19,12 @@ from .paths import get_default_data_dir
 def _pandas_parses_floats_exactly(version: str) -> bool:
     """Whether this pandas reads a float as ``float()`` of its text by default.
 
-    pandas 3.1.0 made every ``float_precision`` mode use one correctly rounded
-    converter and deprecated the argument (its ``read_csv`` docs: "All float
-    precision modes now use the same converter"). Before 3.1 only
-    ``float_precision="round_trip"`` did (issue #425).
+    pandas 3.1.0 made every ``float_precision`` mode use the same converter and
+    deprecated the argument (its ``read_csv`` docs: "All float precision modes
+    now use the same converter"). The docs do not say that converter is
+    correctly rounded; that it is, is this project's own measurement, repeated
+    by ``tests/test_fileutils.py`` on the installed pandas. Before 3.1 only
+    ``float_precision="round_trip"`` read exactly (issue #425).
 
     Example:
         >>> _pandas_parses_floats_exactly("3.0.3"), _pandas_parses_floats_exactly("3.1.1")
