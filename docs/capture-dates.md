@@ -90,7 +90,7 @@ Written after the split (2026-10), as the coordinate twin of the #226 rule.
 pandas' default C parser is not correctly rounded: on the dev catalog's six walk CSVs it returned 4.6–5.6 % of latitudes and 37.3–38.6 % of longitudes one ULP off their own text, never more than one.
 That is invisible to every statistic that aggregates (measured under both parsers over eight dated grid runs: zero stored grid stats moved, zero query-radius status flips, identical grid keys).
 It was fatal to the one consumer that keys on a rounded coordinate: `compute_streetwalk_coverage` joins samples to rows on a 9-decimal key, so a sample one ULP from a half-way point missed its own row and was scored uncovered — Seattle 5 of 247,292 samples on the dev catalog, a real +0.075 km and the published 98.4 → 98.5.
-The loader therefore reads `float_precision="round_trip"`, and the test that pins it uses a literal from a real walk CSV that the default parser is known to misplace (`tests/test_fileutils.py`).
+The loader therefore reads `float_precision="round_trip"` (on pandas before 3.1; from 3.1 the default parser is exact and the option is deprecated, so the loader omits it, #458), and the test that pins it uses a literal from a real walk CSV that the default parser is known to misplace (`tests/test_fileutils.py`).
 Two limits are stated rather than implied.
 The option reaches the `np.float64` columns only: nullable `Float64Dtype` columns (`pano_lat`, `pano_lon`) are parsed by another path and are unchanged, and nothing keys on them.
 And it costs 1.15–1.42× of load wall-clock with no memory cost (the 16.6M-row Detroit census: 29.6 → 37.1 s).
