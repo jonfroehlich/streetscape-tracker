@@ -28,7 +28,8 @@ Nominatim, no keys needed). Dry-run by default; pass --execute to write.
 The dry run geocodes nothing, so it cannot run --execute's check of each row
 against the GEOCODED centers of the rows registered before it in the same
 batch. It compares manifest coordinates instead: a row within --overlap-km of
-an earlier would-be-new row prints REUSE IN-BATCH, and one within --overlap-km
+an earlier would-be-new row prints REUSE IN-BATCH (and is counted in
+reused-existing, as --execute counts it), and one within --overlap-km
 + --max-center-km of another earlier row that is not headed for an existing
 catalog city gets a WARNING line, since the center guard lets a geocoded
 center sit that far from its manifest point (issue #460). Distance only: two rows that share a query, or a
@@ -459,6 +460,9 @@ def main(argv=None):
                         f"center lands more than {args.overlap_km:g} km away)"
                     )
                     in_batch_reuse += 1
+                    # Counted where --execute counts it, so the two summary
+                    # lines agree and the dry run's counts add up to the rows.
+                    reused += 1
                 else:
                     print(f"{prefix} -> NEW (would geocode + register disabled)")
                     would_be_new.append((label, lat, lon))
@@ -513,7 +517,8 @@ def main(argv=None):
     if in_batch_reuse or in_batch_at_risk or in_batch_notes:
         print(
             f"In-batch neighbours: {in_batch_reuse} row(s) --execute may alias onto an "
-            f"earlier row of this manifest, {in_batch_at_risk} warning(s) for rows close "
+            f"earlier row of this manifest (counted in reused-existing above, as "
+            f"--execute counts them), {in_batch_at_risk} warning(s) for rows close "
             f"enough that a geocoded center could alias them, and {in_batch_notes} note(s) "
             f"on catalog reuses. These compare MANIFEST points "
             f"and assume every earlier row registers. Before --execute, lower --overlap-km, "

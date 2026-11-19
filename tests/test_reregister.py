@@ -150,6 +150,19 @@ def test_a_manually_resized_grid_is_deferred_not_grown_back():
     assert generic["rec_width_m"] == 12000 and "grow to full" in generic["rec_basis"]  # premise
 
 
+def test_a_hand_fit_larger_than_its_bbox_is_spared_a_recenter():
+    """The guard's reason must not say only "grown back": a hand fit already
+    larger than its OSM bbox but 3 km off its midpoint is a would-be RESIZE
+    that changes the center and no dimension (PR #466 review round 4)."""
+    r = row("UNDER", **_FITTED_ROW)
+    moved = rr.decide(r, cur(43.517, -116.42, 14000, 14000))
+    assert moved.action == "RESIZE"
+    assert (moved.new_width_m, moved.new_height_m) == (14000, 14000)  # recentered, not grown
+    d = rr.decide(r, cur(43.517, -116.42, 14000, 14000, manually_resized=True))
+    assert d.action == "DEFER" and d.reason == rr.MANUAL_RESIZE_REASON
+    assert "recentered it on or grown it" in rr.MANUAL_RESIZE_REASON
+
+
 def test_the_manual_resize_guard_diverts_only_a_would_be_resize():
     # Already at the audit's target: nothing would change, so nothing to review.
     at_target = cur(43.49, -116.42, 12000, 11000, manually_resized=True)
@@ -189,6 +202,10 @@ def test_every_deferral_of_a_hand_fitted_grid_recommends_keeping_it(audit_row):
     # (round 3): a WRONG_PLACE city still has to say "verify geocode first".
     assert plain.reason in fitted.rec_basis
     assert plain.rec_basis in fitted.rec_basis
+    # ...and the generic advice ("grow to full OSM bbox") is introduced as
+    # advice that ignores the hand fit, not left to read as a second
+    # recommendation beside "keep current" (round 4).
+    assert f"{rr.GENERIC_ADVICE_LABEL}: {plain.rec_basis}" in fitted.rec_basis
 
 
 def test_load_current_geometry_reads_the_resize_note_resize_city_writes(tmp_path, monkeypatch):

@@ -768,6 +768,8 @@ python scripts/register_frame.py --manifest mapillary_discovery_cities_tranche3.
 # read the dry run: every row "-> NEW", and "newly-registered=25 failed=0"; then the same with --execute
 ```
 
+- Against a catalog that holds none of these rows, the dry run since #460 also prints four `WARNING` lines for rows within 14 km of an earlier one (Stanford 5.4 km from East Palo Alto is the nearest).
+  They are expected: they are the pairs the next bullet measures, and `_tranche3_overlaps.json` records their margins.
 - `--overlap-km 4`, not tranche 2's 5.
   `find_overlap` measures from each row's GeoNames point to every centre already in the catalog, and with `--execute` that includes the GEOCODED centres of the rows this same run has just registered (the dry run registers nothing, so it cannot see those).
   Stanford's point is 5.56 km from East Palo Alto's vetted centre, so at 5 km a 0.6 km geocode drift on the day would silently alias Stanford onto East Palo Alto.
@@ -787,7 +789,10 @@ Since #459 the script enforces that itself: `resize_city.py` stamps `cities.note
 Every deferral of such a city, by this branch or by any other (an OSM bbox over the 30 km threshold, `NO_POLYGON`, `WRONG_PLACE`), carries a "keep current" recommendation that names the hand fit, so the review page never offers growing it back as the recommended choice.
 That recommendation's text also carries the audit's own reason and advice, because the page shows the recommendation's basis in place of the reason.
 The guard covers the unattended pass only; an `apply_decisions.py` decision a person made on the review page still applies.
-The note is never removed, since `cities.notes` is append-only: a city fitted by hand once is deferred by every later audit, even after a reviewed geometry is applied to it.
+The note is never removed, since `cities.notes` is append-only: a city fitted with `resize_city.py` once is never resized unattended by a later audit, even after a reviewed geometry is applied to it.
+The guard recognises that one note and nothing else.
+A geometry a person chose another way carries no such note and is still resized unattended when it grades `UNDER` below the threshold:
+an `apply_decisions.py` APPLY (it stamps only its own `APPLY_NOTE`), or a registration with explicit `--width`/`--height` (no note at all).
 `resize_city.py` refuses a city with real runs unless `--force`; these have none, so no `--force` is needed, and a refusal means something collected them — stop.
 
 ```bash

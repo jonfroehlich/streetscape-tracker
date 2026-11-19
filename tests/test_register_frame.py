@@ -367,7 +367,9 @@ def test_dry_run_reports_the_in_batch_reuse_execute_would_perform(
     lines = out.splitlines()
     assert "NEW (would geocode" in lines[0] and "Aville" in lines[0]
     assert "REUSE IN-BATCH [1] Aville, Testland (5.5 km" in lines[1]
-    assert "newly-registered=2" in out  # A and C; B is not counted as new
+    # A and C are new; B is counted where --execute counts it, so the counts
+    # add up to the manifest's three rows (PR #466 review round 4).
+    assert "reused-existing=1 newly-registered=2 failed=0" in out
     assert "1 row(s) --execute may alias" in out
     assert fake_geocode["calls"] == 0  # still no geocoding in a dry run
 
@@ -380,7 +382,7 @@ def test_dry_run_reports_the_in_batch_reuse_execute_would_perform(
     assert rf.main(["--manifest", manifest, "--db-path", catalog, *flags, "--execute"]) == 0
     executed = capsys.readouterr().out
     assert "Bville, Testland -> reused existing" in executed
-    assert "newly-registered=2" in executed
+    assert "reused-existing=1 newly-registered=2 failed=0" in executed  # the same counts
 
 
 def test_dry_run_warns_when_a_geocode_drift_could_alias_a_neighbour(
@@ -459,6 +461,20 @@ def test_dry_run_notes_a_batch_row_that_could_take_a_catalog_reuse(
     assert f"REUSE existing {existing_id}" in out
     assert "NOTE: [1] Cville, Testland is 5.5 km away" in out
     assert "1 note(s) on catalog reuses" in out
+
+    # The claim itself: the first row geocodes 1.1 km east of its manifest
+    # point (inside the guard, and still 9.9 km from the catalog city, so it
+    # registers), which puts it 4.4 km from A against the catalog city's 5.5.
+    fake_geocode["center_by_query"] = {
+        _ROW_C["query_string"]: (10.0, 19.96),
+        _ROW_A["query_string"]: (10.0, 20.0),
+    }
+    manifest = str(tmp_path / "frame.csv")
+    flags = ("--overlap-km", "6", "--max-center-km", "10")
+    assert rf.main(["--manifest", manifest, "--db-path", catalog, *flags, "--execute"]) == 0
+    executed = capsys.readouterr().out
+    assert "Aville, Testland -> reused existing cville" in executed
+    assert f"Aville, Testland -> reused existing {existing_id}" not in executed
 
 
 def test_in_batch_neighbour_reach_is_inclusive_like_find_overlap():

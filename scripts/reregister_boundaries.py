@@ -248,10 +248,16 @@ def _keep_hand_fit(current: Current, why_deferred: str) -> dict:
     )
 
 
-# The DEFER reason for a hand-fitted grid (issue #459).
+# How a hand-fitted grid's keep-current basis introduces recommend()'s advice.
+GENERIC_ADVICE_LABEL = "Advice for a grid that was NOT fitted by hand, shown for reference only"
+
+# The DEFER reason for a hand-fitted grid (issue #459). "Recentered on or
+# grown to", not "grown back": a hand fit already larger than its OSM bbox but
+# off its midpoint is graded UNDER too, and the RESIZE it is spared would only
+# have moved its center.
 MANUAL_RESIZE_REASON = (
     "manually resized (scripts/resize_city.py); review by hand, "
-    "the audit would have grown it back to its OSM bbox unattended"
+    "the audit would have recentered it on or grown it to its OSM bbox unattended"
 )
 
 
@@ -283,7 +289,14 @@ def decide(row: dict, current: Current | None, threshold_m: float = REVIEW_THRES
         if current.manually_resized:
             # recommend()'s basis carries branch advice the reason lacks
             # (WRONG_PLACE: "verify geocode first"), so keep both in the text.
-            audit = reason if reason == MANUAL_RESIZE_REASON else f"{reason}; {rec['rec_basis']}"
+            # That advice was computed as if the grid were never fitted
+            # ("grow to full OSM bbox"), so it is labelled as such rather than
+            # left to read as a second recommendation beside "keep current".
+            audit = (
+                reason
+                if reason == MANUAL_RESIZE_REASON
+                else f"{reason}. {GENERIC_ADVICE_LABEL}: {rec['rec_basis']}"
+            )
             rec = _keep_hand_fit(current, audit)
         return d(
             "DEFER",

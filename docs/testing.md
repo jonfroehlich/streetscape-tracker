@@ -149,12 +149,21 @@ a geocode that lands on a city the catalog already holds (a second spelling of a
 ## City registration manifests (issue #110, and the purposive additions)
 
 `tests/test_register_frame.py` pins the bulk-registration safety rails — overlap reuse, `enabled = 0` until vetted, the GeoNames center guard against a province-centroid geocode, dry-run-by-default writing nothing, idempotent re-runs — with the geocoding seam monkeypatched, so no network.
-The dry run's in-batch report (#460) is pinned against `--execute` itself, not against its own wording: two manifest rows 5.5 km apart print `REUSE IN-BATCH` at `--overlap-km 6` and the same manifest then really aliases the second row under `--execute`; at `--overlap-km 5` the pair prints a `WARNING` and a 0.6 km drift of the first row's geocoded centre really aliases the second; rows farther apart than `--overlap-km` + `--max-center-km` print nothing; a row the dry run would alias still warns later rows, with the three-row chain run under `--execute` to show the alias it warns about; a catalog reuse prints a NOTE when an earlier row of the batch could become the nearer target.
-The report is distance-only: rows that `--execute` merges by name (a shared query, or a shared city/admin/country) are not previewed (#467).
-`tests/test_reregister.py` pins the manual-resize guard (#459) with its premise: the same Kuna-shaped city is RESIZEd without the note and DEFERred with it, its advisory recommendation is the CURRENT grid with a basis that says why (the review page shows the basis in place of the reason, and offers any other rectangle as a one-click choice),
-on every deferring branch and not only the would-be RESIZE (over-threshold, `NO_POLYGON` and `WRONG_PLACE` are parametrized, each against the same city without the note),
-the guard diverts only a would-be RESIZE (NOCHANGE, SKIP and the over-threshold DEFER are unchanged), and `load_current_geometry` reads the note that `resize_city.py --execute` really writes, appended after another note or onto NULL notes.
 It pins `--notes-label` by MUTATING it rather than by asserting the default: a case that only read `cities.notes` after a default run would stay green while the flag was dropped on the floor, and that label is how the vetting and enable steps select one batch out of the catalog.
+The dry run's in-batch report (#460) is pinned against `--execute` itself, not against its own wording:
+two manifest rows 5.5 km apart print `REUSE IN-BATCH` at `--overlap-km 6`, and the same manifest then really aliases the second row under `--execute`, with the same `reused-existing` and `newly-registered` counts in both summaries;
+at `--overlap-km 5` the pair prints a `WARNING`, and a 0.6 km drift of the first row's geocoded centre really aliases the second;
+rows farther apart than `--overlap-km` + `--max-center-km` print nothing;
+a row the dry run would alias still warns later rows, with the three-row chain run under `--execute` to show the alias it warns about;
+a catalog reuse prints a NOTE when an earlier row of the batch could become the nearer target, and a 1.1 km drift of that row under `--execute` really takes the alias from the catalog city.
+The report is distance-only: rows that `--execute` merges by name (a shared query, or a shared city/admin/country) are not previewed (#467).
+
+`tests/test_reregister.py` pins the manual-resize guard (#459) with its premise: the same Kuna-shaped city is RESIZEd without the note and DEFERred with it.
+Its advisory recommendation is the CURRENT grid with a basis that says why (the review page shows the basis in place of the reason, and offers any other rectangle as a one-click choice),
+on every deferring branch and not only the would-be RESIZE (over-threshold, `NO_POLYGON` and `WRONG_PLACE` are parametrized, each against the same city without the note);
+there the basis carries the audit's own reason and its generic advice, the advice labelled as written for a grid that was not fitted by hand.
+The guard diverts only a would-be RESIZE (NOCHANGE, SKIP and the over-threshold DEFER are unchanged), including one that would only have recentered a hand fit larger than its bbox.
+`load_current_geometry` reads the note that `resize_city.py --execute` really writes, appended after another note or onto NULL notes.
 
 `tests/test_mapillary_360_cities_manifest.py` IS the provenance of `mapillary_360_cities.csv`.
 The city list is curated, but its values are a GeoNames join keyed by `geonameid` and there is no generator script to name in a `generated_by`, so the test re-runs that join in reverse: city, admin, country, continent, population and coordinates must match the vendored records, and `query_string` must equal what `build_worldwide_frame.query_string` writes, so a query here behaves exactly like a frame query at the geocoder.
