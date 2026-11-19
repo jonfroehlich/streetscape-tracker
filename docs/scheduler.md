@@ -1103,10 +1103,13 @@ It is entered **on the nightly unit only** (`_is_nightly_unit`): ignoring a SIGT
 What it cannot save, stated rather than implied:
 
 - `KillMode` is the default `control-group`, so systemd signals every process in the unit: **a publish rsync in flight at that instant still dies**.
-  The publish reports the failure and the night alerts; `regenerate-aggregate --publish` recovers it.
+  `_finish_batch` retries that publish once (`_retry_publish_after_tail_sigterm`, #389 review), only when the signal arrived after the publish started (a later rsync was never signalled), bounded by what is left of `TimeoutStopSec` since the signal less a 120 s reserve, and by `PUBLISH_TIMEOUT_S`, and not at all under 60 s; if the retry fails too, the night reports `PUBLISH FAILED` and `regenerate-aggregate --publish` recovers it.
   `KillMode` is deliberately unchanged, because the same cgroup signal is what ends an in-flight child promptly on a `stop`.
 - A SIGKILL after `TimeoutStopSec` is unchanged: nothing survives it.
-- The guard is entered as the `Done:` line is logged, after the loop's `_stop_on_sigterm` context has closed, so the few in-process statements between them (building that summary and the quarantine claim, well under a second) still run under the default handler.
+- The guard is entered on the statement after the loop's `_stop_on_sigterm` context closes (#389 review), so building the `Done:` summary and the quarantine claim are covered too; the gap left is between two consecutive statements.
+
+A caught SIGTERM is never silent (#389 review): the night alerts with a `SIGTERM IN THE TAIL` subject part and exits nonzero, because its usual sender is the start timeout landing in the tail, the breach this section exists to prevent, and the unit's `OnFailure=` mail is not wired.
+An operator's `systemctl stop` typed during the tail mails the same way, since the two senders cannot be told apart from inside the process.
 - The city loop's and the fill's SIGTERM handling is unchanged.
 
 The deadline is still sized to keep every night out of that band, because the publish is the step the guard protects least.

@@ -2981,6 +2981,18 @@ def _stop_on_sigterm():
         signal.signal(signal.SIGTERM, previous)
 
 
+class _TailSigterm(threading.Event):
+    """What ``_tail_survives_sigterm`` yields: whether a SIGTERM reached the tail, and when.
+
+    An ``Event`` so the tests and ``is_set()`` read as before, plus
+    ``received_at``, the ``time.monotonic()`` of the first signal: the SIGKILL
+    that follows a start timeout or a ``systemctl stop`` is ``TimeoutStopSec``
+    after it, which is what bounds the publish retry in ``_finish_batch``.
+    """
+
+    received_at: float | None = None
+
+
 @contextlib.contextmanager
 def _tail_survives_sigterm():
     """Log and ignore a SIGTERM that arrives while the night's tail runs (issue #389).
@@ -3005,10 +3017,17 @@ def _tail_survives_sigterm():
     this cannot do, stated rather than implied:
 
     - Under ``KillMode=control-group`` the same SIGTERM reaches every process in
-      the unit, so a publish rsync in flight at that instant still dies; the
-      publish reports the failure, the night alerts, and
-      ``regenerate-aggregate --publish`` recovers it.
+      the unit, so a publish rsync in flight at that instant still dies.
+      ``_finish_batch`` retries that publish once, inside what is left of
+      ``TimeoutStopSec`` (``_retry_publish_after_tail_sigterm``); if the retry
+      fails too, the night alerts and ``regenerate-aggregate --publish``
+      recovers it.
     - A SIGKILL after ``TimeoutStopSec`` is unchanged: nothing survives it.
+
+    A caught SIGTERM is never silent: ``_finish_batch`` reads the yielded
+    ``_TailSigterm``, names it in the alert subject and forces the alert,
+    because its usual sender is the start timeout the bracket exists to keep
+    clear of the tail, and that breach would otherwise be one log line.
 
     ``cmd_run_due`` enters it only on the nightly unit (``_is_nightly_unit``),
     because that safety argument is systemd's: a hand run from a shell has no
@@ -3017,9 +3036,9 @@ def _tail_survives_sigterm():
 
     Nothing about the city loop or the fill changes: they are inside
     ``_stop_on_sigterm``, whose handler replaces this one and restores it on
-    exit. This one is entered after that context has closed, so the few
-    in-process statements between the two (the ``Done:`` summary and the
-    quarantine claim, well under a second) still run under the default handler.
+    exit. ``cmd_run_due`` enters this one on the statement right after that
+    context closes, so the ``Done:`` summary and the quarantine claim between
+    the loop and ``_finish_batch`` are covered too (#389 review).
 
     The WARNING is logged from the handler itself, once, so it is on disk even if
     the SIGKILL comes before the tail ends. That is safe here: a handler runs on
@@ -3029,17 +3048,18 @@ def _tail_survives_sigterm():
     reach the tail. Restores the previous handler on every exit path, and
     no-ops off the main thread, like ``_stop_on_sigterm``.
     """
-    seen = threading.Event()
+    seen = _TailSigterm()
 
     def handler(signum, frame):
         if seen.is_set():
             return
+        seen.received_at = time.monotonic()
         seen.set()
         logger.warning(
             "SIGTERM received during the night's tail; ignoring it so the aggregate, "
             "backup and publish can finish (issue #389). A publish rsync running at this "
-            "instant was signalled too and may fail; systemd SIGKILLs the unit if the tail "
-            "outlasts TimeoutStopSec."
+            "instant was signalled too and is retried once if it fails; systemd SIGKILLs "
+            "the unit if the tail outlasts TimeoutStopSec."
         )
 
     try:
@@ -4477,7 +4497,12 @@ def _run_publish_child(cmd: list[str], fh, timeout_s: float) -> subprocess.Compl
     return subprocess.CompletedProcess(cmd, returncode)
 
 
-def _publish(cfg: SchedulerConfig, context: str, alert_on_failure: bool = True) -> int:
+def _publish(
+    cfg: SchedulerConfig,
+    context: str,
+    alert_on_failure: bool = True,
+    timeout_s: float | None = None,
+) -> int:
     """
     Run the publish script (rsync data/ to the web server), returning its exit code.
 
@@ -4513,6 +4538,11 @@ def _publish(cfg: SchedulerConfig, context: str, alert_on_failure: bool = True) 
     is not a detail — see ``_run_publish_child``, where the rsync we are actually
     trying to stop is a grandchild.
 
+    ``timeout_s`` replaces that bound for one call, and only ever shortens it:
+    the tail's one retry after a SIGTERM (``_retry_publish_after_tail_sigterm``)
+    has to finish before systemd's SIGKILL, not 600 s later. ``None`` (every
+    other caller) reads ``PUBLISH_TIMEOUT_S`` at call time.
+
     One case the bound still does not cover, stated rather than implied: a child
     the KERNEL will not kill. Over SSH the child is in interruptible sleep and
     dies at once; on prod's ``--local`` path one blocked in an uninterruptible
@@ -4523,6 +4553,7 @@ def _publish(cfg: SchedulerConfig, context: str, alert_on_failure: bool = True) 
     the timeout and the ACTUAL elapsed separately, so a gap between them is
     visible rather than silent.
     """
+    timeout = PUBLISH_TIMEOUT_S if timeout_s is None else min(timeout_s, PUBLISH_TIMEOUT_S)
     cmd = ["bash", cfg.publish_script]
     if cfg.publish_local:
         cmd.append("--local")
@@ -4548,19 +4579,19 @@ def _publish(cfg: SchedulerConfig, context: str, alert_on_failure: bool = True) 
             fh.write(f"\n===== {datetime.now(UTC).isoformat()} =====\n")
             fh.write(redact_credentials(" ".join(cmd)) + "\n\n")
             fh.flush()
-            result = _run_publish_child(cmd, fh, PUBLISH_TIMEOUT_S)
+            result = _run_publish_child(cmd, fh, timeout)
     except subprocess.TimeoutExpired:
         elapsed = time.monotonic() - started
         # The bound and the actual elapsed are reported as two numbers, not one:
         # subprocess.run's post-kill wait() is unbounded, so `timed out at 600 s
         # after 742.3 s` is the signature of a SIGKILL the kernel deferred (see
         # the docstring), and there is no other place that shows.
-        detail = f"(timed out at {PUBLISH_TIMEOUT_S:.0f} s) after {elapsed:.1f} s"
+        detail = f"(timed out at {timeout:.0f} s) after {elapsed:.1f} s"
         # The alert carries BOTH numbers too, not just the bound: it is the first
         # thing an operator reads, and the gap between them is the whole signal
         # (see the docstring). Leaving the elapsed to the log tail lower in the
         # same email made the headline the one number that says least.
-        reason = f"timed out at {PUBLISH_TIMEOUT_S:.0f} s and was killed after {elapsed:.1f} s"
+        reason = f"timed out at {timeout:.0f} s and was killed after {elapsed:.1f} s"
         # The same 1 the OSError branch below already returns. _finish_batch has
         # only an int to act on, so a bespoke status here would put a second
         # meaning on a number no caller can interpret; the reason travels in the
@@ -6900,14 +6931,27 @@ def cmd_timer_status(
         print(f"heartbeat NOT written: {e}")
 
     if alert and (not result.healthy or result.rearmed or bracket_bad):
+        # The timer paragraphs only when the timers are why it mails (#389
+        # review): a bracket-only mail on healthy timers must not open with
+        # "found or fixed something" and REARMED advice about nothing.
+        timers_news = not result.healthy or bool(result.rearmed)
+        opening = (
+            "The user-timer watchdog (issue #369) found or fixed something.\n\n"
+            if timers_news
+            else "The user timers are healthy; the collection unit's bracket check (issue #389) "
+            "is why this mailed.\n\n"
+        )
+        rearm_advice = (
+            "\n\nAfter a REARMED mail, check whether the night before published "
+            "(regenerate-aggregate --publish recovers it). See deploy/README.md, "
+            '"After a reboot: the timer watchdog".'
+            if timers_news
+            else ""
+        )
         send_alert(
             cfg.alerts,
             f"user timers on {host} — {result.verdict}" + _BRACKET_SUBJECT.get(bracket_word, ""),
-            "The user-timer watchdog (issue #369) found or fixed something.\n\n"
-            + report
-            + "\n\nAfter a REARMED mail, check whether the night before published "
-            "(regenerate-aggregate --publish recovers it). See deploy/README.md, "
-            '"After a reboot: the timer watchdog".' + _BRACKET_BODY.get(bracket_word, ""),
+            opening + report + rearm_advice + _BRACKET_BODY.get(bracket_word, ""),
         )
     return 0 if result.healthy else 1
 
@@ -10217,17 +10261,28 @@ def _installed_unit_timeout_s(unit_timeout_env: str | None) -> tuple[float, str]
     ``UNIT_TIMEOUT_ENV_VAR``'s value when it is a usable number, else
     ``LEGACY_UNIT_TIMEOUT_START_S``; see :func:`night_window_seconds`.
     """
-    try:
-        unit_s = float(unit_timeout_env) if unit_timeout_env is not None else None
-    except ValueError:
-        unit_s = None
-    if unit_s is None or not math.isfinite(unit_s) or unit_s <= NIGHT_OVERRUN_S + NIGHT_MARGIN_S:
+    unit_s = _usable_unit_timeout_s(unit_timeout_env)
+    if unit_s is None:
         source = (
             f"{UNIT_TIMEOUT_ENV_VAR} is {'not set' if unit_timeout_env is None else repr(unit_timeout_env)}, "
             f"so assuming the pre-#389 unit's {LEGACY_UNIT_TIMEOUT_START_S / 3600:g} h"
         )
         return LEGACY_UNIT_TIMEOUT_START_S, source
     return unit_s, f"{UNIT_TIMEOUT_ENV_VAR}={unit_s:g} s ({unit_s / 3600:g} h)"
+
+
+def _usable_unit_timeout_s(unit_timeout_env: str | None) -> float | None:
+    """``UNIT_TIMEOUT_ENV_VAR``'s value in seconds, or ``None`` when absent or unusable.
+
+    Unusable: not a number, not finite, or too small to leave any window.
+    """
+    try:
+        unit_s = float(unit_timeout_env) if unit_timeout_env is not None else None
+    except ValueError:
+        return None
+    if unit_s is None or not math.isfinite(unit_s) or unit_s <= NIGHT_OVERRUN_S + NIGHT_MARGIN_S:
+        return None
+    return unit_s
 
 
 def _unit_room_s(unit_s: float) -> float:
@@ -10251,8 +10306,25 @@ def _fit_night_to_unit(cfg: SchedulerConfig, *, batch_started: float) -> Schedul
     A clamp rather than a refusal: refusing to start would lose the whole
     night, while a shortened night loses only the hours it could not have
     held and still publishes.
+
+    A variable that is SET but unusable is logged as a WARNING even when the
+    window fits (#389 review): the 14 h fallback is the conservative reading
+    of an absent variable, but a junk one in a unit shorter than 14 h is not
+    held to that unit. The loaded timeout itself is checked daily by
+    ``timer-status`` (``VIOLATED``), which does not read the variable.
     """
     unit_timeout_env = os.environ.get(UNIT_TIMEOUT_ENV_VAR)
+    if (
+        unit_timeout_env is not None
+        and _usable_unit_timeout_s(unit_timeout_env) is None
+        and _is_nightly_unit()
+    ):
+        logger.warning(
+            f"{UNIT_TIMEOUT_ENV_VAR}={unit_timeout_env!r} is not a usable timeout (a finite "
+            f"number of seconds above {NIGHT_OVERRUN_S + NIGHT_MARGIN_S:.0f}), so tonight "
+            f"assumes the pre-#389 unit's {LEGACY_UNIT_TIMEOUT_START_S / 3600:g} h; fix the "
+            f"Environment= line in the installed streetscape-tracker.service (issue #389)"
+        )
     window_s, note = night_window_seconds(
         cfg.max_batch_hours,
         is_nightly=_is_nightly_unit(),
@@ -10956,6 +11028,20 @@ def cmd_run_due(
             skipped_budget += fill_report.skipped_budget
             stop_reason = fill_report.stop_reason
 
+    # On the nightly unit, a SIGTERM from here on is logged and ignored rather
+    # than killing the tail (issue #389); see _tail_survives_sigterm for what it
+    # cannot save. Entered on the statement right after the loop's own handler
+    # is restored, so the Done: summary and the quarantine claim below are
+    # covered too, and closed by the `with tail_guard:` around _finish_batch. A
+    # hand run keeps the default disposition: no systemd SIGKILL follows there,
+    # so an operator's `kill` must still end it. Nothing between here and there
+    # raises by design (#167); if something ever did, the guard would stay
+    # installed until the process exited, which systemd's SIGKILL still bounds.
+    tail_guard = contextlib.ExitStack()
+    tail_sigterm = (
+        tail_guard.enter_context(_tail_survives_sigterm()) if _is_nightly_unit() else None
+    )
+
     if stop_reason:
         logger.info(f"Stopped early: {stop_reason}")
 
@@ -11096,11 +11182,7 @@ def cmd_run_due(
         + (f"; {plan_error}" if plan_error else "")
     )
     logger.info("Done: " + summary)
-    # On the nightly unit, a SIGTERM from here on is logged and ignored rather
-    # than killing the publish (issue #389); see _tail_survives_sigterm for what
-    # it cannot save. A hand run keeps the default disposition: no systemd
-    # SIGKILL follows there, so an operator's `kill` must still end it.
-    with _tail_survives_sigterm() if _is_nightly_unit() else contextlib.nullcontext():
+    with tail_guard:
         return _finish_batch(
             cfg,
             conn,
@@ -11117,6 +11199,7 @@ def cmd_run_due(
             rejected_argv=rejected_argv,
             quarantine_alerts=quarantine_alerts,
             quarantine_error=quarantine_error or None,
+            tail_sigterm=tail_sigterm,
         )
 
 
@@ -15335,6 +15418,90 @@ def _rejected_argv_alert_note(rejected: ArgvRejections) -> str:
     )
 
 
+# The publish retry after a SIGTERM in the tail (issue #389 review). What the
+# retry must leave before systemd's SIGKILL: the reap grace of a retry that
+# times out, the alert's own send (its transports time out at 30 s), and slack.
+_TAIL_RETRY_RESERVE_S = _PUBLISH_REAP_GRACE_S + 90.0
+# Below this much room the retry is not attempted: a healthy publish took
+# 12-25 s (PUBLISH_TIMEOUT_S's measurement), so less than this cannot finish one.
+_PUBLISH_RETRY_MIN_S = 60.0
+
+
+def _retry_publish_after_tail_sigterm(
+    cfg: SchedulerConfig,
+    summary: str,
+    tail_sigterm: _TailSigterm | None,
+    publish_started: float,
+) -> tuple[int | None, str]:
+    """Retry a publish the tail's SIGTERM killed, once, inside the time left (#389 review).
+
+    Only when the signal arrived AFTER the publish started: under
+    ``KillMode=control-group`` systemd signals the processes in the unit at
+    that instant, so the rsync that was running died of it, while a publish
+    started after the signal was never signalled and failed of something else,
+    which a retry would not fix. One retry, never a loop, bounded by what is
+    left of ``NIGHT_TAIL_ALLOWANCE_S`` (equal to ``TimeoutStopSec``, by test)
+    since the signal, less ``_TAIL_RETRY_RESERVE_S``, and by
+    ``PUBLISH_TIMEOUT_S``.
+
+    Returns ``(rc, note)``: the retry's exit status, or ``None`` when no retry
+    was made, and a sentence for the alert (``""`` when the signal did not
+    reach the publish). Never raises: it runs in the tail.
+    """
+    try:
+        if tail_sigterm is None or not tail_sigterm.is_set():
+            return None, ""
+        received_at = tail_sigterm.received_at
+        if received_at is None or received_at < publish_started:
+            return None, ""
+        room_s = NIGHT_TAIL_ALLOWANCE_S - (time.monotonic() - received_at) - _TAIL_RETRY_RESERVE_S
+        if room_s < _PUBLISH_RETRY_MIN_S:
+            logger.warning(
+                f"Not retrying the publish the SIGTERM killed: {max(room_s, 0.0):.0f} s left "
+                f"before the unit's SIGKILL, under the {_PUBLISH_RETRY_MIN_S:.0f} s a publish "
+                f"needs (issue #389)"
+            )
+            return None, (
+                "It arrived while the publish rsync was running, which failed; there was not "
+                "time left before the SIGKILL to retry it."
+            )
+        timeout_s = min(PUBLISH_TIMEOUT_S, room_s)
+        logger.warning(
+            f"Retrying the publish once, bounded at {timeout_s:.0f} s: the SIGTERM reached the "
+            f"rsync in flight (issue #389)"
+        )
+        rc = _publish(cfg, summary, alert_on_failure=False, timeout_s=timeout_s)
+    except Exception as exc:  # the tail reports, never propagates (#167)
+        logger.exception("Publish retry after the tail's SIGTERM failed to run")
+        return None, f"It arrived while the publish rsync was running; the retry raised ({exc!r})."
+    outcome = "succeeded" if rc == 0 else f"failed too (status {rc})"
+    return rc, (
+        f"It arrived while the publish rsync was running, which failed; the one retry {outcome}."
+    )
+
+
+def _tail_sigterm_alert_note(tail_sigterm: _TailSigterm | None, retry_note: str) -> str:
+    """The alert paragraph for a SIGTERM caught in the tail, or ``""`` (#389 review).
+
+    Never raises, since it decides whether the night's only alert is sent.
+    """
+    try:
+        if tail_sigterm is None or not tail_sigterm.is_set():
+            return ""
+        return (
+            "A SIGTERM reached the nightly during its tail and was ignored so the tail could "
+            "finish (issue #389). The usual sender is the unit's TimeoutStartSec, which means "
+            "this night overran its bracket: compare the opening line's max_batch_hours and "
+            "the Done: timestamp with `systemctl --user show streetscape-tracker.service "
+            "-p TimeoutStartUSec -p Result` (Result=timeout confirms it), and read "
+            "docs/scheduler.md, \"The night's length\". The other senders are an operator's "
+            "`systemctl --user stop` or a bare `kill` typed during the tail. systemd SIGKILLs "
+            "the unit TimeoutStopSec after the signal." + (f" {retry_note}" if retry_note else "")
+        )
+    except Exception:
+        return "A SIGTERM reached the nightly during its tail (issue #389)."
+
+
 def _finish_batch(
     cfg: SchedulerConfig,
     conn,
@@ -15351,6 +15518,7 @@ def _finish_batch(
     crashed: str = "LOOP",
     quarantine_alerts: Sequence | None = None,
     quarantine_error: str | None = None,
+    tail_sigterm: _TailSigterm | None = None,
 ) -> int:
     """Rebuild the published indexes, back up the catalog, publish, alert.
 
@@ -15411,6 +15579,13 @@ def _finish_batch(
     already carries it as a clause; it is passed separately because it alerts on
     its own, as ``QUARANTINE CHECK FAILED``: a failed claim is exactly the night
     an alert goes unsent (it is claimed the next night instead).
+
+    ``tail_sigterm`` is what the nightly's ``_tail_survives_sigterm`` yielded
+    (``None`` on a hand run). A SIGTERM it caught alerts unconditionally, as
+    ``SIGTERM IN THE TAIL``, and exits nonzero: its usual sender is the start
+    timeout, a bracket breach no other signal reports (the unit's
+    ``OnFailure=`` mail is not wired). A publish it killed in flight is retried
+    once (``_retry_publish_after_tail_sigterm``).
     """
     # Every index rebuild goes through _tail_artifact, which reports a failure
     # instead of propagating it — see there for why a lost tail is the worse
@@ -15526,8 +15701,16 @@ def _finish_batch(
     # bare "publish script FAILED" and dropped the tail_errors, the backup
     # failure and the host conditions that explain it. One complete email.
     publish_error: str | None = None
+    publish_retry_note = ""
     if cfg.publish_enabled and succeeded > 0:
+        publish_started = time.monotonic()
         rc = _publish(cfg, summary, alert_on_failure=False)
+        if rc != 0:
+            retry_rc, publish_retry_note = _retry_publish_after_tail_sigterm(
+                cfg, summary, tail_sigterm, publish_started
+            )
+            if retry_rc is not None:
+                rc = retry_rc
         if rc != 0:
             # Deliberately NOT "(exit {rc})": _publish returns 1 for a timeout
             # and for an unwritable log, neither of which is a status the rsync
@@ -15586,6 +15769,7 @@ def _finish_batch(
     rejected_note = _rejected_argv_alert_note(rejected_argv)
     quarantine_alerts = list(quarantine_alerts or ())
     quarantine_note = _quarantine_alert_note(cfg, quarantine_alerts)
+    sigterm_note = _tail_sigterm_alert_note(tail_sigterm, publish_retry_note)
 
     failures = attempted - succeeded
     unhealthy = (
@@ -15605,6 +15789,9 @@ def _finish_batch(
         # ...and the night the claim or the standing-set read failed, for the
         # same reason.
         quarantine_error,
+        # A SIGTERM the nightly's tail caught (issue #389 review): usually the
+        # start timeout landing in the tail, which nothing else reports.
+        sigterm_note,
         # Deliberately NOT `blocked_hosts.stranded` (issue #373): a host
         # stranding already alerts through its host condition, and a DEADLINE
         # stranding alone is routine once nights end on the deadline -- the
@@ -15667,6 +15854,8 @@ def _finish_batch(
             parts.append(f"{len(quarantine_alerts)} QUARANTINED")
         if quarantine_error:
             parts.append("QUARANTINE CHECK FAILED")
+        if sigterm_note:
+            parts.append("SIGTERM IN THE TAIL")
         # The failure count is the subject on an ordinary bad night, and noise
         # ("0 failed collection(s)") when something above already carries it.
         if failures or not any(unhealthy):
@@ -15686,6 +15875,7 @@ def _finish_batch(
             + (f"\n\n{busy_recovered_note}" if busy_recovered_note else "")
             + (f"\n\n{rejected_note}" if rejected_note else "")
             + (f"\n\n{quarantine_note}" if quarantine_note else "")
+            + (f"\n\n{sigterm_note}" if sigterm_note else "")
         )
         send_alert(
             cfg.alerts,

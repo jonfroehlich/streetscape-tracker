@@ -630,6 +630,10 @@ def test_timer_status_reports_the_collection_units_bracket_without_changing_its_
         # does shorten (issue #389 review), so never "only when".
         assert "or to 14 h when the variable is absent" in body
         assert "only when" not in body
+        # The timers are healthy, so the mail says the bracket is why it was
+        # sent, not "found or fixed something" with REARMED advice (#389 review).
+        assert "The user timers are healthy" in body
+        assert "found or fixed something" not in body and "After a REARMED mail" not in body
     else:
         # An unreadable timeout is not a violation, and the nightly clamp reads
         # the environment variable rather than this, so the mail must claim
@@ -639,6 +643,8 @@ def test_timer_status_reports_the_collection_units_bracket_without_changing_its_
         assert "VIOLATED" not in subject + body
         assert "shortened" not in body and "cannot hold" not in body
         assert "gave no bound to check" in body and "systemctl --user show" in body
+        assert "The user timers are healthy" in body
+        assert "found or fixed something" not in body and "After a REARMED mail" not in body
 
 
 def test_timer_status_reads_the_bracket_after_the_rearms_daemon_reload(
@@ -663,3 +669,5 @@ def test_timer_status_reads_the_bracket_after_the_rearms_daemon_reload(
     assert line.endswith(": ok")
     [(subject, body)] = sent  # the REARMED mail, and only it
     assert "collection unit" not in subject and "collection unit line" not in body
+    assert "found or fixed something" in body and "After a REARMED mail" in body
+    assert "The user timers are healthy" not in body

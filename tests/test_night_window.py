@@ -255,9 +255,14 @@ def test_a_window_the_unit_cannot_hold_even_without_a_pre_loop_blames_the_unit()
 # --- the clamp, end to end through cmd_run_due --------------------------------
 
 
-def _drive_one_city_night(conn, monkeypatch, cfg, *, on_aggregate=None, dry_run=False):
+def _drive_one_city_night(
+    conn, monkeypatch, cfg, *, on_aggregate=None, dry_run=False, publish=None
+):
     """Run cmd_run_due over one due city with the collection and the publish
-    stubbed; return (rc, the loop's window in seconds, the tail steps run)."""
+    stubbed; return (rc, the loop's window in seconds, the tail steps run).
+
+    ``publish``, when given, replaces the publish stub's return value: it is
+    called with the stub's keyword arguments and returns the exit status."""
     db.register_city(
         conn,
         city_name="Alpha",
@@ -298,7 +303,12 @@ def _drive_one_city_night(conn, monkeypatch, cfg, *, on_aggregate=None, dry_run=
     monkeypatch.setattr(
         sched, "generate_streetwalk_manifest", lambda c, d: tail.append("manifest") or {}
     )
-    monkeypatch.setattr(sched, "_publish", lambda cfg_, summary, **kw: tail.append("publish") or 0)
+
+    def publish_stub(cfg_, summary, **kw):
+        tail.append("publish")
+        return publish(**kw) if publish else 0
+
+    monkeypatch.setattr(sched, "_publish", publish_stub)
     rc = sched.cmd_run_due(cfg, dry_run=dry_run, today=date(2026, 7, 2))
     return rc, seen.get("window_s"), tail
 
@@ -374,6 +384,53 @@ def test_a_dry_run_is_never_clamped_and_never_alerts(conn, monkeypatch):
     assert [s for s, _b in alerts if "night shortened" in s] == []
 
 
+def test_a_hand_run_is_never_clamped_and_never_alerts_end_to_end(conn, monkeypatch, caplog):
+    """A hand `run-due` configured for 16 h with no unit variable, end to end
+    through cmd_run_due (#389 review): the nightly would be held to the legacy
+    14 h unit's 44,700 s, but a hand run has no start timeout, so the loop gets
+    the full 57,600 s and no `night shortened` mail. The pure-function test
+    above cannot see `_fit_night_to_unit` passing the wrong `is_nightly`."""
+    alerts: list[tuple[str, str]] = []
+    monkeypatch.setattr(sched, "_is_nightly_unit", lambda: False)
+    monkeypatch.delenv(sched.UNIT_TIMEOUT_ENV_VAR, raising=False)
+    monkeypatch.setattr(sched, "send_alert", lambda a, s, b: alerts.append((s, b)) or True)
+    cfg = SchedulerConfig(max_batch_hours=16, publish_enabled=True, max_cities_per_day=5)
+
+    with caplog.at_level(logging.INFO):
+        rc, window_s, tail = _drive_one_city_night(conn, monkeypatch, cfg)
+
+    assert abs(window_s - 16 * 3600) < 30, window_s
+    assert [s for s, _b in alerts if "night shortened" in s] == []
+    assert "Night shortened" not in caplog.text
+    logged = re.search(r"; max_batch_hours=([\d.]+)", caplog.text)
+    assert logged and float(logged.group(1)) == 16
+    assert rc == 0 and tail == ["aggregate", "manifest", "publish"]
+
+
+@pytest.mark.parametrize("value", ["abc", "60"])
+def test_a_set_but_unusable_unit_variable_is_warned_about_even_when_the_window_fits(
+    monkeypatch, caplog, value
+):
+    """12 h fits the 14 h fallback, so no note and no mail, but a junk variable
+    is a broken unit edit and is not conservative under a unit shorter than
+    14 h: it is logged (#389 review). Absent, it is the legacy unit: silent."""
+    monkeypatch.setattr(sched, "_is_nightly_unit", lambda: True)
+    monkeypatch.setattr(sched, "_PROCESS_STARTED_MONOTONIC", time.monotonic())
+    monkeypatch.setattr(sched, "send_alert", lambda a, s, b: pytest.fail(f"mailed: {s}"))
+    cfg = SchedulerConfig(max_batch_hours=12)
+
+    monkeypatch.setenv(sched.UNIT_TIMEOUT_ENV_VAR, value)
+    with caplog.at_level(logging.WARNING):
+        assert sched._fit_night_to_unit(cfg, batch_started=time.monotonic()) is cfg
+    assert f"{sched.UNIT_TIMEOUT_ENV_VAR}={value!r} is not a usable timeout" in caplog.text
+
+    caplog.clear()
+    monkeypatch.delenv(sched.UNIT_TIMEOUT_ENV_VAR)
+    with caplog.at_level(logging.WARNING):
+        assert sched._fit_night_to_unit(cfg, batch_started=time.monotonic()) is cfg
+    assert "not a usable timeout" not in caplog.text
+
+
 # --- the tail survives a SIGTERM ----------------------------------------------
 
 
@@ -406,6 +463,7 @@ def test_a_sigterm_during_the_tail_is_logged_once_and_the_tail_runs_on(default_s
         steps.append("publish")
     assert steps == ["aggregate", "backup", "publish"]
     assert seen.is_set()
+    assert seen.received_at is not None and seen.received_at <= time.monotonic()
     assert caplog.text.count("SIGTERM received during the night's tail") == 1
     assert signal.getsignal(signal.SIGTERM) is default_sigterm
 
@@ -426,8 +484,15 @@ def test_a_sigterm_in_the_nights_tail_does_not_cost_the_publish(
     stopping, so the step list alone cannot tell), the guard's WARNING is
     logged once, the manifest and the publish still run, and the handler the
     night started with is back afterwards. The loop's own SIGTERM handling is untouched: its tests
-    are in tests/test_scheduler.py (named in this module's docstring)."""
+    are in tests/test_scheduler.py (named in this module's docstring).
+
+    And it is not silent (#389 review): the night alerts `SIGTERM IN THE TAIL`
+    and exits nonzero, since its usual sender is the start timeout landing in
+    the tail. A publish that started after the signal was never signalled, so
+    it is not retried and the mail says nothing about a retry."""
+    alerts: list[tuple[str, str]] = []
     monkeypatch.setattr(sched, "_is_nightly_unit", lambda: True)
+    monkeypatch.setattr(sched, "send_alert", lambda a, s, b: alerts.append((s, b)) or True)
     cfg = SchedulerConfig(publish_enabled=True, max_cities_per_day=5)
     with caplog.at_level(logging.WARNING):
         rc, _window_s, tail = _drive_one_city_night(
@@ -436,7 +501,148 @@ def test_a_sigterm_in_the_nights_tail_does_not_cost_the_publish(
     assert tail == ["aggregate", "manifest", "publish"]
     assert "aggregate index failed" not in caplog.text
     assert caplog.text.count("SIGTERM received during the night's tail") == 1
-    assert rc == 0
+    [(subject, body)] = alerts
+    assert subject.startswith("SIGTERM IN THE TAIL on ")
+    assert "TimeoutStartSec" in body and "Result=timeout" in body
+    assert "retry" not in body
+    assert rc == 1
+    assert signal.getsignal(signal.SIGTERM) is default_sigterm
+
+
+def test_a_publish_the_tail_sigterm_killed_is_retried_once_inside_the_stop_timeout(
+    conn, monkeypatch, default_sigterm
+):
+    """The signal lands while the rsync runs (same cgroup, so it dies): the
+    publish is retried once, bounded below PUBLISH_TIMEOUT_S by what is left of
+    TimeoutStopSec, and a successful retry leaves PUBLISH FAILED out of the
+    subject while the SIGTERM part stays (#389 review)."""
+    alerts: list[tuple[str, str]] = []
+    calls: list[dict] = []
+    monkeypatch.setattr(sched, "_is_nightly_unit", lambda: True)
+    monkeypatch.setattr(sched, "send_alert", lambda a, s, b: alerts.append((s, b)) or True)
+    # Leave 300 s of TimeoutStopSec, so the bound is the room, not 600 s.
+    monkeypatch.setattr(sched, "NIGHT_TAIL_ALLOWANCE_S", 300 + sched._TAIL_RETRY_RESERVE_S)
+
+    def publish(**kw):
+        calls.append(kw)
+        if len(calls) == 1:
+            os.kill(os.getpid(), signal.SIGTERM)
+            return 23  # rsync killed mid-transfer
+        return 0
+
+    cfg = SchedulerConfig(publish_enabled=True, max_cities_per_day=5)
+    rc, _window_s, tail = _drive_one_city_night(conn, monkeypatch, cfg, publish=publish)
+
+    assert tail.count("publish") == 2
+    assert "timeout_s" not in calls[0]
+    assert 290 < calls[1]["timeout_s"] <= 300
+    [(subject, body)] = alerts
+    assert "PUBLISH FAILED" not in subject and "SIGTERM IN THE TAIL" in subject
+    assert "the one retry succeeded" in body
+    assert rc == 1
+
+
+def test_a_retry_that_fails_too_is_reported_and_never_repeated(conn, monkeypatch, default_sigterm):
+    alerts: list[tuple[str, str]] = []
+    monkeypatch.setattr(sched, "_is_nightly_unit", lambda: True)
+    monkeypatch.setattr(sched, "send_alert", lambda a, s, b: alerts.append((s, b)) or True)
+
+    def publish(**kw):
+        os.kill(os.getpid(), signal.SIGTERM)
+        return 23
+
+    cfg = SchedulerConfig(publish_enabled=True, max_cities_per_day=5)
+    rc, _window_s, tail = _drive_one_city_night(conn, monkeypatch, cfg, publish=publish)
+
+    assert tail.count("publish") == 2
+    [(subject, body)] = alerts
+    assert "PUBLISH FAILED" in subject and "SIGTERM IN THE TAIL" in subject
+    assert "the one retry failed too (status 23)" in body
+    assert rc == 1
+
+
+def test_no_retry_when_too_little_of_the_stop_timeout_is_left(conn, monkeypatch, default_sigterm):
+    alerts: list[tuple[str, str]] = []
+    monkeypatch.setattr(sched, "_is_nightly_unit", lambda: True)
+    monkeypatch.setattr(sched, "send_alert", lambda a, s, b: alerts.append((s, b)) or True)
+    monkeypatch.setattr(sched, "NIGHT_TAIL_ALLOWANCE_S", sched._TAIL_RETRY_RESERVE_S + 10)
+
+    def publish(**kw):
+        os.kill(os.getpid(), signal.SIGTERM)
+        return 23
+
+    cfg = SchedulerConfig(publish_enabled=True, max_cities_per_day=5)
+    rc, _window_s, tail = _drive_one_city_night(conn, monkeypatch, cfg, publish=publish)
+
+    assert tail.count("publish") == 1
+    [(subject, body)] = alerts
+    assert "PUBLISH FAILED" in subject and "not time left before the SIGKILL" in body
+    assert rc == 1
+
+
+def test_a_hand_runs_failed_publish_is_never_retried(conn, monkeypatch):
+    """No guard, no signal record: a hand run's failed publish is reported as
+    before, once."""
+    alerts: list[tuple[str, str]] = []
+    monkeypatch.setattr(sched, "_is_nightly_unit", lambda: False)
+    monkeypatch.setattr(sched, "send_alert", lambda a, s, b: alerts.append((s, b)) or True)
+    cfg = SchedulerConfig(publish_enabled=True, max_cities_per_day=5)
+    rc, _window_s, tail = _drive_one_city_night(conn, monkeypatch, cfg, publish=lambda **kw: 23)
+    assert tail.count("publish") == 1
+    [(subject, _body)] = alerts
+    assert "PUBLISH FAILED" in subject and "SIGTERM" not in subject
+    assert rc == 1
+
+
+def test_the_sigterm_alert_and_the_retry_never_raise(monkeypatch, caplog):
+    """Both run in the tail and decide the night's only mail: a raise in either
+    must degrade to a sentence, never propagate (#167)."""
+
+    class Broken:
+        def is_set(self):
+            raise RuntimeError("broken event")
+
+    assert "A SIGTERM reached the nightly" in sched._tail_sigterm_alert_note(Broken(), "")
+
+    seen = sched._TailSigterm()
+    seen.received_at = time.monotonic()
+    seen.set()
+
+    def boom(*a, **kw):
+        raise OSError("publish log unwritable")
+
+    monkeypatch.setattr(sched, "_publish", boom)
+    with caplog.at_level(logging.ERROR):
+        rc, note = sched._retry_publish_after_tail_sigterm(
+            SchedulerConfig(), "summary", seen, publish_started=seen.received_at - 1
+        )
+    assert rc is None and "the retry raised" in note
+
+
+def test_a_sigterm_between_the_loop_and_the_tail_is_caught_too(
+    conn, monkeypatch, default_sigterm, caplog
+):
+    """The quarantine claim runs after the loop's handler is restored and before
+    _finish_batch: the nightly's tail guard is entered on the statement right
+    after the loop, so a SIGTERM there is caught, not the default death that
+    would end the night with no tail (#389 review)."""
+    alerts: list[tuple[str, str]] = []
+    monkeypatch.setattr(sched, "_is_nightly_unit", lambda: True)
+    monkeypatch.setattr(sched, "send_alert", lambda a, s, b: alerts.append((s, b)) or True)
+
+    def claim(cfg_, conn_):
+        os.kill(os.getpid(), signal.SIGTERM)
+        return [], None
+
+    monkeypatch.setattr(sched, "_claim_quarantine_alerts", claim)
+    cfg = SchedulerConfig(publish_enabled=True, max_cities_per_day=5)
+    with caplog.at_level(logging.WARNING):
+        rc, _window_s, tail = _drive_one_city_night(conn, monkeypatch, cfg)
+    assert tail == ["aggregate", "manifest", "publish"]
+    assert caplog.text.count("SIGTERM received during the night's tail") == 1
+    [(subject, _body)] = alerts
+    assert "SIGTERM IN THE TAIL" in subject
+    assert rc == 1
     assert signal.getsignal(signal.SIGTERM) is default_sigterm
 
 
