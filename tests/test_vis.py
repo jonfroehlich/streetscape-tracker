@@ -7,6 +7,7 @@ raising. The focus is the degenerate-geometry guard from issue #69.
 """
 
 import pathlib
+import re
 
 import folium
 import pandas as pd
@@ -445,6 +446,11 @@ def _tile_urls(folium_map):
     ]
 
 
+def _option(name, value):
+    """Match one rendered L.tileLayer option, whatever folium's JSON spacing."""
+    return re.compile(rf'"{name}":\s*{re.escape(value)}(?![\w.])')
+
+
 def _assert_every_carto_layer_is_keyed(folium_map):
     from urllib.parse import quote
 
@@ -464,8 +470,12 @@ def _assert_every_carto_layer_is_keyed(folium_map):
     # coverage-map points sit ~20 m apart and separate only past zoom 18).
     html = folium_map.get_root().render()
     assert keyed in html
-    assert '"maxZoom": 20' in html
-    assert '"subdomains": "abcd"' in html
+    assert _option("maxZoom", "20").search(html)
+    assert _option("subdomains", '"abcd"').search(html)
+    # CARTO's free tier is conditioned on crediting CARTO and OpenStreetMap.
+    assert "carto.com/attributions" in html
+    assert "openstreetmap.org/copyright" in html
+    return html
 
 
 def test_search_area_preview_basemap_carries_the_carto_key():
@@ -475,4 +485,36 @@ def test_search_area_preview_basemap_carries_the_carto_key():
 
 def test_coverage_map_basemap_carries_the_carto_key():
     rows = [_row("p1", 47.60, -122.33), _row("p2", 47.62, -122.35), _row("p3", 47.64, -122.31)]
-    _assert_every_carto_layer_is_keyed(vis.create_visualization_map(_frame(rows), "Seattle, WA"))
+    html = _assert_every_carto_layer_is_keyed(
+        vis.create_visualization_map(_frame(rows), "Seattle, WA")
+    )
+    # The dark basemap is drawn at 0.8 so the coverage dots stand out over it.
+    assert _option("opacity", "0.8").search(html)
+
+
+def test_python_carto_tile_url_matches_the_frontend_form():
+    """The JS and Python builders must agree on host, path and key parameter.
+
+    A rename on one side only (``key=`` to ``api_key=``, a new host) leaves the
+    other side's maps watermarked with HTTP 200 and nothing failing, so the
+    JS form is read out of ``addBasemapLayer`` and held to ``carto_tile_url``.
+    """
+    from urllib.parse import quote
+
+    from streetscape_metadata_tracker.basemap import (
+        BASEMAP_KEY_SOURCE,
+        carto_basemap_key,
+        carto_tile_url,
+    )
+
+    js = pathlib.Path(BASEMAP_KEY_SOURCE).read_text(encoding="utf-8")
+    m = re.search(
+        r'function addBasemapLayer\(map\) \{\s*return L\.tileLayer\(\s*"([^"]+)"\s*\+\s*'
+        r"`\?(\w+)=\$\{encodeURIComponent\(CARTO_BASEMAP_KEY\)\}`",
+        js,
+    )
+    assert m, "addBasemapLayer's tile URL not found in streetscape-utils.js (reshaped?)"
+    js_url, js_param = m.groups()
+    js_style = re.search(r"basemaps\.cartocdn\.com/([^{]+)/\{z\}", js_url).group(1)
+    key = quote(carto_basemap_key(), safe="")
+    assert carto_tile_url(js_style) == f"{js_url}?{js_param}={key}"

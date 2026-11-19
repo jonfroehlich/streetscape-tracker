@@ -39,15 +39,14 @@ import json
 import logging
 import os
 import sys
-from urllib.parse import quote
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from streetscape_metadata_tracker import db  # noqa: E402
 
-# The key is read from the frontend module by the shared helper, so this viewer
-# and the vis.py maps cannot drift apart (the tests address it as bbr.*).
-from streetscape_metadata_tracker.basemap import carto_basemap_key  # noqa: E402
+# The keyed tile URL comes from the shared helper, which reads the key out of
+# the frontend module, so this viewer and the vis.py maps cannot drift apart.
+from streetscape_metadata_tracker.basemap import carto_tile_url  # noqa: E402
 from streetscape_metadata_tracker.boundary_audit import (  # noqa: E402
     frozen_rect_bounds,
     rect_polygon_coverage,
@@ -61,7 +60,8 @@ DEFAULT_AUDIT_DIR = os.path.join(_PROJECT_ROOT, "audit")
 TEMPLATE_PATH = os.path.join(_PROJECT_ROOT, "scripts", "boundary_review.template.html")
 DATA_PLACEHOLDER = "/*__DATA__*/"
 META_PLACEHOLDER = "/*__META__*/"
-CARTO_KEY_PLACEHOLDER = "__CARTO_KEY__"
+CARTO_TILE_URL_PLACEHOLDER = "__CARTO_TILE_URL__"
+CARTO_STYLE = "rastertiles/voyager"
 
 
 # Coordinate precision for embedded polygons: ~1 m at the equator, small file.
@@ -431,10 +431,10 @@ def render_html(
         template = f.read()
     if DATA_PLACEHOLDER not in template:
         raise ValueError(f"template missing {DATA_PLACEHOLDER!r} placeholder")
-    if CARTO_KEY_PLACEHOLDER not in template:
-        raise ValueError(f"template missing {CARTO_KEY_PLACEHOLDER!r} placeholder")
+    if CARTO_TILE_URL_PLACEHOLDER not in template:
+        raise ValueError(f"template missing {CARTO_TILE_URL_PLACEHOLDER!r} placeholder")
     html = template.replace(DATA_PLACEHOLDER, _json_for_script(payloads))
-    html = html.replace(CARTO_KEY_PLACEHOLDER, quote(carto_basemap_key(), safe=""))
+    html = html.replace(CARTO_TILE_URL_PLACEHOLDER, carto_tile_url(CARTO_STYLE))
     if META_PLACEHOLDER in html:
         html = html.replace(META_PLACEHOLDER, _json_for_script(meta or {}))
     return html

@@ -19,6 +19,7 @@ _spec = importlib.util.spec_from_file_location(
 bbr = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(bbr)
 
+from streetscape_metadata_tracker.basemap import carto_basemap_key, carto_tile_url  # noqa: E402
 from streetscape_metadata_tracker.boundary_audit import frozen_rect_bounds  # noqa: E402
 
 CURRENT = {"center_lat": 42.35, "center_lon": -71.06, "grid_width_m": 20000, "grid_height_m": 20000}
@@ -383,7 +384,8 @@ def test_render_html_neutralizes_close_tag():
 # missing, stale or placeholder key with HTTP 200 and "API KEY REQUIRED"
 # printed across the tile, and on a tool whose whole job is judging a city
 # boundary by eye, a watermark over every tile is a working-looking page that
-# is harder to review.
+# is harder to review. The whole URL is substituted, not just the key, so a
+# change to the URL form in basemap.carto_tile_url reaches this page too.
 
 
 def test_render_html_substitutes_the_frontend_carto_key():
@@ -398,9 +400,12 @@ def test_render_html_substitutes_the_frontend_carto_key():
         )
     ]
     html = bbr.render_html(payloads)
-    assert bbr.CARTO_KEY_PLACEHOLDER not in html
-    # render_html URL-encodes the key, so compare against the encoded form.
-    assert f"?key={quote(bbr.carto_basemap_key(), safe='')}" in html
+    assert bbr.CARTO_TILE_URL_PLACEHOLDER not in html
+    # carto_tile_url URL-encodes the key, so compare against the encoded form.
+    assert f"?key={quote(carto_basemap_key(), safe='')}" in html
+    # The page uses the shared builder's URL verbatim, never a form of its own.
+    assert f'"{carto_tile_url(bbr.CARTO_STYLE)}"' in html
+    assert "basemaps.cartocdn.com/rastertiles/voyager/{z}" in html
 
 
 def test_carto_key_comes_from_the_frontend_module_not_a_second_copy():
@@ -408,13 +413,14 @@ def test_carto_key_comes_from_the_frontend_module_not_a_second_copy():
     js = os.path.join(PROJECT_ROOT, "www", "js", "streetscape-utils.js")
     with open(js, encoding="utf-8") as f:
         js_source = f.read()
-    assert f'CARTO_BASEMAP_KEY = "{bbr.carto_basemap_key()}"' in js_source
+    assert f'CARTO_BASEMAP_KEY = "{carto_basemap_key()}"' in js_source
 
-    # The template must carry the placeholder, never the key itself.
+    # The template must carry the placeholder, never the key or a URL of its own.
     with open(bbr.TEMPLATE_PATH, encoding="utf-8") as f:
         template = f.read()
-    assert bbr.CARTO_KEY_PLACEHOLDER in template
-    assert bbr.carto_basemap_key() not in template
+    assert bbr.CARTO_TILE_URL_PLACEHOLDER in template
+    assert carto_basemap_key() not in template
+    assert "cartocdn.com" not in template
 
 
 def test_carto_key_read_raises_rather_than_degrading(tmp_path):
@@ -427,13 +433,13 @@ def test_carto_key_read_raises_rather_than_degrading(tmp_path):
     empty = tmp_path / "no-key.js"
     empty.write_text("const SOMETHING_ELSE = 1;\n", encoding="utf-8")
     with pytest.raises(ValueError, match="CARTO_BASEMAP_KEY"):
-        bbr.carto_basemap_key(str(empty))
+        carto_basemap_key(str(empty))
 
 
-def test_render_html_raises_when_the_template_loses_the_key_placeholder(tmp_path):
+def test_render_html_raises_when_the_template_loses_the_tile_url_placeholder(tmp_path):
     with open(bbr.TEMPLATE_PATH, encoding="utf-8") as f:
         template = f.read()
     stripped = tmp_path / "template.html"
-    stripped.write_text(template.replace("?key=" + bbr.CARTO_KEY_PLACEHOLDER, ""), encoding="utf-8")
-    with pytest.raises(ValueError, match=bbr.CARTO_KEY_PLACEHOLDER):
+    stripped.write_text(template.replace(bbr.CARTO_TILE_URL_PLACEHOLDER, ""), encoding="utf-8")
+    with pytest.raises(ValueError, match=bbr.CARTO_TILE_URL_PLACEHOLDER):
         bbr.render_html([], template_path=str(stripped))
