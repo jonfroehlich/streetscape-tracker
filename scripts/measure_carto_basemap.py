@@ -45,13 +45,14 @@ import urllib.error
 import urllib.request
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _PROJECT_ROOT)
+
+# The key lives in exactly one place, and the shared helper reads it from there
+# rather than this script carrying a second copy (see docs/frontend.md).
+from streetscape_metadata_tracker.basemap import carto_basemap_key  # noqa: E402
+
 DEFAULT_OUT_DIR = os.path.join(_PROJECT_ROOT, "docs", "experiments")
 EXPERIMENT = "carto-basemap-key"
-
-# The key lives in exactly one place; this reads it rather than carrying a
-# second copy (see docs/frontend.md).
-BASEMAP_KEY_SOURCE = os.path.join(_PROJECT_ROOT, "www", "js", "streetscape-utils.js")
-_CARTO_KEY_RE = re.compile(r'CARTO_BASEMAP_KEY\s*=\s*"([^"]+)"')
 
 # One stable tile with real content on it (San Francisco, z12). An all-water
 # tile would be near-identical with and without a watermark, which would make
@@ -78,15 +79,6 @@ BUNDLES = {
 
 TIMEOUT_S = 60
 USER_AGENT = "streetscape-tracker-measurement"
-
-
-def carto_basemap_key(source_path: str = BASEMAP_KEY_SOURCE) -> str:
-    """Read the site's CARTO key out of the frontend module that owns it."""
-    with open(source_path, encoding="utf-8") as f:
-        match = _CARTO_KEY_RE.search(f.read())
-    if not match:
-        raise ValueError(f"no CARTO_BASEMAP_KEY const found in {source_path}")
-    return match.group(1)
 
 
 def fetch(url: str, headers: dict | None = None) -> dict:

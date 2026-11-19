@@ -1693,6 +1693,117 @@ def test_a_kartaview_host_refused_or_held_tonight_leaves_the_channel_not_the_cit
     )
 
 
+@pytest.mark.parametrize("arm", ["due-backlog", "edge-host-held", "live-checkpoint"])
+def test_a_spent_night_allowance_leaves_kartaview_not_the_city(conn, monkeypatch, arm):
+    """#464, through `_fill_admission`: a spent KartaView night allowance holds
+    the host for a FRESH KartaView crawl, so the fill leaves that channel to its
+    due schedule and refreshes the rest of the city. On a real night the due
+    phase's held KartaView pairs are unattempted, so they are a backlog and the
+    channel is `held_left` (realistic arm). `host_left` is the edge path, when
+    no held pair is left to count (`held` empty). A city with a live KartaView
+    checkpoint is paid-for work and is never left for the allowance. Kills:
+    `_fill_admission` filtering allowance holds out of `held_hosts` (edge arm),
+    or passing the bare `holds.current()` (checkpoint arm)."""
+    from streetscape_metadata_tracker.download_common import HOST_KARTAVIEW
+
+    cid = _city(conn, "Enrolled", {"gsv": 60, "mapillary": 60, "kartaview": 60})
+    city = db.resolve_city(conn, cid)
+    cfg = _opt_in_cfg()
+    assert sched._channel_estimate(cfg, city, "kartaview", conn) <= 37, "premise: one launch"
+    _live_checkpoints(monkeypatch, {(cid, "kartaview")} if arm == "live-checkpoint" else set())
+    holds = sched.HostHolds(allowances_s={HOST_KARTAVIEW: 1800.0})
+    holds.charge(HOST_KARTAVIEW, 1800.0, fresh=True)
+    breaker = sched.HostBreaker(holds=holds)
+    held = {"kartaview"} if arm == "due-backlog" else set()
+    verdict = sched._fill_admission(
+        cfg, conn, TODAY, city, ["gsv", "mapillary", "kartaview"], 10_000.0, breaker, held=held
+    )
+    if arm == "live-checkpoint":
+        # Admitted WHOLE, KartaView included (#464 review round 3, finding 8):
+        # not merely "not left", which a declined city also satisfies.
+        assert verdict.admit is True, verdict
+        assert verdict.run == ("gsv", "mapillary", "kartaview")
+        assert verdict.left == () and verdict.host_left == ()
+        return
+    assert verdict.admit is True, verdict
+    assert verdict.run == ("gsv", "mapillary")
+    assert verdict.left == ("kartaview",)
+    if arm == "due-backlog":
+        assert verdict.held_left == ("kartaview",) and verdict.host_left == ()
+    else:
+        assert verdict.host_left == ("kartaview",) and verdict.held_left == ()
+
+
+def test_fill_admission_judges_the_allowance_exemption_over_what_it_launches(conn, monkeypatch):
+    """#464 review 1, finding 4: a live `kartaview` checkpoint left to the due
+    schedule as a backlog (`held_left`) is not tonight's launch, so it cannot
+    exempt `kartaview_streets`, which has no checkpoint of its own. Admission
+    judges the exemption over the channels it can still launch -- the list the
+    launch hands `_run_city_channels` -- so the walk is left with its host
+    held, never admitted only to be held at launch. Kills: `_fill_judge`
+    calling `_city_holds` over all of `channels`."""
+    from streetscape_metadata_tracker.download_common import HOST_KARTAVIEW
+
+    cid = _city(conn, "Enrolled", {"gsv": 60, "mapillary": 60, "kartaview": 60})
+    db.set_channel_membership(conn, cid, "kartaview_streets", True, cycle_days=90)
+    city = db.resolve_city(conn, cid)
+    cfg = _opt_in_cfg()
+    cfg.providers["kartaview_streets"] = ProviderConfig(daily_request_budget=10_000)
+    monkeypatch.setattr(sched, "_walk_network_is_frozen", lambda cfg_, city_, channel: True)
+    monkeypatch.setattr(sched, "channel_census_cache_marker", lambda city_, ch, **kw: None)
+    _live_checkpoints(monkeypatch, {(cid, "kartaview")})
+    holds = sched.HostHolds(allowances_s={HOST_KARTAVIEW: 1800.0})
+    holds.charge(HOST_KARTAVIEW, 1800.0, fresh=True)
+    breaker = sched.HostBreaker(holds=holds)
+    channels = ["gsv", "mapillary", "kartaview", "kartaview_streets"]
+    verdict = sched._fill_admission(
+        cfg, conn, TODAY, city, channels, 10_000.0, breaker, held={"kartaview"}
+    )
+    assert verdict.admit is True, verdict
+    assert verdict.held_left == ("kartaview",)
+    assert verdict.host_left == ("kartaview_streets",)
+    assert verdict.run == ("gsv", "mapillary")
+    # The launch's own reading of the run it is handed agrees: no channel of
+    # it is on a host that reading holds.
+    launch_held = set(sched._city_holds(cfg, city, list(verdict.run), holds)[0])
+    assert not any(set(sched.CHANNEL_HOSTS[c]) & launch_held for c in verdict.run)
+
+
+@pytest.mark.parametrize("minutes", [1.0, None], ids=["allowance", "unset-control"])
+def test_the_fill_preview_charges_the_night_allowance(conn, monkeypatch, capsys, minutes):
+    """#464 review 2, finding 1: the live fill's KartaView launches are
+    charged to the night allowance, so the dry run's fill section charges
+    them too, as its due rows do. With a 1-minute allowance the first fill
+    city's kartaview crawl spends it and the second's is left to its due
+    schedule; unset, both are listed. Kills: dropping the
+    `_charge_preview_allowance` call from `_print_fill_preview.consider`."""
+    import dataclasses
+
+    from streetscape_metadata_tracker.download_common import HOST_KARTAVIEW
+
+    cities = []
+    for name in ("Albany", "Bend"):
+        cid = _city(conn, name, {"gsv": 60, "mapillary": 60, "kartaview": 60})
+        db.set_channel_membership(conn, cid, "kartaview", True, cycle_days=90)
+        cities.append(cid)
+    _live_checkpoints(monkeypatch, set())
+    cfg = _opt_in_cfg()
+    if minutes is not None:
+        cfg = dataclasses.replace(cfg, host_night_minutes={HOST_KARTAVIEW: minutes})
+    est = sched._channel_estimate(cfg, db.resolve_city(conn, cities[0]), "kartaview", conn)
+    assert 2 <= est <= 37, "premise: one launch, priced past 1 minute at 1.5/min"
+    monkeypatch.setattr(sched.db, "connect", lambda path: conn)
+    capsys.readouterr()
+    sched.cmd_run_due(cfg, dry_run=True, today=TODAY)
+    out = capsys.readouterr().out
+    rows = [
+        ln.split()[0]
+        for ln in out.splitlines()
+        if ln.startswith("  ") and " kartaview " in ln and ln.rstrip().endswith("fill")
+    ]
+    assert rows == (cities[:1] if minutes is not None else cities), out
+
+
 def test_a_fill_ended_by_a_ceiling_decline_says_so(conn, monkeypatch, caplog):
     """#456 third round, finding 5: a fill whose last candidate was declined
     because nothing but an oversized KartaView crawl was left to run ends

@@ -17,6 +17,7 @@ import pandas as pd
 import seaborn as sns
 
 from .analysis import is_google_copyright, plausible_capture_mask
+from .basemap import add_carto_basemap
 from .geoutils import get_best_folium_zoom_level, get_bounding_box, get_bounding_box_size
 from .progress import progress
 
@@ -84,9 +85,8 @@ def display_search_area(
     )
 
     # Map base style
-    m = folium.Map(
-        location=[city_center_lat, city_center_lng], zoom_start=zoom_level, tiles="CartoDB positron"
-    )
+    m = folium.Map(location=[city_center_lat, city_center_lng], zoom_start=zoom_level, tiles=None)
+    add_carto_basemap(m, "light_all")
 
     # Create styled HTML for popup
     popup_html = f"""
@@ -455,11 +455,7 @@ def create_visualization_map(df: pd.DataFrame, city_name: str, provider: str = "
     folium_map = folium.Map(location=map_center, zoom_start=zoom_level, tiles=None)
 
     # Add dark theme tile layer
-    folium.TileLayer(
-        tiles="cartodbdark_matter",
-        attr='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
-        opacity=0.8,
-    ).add_to(folium_map)
+    add_carto_basemap(folium_map, "dark_all", opacity=0.8)
 
     # Create enhanced tooltip HTML
     bbox_tooltip_html = f"""

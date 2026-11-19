@@ -150,6 +150,21 @@ a geocode that lands on a city the catalog already holds (a second spelling of a
 
 `tests/test_register_frame.py` pins the bulk-registration safety rails — overlap reuse, `enabled = 0` until vetted, the GeoNames center guard against a province-centroid geocode, dry-run-by-default writing nothing, idempotent re-runs — with the geocoding seam monkeypatched, so no network.
 It pins `--notes-label` by MUTATING it rather than by asserting the default: a case that only read `cities.notes` after a default run would stay green while the flag was dropped on the floor, and that label is how the vetting and enable steps select one batch out of the catalog.
+The dry run's in-batch report (#460) is pinned against `--execute` itself, not against its own wording:
+two manifest rows 5.5 km apart print `REUSE IN-BATCH` at `--overlap-km 6`, and the same manifest then really aliases the second row under `--execute`, with the same `reused-existing` and `newly-registered` counts in both summaries;
+at `--overlap-km 5` the pair prints a `WARNING`, and a 0.6 km drift of the first row's geocoded centre really aliases the second;
+rows farther apart than `--overlap-km` + `--max-center-km` print nothing;
+a row the dry run would alias still warns later rows, with the three-row chain run under `--execute` to show the alias it warns about;
+a catalog reuse prints a NOTE when an earlier row of the batch could become the nearer target, and a 1.1 km drift of that row under `--execute` really takes the alias from the catalog city.
+The report is distance-only: rows that `--execute` merges by name (a shared query, or a shared city/admin/country) are not previewed (#467).
+
+`tests/test_reregister.py` pins the manual-resize guard (#459) with its premise: the same Kuna-shaped city is RESIZEd without the note and DEFERred with it.
+Its advisory recommendation is the CURRENT grid with a basis that says why (the review page shows the basis in place of the reason, and offers any other rectangle as a one-click choice),
+on every deferring branch and not only the would-be RESIZE (over-threshold, `NO_POLYGON` and `WRONG_PLACE` are parametrized, each against the same city without the note);
+there the basis carries the audit's own reason and its generic advice, the advice labelled as written for a grid that was not fitted by hand.
+The guard diverts only a would-be RESIZE (NOCHANGE, SKIP and the over-threshold DEFER are unchanged), including one that would only have recentered a hand fit larger than its bbox.
+`load_current_geometry` reads the note that `resize_city.py --execute` really writes, appended after another note or onto NULL notes.
+The same catalog then drives the script's dry run: its summary counts the kept hand fits among the deferrals, and prints no such line when there are none.
 
 `tests/test_mapillary_360_cities_manifest.py` IS the provenance of `mapillary_360_cities.csv`.
 The city list is curated, but its values are a GeoNames join keyed by `geonameid` and there is no generator script to name in a `generated_by`, so the test re-runs that join in reverse: city, admin, country, continent, population and coordinates must match the vendored records, and `query_string` must equal what `build_worldwide_frame.query_string` writes, so a query here behaves exactly like a frame query at the geocoder.
@@ -1296,6 +1311,37 @@ A hold keeps a host's channels from launching without anything having refused us
   - `test_the_production_fetch_never_follows_a_redirect` (`allow_redirects=False` reaches `requests.get`) and `test_the_token_comes_from_the_existing_loader`.
 - `test_the_done_line_names_each_metered_hosts_presence_and_the_gap_before_it` — first launch to last finish on the tile CDN, the gap back to the newest ledger stamp from BEFORE the run (tonight's own stamps are seeded and must be ignored), and neither GSV nor Overpass named; killed by marking the launch after the inline child, by dropping the finish mark, by reading tonight's stamps, and by letting Overpass in.
 
+## The KartaView night allowance (issue #464)
+
+`tests/test_kartaview_night_allowance.py`.
+Its fake child MOVES the frozen UTC clock by the minutes a launch should take, which is what the allowance charges, and it fakes checkpoints and cached censuses at their two readers (`_sweep_checkpoint_progress`, `channel_census_cache_marker`).
+Each docstring names the one-line mutation that turns it red; all were run red before the PR.
+
+- Config: `test_a_night_allowance_loads_for_the_kartaview_host`; `test_an_invalid_night_allowance_fails_closed` (0, −5, a bool, a string, 1441, and a valid value on the tile CDN and on Panoramax: exit 64 before connecting); `test_makelab1_ships_the_allowance_commented_out` (prod unset, the commented line present).
+- `test_an_unset_allowance_probes_nothing_and_leaves_the_night_as_it_was` — both probes RAISE for a census channel on a Mapillary rest night with the key unset, and the launches and the HELD clause are the pre-change values; killed by computing the paid-for set before the short-circuit.
+- The hold: `test_a_spent_allowance_leaves_fresh_crawls_due_and_takes_no_slot` (no attempt, no failure, no alert, still due, one crossing WARNING; the unset control launches the city); `test_a_spent_allowance_is_never_counted_as_attempted` (a two-city night where the held city must not take the gsv city's slot; the hoist order is asserted).
+- Pairing and paid-for work: `test_an_allowance_spent_mid_city_never_splits_the_grid_from_its_walk` (killed by a per-launch read); `test_a_resumed_grid_that_completes_is_followed_by_its_free_walk` and `test_a_resumed_grid_that_pauses_still_defers_its_walk` (the fake grid clears its checkpoint and promotes the census, or exits 83); `test_a_cached_walk_is_exempt_and_a_fresh_one_is_not`; `test_the_stranded_walk_retry_is_exempt_through_the_retry_pass` (driven through `_retry_stranded_walks` itself); `test_an_unhoisted_resumer_still_runs_when_the_reserve_fills_the_allowance`.
+- `test_an_unfinishable_city_is_skipped_as_unfinishable_never_held` — the #456 WARNING and `ceiling_skipped`, and `allowance_skipped` stays 0.
+- The reserve and the charge: `test_resumes_are_reserved_out_of_the_allowance_first` (killed by skipping the reserve); `test_a_resume_does_not_spend_the_fresh_allowance` (killed by charging every launch as fresh); `test_a_launch_on_the_pool_path_is_charged` (two lanes, as prod; killed by dropping `end_charge`).
+- Reporting: `test_the_done_clause_carries_the_numbers_and_never_the_held_token` (the exact clause, and `mapillary_night_report._HELD_RE` matches nothing); `test_a_rest_night_beside_a_spent_allowance_keeps_the_held_count_mapillarys` (the regex's `n` is the Mapillary launches alone); `test_the_dry_run_holds_what_the_night_would_hold`; `test_status_names_the_night_allowance`; `test_ignore_host_holds_lifts_the_night_allowance`.
+- `test_a_spent_night_allowance_leaves_kartaview_not_the_city` (`tests/test_fill_underfull_nights.py`) — through `_fill_admission`: `held_left` on a real night's backlog, `host_left` on the edge path, and a live checkpoint never left.
+- Review 1 of the PR added four more.
+  - `test_a_kartaview_rest_or_cooldown_outranks_its_spent_allowance` (rest and cooldown arms): the same host carries both holds, its reserve spends the allowance, and the live checkpoint is neither exempted nor launched. It is killed by reordering `HostHolds.active`.
+  - `test_an_exempt_city_run_twice_is_counted_once`: the exempt tally is distinct cities.
+  - `test_the_fill_names_a_spent_allowance_only_where_it_is_the_reason`: the unset test also pins the fill's decline line to the #444 text, byte for byte.
+  - `test_fill_admission_judges_the_allowance_exemption_over_what_it_launches` (in the fill file): a backlogged `kartaview` checkpoint does not exempt a `kartaview_streets` that has none.
+- Review 2 added five more.
+  - `test_the_fill_preview_charges_the_night_allowance` (in the fill file, with an unset control): the dry run's fill section charges the allowance as its due rows do.
+  - `test_the_reserve_counts_cities_not_channels`: a city with checkpoints on both channels reserves one launch.
+  - `test_the_reserve_is_silent_on_a_run_that_touches_no_kartaview_channel`.
+  - `test_the_dry_run_never_lists_a_spent_allowance_as_held_tonight`.
+- Review round 3 replaced one test, added three and extended four.
+  - `test_a_checkpoint_at_the_age_wall_reaches_the_age_wall_arm` (6.5 days and 7 days + 1 h, each unfinishable and fitting) replaces review 2's `test_a_checkpoint_past_the_age_wall_is_not_paid_for_work`, which pinned the opposite: a checkpoint of any age is never held, so the age-wall arm records its failure, and one past the discard that launches is charged fresh. It is killed by exempting on the aged predicate, and by charging on `progress is not None`.
+  - `test_a_checkpoint_with_no_first_commit_stamp_is_charged_fresh_not_crashed`: `age_s = None` raised `TypeError` in the city loop before the fix.
+  - `test_an_allowance_as_long_as_the_batch_window_is_warned_as_bounding_nothing` (720 and 719 min against a 12 h window).
+  - `test_an_unset_allowance_with_kartaview_enabled_leaves_the_night_as_it_was`: both KartaView channels enabled, a resumer, a fresh pair, a cached walk and a gsv city, with every #464-only helper patched to raise; the launches and the whole `Done:` line are literals, and the same file run against an extracted `origin/main` tree passes this test unchanged.
+  - It also extended four: `test_an_invalid_night_allowance_fails_closed` covers `assess-city`, `test_the_dry_run_holds_what_the_night_would_hold` counts allowance-only cities apart from #444's, `test_ignore_host_holds_lifts_the_night_allowance` pins the narrow `--provider` form in the WARNING, and the fill file's live-checkpoint arm asserts the city is admitted whole.
+
 ## The Mapillary night report (issue #444)
 
 `tests/test_mapillary_night_report.py` pins `scripts/mapillary_night_report.py`, the read-only Stage 1 read-out.
@@ -1677,6 +1723,18 @@ Every assertion above was mutation-checked; the table is in the PR body.
 `captureHistoryLegendHtml` is empty without a harvest; otherwise it carries the canvas id, `role="img"`, an `aria-label` naming both dates, one table row per year WITH imagery (4, not the 18 filled bars), the caveat verbatim, and the dropped-dates line only when dates were dropped, worded "implausible or unreadable" because the count includes NaT; a hostile caveat and harvest date are escaped.
 `streetscape-utils.test.js` pins `adaptCityRecord.capture_history`: the gsv block's own pointer, null for the same city's Mapillary view (a record-level read fails it), and null — never undefined — on v1 and unharvested records; and that a harvest filename resolves to no provider and is not a valid run.
 The Python half of that last pin is `test_a_history_artifact_is_not_a_run_file_in_either_language` in `tests/test_naming.py`, which runs the JS `RUN_FILENAME_RE` itself (widening its token class to `[a-z_]+` fails it).
+
+## Generated maps carry the CARTO key
+
+`tests/test_vis.py` builds both `vis.py` maps, the `--check-boundary` preview (`test_search_area_preview_basemap_carries_the_carto_key`) and the coverage map (`test_coverage_map_basemap_carries_the_carto_key`), and requires every tile layer to point at `basemaps.cartocdn.com` and end in `?key=` plus the URL-encoded key that `basemap.carto_basemap_key` reads from `www/js/streetscape-utils.js`.
+Encoded, because the code encodes it: a rotated key holding `+`, `/` or `=` must not fail a correct URL.
+Each also renders the page with `get_root().render()`, since the saved HTML is what a reader opens, and requires the keyed URL there with CARTO's `maxZoom` 20 and `abcd` subdomains, which folium's generic 18 and `abc` would replace (drop `_CARTO_TILE_DEFAULTS`).
+The options are matched by a regex that tolerates folium's JSON spacing, since `requirements.txt` allows any folium from 0.15.1.
+Both require the CARTO and OpenStreetMap attribution links (the free tier's condition), and the coverage map its dark basemap's `opacity` 0.8.
+`test_python_carto_tile_url_matches_the_frontend_form` reads the URL template and key parameter out of `addBasemapLayer` in the JS and requires `carto_tile_url` to build the same URL: rename `key=` or the host on one side only and it goes red, where every other Python test stays green and the other side's maps are watermarked.
+Restore folium's bare tile names in `vis.py` (`tiles="CartoDB positron"`, `tiles="cartodbdark_matter"`) and both go red: those request the tile with no key, which CARTO answers with HTTP 200 and a watermark, so nothing else fails.
+The boundary-review viewer's equivalent is `test_render_html_substitutes_the_frontend_carto_key` and its neighbours in `tests/test_build_boundary_review.py`; the viewer's template carries a whole-URL placeholder and no `cartocdn.com` URL of its own, so a URL-form change in `carto_tile_url` reaches it too.
+Whether CARTO actually honours the key is a network question, answered only by the e2e `tests/e2e/test_basemap_key.py`.
 
 ## The pivoted data tables (issue #250)
 
