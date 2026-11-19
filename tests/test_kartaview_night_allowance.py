@@ -19,6 +19,7 @@ turns it red.
 
 import logging
 import os
+import re
 import threading
 import time
 from collections import Counter
@@ -266,11 +267,11 @@ def test_a_night_allowance_loads_for_the_kartaview_host(tmp_path):
     ],
     ids=["zero", "negative", "bool", "string", "over-a-day", "tile-cdn", "panoramax"],
 )
-def test_an_invalid_night_allowance_fails_closed(conn, monkeypatch, tmp_path, block):
+def test_an_invalid_night_allowance_fails_closed(conn, monkeypatch, tmp_path, caplog, block):
     """Dropping a bad allowance would run the unbounded night (fail-OPEN), so it
     is recorded and run-due/assess-city exit 64 before connecting.
     Mutation: accept `<= 0` (zero, negative) or drop the `_ALLOWANCE_HOSTS` test
-    (tile-cdn, panoramax)."""
+    (tile-cdn, panoramax); drop the `_config_refusals` gate from either command."""
     path = tmp_path / "bad.toml"
     path.write_text(
         "[providers.gsv]\nenabled = true\n\n"
@@ -283,7 +284,13 @@ def test_an_invalid_night_allowance_fails_closed(conn, monkeypatch, tmp_path, bl
     assert "max_night_minutes" in cfg.host_budget_errors[0]
     connected = []
     monkeypatch.setattr(sched.db, "connect", lambda path: connected.append(path) or conn)
-    assert sched.cmd_run_due(cfg, today=THURSDAY) == sched.USAGE_EXIT_CODE
+    # assess-city refuses on the same list (review round 3, finding 8), before
+    # it geocodes, registers or connects: one ERROR per command names the key.
+    caplog.clear()  # the loader's own ERROR
+    with caplog.at_level(logging.ERROR, logger="streetscape_scheduler"):
+        assert sched.cmd_run_due(cfg, today=THURSDAY) == sched.USAGE_EXIT_CODE
+        assert sched.cmd_assess_city(cfg, "Albany, Oregon", today=THURSDAY) == sched.USAGE_EXIT_CODE
+    assert len(_messages(caplog, "max_night_minutes", logging.ERROR)) == 2
     assert connected == []
 
 
@@ -353,6 +360,63 @@ def test_an_unset_allowance_probes_nothing_and_leaves_the_night_as_it_was(
         "Mapillary's tile CDN (tiles.mapillary.com) is held tonight (mapillary): "
         "rest night or cooldown"
     )
+
+
+def test_an_unset_allowance_with_kartaview_enabled_leaves_the_night_as_it_was(
+    conn, monkeypatch, tmp_path, caplog
+):
+    """Review round 3, finding 8: the unset night WITH both KartaView channels
+    enabled -- the shape prod runs -- spelled out as origin/main runs it.
+    Albany resumes a live grid checkpoint (its walk defers behind it), Bend is
+    a fresh pair, Corvallis's walk reuses a cached census, Dalles is gsv-only;
+    every KartaView launch takes 31 minutes, which would spend any allowance
+    under the 4 h this night runs. Every #464-only helper is patched to RAISE
+    (`raising=False`, so this file's test also runs unchanged against an
+    origin/main tree, where it passes: that is how its literals were checked),
+    and the launches, the `Done:` line, the failure counts and the absence of
+    any allowance log line are the pre-change values.
+    Mutation: key `_allowance_charge`'s early return on the channel's hosts
+    alone (`if not set(CHANNEL_HOSTS.get(provider, ())) & {HOST_KARTAVIEW}:`),
+    so an unset run classes each KartaView launch (`_allowance_checkpoint`
+    then raises). The reserve and `_city_holds` are each gated twice
+    (`has_allowance()` at the caller and inside), so no one-line mutation of
+    either reaches this night."""
+
+    def boom(*args, **kwargs):
+        raise AssertionError("a #464 helper the unset night must not reach")
+
+    for name in ("_paid_for_on_host", "_allowance_checkpoint", "_allowance_launch_s"):
+        monkeypatch.setattr(sched, name, boom, raising=False)
+    monkeypatch.setattr(sched.HostBreaker, "start_charge", boom, raising=False)
+    cfg = _cfg(tmp_path, None, channels=KV_PAIR)
+    a = _kv_only(conn, cfg, "Albany", KV_PAIR)
+    b = _kv_only(conn, cfg, "Bend", KV_PAIR)
+    c = _kv_only(conn, cfg, "Corvallis", ("kartaview_streets",))
+    d = _register(conn, "Dalles")
+    _live(monkeypatch, {(a, "kartaview")})
+    _cached(monkeypatch, {(c, "kartaview_streets")})
+    with caplog.at_level(logging.INFO, logger="streetscape_scheduler"):
+        rc, launches, alerts = _night(
+            monkeypatch, conn, cfg, minutes=lambda cid, p: 31 if p.startswith("kartaview") else 0
+        )
+    assert rc == 0 and alerts == []
+    assert launches == [
+        (a, "kartaview"),
+        (b, "kartaview"),
+        (b, "kartaview_streets"),
+        (c, "kartaview_streets"),
+        (d, "gsv"),
+    ], launches
+    done = re.sub(r" in \d+\.\d+ h;", " in T h;", _done_line(caplog))
+    assert done == (
+        "Done: run-due 2026-10-15: 5/5 runs succeeded across 4 cities in T h; "
+        "1 walk(s) deferred behind a paused sibling sweep (kartaview_streets); "
+        "on the KartaView API (api.kartaview.org) 09:00-11:04 UTC (2.1 h)"
+    ), done
+    assert "ALLOWANCE" not in done and "left for a later night" not in done
+    assert _messages(caplog, "night allowance") == []
+    assert _messages(caplog, "#464") == []
+    assert set(_failures(conn).values()) == {0}
 
 
 def test_the_fill_names_a_spent_allowance_only_where_it_is_the_reason(conn, monkeypatch, tmp_path):
@@ -588,11 +652,52 @@ def test_the_reserve_is_silent_on_a_run_that_touches_no_kartaview_channel(conn, 
     assert len(_messages(caplog, f"{LABEL} night allowance 120 min: 0 city(ies)")) == 1
 
 
-def test_a_checkpoint_past_the_age_wall_is_not_paid_for_work(conn, monkeypatch, tmp_path):
-    """Review 2, nit: a checkpoint aged past `CHECKPOINT_MAX_AGE_S` is
-    discarded by the child, which crawls fresh, so it exempts nothing from a
-    spent allowance. Mutation: `_allowance_checkpoint` returning
-    `progress is not None` (no age test)."""
+@pytest.mark.parametrize(
+    ("minutes", "warned"), [(720, True), (719, False)], ids=["the-window", "under-it"]
+)
+def test_an_allowance_as_long_as_the_batch_window_is_warned_as_bounding_nothing(
+    conn, tmp_path, caplog, minutes, warned
+):
+    """Review round 3, finding 5: the loader accepts up to a day (a units-typo
+    guard), but a run launches for at most `max_batch_hours`, so an allowance
+    at least that long can never be spent. Accepted, and warned once per run
+    where the reserve is logged. Mutation: drop the warning's condition
+    (`if False:`)."""
+    cfg = _cfg(tmp_path, minutes, schedule="max_batch_hours = 12")
+    assert cfg.host_budget_errors == []
+    holds = sched._host_holds(cfg, THURSDAY)
+    with caplog.at_level(logging.INFO, logger="streetscape_scheduler"):
+        sched._reserve_allowance_resumes(cfg, holds, [], {}, ["kartaview"])
+    found = _messages(caplog, "so it bounds nothing", logging.WARNING)
+    assert len(found) == (1 if warned else 0)
+    if warned:
+        assert f"{LABEL} night allowance 720 min is at least the 12 h batch window" in found[0]
+
+
+@pytest.mark.parametrize("est", [400, 20], ids=["unfinishable", "fits"])
+@pytest.mark.parametrize(
+    "age_s",
+    [6.5 * 86400, sched.CHECKPOINT_MAX_AGE_S + 3600.0],
+    ids=["inside-the-wall-margin", "past-the-discard"],
+)
+def test_a_checkpoint_at_the_age_wall_reaches_the_age_wall_arm(
+    conn, monkeypatch, tmp_path, caplog, age_s, est
+):
+    """Review round 3, finding 1: a spent allowance never holds a channel
+    with ANY readable checkpoint, aged or not, because the launch plan's
+    age-wall arm is what records the failure that feeds the alert and the
+    quarantine. Held, a checkpoint the arm would refuse is "left for a later
+    night" every night the fresh allowance is spent, and nothing alerts.
+    Checkpoint at 1/2 roots, 6.5 days (inside the arm's one-night margin, not
+    yet discarded) or 7 days + 1 h (past `CHECKPOINT_MAX_AGE_S`, discarded by
+    the child). Unfinishable (~200 requests left against one 60-minute launch
+    at 1.5/min): the arm refuses it and records a consecutive_failure, as on
+    origin/main. Fits (~10 left): it launches, charged as PAID at 6.5 days (the
+    child resumes) and as FRESH past the discard (the child crawls from zero).
+    Mutations: `_paid_for_on_host` testing `_allowance_checkpoint` (the aged
+    predicate) for the exemption -- every past-the-discard arm turns red, held;
+    `_allowance_charge` testing `progress is not None` -- past-the-discard/fits
+    is charged as paid."""
     cfg = _cfg(tmp_path, 30)
     a = _kv_only(conn, cfg, "Albany")
     _cached(monkeypatch, set())
@@ -600,16 +705,72 @@ def test_a_checkpoint_past_the_age_wall_is_not_paid_for_work(conn, monkeypatch, 
         sched,
         "_sweep_checkpoint_progress",
         lambda cfg_, city, channel: (
-            {"age_s": sched.CHECKPOINT_MAX_AGE_S + 1.0, "units_done": 1, "unit_count": 2}
+            {"age_s": age_s, "units_done": 1, "unit_count": 2, "unit_name": "root cells"}
             if channel == "kartaview"
             else None
         ),
     )
+    real = sched._channel_estimate
+    monkeypatch.setattr(
+        sched,
+        "_channel_estimate",
+        lambda cfg_, city, provider, conn_=None, **kw: (
+            est if provider == "kartaview" else real(cfg_, city, provider, conn_, **kw)
+        ),
+    )
     breaker = _spent_breaker(cfg, 30)
-    launches, _ = _city_channels(monkeypatch, conn, cfg, a, KV_GRID, breaker)
-    assert launches == []
-    assert breaker.allowance_skipped[HOST_KARTAVIEW] == 1
-    assert breaker.allowance_exempt == {}
+    with caplog.at_level(logging.INFO, logger="streetscape_scheduler"):
+        launches, _ = _city_channels(monkeypatch, conn, cfg, a, KV_GRID, breaker, minutes=25)
+    assert breaker.allowance_skipped[HOST_KARTAVIEW] == 0
+    assert breaker.allowance_exempt == {HOST_KARTAVIEW: {a}}
+    assert "left for a later night" not in caplog.text
+    usage = breaker.holds.usage(HOST_KARTAVIEW)
+    if est == 400:
+        assert launches == []
+        assert _failures(conn)[(a, "kartaview")] == 1
+        assert len(_messages(caplog, "refusing to resume", logging.WARNING)) == 1
+        assert (usage.fresh_n, usage.paid_n) == (1, 0)  # the pre-spend alone
+        return
+    assert launches == ["kartaview"]
+    assert _failures(conn)[(a, "kartaview")] == 0
+    if age_s < sched.CHECKPOINT_MAX_AGE_S:
+        assert (usage.fresh_n, usage.paid_n) == (1, 1)
+    else:
+        assert (usage.fresh_n, usage.paid_n) == (2, 0)
+
+
+def test_a_checkpoint_with_no_first_commit_stamp_is_charged_fresh_not_crashed(
+    conn, monkeypatch, tmp_path
+):
+    """Review round 3, finding 1: `sweep_progress` reports `age_s = None` for a
+    store with no `created_at` (a KartaView v1 record, #272, which the child
+    discards as a format mismatch). The age test read `progress.get("age_s",
+    0.0)`, which is None for a PRESENT key, so `None < CHECKPOINT_MAX_AGE_S`
+    raised TypeError in the city loop. It is a checkpoint (exempt; the launch
+    plan judges it) that is not resumed, so it is charged as fresh and is not
+    reserved. Mutation: restore `progress.get("age_s", 0.0) < ...`."""
+    cfg = _cfg(tmp_path, 30)
+    a = _kv_only(conn, cfg, "Albany")
+    _cached(monkeypatch, set())
+    monkeypatch.setattr(
+        sched,
+        "_sweep_checkpoint_progress",
+        lambda cfg_, city, channel: (
+            {"age_s": None, "units_done": 1, "unit_count": 2, "unit_name": "root cells"}
+            if channel == "kartaview"
+            else None
+        ),
+    )
+    city = db.resolve_city(conn, a)
+    assert sched._allowance_checkpoint(cfg, city, "kartaview") is False
+    holds = sched._host_holds(cfg, THURSDAY)
+    sched._reserve_allowance_resumes(cfg, holds, [city], {a: ["kartaview"]}, ["kartaview"])
+    assert holds.usage(HOST_KARTAVIEW).reserved_n == 0
+    breaker = _spent_breaker(cfg, 30)
+    launches, _ = _city_channels(monkeypatch, conn, cfg, a, KV_GRID, breaker, minutes=25)
+    assert launches == ["kartaview"]
+    usage = breaker.holds.usage(HOST_KARTAVIEW)
+    assert (usage.fresh_n, usage.paid_n) == (2, 0)
 
 
 def test_resumes_are_reserved_out_of_the_allowance_first(conn, monkeypatch, tmp_path, caplog):
@@ -864,8 +1025,9 @@ def test_the_dry_run_holds_what_the_night_would_hold(conn, monkeypatch, tmp_path
     """A 1-minute allowance: the preview charges its own first fresh row at the
     configured pace, then passes over the next two KartaView-only cities (held
     on every channel, so no row and no slot) and prints the gsv+kartaview
-    city's kartaview row HELD (night allowance spent). Mutation: drop the
-    preview's `holds.charge(...)` call."""
+    city's kartaview row HELD (night allowance spent). Mutations: drop the
+    preview's `holds.charge(...)` call; count every passed-over city under
+    #444's HELD line (`if False:` for the allowance-only test)."""
     cfg = _cfg(tmp_path, 1)
     kv = [_kv_only(conn, cfg, name) for name in ("Albany", "Bend", "Corvallis")]
     d = _register(conn, "Dalles")
@@ -880,7 +1042,9 @@ def test_the_dry_run_holds_what_the_night_would_hold(conn, monkeypatch, tmp_path
     assert [ln for ln in out.splitlines() if "HELD (night allowance spent)" in ln] == [
         ln for ln in out.splitlines() if ln.startswith(f"  {d}") and "kartaview" in ln
     ]
-    assert "(2 due city(ies) HELD on every channel passed over" in out
+    # Counted as #464's, never under #444's HELD pass-over (review round 3, finding 4).
+    assert "(2 due city(ies) left for a later night by the spent night allowance" in out
+    assert "HELD on every channel passed over" not in out
 
 
 def test_the_dry_run_never_lists_a_spent_allowance_as_held_tonight(
@@ -935,3 +1099,6 @@ def test_ignore_host_holds_lifts_the_night_allowance(conn, monkeypatch, tmp_path
     warning = _messages(caplog, "--ignore-host-holds", logging.WARNING)
     assert len(warning) == 1
     assert f"the night allowance ({LABEL} 10 min) is lifted too" in warning[0]
+    # Review round 3, finding 2: the WARNING names the narrow form, since a full
+    # run also lifts the tile CDN's rest night and refusal cooldown.
+    assert "run only `--provider kartaview,kartaview_streets`, never a full run" in warning[0]

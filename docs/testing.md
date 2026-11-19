@@ -1279,8 +1279,13 @@ Each docstring names the one-line mutation that turns it red; all were run red b
   - `test_the_fill_preview_charges_the_night_allowance` (in the fill file, with an unset control): the dry run's fill section charges the allowance as its due rows do.
   - `test_the_reserve_counts_cities_not_channels`: a city with checkpoints on both channels reserves one launch.
   - `test_the_reserve_is_silent_on_a_run_that_touches_no_kartaview_channel`.
-  - `test_a_checkpoint_past_the_age_wall_is_not_paid_for_work`.
   - `test_the_dry_run_never_lists_a_spent_allowance_as_held_tonight`.
+- Review round 3 replaced one test, added three and extended four.
+  - `test_a_checkpoint_at_the_age_wall_reaches_the_age_wall_arm` (6.5 days and 7 days + 1 h, each unfinishable and fitting) replaces review 2's `test_a_checkpoint_past_the_age_wall_is_not_paid_for_work`, which pinned the opposite: a checkpoint of any age is never held, so the age-wall arm records its failure, and one past the discard that launches is charged fresh. It is killed by exempting on the aged predicate, and by charging on `progress is not None`.
+  - `test_a_checkpoint_with_no_first_commit_stamp_is_charged_fresh_not_crashed`: `age_s = None` raised `TypeError` in the city loop before the fix.
+  - `test_an_allowance_as_long_as_the_batch_window_is_warned_as_bounding_nothing` (720 and 719 min against a 12 h window).
+  - `test_an_unset_allowance_with_kartaview_enabled_leaves_the_night_as_it_was`: both KartaView channels enabled, a resumer, a fresh pair, a cached walk and a gsv city, with every #464-only helper patched to raise; the launches and the whole `Done:` line are literals, and the same file run against an extracted `origin/main` tree passes this test unchanged.
+  - It also extended four: `test_an_invalid_night_allowance_fails_closed` covers `assess-city`, `test_the_dry_run_holds_what_the_night_would_hold` counts allowance-only cities apart from #444's, `test_ignore_host_holds_lifts_the_night_allowance` pins the narrow `--provider` form in the WARNING, and the fill file's live-checkpoint arm asserts the city is admitted whole.
 
 ## The Mapillary night report (issue #444)
 

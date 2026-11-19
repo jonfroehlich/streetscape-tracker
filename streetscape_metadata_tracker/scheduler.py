@@ -45,6 +45,7 @@ import tomllib
 import traceback
 from collections import Counter, defaultdict
 from collections.abc import Callable, Collection, Mapping, Sequence
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -357,6 +358,12 @@ class HostHold:
         return f"{label}: {self.reason} ({self.detail})"
 
 
+# The held hosts the fill's judges read: a plain set of host names (#444's
+# callers), or one city's ``_city_holds`` reading, host -> its hold, whose
+# reasons name a spent night allowance (issue #464).
+_HeldHosts = AbstractSet[str] | Mapping[str, HostHold]
+
+
 def _utc_minute(when: datetime) -> str:
     """``2026-10-18 21:03 UTC``: how a hold names an instant."""
     return when.astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC")
@@ -571,11 +578,14 @@ def _allowance_checkpoint(cfg: "SchedulerConfig", city: db.CityRow, channel: str
     """Does ``channel`` have a checkpoint tonight's launch would RESUME? (issue #464)
 
     :func:`_sweep_checkpoint_progress`, less one aged past
-    ``CHECKPOINT_MAX_AGE_S``: the child discards that and crawls fresh, so it
-    is neither reserved, exempt nor charged as paid.
+    ``CHECKPOINT_MAX_AGE_S`` or carrying no first-commit stamp (a KartaView v1
+    store, #272): the child discards either and crawls fresh, so it is neither
+    reserved nor charged as paid. The CHARGE class and the reserve read this;
+    the hold's exemption does not (:func:`_paid_for_on_host`).
     """
     progress = _sweep_checkpoint_progress(cfg, city, channel)
-    return progress is not None and progress.get("age_s", 0.0) < CHECKPOINT_MAX_AGE_S
+    age_s = None if progress is None else progress.get("age_s")
+    return age_s is not None and age_s < CHECKPOINT_MAX_AGE_S
 
 
 def _paid_for_on_host(
@@ -583,16 +593,26 @@ def _paid_for_on_host(
 ) -> bool:
     """Is ``city`` PAID-FOR work on ``host`` tonight? (issue #464)
 
-    True when any of ``channels`` touching ``host`` has a live checkpoint
-    (a sweep tonight resumes) or a cached census (a walk that collects for 0
-    requests, #290). Judged per city and host, never per channel, so a city's
-    two KartaView channels are always held or exempted together.
+    True when any of ``channels`` touching ``host`` has a checkpoint or a
+    cached census (a walk that collects for 0 requests, #290). Judged per city
+    and host, never per channel, so a city's two KartaView channels are always
+    held or exempted together.
+
+    ANY readable checkpoint, aged or not -- the predicate
+    :func:`_city_channel_unfinishable` and the launch plan use -- so a
+    checkpoint at or past the age wall still reaches
+    :func:`_sweep_launch_plan`'s age-wall arm, which records the failure that
+    feeds the alert and the quarantine (review round 3, finding 1). Held
+    instead, it would be "left for a later night" every night the fresh
+    allowance is spent, silently. One past ``CHECKPOINT_MAX_AGE_S`` that the
+    arm lets through is a fresh crawl and is charged as one
+    (:func:`_allowance_charge`).
     """
     window_s = _census_reuse_window_s(cfg)
     for channel in channels:
         if host not in CHANNEL_HOSTS.get(channel, ()):
             continue
-        if _allowance_checkpoint(cfg, city, channel):
+        if _sweep_checkpoint_progress(cfg, city, channel) is not None:
             return True
         if channel_census_cache_marker(city, channel, max_age_s=window_s) is not None:
             return True
@@ -607,7 +627,8 @@ def _city_holds(
     ``holds.current()``, less a spent night allowance on a host where the
     city is paid-for work (:func:`_paid_for_on_host`): a live checkpoint must
     be resumed on consecutive nights or it ages out at the 7-day wall as a
-    recorded failure, and a cached census costs no requests at all. THE ONE
+    recorded failure, one at the wall is the age-wall arm's to judge, and a
+    cached census costs no requests at all. THE ONE
     reading the launch gate, the dry run and the fill all take, so none of
     them can disagree about which city is held.
 
@@ -726,6 +747,16 @@ def _reserve_allowance_resumes(
         holds.reserve(host, resumers * launch_s, resumers)
         usage = holds.usage(host)
         assert usage is not None
+        if usage.allowance_s >= cfg.max_batch_hours * 3600:
+            # Accepted (the loader's bound is a units-typo guard, a day), but a
+            # run cannot launch for longer than its own batch window, so this
+            # allowance can never be spent (review round 3, finding 5).
+            logger.warning(
+                f"{HOST_LABELS.get(host, host)} night allowance "
+                f"{usage.allowance_s / 60:g} min is at least the "
+                f"{cfg.max_batch_hours:g} h batch window, so it bounds nothing; "
+                f"lower [hosts.{host}].{_HOST_ALLOWANCE_KEY} or unset it (issue #464)."
+            )
         logger.info(
             f"{HOST_LABELS.get(host, host)} night allowance {usage.allowance_s / 60:g} min: "
             f"{resumers} city(ies) resume a live checkpoint tonight "
@@ -10538,7 +10569,9 @@ def cmd_run_due(
                     f"{HOST_LABELS.get(h, h)} {m:g} min"
                     for h, m in sorted(cfg.host_night_minutes.items())
                 )
-                + ") is lifted too (issue #464)"
+                + ") is lifted too (issue #464; to lift the allowance alone, run only "
+                "`--provider kartaview,kartaview_streets`, never a full run, which also "
+                "lifts the tile CDN's rest night and refusal cooldown)"
                 if cfg.host_night_minutes
                 else ""
             )
@@ -10789,6 +10822,7 @@ def cmd_run_due(
         # night reaches. Its held pairs still hold the fill, as they do live.
         previewed = 0
         passed_over = 0
+        passed_over_allowance = 0
         passed_over_unfinishable = 0
         for city in due:
             if previewed >= day_cap:
@@ -10796,7 +10830,14 @@ def cmd_run_due(
             city_channels = providers_for_city[city.city_id]
             city_holds = _city_holds(cfg, city, city_channels, holds)[0]
             if city_channels and all(_held_by(p, city) for p in city_channels):
-                passed_over += 1
+                # Counted by reason (review round 3, finding 4): a city held
+                # by nothing but a spent night allowance is #464's, not #444's.
+                if all(
+                    h.reason == HOLD_ALLOWANCE for p in city_channels for h in _held_by(p, city)
+                ):
+                    passed_over_allowance += 1
+                else:
+                    passed_over += 1
                 for provider in city_channels:
                     preview_unfinished[provider] += 1
                 continue
@@ -10934,6 +10975,12 @@ def cmd_run_due(
                 f"  ({passed_over:,} due city(ies) HELD on every channel passed over, as the "
                 f"night passes them: they take no city-cap slot; issue #444)"
             )
+        if passed_over_allowance:
+            print(
+                f"  ({passed_over_allowance:,} due city(ies) left for a later night by the "
+                f"spent night allowance on every channel passed over, as the night passes "
+                f"them: they take no city-cap slot and stay due; issue #464)"
+            )
         if passed_over_unfinishable:
             print(
                 f"  ({passed_over_unfinishable:,} due city(ies) skipped as unfinishable under "
@@ -10954,7 +11001,6 @@ def cmd_run_due(
                 host_spent=host_spent,
                 unfinished=preview_unfinished,
                 window_start=preview_now - HOST_BUDGET_WINDOW,
-                held_hosts=set(holds.current()),
                 holds=holds,
             )
         if cfg.driving_plan.enabled:
@@ -11542,15 +11588,15 @@ def _run_city_channels(
     # cache hit. A hold that lifts mid-city takes effect from the next city.
     # A night allowance spent between a city's grid and its walk likewise
     # takes effect from the next city (issue #464), and a city that is
-    # paid-for work on the host (a live checkpoint, a cached census) is exempt
+    # paid-for work on the host (a checkpoint, a cached census) is exempt
     # from a spent allowance: `_city_holds` drops that hold for it.
     city_holds, allowance_exempt = _city_holds(cfg, city, providers, blocked_hosts.holds)
     for host in sorted(allowance_exempt):
         blocked_hosts.allowance_exempt.setdefault(host, set()).add(city.city_id)
         logger.info(
             f"{city.city_id}: {HOST_LABELS.get(host, host)} night allowance is spent, but "
-            f"this city resumes a live checkpoint or reuses a cached census there, so it "
-            f"runs as paid-for work (issue #464)."
+            f"this city has a checkpoint there (resumed, or judged at the age wall) or a "
+            f"cached census, so it is not held (issue #464)."
         )
     # ...and the walks the batch deadline deferred (issue #373), stranded
     # below when their grid sibling landed in this same call.
@@ -14002,7 +14048,7 @@ def _fill_leaves_to_due_schedule(
     return est
 
 
-def _fill_held_reason(on_hold: set[str], held_hosts: Collection[str]) -> str:
+def _fill_held_reason(on_hold: set[str], held_hosts: _HeldHosts) -> str:
     """Why the fill's held hosts are held, for the decline line.
 
     "rest night or cooldown" -- the #444 wording, byte for byte -- unless
@@ -14026,7 +14072,7 @@ def _fill_prebudget_refusal(
     city: db.CityRow,
     channels: Sequence[str],
     latched: set[str],
-    held_hosts: Collection[str] = frozenset(),
+    held_hosts: _HeldHosts = frozenset(),
 ) -> FillVerdict | None:
     """The two refusals that precede the budget rule, or None (issue #404).
 
@@ -14087,7 +14133,7 @@ def _fill_judge(
     reserve: dict[str, int] | None = None,
     fill_spent: dict[str, int] | None = None,
     held: set[str] | frozenset[str] = frozenset(),
-    held_hosts: Collection[str] = frozenset(),
+    held_hosts: _HeldHosts = frozenset(),
     holds: HostHolds | None = None,
 ) -> tuple[FillVerdict, dict[str, int]]:
     """Every admission question in order, against ledgers already read (#404).

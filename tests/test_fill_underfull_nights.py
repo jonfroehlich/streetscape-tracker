@@ -1719,8 +1719,11 @@ def test_a_spent_night_allowance_leaves_kartaview_not_the_city(conn, monkeypatch
         cfg, conn, TODAY, city, ["gsv", "mapillary", "kartaview"], 10_000.0, breaker, held=held
     )
     if arm == "live-checkpoint":
-        assert "kartaview" not in verdict.left, verdict
-        assert verdict.host_left == ()
+        # Admitted WHOLE, KartaView included (#464 review round 3, finding 8):
+        # not merely "not left", which a declined city also satisfies.
+        assert verdict.admit is True, verdict
+        assert verdict.run == ("gsv", "mapillary", "kartaview")
+        assert verdict.left == () and verdict.host_left == ()
         return
     assert verdict.admit is True, verdict
     assert verdict.run == ("gsv", "mapillary")

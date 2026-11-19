@@ -659,14 +659,19 @@ A channel the per-city ceiling cannot finish is never called held: it falls thro
 
 **Paid-for work is never held, because a strict bound would age checkpoints out.**
 A paused sweep has to be resumed on consecutive nights, and a checkpoint at the 7-day wall that cannot finish is a recorded failure and a discarded crawl.
-So a city is exempt from a spent allowance when any of its channels on the host has a live checkpoint or a cached census (#290); the exemption is per city and host, never per channel, so a resumed grid that completes tonight is followed by its free walk, and a walk whose grid landed earlier (the #380 stranded-walk retry's case) still collects for 0 requests.
+So a city is exempt from a spent allowance when any of its channels on the host has a checkpoint or a cached census (#290); the exemption is per city and host, never per channel, so a resumed grid that completes tonight is followed by its free walk, and a walk whose grid landed earlier (the #380 stranded-walk retry's case) still collects for 0 requests.
 Each LAUNCH is classed from its own channel's state: a cached census (`est == 0`) is not charged at all, since it sends no KartaView requests and its wall clock may be an Overpass fetch; a resume of a live checkpoint on that channel is charged as paid; anything else is fresh.
+**The exemption takes ANY readable checkpoint, aged or not, and the charge only a live one** (review round 3).
+The exemption is the predicate `_city_channel_unfinishable` and the launch plan use, so a checkpoint at the age wall still reaches the age-wall arm, which records the failure that feeds the alert and the quarantine; held instead, it would be left for a later night every night the fresh allowance is spent, and nothing would alert.
+A checkpoint past `CHECKPOINT_MAX_AGE_S`, or one with no first-commit stamp (a KartaView v1 store, #272), is discarded by the child, so when the arm lets it launch it is charged as fresh and it is not reserved.
+A fresh walk on a network that is not yet frozen is charged whole, its Overpass fetch included (up to the ~7.5 min retry window): the measured wall clock is the one honest reading the launch site has, and the error is in the conservative direction.
 
 **Tonight's resumes are reserved first** (`_reserve_allowance_resumes`, once per run, before the dry-run branch).
 The reserve is R × l: R is the number of slate cities with a live checkpoint on a due KartaView channel (cities, not channels, since a walk behind its grid's checkpoint defers), and l is one paced launch, `min(ceiling, per_night × 60 / rate)`, which at prod's 1.5/min is `min(3600, 37 × 40) = 1480` s, about 24.7 min (the issue measured 23.3 min for one 37-request launch).
 Fresh crawls get `allowance − R × l`, and nothing when the reserve meets the allowance.
 Without the reserve, fresh crawls could spend the whole allowance and the exempt resumes run on top, adding checkpoints every night until the night is long again.
-The slate is never truncated, so R counts resumers past the city cap too: an over-estimate, in the safe direction.
+The slate is never truncated, so R counts resumers past the city cap too, and a checkpoint 6 to 7 days old that the age wall will refuse: an over-estimate, in the safe direction.
+The reserve is never reconciled against what actually launched, so on a night with many live checkpoints it can hold every fresh crawl from the start even when few resumers run; that is a known limit, not a bug.
 
 **What it reports.**
 The run's start logs one INFO line with the allowance, R and the reserve.
@@ -677,17 +682,20 @@ It never contains `HELD`, and the counts never reach `held_launches`, because `s
 The `on the KartaView API ... (N h)` clause is first launch to last finish, and it will still read long: exempt resumes behind the gsv block, cached walks, the stranded-walk retry and the fill's KartaView launches all run late.
 So this change reduces KartaView's volume and launch minutes; it is never to be read as shortening or concentrating its presence.
 `run-due --dry-run` prints the allowance and the reserve, charges its own preview at the configured pace (the night charges measured wall clock, so the night can hold cities the preview lists), and prints a held channel `HELD (night allowance spent)`.
+A city passed over because the spent allowance holds every channel it is due on is counted on its own line, `left for a later night by the spent night allowance`, never in #444's `HELD on every channel passed over` count.
 `scheduler status` names the setting; usage is per run and in memory, so it is on each night's `Done:` line only.
 
 **It is a soft bound.**
 It is read once per city, so the city in flight finishes both channels (at worst two launches at the 60-minute ceiling), and the reserve is priced at the paced rate, so a slower host overruns it.
 **It is per run and in memory**: every `run-due` starts at zero, including a hand run, the timer watchdog's catch-up night, a re-run after a crash, and each pasted recovery command (`docs/operations.md`).
 `--ignore-host-holds` lifts it for one invocation, logged at WARNING.
+It is the only way to lift the allowance, and it lifts every hold, so the safe form is `run-due --provider kartaview,kartaview_streets --ignore-host-holds`: a full run with it also launches on the tile CDN on a rest night or inside a refusal cooldown, and the WARNING says so.
 For the fill, a spent allowance is a held host for a fresh KartaView crawl and not for paid-for work, read through the same `_city_holds`; on a real night the held KartaView pairs are unattempted, so the fill already leaves them as a backlog (`held_left`), and `host_left` is only the edge path when no held pair is left to count.
 
 **Accepted only on `[hosts.kartaview]`**, for the reason `max_city_minutes` is KartaView-only: a spent allowance holds the host for the fill, whose leave-to-due exception is KartaView's alone.
 On the tile CDN it would end the fill for every Mapillary-member city (#443), and on Panoramax it would decline every Panoramax member's fill city whole.
 A value that is not a number of minutes in (0, 1440], or the key on any other host, fails CLOSED like every `[hosts.*]` key: `run-due` and `assess-city` exit 64.
+A value of at least `max_batch_hours × 60` is accepted but can never be spent, so each run logs a WARNING that it bounds nothing.
 
 **Choosing the value needs two prod reads, and is the Maintainer's.**
 
