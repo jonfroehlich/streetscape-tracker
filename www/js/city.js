@@ -451,6 +451,7 @@ function applyDesired({ fromMove = false, freeze = false } = {}) {
     inPopulation: (m) => accept(m.options.panoIdx),
     prevPlan: lastPlan,
     sampleKey: `${modeCacheGeneration}|${filter.officialOnly}|${year}`,
+    yearFiltered: activeYears.size > 0,
   });
   // The legend's "in view" figure counts the VISIBLE map, not the padded area.
   plan.visible = plan.mode === "view"

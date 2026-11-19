@@ -15,6 +15,7 @@ const path = require("node:path");
 const {
   TIER_LEAVE_FACTOR,
   TIER_ANNOUNCEMENTS,
+  TIER_ANNOUNCEMENTS_YEAR,
   mercatorCell,
   mortonEncode,
   mortonDecode,
@@ -397,6 +398,8 @@ test("planner: a 'complete' from mode all earns no band — the view re-enters a
     populationSize: size, prevTier: "complete", prevPlan: all, freezeTier: true, countInView: () => size,
   }));
   assert.equal(frozen.tier, "sampled");
+  // The freeze was refused, so what is drawn changed: that is announced.
+  assert.equal(frozen.announce, TIER_ANNOUNCEMENTS.sampled);
   // The band still holds a "complete" the view earned...
   const entered = planMapView(state({ populationSize: size, prevTier: "sampled", countInView: () => BUDGET }));
   assert.equal(entered.mode, "view");
@@ -429,6 +432,27 @@ test("planner: announces once per actual tier change, never on the first plan or
   assert.equal(planMapView(state({ prevTier: "sampled", countInView: () => 10 ** 6 })).announce, null);
   assert.equal(planMapView(state({ prevTier: null, countInView: () => 10 })).announce, null);
   assert.match(TIER_ANNOUNCEMENTS.sampled, /zoom in/i);
+});
+
+test("planner: under a year filter the announcement says 'of this year', as the notice does", () => {
+  // PR #470 review 4: the live region said "Every panorama in view is now
+  // drawn." while the visible notice said "...of this year in view".
+  const complete = planMapView(state({ prevTier: "sampled", countInView: () => 10, yearFiltered: true }));
+  assert.equal(complete.announce, TIER_ANNOUNCEMENTS_YEAR.complete);
+  assert.match(complete.announce, /of this year in view/);
+  const sampled = planMapView(state({ prevTier: "complete", countInView: () => LEAVE + 1, yearFiltered: true }));
+  assert.equal(sampled.announce, TIER_ANNOUNCEMENTS_YEAR.sampled);
+  assert.match(sampled.announce, /of this year in view.*zoom in/i);
+  // A year filter that fits the cap is drawn whole (mode "all"): same words.
+  const all = planMapView(state({ populationSize: BUDGET - 1, prevTier: "sampled", yearFiltered: true }));
+  assert.equal(all.mode, "all");
+  assert.equal(all.announce, TIER_ANNOUNCEMENTS_YEAR.complete);
+  // The wording never decides the tier.
+  for (const [prevTier, count] of [["sampled", 10], ["complete", LEAVE + 1], ["complete", LEAVE]]) {
+    const bare = planMapView(state({ prevTier, countInView: () => count }));
+    const year = planMapView(state({ prevTier, countInView: () => count, yearFiltered: true }));
+    assert.deepEqual([year.mode, year.tier], [bare.mode, bare.tier]);
+  }
 });
 
 test("planner: a popup's own auto-pan never re-tiers", () => {
@@ -567,6 +591,9 @@ test("drawnNoticeText says, in words, which state the dots are in", () => {
   // (review 2: "all 498 in view" while 7,195 dated panoramas were in view).
   assert.equal(drawnNoticeText({ mode: "view", drawn: 520, population: 3420, visible: 498, yearFiltered: true }),
     "Showing all 498 panoramas of this year in view.");
+  // ...and the sampled tier's population is that year's too (review 4).
+  assert.equal(drawnNoticeText({ mode: "sample", drawn: 40000, population: 44000, visible: null, yearFiltered: true }),
+    "Showing a spatial sample: 40,000 of 44,000 panoramas of this year. Zoom in to see every panorama.");
   assert.match(drawnNoticeText({ mode: "all", population: 50001, renderAll: true }), /all 50,001.*slow/);
   assert.match(drawnNoticeText({ mode: "hidden" }), /hidden/);
 });

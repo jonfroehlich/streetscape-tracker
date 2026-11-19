@@ -597,6 +597,18 @@ const TIER_ANNOUNCEMENTS = {
 };
 
 /**
+ * The same words under a year filter, matching the legend's notice
+ * (drawnNoticeText): the counts are then that year's panoramas only, so the
+ * bare form would tell a screen-reader user every panorama is drawn while the
+ * visible notice says "of this year" (PR #470 review 4).
+ */
+const TIER_ANNOUNCEMENTS_YEAR = {
+  complete: "Every panorama of this year in view is now drawn.",
+  sampled: "Too many panoramas of this year in view to draw them all: the map now shows a "
+    + "spatial sample. Zoom in to see every panorama.",
+};
+
+/**
  * Whether the drawn set depends on the view at all. False exactly when the
  * population fits the budget (every city at or under RENDER_CAP, and a larger
  * city under a year filter that fits) or "Render all" is on: those take the
@@ -653,6 +665,14 @@ function completeFromView(prevPlan) {
  * A view-dependent plan therefore draws at most TIER_LEAVE_FACTOR × budget
  * panos (plus the date's and the pin), and more than the budget only while
  * staying in a "complete" tier that a view holding at most the budget entered.
+ * A zoom does not reset the band, by design: zoom in until a view earns
+ * "complete", zoom back out, and the tier holds while the count stays within
+ * the band, so a city of at most TIER_LEAVE_FACTOR × budget panos then draws
+ * every pano at every zoom for the rest of the session. Only the routes where
+ * no view earned the tier (mode "all": a year filter, Render all) are closed.
+ *
+ * A tier change is announced unless the freeze held the tier (then nothing
+ * changed); a freeze the band rule refused is a real change and is announced.
  *
  * The selected capture date never decides the tier or narrows the set: its
  * panos are unioned in, as before #77, so the map cannot under-show the
@@ -704,6 +724,8 @@ function completeFromView(prevPlan) {
  * @param {string} [s.sampleKey] - Names the sample `sampleItems` returns (the
  *   filter, and which build of the caches); equal keys mean the same sample.
  * @param {?string} [s.dateKey] - Names the selected date, or null.
+ * @param {boolean} [s.yearFiltered] - A year filter is active; picks the
+ *   announcement's wording (TIER_ANNOUNCEMENTS_YEAR), never the tier.
  * @returns {{mode: string, tier: ?string, desired: Set, inViewCount: ?number,
  *   announce: ?string, flatShown: boolean, reused: boolean, sampleKey: ?string,
  *   dateKey: ?string, pinnedItem: *, completeFromView?: boolean}} A "hidden"
@@ -759,13 +781,15 @@ function planMapView(s) {
     if (pinnedItem != null) desired.add(pinnedItem);
   }
 
-  const changed = s.prevTier != null && tier !== s.prevTier && !s.freezeTier;
+  // A freeze that held the tier leaves tier === prevTier, so it is never
+  // announced; one completeFromView refused changed what is drawn, and is.
+  const changed = s.prevTier != null && tier !== s.prevTier;
   return {
     mode,
     tier,
     desired,
     inViewCount,
-    announce: changed ? TIER_ANNOUNCEMENTS[tier] : null,
+    announce: changed ? (s.yearFiltered ? TIER_ANNOUNCEMENTS_YEAR : TIER_ANNOUNCEMENTS)[tier] : null,
     flatShown,
     reused,
     sampleKey,
@@ -808,7 +832,8 @@ function drawnNoticeText(s) {
   // No threshold is quoted: the tier is counted over the drawn area (the view
   // plus a margin) with hysteresis, so "N or fewer in view" would be false for
   // a view holding fewer than N that is still sampled.
-  return `Showing a spatial sample: ${f(s.drawn)} of ${f(s.population)} panoramas. `
+  return `Showing a spatial sample: ${f(s.drawn)} of ${f(s.population)} panoramas`
+    + `${s.yearFiltered ? " of this year" : ""}. `
     + "Zoom in to see every panorama.";
 }
 
@@ -819,6 +844,7 @@ if (typeof module !== "undefined" && module.exports) {
     INDEX_MIN_LEVEL,
     TIER_LEAVE_FACTOR,
     TIER_ANNOUNCEMENTS,
+    TIER_ANNOUNCEMENTS_YEAR,
     mercatorCell,
     cellBounds,
     mortonEncode,

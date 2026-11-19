@@ -97,7 +97,12 @@ function addBasemapLayer(map) {
  * Once a view has entered that every-pano tier it stays in it up to
  * TIER_LEAVE_FACTOR (1.25) × this count, so a pan across the threshold does
  * not flicker; that band is the one way more than this many are drawn without
- * "Render all" (plus a selected date's panos, which are always drawn).
+ * "Render all" (plus a selected date's panos, which are always drawn). A zoom
+ * does not reset it, by design: a city of at most 1.25 × this count that a
+ * zoom-in brought into the every-pano tier keeps it on zooming back out, and
+ * then draws all of its panos at every zoom for the session. Only a tier no
+ * view earned (a year filter or "Render all" drawing the whole population)
+ * leaves no band behind.
  * "Render all" stays as the opt-in override. The diff overlay (diff-overlay.js)
  * still stride-samples, at a quarter of this cap, at every zoom. Reported
  * stats/counts/plot always use the FULL in-memory set — only the drawn dots are

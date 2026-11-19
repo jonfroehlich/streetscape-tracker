@@ -36,7 +36,9 @@ LEVELS = (0, 1, 2, 4, 8, 10, 12, 14, 15, 16, 18, 20)
 # a point ON an edge would make the golden a coin toss rather than a contract.
 EDGE_MARGIN_CELLS = 1e-6
 
-# Two values the plan derived by hand and the review recomputed independently.
+# Named cities across hemispheres and latitudes. Two of their cells (Seattle at
+# level 10, Sydney at level 12) the plan derived by hand and the review recomputed
+# independently; test_the_hand_derived_cells_are_in_the_golden asserts those.
 NAMED = [
     ("seattle", 47.6062, -122.3321),
     ("sydney", -33.8688, 151.2093),
@@ -46,7 +48,7 @@ NAMED = [
     ("tokyo", 35.6762, 139.6503),
 ]
 
-# A 3x3 cluster around a zoom-8 tile CORNER (x 43/44, y 90/91), so the golden
+# A 3x3 cluster around a zoom-8 tile CORNER (x 42|43, y 90|91), so the golden
 # holds points on all four sides of a coarse boundary.
 Z8_CORNER_LON = 43 / 256 * 360 - 180  # -119.53125
 Z8_CORNER_LAT = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * 91 / 256))))

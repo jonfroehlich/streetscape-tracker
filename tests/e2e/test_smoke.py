@@ -3149,6 +3149,7 @@ _DENSE_STATE_FN = """() => {
 }"""
 
 _COMPLETE = "Every panorama in view is now drawn."
+_COMPLETE_YEAR = "Every panorama of this year in view is now drawn."
 _SAMPLED = (
     "Too many panoramas in view to draw them all: the map now shows a spatial sample. "
     "Zoom in to see every panorama."
@@ -3564,7 +3565,13 @@ def test_a_year_filter_round_trip_leaves_no_band_behind(page: Page, base_url, de
     The 45,000-pano census city loads sampled. A year filter fits the cap, so it
     is drawn whole (mode "all", tier "complete"); clearing the filter on the same
     view used to keep "complete" through the 1.25x band and draw all 45,000 dots,
-    more than RENDER_CAP, at every zoom from then on.
+    more than RENDER_CAP, at every zoom from then on. Only this route and Render
+    all are closed: zooming in until a view earns "complete" and back out keeps
+    it by design (the band is anti-flicker, and a view earned it), so that
+    session does draw all 45,000 (review 4, N1).
+
+    The year filter's own announcement says "of this year", as the legend does,
+    which pins city.js passing `yearFiltered` to the planner (review 4, N2).
     """
     errors = _capture_errors(page)
     page.set_viewport_size({"width": 1440, "height": 900})
@@ -3575,6 +3582,7 @@ def test_a_year_filter_round_trip_leaves_no_band_behind(page: Page, base_url, de
     year = page.evaluate("inModeAll[0].options.captureDate.getFullYear()")
     page.evaluate(f"toggleYear({year})")
     assert page.evaluate("lastPlan.mode") == "all", "precondition: the year fits the cap"
+    assert _dense_state(page)["status"] == _COMPLETE_YEAR
     page.evaluate(f"toggleYear({year})")
     s = _dense_state(page)
     assert (s["tier"], s["mode"]) == ("sampled", "sample"), s
