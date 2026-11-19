@@ -21,6 +21,11 @@ Policy (per city, driven by the audit `verdict`):
   * WRONG_PLACE / NO_POLYGON / NOT_FOUND / BBOX_SUSPECT / OVER -> MANUAL REVIEW
     (geometry left untouched — a wrong OSM match must not be applied blindly).
   * OK -> skipped silently.
+  * UNDER, but the grid was fitted by hand with scripts/resize_city.py (its
+    cities.notes carry db.MANUAL_RESIZE_NOTE) -> MANUAL REVIEW. A grid shrunk
+    to a town's streets is "UNDER" its boundary on purpose, and growing it back
+    unattended would undo the fit and, once the city has runs, break its diff
+    continuity (issue #459).
 
 Grid geometry is otherwise immutable; this is the deliberate escape hatch
 (db.update_city_geometry). Re-registration makes ZERO provider API calls — it
@@ -95,6 +100,9 @@ class Current:
     width_m: int
     height_m: int
     step_m: int
+    # True when cities.notes carry db.MANUAL_RESIZE_NOTE: someone fitted this
+    # grid by hand, so it is never resized unattended (issue #459).
+    manually_resized: bool = False
 
 
 @dataclass
@@ -220,6 +228,39 @@ def recommend(row: dict, current: Current, ceiling_m: float = REC_CEILING_M) -> 
     )
 
 
+def _keep_hand_fit(current: Current, why_deferred: str) -> dict:
+    """The rec_* fields for a hand-fitted grid: its own geometry, and why.
+
+    ``why_deferred`` is appended to the basis because the review page shows
+    rec_basis IN PLACE OF the reason, so a deferral's own explanation
+    ("verify geocode first", the 30 km threshold) would otherwise never reach
+    the reviewer.
+    """
+    return dict(
+        rec_center_lat=round(current.center_lat, 6),
+        rec_center_lon=round(current.center_lon, 6),
+        rec_width_m=current.width_m,
+        rec_height_m=current.height_m,
+        rec_basis=(
+            "keep current: this grid was fitted by hand (scripts/resize_city.py), "
+            f"so do not resize it without checking that fit. Audit: {why_deferred}"
+        ),
+    )
+
+
+# How a hand-fitted grid's keep-current basis introduces recommend()'s advice.
+GENERIC_ADVICE_LABEL = "Advice for a grid that was NOT fitted by hand, shown for reference only"
+
+# The DEFER reason for a hand-fitted grid (issue #459). "Recentered on or
+# grown to", not "grown back": a hand fit already larger than its OSM bbox but
+# off its midpoint is graded UNDER too, and the RESIZE it is spared would only
+# have moved its center.
+MANUAL_RESIZE_REASON = (
+    "manually resized (scripts/resize_city.py); review by hand, "
+    "the audit would have recentered it on or grown it to its OSM bbox unattended"
+)
+
+
 def decide(row: dict, current: Current | None, threshold_m: float = REVIEW_THRESHOLD_M) -> Decision:
     """
     Pure policy: map one audit-report row + current geometry to a Decision.
@@ -239,6 +280,24 @@ def decide(row: dict, current: Current | None, threshold_m: float = REVIEW_THRES
     def defer(reason):
         # Deferred cities carry both current geometry and an advisory
         # recommended geometry, for side-by-side human review.
+        # A hand-fitted grid (issue #459) never gets recommend()'s advice,
+        # on ANY deferral: the review page shows rec_basis in place of the
+        # reason and offers the recommended rectangle as a one-click choice
+        # unless it equals the current one, so a generic "grow to full OSM
+        # bbox" would hide the fit and invite undoing it.
+        rec = recommend(row, current)
+        if current.manually_resized:
+            # recommend()'s basis carries branch advice the reason lacks
+            # (WRONG_PLACE: "verify geocode first"), so keep both in the text.
+            # That advice was computed as if the grid were never fitted
+            # ("grow to full OSM bbox"), so it is labelled as such rather than
+            # left to read as a second recommendation beside "keep current".
+            audit = (
+                reason
+                if reason == MANUAL_RESIZE_REASON
+                else f"{reason}. {GENERIC_ADVICE_LABEL}: {rec['rec_basis']}"
+            )
+            rec = _keep_hand_fit(current, audit)
         return d(
             "DEFER",
             reason,
@@ -246,7 +305,7 @@ def decide(row: dict, current: Current | None, threshold_m: float = REVIEW_THRES
             old_center_lon=current.center_lon,
             old_width_m=current.width_m,
             old_height_m=current.height_m,
-            **recommend(row, current),
+            **rec,
         )
 
     if current is None:
@@ -307,17 +366,27 @@ def decide(row: dict, current: Current | None, threshold_m: float = REVIEW_THRES
     )
     if already:
         return d("NOCHANGE", "already at target geometry", **common)
+    if current.manually_resized:
+        # Checked last, so only a would-be RESIZE is diverted: the other
+        # branches already leave the geometry alone.
+        return defer(MANUAL_RESIZE_REASON)
     return d("RESIZE", "recenter on OSM midpoint + grow to OSM bbox", **common)
 
 
 def load_current_geometry(conn) -> dict:
     """Map city_id -> Current for every city in the catalog."""
     rows = conn.execute(
-        "SELECT city_id, center_lat, center_lon, grid_width_m, grid_height_m, step_m FROM cities"
+        "SELECT city_id, center_lat, center_lon, grid_width_m, grid_height_m, step_m, notes "
+        "FROM cities"
     ).fetchall()
     return {
         r["city_id"]: Current(
-            r["center_lat"], r["center_lon"], r["grid_width_m"], r["grid_height_m"], r["step_m"]
+            r["center_lat"],
+            r["center_lon"],
+            r["grid_width_m"],
+            r["grid_height_m"],
+            r["step_m"],
+            manually_resized=db.MANUAL_RESIZE_NOTE in (r["notes"] or ""),
         )
         for r in rows
     }
@@ -423,6 +492,11 @@ def main() -> int:
     print(f"Re-register (recenter + resize): {len(resize)}")
     print(f"Already at target (no change):   {len(nochange)}")
     print(f"Deferred to manual review:       {len(defer)}")
+    # Shows the issue #459 guard fired: these rows recommend their own geometry.
+    # (A DEFER always has a catalog row: decide() SKIPs an unknown city.)
+    hand_fitted = sum(current_by_id[d.city_id].manually_resized for d in defer)
+    if hand_fitted:
+        print(f"  of which hand-fitted (kept):   {hand_fitted}")
     print(
         f"Grid-point delta from resizes:   {point_delta:+,} "
         f"(one-time; free GSV metadata, ~{point_delta // 90:+,}/day over the 90-day cycle)"

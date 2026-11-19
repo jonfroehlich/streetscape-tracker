@@ -25,6 +25,25 @@ already-registered cities are skipped, so it is safe to re-run and resumable
 via ``--limit``. Makes ZERO provider API calls (geocoding is rate-limited
 Nominatim, no keys needed). Dry-run by default; pass --execute to write.
 
+The dry run geocodes nothing, so it cannot run --execute's check of each row
+against the GEOCODED centers of the rows registered before it in the same
+batch. It compares manifest coordinates instead: a row within --overlap-km of
+an earlier would-be-new row prints REUSE IN-BATCH (and is counted in
+reused-existing, as --execute counts it), and one within --overlap-km
++ --max-center-km of another earlier row that is not headed for an existing
+catalog city gets a WARNING line, since the center guard lets a geocoded
+center sit that far from its manifest point (issue #460).
+
+It compares distance only, never identity. Two rows that share a query, or a
+city/admin/country under different queries, are NOT flagged when they sit
+farther apart than that, although --execute makes one city of them (issue
+#467). Two rows that share a query and sit within --overlap-km print REUSE
+IN-BATCH and count as reused-existing here, where --execute counts the second
+as already-registered: the same city either way, in a different summary
+bucket. It is a preview, not a proof: it assumes every earlier row registers,
+and a row that fails to geocode under --execute changes the outcome
+for its neighbours.
+
 Safety rails (issue #110):
   * **Overlap reuse.** A frame city whose GeoNames coordinates fall within
     ``--overlap-km`` (default 25) of an already-registered city — under ANY
@@ -114,6 +133,37 @@ def find_overlap(existing_cities, lat, lon, overlap_km):
         if d <= best_km:
             best, best_km = city, d
     return best
+
+
+def in_batch_neighbour(earlier_new_rows, lat, lon, reach_km):
+    """
+    The nearest of ``earlier_new_rows`` within ``reach_km`` (inclusive, like
+    ``find_overlap``) of (lat, lon), as ``(label, km)``, or None. Dry run only
+    (issue #460).
+
+    ``--execute`` checks each row against the rows registered before it in the
+    same batch, at their GEOCODED centres. The dry run geocodes nothing, so it
+    compares manifest coordinates instead and reports the pairs that are close
+    enough for the answer to depend on where the earlier row geocodes.
+
+    Args:
+        earlier_new_rows: ``(label, lat, lon)`` for the earlier rows to
+            compare against: the would-be-new rows for the nominal outcome,
+            and those plus the REUSE IN-BATCH rows for warnings.
+        reach_km: how far to look; ``main`` passes ``overlap_km +
+            max_center_km``, the farthest an earlier row's manifest point can
+            be while its accepted centre still lands within ``overlap_km``.
+
+    Example:
+        >>> in_batch_neighbour([("[1] A", 10.0, 20.0)], 10.0, 20.05, 15.0)[0]
+        '[1] A'
+    """
+    best, best_km = None, reach_km
+    for label, other_lat, other_lon in earlier_new_rows:
+        d = _haversine_km(lat, lon, other_lat, other_lon)
+        if d <= best_km:
+            best, best_km = label, d
+    return None if best is None else (best, best_km)
 
 
 def frame_identity(row):
@@ -344,6 +394,14 @@ def main(argv=None):
 
     already = reused = new = failed = 0
     needs_review = []
+    # Dry run only (issue #460): the rows it would register, at their manifest
+    # coordinates, and how many later rows sit close enough to one of them that
+    # --execute could alias instead of register.
+    would_be_new = []
+    # Every row the dry run did not send to an EXISTING catalog city, REUSE
+    # IN-BATCH rows included; warnings are checked against all of them.
+    in_batch_candidates = []
+    in_batch_reuse = in_batch_at_risk = in_batch_notes = 0
     try:
         existing_cities = db.get_all_cities(conn)
         for i, row in enumerate(frame, 1):
@@ -375,12 +433,64 @@ def main(argv=None):
                     print(
                         f"{prefix} -> REUSE existing {overlap.city_id} ({km:.0f} km; would alias)"
                     )
+                    # --execute picks the NEAREST of the catalog cities and the
+                    # rows registered so far, so an earlier row of this batch
+                    # that geocodes nearer becomes the alias target instead.
+                    rival = in_batch_neighbour(
+                        in_batch_candidates,
+                        float(row["lat"]),
+                        float(row["lon"]),
+                        km + args.max_center_km,
+                    )
+                    if rival is not None:
+                        print(
+                            f"    NOTE: {rival[0]} is {rival[1]:.1f} km away by manifest "
+                            f"points; if its geocoded center is nearer than "
+                            f"{overlap.city_id}'s, --execute aliases this row onto it instead."
+                        )
+                        in_batch_notes += 1
                 reused += 1
                 continue
 
             if not args.execute:
-                print(f"{prefix} -> NEW (would geocode + register disabled)")
-                new += 1
+                lat, lon = float(row["lat"]), float(row["lon"])
+                label = f"[{i}] {query}"
+                reach_km = args.overlap_km + args.max_center_km
+                nominal = in_batch_neighbour(would_be_new, lat, lon, args.overlap_km)
+                if nominal is not None:
+                    # --execute aliases this row unless the earlier one geocodes
+                    # farther away than its manifest point.
+                    print(
+                        f"{prefix} -> REUSE IN-BATCH {nominal[0]} ({nominal[1]:.1f} km between "
+                        f"manifest points; --execute would alias unless that row's geocoded "
+                        f"center lands more than {args.overlap_km:g} km away)"
+                    )
+                    in_batch_reuse += 1
+                    # Counted where --execute counts it, so the two summary
+                    # lines agree and the dry run's counts add up to the rows.
+                    reused += 1
+                else:
+                    print(f"{prefix} -> NEW (would geocode + register disabled)")
+                    would_be_new.append((label, lat, lon))
+                    new += 1
+                # Warn against EVERY earlier candidate, a REUSE IN-BATCH row
+                # included: that row is registered after all if its own target
+                # geocodes away, and can then capture this one. Over-reporting a
+                # chain is the safe side; missing one is not.
+                others = [c for c in in_batch_candidates if nominal is None or c[0] != nominal[0]]
+                near = in_batch_neighbour(others, lat, lon, reach_km)
+                if near is not None:
+                    in_reach = sum(_haversine_km(lat, lon, c[1], c[2]) <= reach_km for c in others)
+                    more = f" (nearest of {in_reach} in reach)" if in_reach > 1 else ""
+                    print(
+                        f"    WARNING: {near[1]:.1f} km from {near[0]}{more} by manifest points. "
+                        f"--execute checks against that row's GEOCODED center if it is "
+                        f"registered, which may sit up to {args.max_center_km:g} km from its "
+                        f"manifest point; within {args.overlap_km:g} km this row is aliased "
+                        f"onto it."
+                    )
+                    in_batch_at_risk += 1
+                in_batch_candidates.append((label, lat, lon))
                 continue
             try:
                 city_row = register_frame_city(
@@ -410,6 +520,17 @@ def main(argv=None):
         f"\nDone{mode}. already-registered={already} reused-existing={reused} "
         f"newly-registered={new} failed={failed}"
     )
+    if in_batch_reuse or in_batch_at_risk or in_batch_notes:
+        print(
+            f"In-batch neighbours: {in_batch_reuse} row(s) --execute may alias onto an "
+            f"earlier row of this manifest (counted in reused-existing above, as "
+            f"--execute counts them), {in_batch_at_risk} warning(s) for rows close "
+            f"enough that a geocoded center could alias them, and {in_batch_notes} note(s) "
+            f"on catalog reuses. These compare MANIFEST points "
+            f"and assume every earlier row registers. Before --execute, lower --overlap-km, "
+            f"or get each row's geocoded center from scripts/vet_manifest_geometry.py and "
+            f"measure these pairs yourself (it prints centers, not pairwise distances)."
+        )
     if needs_review:
         print("Needs manual review (not registered):")
         for query in needs_review:

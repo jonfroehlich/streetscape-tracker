@@ -6,17 +6,26 @@ undersized->grow, huge-bbox->defer, wrong-place->defer) plus idempotency. No
 network, no DB — decide() takes the report row and current geometry directly.
 """
 
+import csv
 import importlib.util
 import os
+import sys
 
 import pytest
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_spec = importlib.util.spec_from_file_location(
-    "reregister_boundaries", os.path.join(PROJECT_ROOT, "scripts", "reregister_boundaries.py")
-)
-rr = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(rr)
+
+
+def _load_script(name):
+    spec = importlib.util.spec_from_file_location(
+        name, os.path.join(PROJECT_ROOT, "scripts", f"{name}.py")
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+rr = _load_script("reregister_boundaries")
 
 
 def row(verdict, *, osm_w=None, osm_h=None, sug_lat=None, sug_lon=None, city_id="c", name="City"):
@@ -31,8 +40,15 @@ def row(verdict, *, osm_w=None, osm_h=None, sug_lat=None, sug_lon=None, city_id=
     }
 
 
-def cur(lat, lon, w, h, step=20):
-    return rr.Current(center_lat=lat, center_lon=lon, width_m=w, height_m=h, step_m=step)
+def cur(lat, lon, w, h, step=20, manually_resized=False):
+    return rr.Current(
+        center_lat=lat,
+        center_lon=lon,
+        width_m=w,
+        height_m=h,
+        step_m=step,
+        manually_resized=manually_resized,
+    )
 
 
 def test_offset_city_recenters_without_shrinking():
@@ -103,6 +119,162 @@ def test_idempotent_after_applying_target():
     # Feed back the post-execute geometry: same center, grown dimensions.
     applied = cur(first.new_center_lat, first.new_center_lon, first.new_width_m, first.new_height_m)
     assert rr.decide(r, applied).action == "NOCHANGE"
+
+
+# --- issue #459: a hand-fitted grid is never grown back unattended ------------
+
+# Kuna, Idaho's shape (#457): a 4.9 x 5.7 km grid fitted to its streets inside
+# a boundary bbox several times that size, well under the 30 km threshold.
+_FITTED_ROW = dict(osm_w=12000, osm_h=11000, sug_lat=43.49, sug_lon=-116.42)
+
+
+def test_a_manually_resized_grid_is_deferred_not_grown_back():
+    r = row("UNDER", **_FITTED_ROW)
+    # The premise: without the note this exact city IS resized unattended.
+    assert rr.decide(r, cur(43.49753, -116.42638, 4900, 5700)).action == "RESIZE"
+
+    d = rr.decide(r, cur(43.49753, -116.42638, 4900, 5700, manually_resized=True))
+    assert d.action == "DEFER"
+    assert d.reason == rr.MANUAL_RESIZE_REASON
+    # Geometry untouched.
+    assert d.new_width_m is None and d.new_height_m is None
+    assert (d.old_width_m, d.old_height_m) == (4900, 5700)
+    # The review page shows rec_basis in place of the reason and offers the
+    # recommended rectangle as a one-click choice unless it equals the current
+    # one. So the recommendation must BE the current grid and say why, not
+    # recommend()'s generic "grow to full OSM bbox" (PR #466 review).
+    assert (d.rec_center_lat, d.rec_center_lon) == (43.49753, -116.42638)
+    assert (d.rec_width_m, d.rec_height_m) == (4900, 5700)
+    assert "fitted by hand" in d.rec_basis and "grow to full" not in d.rec_basis
+    assert rr.MANUAL_RESIZE_REASON in d.rec_basis  # the page shows the basis, not the reason
+    generic = rr.recommend(r, cur(43.49753, -116.42638, 4900, 5700))
+    assert generic["rec_width_m"] == 12000 and "grow to full" in generic["rec_basis"]  # premise
+
+
+def test_a_hand_fit_larger_than_its_bbox_is_spared_a_recenter():
+    """The guard's reason must not say only "grown back": a hand fit already
+    larger than its OSM bbox but 3 km off its midpoint is a would-be RESIZE
+    that changes the center and no dimension (PR #466 review round 4)."""
+    r = row("UNDER", **_FITTED_ROW)
+    moved = rr.decide(r, cur(43.517, -116.42, 14000, 14000))
+    assert moved.action == "RESIZE"
+    assert (moved.new_width_m, moved.new_height_m) == (14000, 14000)  # recentered, not grown
+    d = rr.decide(r, cur(43.517, -116.42, 14000, 14000, manually_resized=True))
+    assert d.action == "DEFER" and d.reason == rr.MANUAL_RESIZE_REASON
+    assert "recentered it on or grown it" in rr.MANUAL_RESIZE_REASON
+
+
+def test_the_manual_resize_guard_diverts_only_a_would_be_resize():
+    # Already at the audit's target: nothing would change, so nothing to review.
+    at_target = cur(43.49, -116.42, 12000, 11000, manually_resized=True)
+    assert rr.decide(row("UNDER", **_FITTED_ROW), at_target).action == "NOCHANGE"
+    fitted = cur(43.49753, -116.42638, 4900, 5700, manually_resized=True)
+    assert rr.decide(row("OK"), fitted).action == "SKIP"
+    over_threshold = rr.decide(
+        row("UNDER", osm_w=194000, osm_h=153000, sug_lat=43.49, sug_lon=-116.42), fitted
+    )
+    assert over_threshold.action == "DEFER" and "threshold" in over_threshold.reason
+
+
+@pytest.mark.parametrize(
+    "audit_row",
+    [
+        row("UNDER", osm_w=40000, osm_h=35000, sug_lat=43.49, sug_lon=-116.42),  # over 30 km
+        row("NO_POLYGON", **_FITTED_ROW),
+        row("WRONG_PLACE", **_FITTED_ROW),
+    ],
+    ids=["over-threshold", "no-polygon", "wrong-place"],
+)
+def test_every_deferral_of_a_hand_fitted_grid_recommends_keeping_it(audit_row):
+    """A town fitted by hand usually sits inside a huge boundary, which is the
+    over-threshold branch, not the would-be RESIZE one. Whatever defers it, the
+    review page must not be handed a recommendation to grow it (PR #466
+    review round 2). The branch's own reason is kept."""
+    plain = rr.decide(audit_row, cur(43.49753, -116.42638, 4900, 5700))
+    fitted = rr.decide(audit_row, cur(43.49753, -116.42638, 4900, 5700, manually_resized=True))
+    assert plain.action == fitted.action == "DEFER"
+    assert fitted.reason == plain.reason
+    assert (fitted.rec_width_m, fitted.rec_height_m) == (4900, 5700)
+    assert (fitted.rec_center_lat, fitted.rec_center_lon) == (43.49753, -116.42638)
+    assert fitted.rec_basis.startswith("keep current: this grid was fitted by hand")
+    assert "fitted by hand" not in plain.rec_basis  # premise: the generic advice differs
+    # The review page shows rec_basis IN PLACE OF the reason, so the deferral's
+    # own explanation and the generic branch advice must both be in the basis
+    # (round 3): a WRONG_PLACE city still has to say "verify geocode first".
+    assert plain.reason in fitted.rec_basis
+    assert plain.rec_basis in fitted.rec_basis
+    # ...and the generic advice ("grow to full OSM bbox") is introduced as
+    # advice that ignores the hand fit, not left to read as a second
+    # recommendation beside "keep current" (round 4).
+    assert f"{rr.GENERIC_ADVICE_LABEL}: {plain.rec_basis}" in fitted.rec_basis
+
+
+def test_load_current_geometry_reads_the_resize_note_resize_city_writes(
+    tmp_path, monkeypatch, capsys
+):
+    """End to end across the two scripts: the note resize_city.py really writes
+    is the note reregister_boundaries.py really reads, among other notes."""
+    from streetscape_metadata_tracker import db
+
+    catalog = str(tmp_path / "catalog.db")
+    conn = db.connect(catalog)
+    ids = {}
+    for name in ("Kuna", "Boise", "Magna"):
+        ids[name] = db.register_city(
+            conn,
+            city_name=name,
+            state_name="Idaho",
+            state_code="ID",
+            country_name="United States",
+            country_code="US",
+            center_lat=43.5,
+            center_lon=-116.4,
+            grid_width_m=12000,
+            grid_height_m=11000,
+            step_m=20,
+            notes="tranche 3" if name == "Magna" else None,
+        )
+    conn.close()
+
+    resize = _load_script("resize_city")
+    for name in ("Kuna", "Magna"):
+        argv = ["resize_city.py", ids[name], "--width", "4900", "--height", "5700"]
+        monkeypatch.setattr(sys, "argv", [*argv, "--db-path", catalog, "--execute"])
+        assert resize.main() == 0
+
+    conn = db.connect(catalog)
+    current = rr.load_current_geometry(conn)
+    conn.close()
+    assert current[ids["Kuna"]].manually_resized is True
+    assert current[ids["Magna"]].manually_resized is True  # appended after another note
+    assert current[ids["Boise"]].manually_resized is False  # NULL notes
+    assert current[ids["Kuna"]].width_m == 4900
+
+    # The summary says how many deferrals are kept hand fits, so an operator
+    # can see the guard fired (round 5). Kuna and Boise get the same small
+    # UNDER row; only the hand-fitted one is deferred.
+    def summary(city_names):
+        report = tmp_path / "report.csv"
+        rows = [
+            row("UNDER", osm_w=13000, osm_h=12000, sug_lat=43.5, sug_lon=-116.4, city_id=ids[n])
+            for n in city_names
+        ]
+        with open(report, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+        monkeypatch.setattr(
+            sys, "argv", ["reregister_boundaries.py", "--report", str(report), "--db-path", catalog]
+        )
+        capsys.readouterr()
+        assert rr.main() == 0
+        return capsys.readouterr().out
+
+    out = summary(["Kuna", "Boise"])
+    assert "Re-register (recenter + resize): 1" in out
+    assert "Deferred to manual review:       1" in out
+    assert "of which hand-fitted (kept):   1" in out
+    assert "hand-fitted" not in summary(["Boise"])  # no line when the guard did not fire
 
 
 def test_unknown_city_skipped():

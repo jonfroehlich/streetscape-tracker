@@ -595,7 +595,7 @@ python scripts/apply_decisions.py --data-dir "$DATA" --decisions <the exported b
 The four steps are #91's sequence, and their order is load-bearing:
 
 1. **Dry run, then read the plan.**
-   It writes `reregister_plan.csv` (small `UNDER` cities, OSM bbox ≤ 30 km on both axes) and `manual_review.csv` (every other non-`OK` verdict); `build_boundary_review.py` renders only the cities on those two lists, so without this step the page is empty and the gate passes having checked nothing.
+   It writes `reregister_plan.csv` (small `UNDER` cities, OSM bbox ≤ 30 km on both axes) and `manual_review.csv` (every other non-`OK` verdict, plus any small `UNDER` city whose grid was hand-fitted with `resize_city.py` and would otherwise have been resized, #459); `build_boundary_review.py` renders only the cities on those two lists, so without this step the page is empty and the gate passes having checked nothing.
 2. **`--execute`.**
    This is safe here because every city in the batch is disabled and has no runs, so a recenter-and-grow resets no diff continuity.
    It is also required: `build_boundary_review.py` shows a plan city only once its geometry has CHANGED from the audit snapshot, so after a dry run alone every auto-resize city is silently dropped, counted only in a `Resize cities skipped (unchanged geometry)` line and a "not shown" banner — and the page is not empty whenever any DEFER city exists, so nothing else would catch it.
@@ -768,6 +768,8 @@ python scripts/register_frame.py --manifest mapillary_discovery_cities_tranche3.
 # read the dry run: every row "-> NEW", and "newly-registered=25 failed=0"; then the same with --execute
 ```
 
+- Against a catalog that holds none of these rows, the dry run since #460 also prints four `WARNING` lines for rows within 14 km of an earlier one (Stanford 5.4 km from East Palo Alto is the nearest).
+  They are expected: they are the pairs the next bullet measures, and `_tranche3_overlaps.json` records their margins.
 - `--overlap-km 4`, not tranche 2's 5.
   `find_overlap` measures from each row's GeoNames point to every centre already in the catalog, and with `--execute` that includes the GEOCODED centres of the rows this same run has just registered (the dry run registers nothing, so it cannot see those).
   Stanford's point is 5.56 km from East Palo Alto's vetted centre, so at 5 km a 0.6 km geocode drift on the day would silently alias Stanford onto East Palo Alto.
@@ -782,7 +784,15 @@ Read the plan before `--execute`: a RESIZE of one of the 22 unfitted towns chang
 **4. Fit Kuna, Magna and Carmel-by-the-Sea to their streets, AFTER the audit.**
 Their boundary-derived grids are mostly farmland, lake flats and ocean.
 The order matters: `reregister_boundaries.py` grades a grid smaller than its OSM bbox `UNDER` and, below 30 km, grows it back to the bbox unattended, so a fit applied before the audit would be undone by it.
-For the same reason, **never pass these three to a later `reregister_boundaries.py --execute`.**
+For the same reason these three must never be grown back by a later `reregister_boundaries.py --execute`.
+Since #459 the script enforces that itself: `resize_city.py` stamps `cities.notes` with `db.MANUAL_RESIZE_NOTE`, and a would-be RESIZE of a city carrying that note is turned into DEFER (`reregister_boundaries.MANUAL_RESIZE_REASON`).
+Every deferral of such a city, by this branch or by any other (an OSM bbox over the 30 km threshold, `NO_POLYGON`, `WRONG_PLACE`), carries a "keep current" recommendation that names the hand fit, so the review page never offers growing it back as the recommended choice.
+That recommendation's text also carries the audit's own reason and advice, because the page shows the recommendation's basis in place of the reason.
+The guard covers the unattended pass only; an `apply_decisions.py` decision a person made on the review page still applies.
+The note is never removed, since `cities.notes` is append-only: a city fitted with `resize_city.py` once is never resized unattended by a later audit, even after a reviewed geometry is applied to it.
+The guard recognises that one note and nothing else.
+A geometry a person chose another way carries no such note and is still resized unattended when it grades `UNDER` below the threshold:
+an `apply_decisions.py` APPLY (it stamps only its own `APPLY_NOTE`), or a registration with explicit `--width`/`--height` (no note at all).
 `resize_city.py` refuses a city with real runs unless `--force`; these have none, so no `--force` is needed, and a refusal means something collected them — stop.
 
 ```bash
