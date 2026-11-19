@@ -341,10 +341,16 @@ Measured the same day, on our own URL form: keyless, a well-formed but wrong key
 So there is no fetch handling, no `errorTileUrl`, and no console warning that could ever have caught it — it reaches a reader as a map that looks oddly branded, and it reached ours for an unknown period before anyone said so.
 **If the maps ever look wrong again, check this first**, and check it with bytes rather than with a status code.
 
-`addBasemapLayer(map)` in `streetscape-utils.js` is the only place the tile URL is built; `index.js` and `city.js` call it and `www/js/__tests__/streetscape-utils.test.js` pins that neither of them contains an `L.tileLayer(` of its own.
+`addBasemapLayer(map)` in `streetscape-utils.js` is the only place the site builds the tile URL; `index.js` and `city.js` call it and `www/js/__tests__/streetscape-utils.test.js` pins that neither of them contains an `L.tileLayer(` of its own.
 That pin is the point rather than tidiness: the two call sites were byte-identical duplicates, and a reintroduced duplicate renders perfectly well — watermarked.
-The generated boundary-review viewer (`scripts/boundary_review.template.html`) is a third CARTO map that cannot load the module, so `build_boundary_review.py` reads `CARTO_BASEMAP_KEY` out of the JS and substitutes it, raising if the const or the placeholder has gone.
-A watermark there is not cosmetic either — that tool exists to judge a city boundary by eye.
+Generated HTML cannot load the module, so the Python side reads `CARTO_BASEMAP_KEY` out of the JS through one helper, `streetscape_metadata_tracker/basemap.py` (`carto_basemap_key`, raising if the const has gone), and **it is the Python-side tile-URL builder**: change the URL form (parameter name, host, vector tiles) in `addBasemapLayer` and `carto_tile_url` together, or the maps it builds go back to the silent watermark.
+`test_python_carto_tile_url_matches_the_frontend_form` in `tests/test_vis.py` reads the JS form out of `addBasemapLayer` and fails if the two disagree.
+Three generated maps use it.
+The boundary-review viewer (`scripts/boundary_review.template.html`) has the whole keyed URL from `carto_tile_url` substituted into its template, so it spells no URL form of its own, and the build raises if the placeholder has gone; a watermark there is not cosmetic either — that tool exists to judge a city boundary by eye.
+`vis.py`'s `--check-boundary` preview and its coverage map build their folium tile layers through `add_carto_basemap`, which also keeps CARTO's zoom 20 and `abcd` subdomains (a custom folium URL otherwise falls back to 18 and `abc`).
+Before that helper they used folium's bare tile names (`"CartoDB positron"`), which request no key, and both rendered only the watermark.
+The cost is a build-time read: a hand `streetscape_tracker.py` run that draws its coverage map after cataloging the run exits nonzero if the JS is unreadable or the const renamed, with the run's data already saved; the scheduler passes `--no-visual` and never builds one.
+`scripts/measure_carto_basemap.py` reads the key through the same helper; the e2e detector below keeps its own reader on purpose, so a bug in the helper cannot also blind the test that checks the key.
 
 **The key is public by construction and bearer-style, which are two different facts.**
 Public by construction: the browser sends it to CARTO on every tile request, so it is readable off the deployed page wherever the repo keeps it, and there is no build step to inject it at ([ADR 0001](adr/0001-no-backend.md)).

@@ -1645,6 +1645,18 @@ Every assertion above was mutation-checked; the table is in the PR body.
 `streetscape-utils.test.js` pins `adaptCityRecord.capture_history`: the gsv block's own pointer, null for the same city's Mapillary view (a record-level read fails it), and null — never undefined — on v1 and unharvested records; and that a harvest filename resolves to no provider and is not a valid run.
 The Python half of that last pin is `test_a_history_artifact_is_not_a_run_file_in_either_language` in `tests/test_naming.py`, which runs the JS `RUN_FILENAME_RE` itself (widening its token class to `[a-z_]+` fails it).
 
+## Generated maps carry the CARTO key
+
+`tests/test_vis.py` builds both `vis.py` maps, the `--check-boundary` preview (`test_search_area_preview_basemap_carries_the_carto_key`) and the coverage map (`test_coverage_map_basemap_carries_the_carto_key`), and requires every tile layer to point at `basemaps.cartocdn.com` and end in `?key=` plus the URL-encoded key that `basemap.carto_basemap_key` reads from `www/js/streetscape-utils.js`.
+Encoded, because the code encodes it: a rotated key holding `+`, `/` or `=` must not fail a correct URL.
+Each also renders the page with `get_root().render()`, since the saved HTML is what a reader opens, and requires the keyed URL there with CARTO's `maxZoom` 20 and `abcd` subdomains, which folium's generic 18 and `abc` would replace (drop `_CARTO_TILE_DEFAULTS`).
+The options are matched by a regex that tolerates folium's JSON spacing, since `requirements.txt` allows any folium from 0.15.1.
+Both require the CARTO and OpenStreetMap attribution links (the free tier's condition), and the coverage map its dark basemap's `opacity` 0.8.
+`test_python_carto_tile_url_matches_the_frontend_form` reads the URL template and key parameter out of `addBasemapLayer` in the JS and requires `carto_tile_url` to build the same URL: rename `key=` or the host on one side only and it goes red, where every other Python test stays green and the other side's maps are watermarked.
+Restore folium's bare tile names in `vis.py` (`tiles="CartoDB positron"`, `tiles="cartodbdark_matter"`) and both go red: those request the tile with no key, which CARTO answers with HTTP 200 and a watermark, so nothing else fails.
+The boundary-review viewer's equivalent is `test_render_html_substitutes_the_frontend_carto_key` and its neighbours in `tests/test_build_boundary_review.py`; the viewer's template carries a whole-URL placeholder and no `cartocdn.com` URL of its own, so a URL-form change in `carto_tile_url` reaches it too.
+Whether CARTO actually honours the key is a network question, answered only by the e2e `tests/e2e/test_basemap_key.py`.
+
 ## The pivoted data tables (issue #250)
 
 **The pivoted data tables (issue #250) are covered on both sides.**
