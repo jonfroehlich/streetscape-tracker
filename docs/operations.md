@@ -595,7 +595,7 @@ python scripts/apply_decisions.py --data-dir "$DATA" --decisions <the exported b
 The four steps are #91's sequence, and their order is load-bearing:
 
 1. **Dry run, then read the plan.**
-   It writes `reregister_plan.csv` (small `UNDER` cities, OSM bbox ≤ 30 km on both axes) and `manual_review.csv` (every other non-`OK` verdict); `build_boundary_review.py` renders only the cities on those two lists, so without this step the page is empty and the gate passes having checked nothing.
+   It writes `reregister_plan.csv` (small `UNDER` cities, OSM bbox ≤ 30 km on both axes) and `manual_review.csv` (every other non-`OK` verdict, plus any small `UNDER` city whose grid was hand-fitted with `resize_city.py` and would otherwise have been resized, #459); `build_boundary_review.py` renders only the cities on those two lists, so without this step the page is empty and the gate passes having checked nothing.
 2. **`--execute`.**
    This is safe here because every city in the batch is disabled and has no runs, so a recenter-and-grow resets no diff continuity.
    It is also required: `build_boundary_review.py` shows a plan city only once its geometry has CHANGED from the audit snapshot, so after a dry run alone every auto-resize city is silently dropped, counted only in a `Resize cities skipped (unchanged geometry)` line and a "not shown" banner — and the page is not empty whenever any DEFER city exists, so nothing else would catch it.

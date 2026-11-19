@@ -164,6 +164,7 @@ on every deferring branch and not only the would-be RESIZE (over-threshold, `NO_
 there the basis carries the audit's own reason and its generic advice, the advice labelled as written for a grid that was not fitted by hand.
 The guard diverts only a would-be RESIZE (NOCHANGE, SKIP and the over-threshold DEFER are unchanged), including one that would only have recentered a hand fit larger than its bbox.
 `load_current_geometry` reads the note that `resize_city.py --execute` really writes, appended after another note or onto NULL notes.
+The same catalog then drives the script's dry run: its summary counts the kept hand fits among the deferrals, and prints no such line when there are none.
 
 `tests/test_mapillary_360_cities_manifest.py` IS the provenance of `mapillary_360_cities.csv`.
 The city list is curated, but its values are a GeoNames join keyed by `geonameid` and there is no generator script to name in a `generated_by`, so the test re-runs that join in reverse: city, admin, country, continent, population and coordinates must match the vendored records, and `query_string` must equal what `build_worldwide_frame.query_string` writes, so a query here behaves exactly like a frame query at the geocoder.

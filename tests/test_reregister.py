@@ -6,6 +6,7 @@ undersized->grow, huge-bbox->defer, wrong-place->defer) plus idempotency. No
 network, no DB — decide() takes the report row and current geometry directly.
 """
 
+import csv
 import importlib.util
 import os
 import sys
@@ -208,7 +209,9 @@ def test_every_deferral_of_a_hand_fitted_grid_recommends_keeping_it(audit_row):
     assert f"{rr.GENERIC_ADVICE_LABEL}: {plain.rec_basis}" in fitted.rec_basis
 
 
-def test_load_current_geometry_reads_the_resize_note_resize_city_writes(tmp_path, monkeypatch):
+def test_load_current_geometry_reads_the_resize_note_resize_city_writes(
+    tmp_path, monkeypatch, capsys
+):
     """End to end across the two scripts: the note resize_city.py really writes
     is the note reregister_boundaries.py really reads, among other notes."""
     from streetscape_metadata_tracker import db
@@ -246,6 +249,32 @@ def test_load_current_geometry_reads_the_resize_note_resize_city_writes(tmp_path
     assert current[ids["Magna"]].manually_resized is True  # appended after another note
     assert current[ids["Boise"]].manually_resized is False  # NULL notes
     assert current[ids["Kuna"]].width_m == 4900
+
+    # The summary says how many deferrals are kept hand fits, so an operator
+    # can see the guard fired (round 5). Kuna and Boise get the same small
+    # UNDER row; only the hand-fitted one is deferred.
+    def summary(city_names):
+        report = tmp_path / "report.csv"
+        rows = [
+            row("UNDER", osm_w=13000, osm_h=12000, sug_lat=43.5, sug_lon=-116.4, city_id=ids[n])
+            for n in city_names
+        ]
+        with open(report, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+        monkeypatch.setattr(
+            sys, "argv", ["reregister_boundaries.py", "--report", str(report), "--db-path", catalog]
+        )
+        capsys.readouterr()
+        assert rr.main() == 0
+        return capsys.readouterr().out
+
+    out = summary(["Kuna", "Boise"])
+    assert "Re-register (recenter + resize): 1" in out
+    assert "Deferred to manual review:       1" in out
+    assert "of which hand-fitted (kept):   1" in out
+    assert "hand-fitted" not in summary(["Boise"])  # no line when the guard did not fire
 
 
 def test_unknown_city_skipped():

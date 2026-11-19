@@ -32,10 +32,16 @@ an earlier would-be-new row prints REUSE IN-BATCH (and is counted in
 reused-existing, as --execute counts it), and one within --overlap-km
 + --max-center-km of another earlier row that is not headed for an existing
 catalog city gets a WARNING line, since the center guard lets a geocoded
-center sit that far from its manifest point (issue #460). Distance only: two rows that share a query, or a
-city/admin/country under different queries, are NOT flagged, although
---execute makes one city of them (issue #467). It is a preview, not a proof: it assumes every earlier row
-registers, and a row that fails to geocode under --execute changes the outcome
+center sit that far from its manifest point (issue #460).
+
+It compares distance only, never identity. Two rows that share a query, or a
+city/admin/country under different queries, are NOT flagged when they sit
+farther apart than that, although --execute makes one city of them (issue
+#467). Two rows that share a query and sit within --overlap-km print REUSE
+IN-BATCH and count as reused-existing here, where --execute counts the second
+as already-registered: the same city either way, in a different summary
+bucket. It is a preview, not a proof: it assumes every earlier row registers,
+and a row that fails to geocode under --execute changes the outcome
 for its neighbours.
 
 Safety rails (issue #110):

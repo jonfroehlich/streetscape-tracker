@@ -492,6 +492,11 @@ def main() -> int:
     print(f"Re-register (recenter + resize): {len(resize)}")
     print(f"Already at target (no change):   {len(nochange)}")
     print(f"Deferred to manual review:       {len(defer)}")
+    # Shows the issue #459 guard fired: these rows recommend their own geometry.
+    # (A DEFER always has a catalog row: decide() SKIPs an unknown city.)
+    hand_fitted = sum(current_by_id[d.city_id].manually_resized for d in defer)
+    if hand_fitted:
+        print(f"  of which hand-fitted (kept):   {hand_fitted}")
     print(
         f"Grid-point delta from resizes:   {point_delta:+,} "
         f"(one-time; free GSV metadata, ~{point_delta // 90:+,}/day over the 90-day cycle)"
