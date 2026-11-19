@@ -873,6 +873,38 @@ rolling_24h_request_budget = 1200
 rest_weekdays = ["Wed", "Sun"]
 refusal_cooldown_h = 36
 
+# KartaView night allowance (issue #464) -- SHIPPED UNSET, deliberately. When
+# set, it bounds the minutes one run-due spends starting FRESH KartaView crawls
+# (both channels together); tonight's resumes of live checkpoints are reserved
+# out of it first and never held, and a city whose census is cached is never
+# held. A held crawl is no attempt and no failure; the city stays due. It
+# lowers KartaView's nightly volume and launch minutes. It does NOT shorten
+# KartaView's presence span on the Done line: exempt resumes, cached walks,
+# the stranded-walk retry and the fill's KartaView launches still run late.
+#
+# Choose the value only after two prod reads (docs/scheduler.md, #464):
+#   S, steady-state need = enrolled / 83 x mean requests per completed sweep.
+#     Enrolled from `scheduler enroll-city --channel kartaview --list`; the
+#     mean is 12,180 grid requests / 313 cities = 38.9 (the RESUMED 2026-11-09
+#     note above). At ~853 enrolled: ~400 requests/day = ~267 min at 1.5/min.
+#   R, live checkpoints tonight, from `run-due --dry-run`'s ALLOWANCE line.
+# Nights to drain = backlog requests / (1.5 x A - S); S already counts resumed
+# launches. Below S (in minutes) the backlog NEVER drains and KartaView
+# refreshes miss their cycle: permanent holes. 360 is ~1.35 x S: 540 - 400 =
+# 140 requests a night, ~2 months; if R x ~24.7 min exceeds A, fresh crawls
+# get nothing and the drain stalls until the resumers finish. Cities
+# first collected from 2026-08-28 come due again from ~2026-11-19, so S
+# arrives during the drain. Recommended: S plus a backlog margin, ~420-480 on
+# today's numbers; if R x ~24.7 min is at or above the candidate, leave it
+# unset and measure KartaView minutes from the child logs first. The minutes
+# it frees go to other hosts within their own budgets and holds (Panoramax
+# and Overpass included), so set it outside #405's measurement window or
+# record it there as a confounder.
+# BEFORE SETTING IT, land #477: the resume reserve is never reconciled against
+# actual launches, and a checkpoint the child will discard still exempts its city.
+# [hosts.kartaview]
+# max_night_minutes = 480
+
 [download]
 batch_size = 100
 # 50 -> 100 on 2026-09-21, in the SAME change that raised
