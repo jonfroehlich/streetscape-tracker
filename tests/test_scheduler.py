@@ -1301,8 +1301,23 @@ def test_makelab1_production_config_is_wired():
     # [schedule].max_batch_hours together.
     #
     # 15M -> 35M on 2026-09-25: just above 12 h x 48,000/min (34.56M), so the
-    # deadline rather than the budget ends the night.
-    assert cfg.max_batch_hours == 12
+    # deadline rather than the budget ends the night. Pinned as that RELATION
+    # (issue #389) rather than as `max_batch_hours == 12`, which restated the
+    # inherited constant: each GSV budget is the window's spend at the
+    # channel's own pace, or just above it -- below it the budget, not the
+    # deadline, ends the night; more than 5% above it and the number no longer
+    # says what it is sized for. Fails from both sides: raise max_batch_hours
+    # without the budgets, or set a budget to 60M.
+    for channel in ("gsv", "gsv_streets"):
+        pc = cfg.providers[channel]
+        rate = pc.max_requests_per_minute or cfg.max_requests_per_minute
+        window_spend = cfg.max_batch_hours * 60 * rate
+        assert window_spend <= pc.daily_request_budget <= 1.05 * window_spend, (
+            f"[providers.{channel}].daily_request_budget = {pc.daily_request_budget:,} is "
+            f"not the {cfg.max_batch_hours:g} h window's spend at {rate:,}/min "
+            f"({window_spend:,.0f}) or just above it; the GSV budgets are wall-clock "
+            "proxies and move with [schedule].max_batch_hours (docs/scheduler.md)"
+        )
     # The crossed timer-watchdog gate (issue #369): backup-status goes unhealthy
     # when the cron watchdog's heartbeat stops. Dropped from prod, the gate is
     # silently off and a dead cron is never reported.
@@ -1405,14 +1420,8 @@ def test_makelab1_production_config_is_wired():
     assert cfg.driving_plan.enabled
     assert "/archive/gsv_driving_plan" in cfg.driving_plan.archive_dir
     assert not cfg.driving_plan.archive_dir.startswith(cfg.data_dir)
-    # The batch deadline must stay strictly below the unit's TimeoutStartSec, or
-    # systemd kills the loop first and the night publishes nothing (#167). These
-    # two live in different files and only mean something together.
-    unit = Path(_PROJECT_ROOT, "deploy", "systemd", "streetscape-tracker.service").read_text()
-    unit_timeout_h = int(re.search(r"^TimeoutStartSec=(\d+)h", unit, re.M).group(1))
-    assert cfg.max_batch_hours < unit_timeout_h, (
-        f"max_batch_hours={cfg.max_batch_hours} must be under TimeoutStartSec={unit_timeout_h}h"
-    )
+    # The batch deadline against the unit's TimeoutStartSec is pinned, with its
+    # tail, in-flight and margin terms, in tests/test_night_window.py (#389).
 
 
 def test_run_one_city_honors_connection_limit_override(conn, monkeypatch, tmp_path):

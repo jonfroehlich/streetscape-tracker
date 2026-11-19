@@ -245,7 +245,7 @@ catalog backups to `backups/` (see below).
 
 ```bash
 systemctl --user stop streetscape-tracker.service     # graceful wind-down
-systemctl --user kill streetscape-tracker.service     # immediate death, no tail
+systemctl --user kill -s SIGKILL streetscape-tracker.service   # immediate death, no tail
 ```
 
 **`stop` is a wind-down, not a kill.** The in-flight collection child dies with
@@ -256,8 +256,10 @@ stopped city's remaining channels are not marked failed: they keep their
 cadence, stay due, and lead the next batch's queue, and the log names them
 (`stop requested — not starting mapillary, mapillary_streets`).
 
-**The stop itself exits 0 and sends no alert — but the night can still be
-unhealthy for its own reasons.** A stop does not suppress anything that had
+**A stop during the loop exits 0 and sends no alert — but the night can still be
+unhealthy for its own reasons.** A stop typed during the nightly's *tail*
+mails `SIGTERM IN THE TAIL` and exits 1 (#389): from inside the process it
+looks the same as the start timeout landing there. A stop does not suppress anything that had
 already gone wrong, and three conditions alert unconditionally, ignoring
 `[alerts].failure_threshold`: a host that refused this IP (#208), a failed
 catalog backup (#145), and a failed driving-plan fetch (#176). So a
@@ -267,13 +269,21 @@ working, not failing — read the subject before assuming otherwise.
 It is bounded by `TimeoutStopSec=30min`. Reaching that is a SIGKILL with no tail
 — the 2026-08-13 shape, where a night's runs sat unpublished until someone ran
 `regenerate-aggregate --publish` by hand. If you need the batch dead *now*, use
-`kill` and expect to publish by hand afterwards.
+`kill -s SIGKILL` and expect to publish by hand afterwards. A bare
+`systemctl kill` sends SIGTERM, which the loop winds down on and the
+nightly's tail ignores (#389), and it queues no stop job, so nothing
+escalates it to a SIGKILL.
 
 Two cautions:
 
-- **Do not type `stop` twice.** The tail runs outside the SIGTERM handler's
-  scope, so a second stop during it kills the publish with the default
-  disposition. systemd itself only sends SIGTERM once, so one `stop` is safe.
+- **A SIGTERM during the nightly unit's tail is logged and ignored** (#389),
+  so a `stop` typed while the tail runs, or the unit's `TimeoutStartSec`
+  landing there, no longer kills the aggregate and the backup. A hand
+  `run-due` from a shell is not covered: no systemd SIGKILL follows there, so
+  a `kill` still ends it. It still reaches a publish rsync
+  in flight at that instant (the cgroup gets the signal); the tail retries
+  that publish once inside what is left of `TimeoutStopSec`, and if the night
+  still reports `PUBLISH FAILED`, run `regenerate-aggregate --publish` by hand.
 - **A stop mid-city releases the Mapillary and Overpass host locks**, so it is a
   reasonable prelude to the manual work described in the next section.
 - **A stop also starts the chained prefreeze pass** the moment the unit goes
@@ -295,7 +305,10 @@ systemctl --user show streetscape-tracker.service -p TimeoutStopUSec
 #   want: TimeoutStopUSec=30min      NOT: TimeoutStopUSec=1min 30s
 ```
 
-`daemon-reload` is safe during a live batch; `stop` obviously is not.
+`daemon-reload` is safe during a live batch for this unit's other directives;
+`stop` obviously is not. A copy that changes `TimeoutStartSec` goes in between
+nights, and is reloaded in the same sitting: assume a reload re-arms a running
+oneshot's start timeout from the new value (see "Raising the night's length").
 
 The same copy-and-reload is what makes `Environment=STREETSCAPE_NIGHTLY=1`
 (issue #412) live. It is one of two independent ways `run-due` recognises the
@@ -985,6 +998,31 @@ systemctl --user list-timers --all | grep streetscape                          #
 ```
 
 The first chained pass is the next night's end; a tranche enabled the afternoon of the deploy needs the manual `--nights 1 --limit 40 --execute` pass.
+
+#### Raising the night's length
+
+`[schedule].max_batch_hours` is read from the checkout, so **`git pull` makes a new value live at the next 02:00 whether or not the unit was re-copied**; the unit is a copy and changes nothing until the `cp` and the `daemon-reload`.
+So the unit goes first, deployed and verified on its own, and the `max_batch_hours` raise is a later, config-only pull.
+If the order is ever got wrong the night is not lost: a nightly whose installed unit cannot hold the window is shortened to fit and mails `night shortened to N h` (#389), and `timer-status` reports the collection unit `VIOLATED` until the unit is fixed.
+Read `docs/scheduler.md`, "The night's length", first: it lists what a raise must settle before the unit is the only thing left.
+
+```bash
+pgrep -af '[s]cheduler .*run-due' || echo idle                     # never mid-batch
+systemctl --user is-active streetscape-prefreeze.service            # want: inactive
+systemctl --user show streetscape-tracker.service -p DropInPaths    # want: empty; a drop-in outranks the unit file
+diff ~/.config/systemd/user/streetscape-tracker.service deploy/systemd/streetscape-tracker.service   # carry over any local edit
+cp deploy/systemd/streetscape-tracker.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user show streetscape-tracker.service -p TimeoutStartUSec -p TimeoutStopUSec -p Environment
+#   want: the unit's TimeoutStartSec, 30min, and STREETSCAPE_UNIT_TIMEOUT_START_S equal to it in seconds
+.venv-makelab2/bin/python -m streetscape_metadata_tracker.scheduler --config config/scheduler.makelab1.toml timer-status
+#   want: "collection unit (loaded): ... : ok"
+```
+
+"Never mid-batch" because the conservative assumption is that a `daemon-reload` applies to the running batch: systemd most likely re-arms an activating unit's start timer from the new `TimeoutStartSec`, counted from the original start, while the running process keeps the old `STREETSCAPE_UNIT_TIMEOUT_START_S` it read (unverified on a host; nothing here relies on the opposite).
+A shorter timeout reloaded mid-batch could therefore land in a night sized for the longer one.
+For the same reason never leave a copied unit un-reloaded: the 08:30 `timer-status --rearm` runs a `daemon-reload` whenever it re-arms a timer, usually mid-batch, and that would load the copy for you.
+`systemctl --user set-property` cannot set a timeout, so the stale `user.control` drop-in of 2026-08 is not this failure; a hand-written `streetscape-tracker.service.d/*.conf` is, which is what the `DropInPaths` line and `timer-status` are for.
 
 ### Turning an opt-in channel on in production (KartaView, #248; the same shape for every opt-in channel since)
 

@@ -46,6 +46,21 @@ def _show(name):
     return ["show", name, *SHOW_PROPS]
 
 
+# The collection unit's bracket read (issue #389), made once per check that
+# reached the manager, after the timers are classified and any re-arm's
+# daemon-reload.
+UNIT_SHOW = [
+    "show",
+    "streetscape-tracker.service",
+    "-p",
+    "LoadState",
+    "-p",
+    "TimeoutStartUSec",
+    "-p",
+    "TimeoutStopUSec",
+]
+
+
 class FakeSystemctl:
     """A `Runner`: records every call and answers from `state`."""
 
@@ -58,6 +73,13 @@ class FakeSystemctl:
                 "NextElapseUSecRealtime": "Sat 2026-09-26 02:07:00 PDT",
             }
             for n in TIMERS
+        }
+        # The collection SERVICE, which timer-status reads for its bracket line
+        # (issue #389) and never starts. Not in TIMERS: it is not a timer.
+        self.state[ut.HOST_UNIT] = {
+            "LoadState": "loaded",
+            "TimeoutStartUSec": "14h",
+            "TimeoutStopUSec": "30min",
         }
         self.manager = manager
         self.start_flips = start_flips
@@ -185,7 +207,7 @@ def test_enabled_but_inactive_timers_exit_nonzero_and_are_not_started_without_re
     out = capsys.readouterr().out
     assert all(f"{n}" in out for n in TIMERS)
     assert "Verdict: INACTIVE: " + ", ".join(TIMERS) in out
-    assert fake.calls == [["is-system-running"]] + [_show(n) for n in TIMERS]
+    assert fake.calls == [["is-system-running"]] + [_show(n) for n in TIMERS] + [UNIT_SHOW]
 
 
 def test_rearm_reloads_once_then_starts_only_the_inactive_timers(cfg, unit_files, sent):
@@ -202,6 +224,7 @@ def test_rearm_reloads_once_then_starts_only_the_inactive_timers(cfg, unit_files
         ["start", b],
         _show(a),
         _show(b),
+        UNIT_SHOW,
     ]
     beat = ut.read_heartbeat(cfg.log_dir)
     assert beat["rearmed"] == [a, b]
@@ -251,7 +274,7 @@ def test_a_not_found_timer_is_unhealthy_and_a_reload_can_recover_it(cfg, unit_fi
 
     fake = fake_for(True)
     assert _run(cfg, fake, rearm=True, alert=True) == 0
-    assert fake.calls[-3:] == [["daemon-reload"], ["start", name], _show(name)]
+    assert fake.calls[-4:] == [["daemon-reload"], ["start", name], _show(name), UNIT_SHOW]
     assert f"REARMED: {name}" in sent[-1][0]
 
     fake = fake_for(False)
@@ -356,7 +379,8 @@ def test_wait_polls_until_the_manager_and_the_unit_files_are_both_visible(cfg, u
     assert rc == 0
     assert fake.verbs().count("is-system-running") == 4
     assert fc.sleeps == [10, 10, 10]
-    assert fake.verbs()[4:] == ["show"] * len(TIMERS)
+    # One per timer, then the collection unit's bracket read (issue #389).
+    assert fake.verbs()[4:] == ["show"] * (1 + len(TIMERS))
 
 
 def test_wait_gives_up_after_the_budget_and_still_writes_the_heartbeat(cfg, unit_files, sent):
@@ -544,3 +568,106 @@ def test_main_forwards_every_timer_status_flag(monkeypatch, cfg, argv, expected)
     monkeypatch.setattr(sched, "cmd_timer_status", lambda c, **kw: seen.update(kw) or 0)
     assert sched.main() == 0
     assert seen == expected
+
+
+# --- the collection unit's bracket (issue #389) -------------------------------
+
+
+@pytest.mark.parametrize(
+    "text,seconds",
+    [
+        ("14h", 50_400),
+        ("30min", 1_800),
+        ("1min 30s", 90),
+        ("1d 2h", 93_600),
+        ("500ms", 0.5),
+        ("infinity", None),
+        ("", None),
+        ("fourteen hours", None),
+    ],
+)
+def test_systemd_time_spans_parse_and_infinity_is_unknown(text, seconds):
+    assert ut.parse_timespan_s(text) == seconds
+
+
+@pytest.mark.parametrize(
+    "load,start,word",
+    [
+        ("loaded", "18h", "ok"),
+        ("loaded", "14h", "VIOLATED"),
+        ("loaded", "17h 35min", "ok"),
+        ("loaded", "infinity", "unknown"),
+        ("not-found", "18h", "unknown"),
+    ],
+    ids=["holds", "too-short", "exact", "infinity", "not-loaded"],
+)
+def test_timer_status_reports_the_collection_units_bracket_without_changing_its_verdict(
+    tmp_path, unit_files, sent, capsys, load, start, word
+):
+    """A 16 h night needs 16 + 0.583 + 1 h: an installed 18 h unit holds it, a
+    17h 35min one holds it exactly (the boundary is `<=`), a
+    14 h one does not, and a timeout that cannot be read is `unknown` -- mailed
+    like a violation, never passed as `ok`. Whatever the line says, the timers
+    are healthy here, so the exit status and the heartbeat must not move: they
+    measure the timers and whether cron runs, and backup-status gates on them."""
+    cfg = SchedulerConfig(log_dir=str(tmp_path / "logs"), max_batch_hours=16)
+    fake = FakeSystemctl()
+    fake.set(ut.HOST_UNIT, LoadState=load, TimeoutStartUSec=start)
+    assert _run(cfg, fake, alert=True) == 0
+    out = capsys.readouterr().out
+    assert f"TimeoutStartSec={start}" in out
+    assert "needs >= 17.58 h" in out
+    [line] = [ln for ln in out.splitlines() if "collection unit" in ln]
+    assert line.endswith(f": {word}")
+    assert ut.read_heartbeat(cfg.log_dir)["healthy"] is True
+    if word == "ok":
+        assert sent == []
+    elif word == "VIOLATED":
+        [(subject, body)] = sent
+        assert "collection unit bracket VIOLATED" in subject
+        assert "reads VIOLATED" in body and "daemon-reload" in body
+        # True with the variable absent too: the clamp then assumes 14 h and
+        # does shorten (issue #389 review), so never "only when".
+        assert "or to 14 h when the variable is absent" in body
+        assert "only when" not in body
+        # The timers are healthy, so the mail says the bracket is why it was
+        # sent, not "found or fixed something" with REARMED advice (#389 review).
+        assert "The user timers are healthy" in body
+        assert "found or fixed something" not in body and "After a REARMED mail" not in body
+    else:
+        # An unreadable timeout is not a violation, and the nightly clamp reads
+        # the environment variable rather than this, so the mail must claim
+        # neither (issue #389 review).
+        [(subject, body)] = sent
+        assert "collection unit timeout unreadable" in subject
+        assert "VIOLATED" not in subject + body
+        assert "shortened" not in body and "cannot hold" not in body
+        assert "gave no bound to check" in body and "systemctl --user show" in body
+        assert "The user timers are healthy" in body
+        assert "found or fixed something" not in body and "After a REARMED mail" not in body
+
+
+def test_timer_status_reads_the_bracket_after_the_rearms_daemon_reload(
+    tmp_path, unit_files, sent, capsys
+):
+    """The #369 reboot shape: the manager came up before the home mounted, so
+    until check_and_rearm's one daemon-reload every unit, the collection
+    service included, is not-found. Read before that reload the bracket line
+    is a false `unknown` riding on the REARMED mail; read after it, the
+    re-loaded 14 h unit holds the 12 h night and nothing about the bracket is
+    mailed."""
+    cfg = SchedulerConfig(log_dir=str(tmp_path / "logs"), max_batch_hours=12)
+    fake = FakeSystemctl(reload_installs=True)
+    for name in [*TIMERS, ut.HOST_UNIT]:
+        fake.set(name, LoadState="not-found")
+    for n in TIMERS:
+        fake.set(n, ActiveState="inactive")
+    assert _run(cfg, fake, rearm=True, alert=True) == 0
+    calls = fake.calls
+    assert calls.index(["daemon-reload"]) < calls.index(UNIT_SHOW)
+    [line] = [ln for ln in capsys.readouterr().out.splitlines() if "collection unit" in ln]
+    assert line.endswith(": ok")
+    [(subject, body)] = sent  # the REARMED mail, and only it
+    assert "collection unit" not in subject and "collection unit line" not in body
+    assert "found or fixed something" in body and "After a REARMED mail" in body
+    assert "The user timers are healthy" not in body

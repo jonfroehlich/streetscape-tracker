@@ -39,6 +39,7 @@ from __future__ import annotations
 import fnmatch
 import json
 import os
+import re
 import subprocess
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -226,6 +227,96 @@ def active_host_glob(unit_dir: Path | None = None) -> str:
 def is_active_host(hostname: str, glob: str) -> bool:
     """Whether ``hostname`` matches the ``ConditionHost=`` glob, as systemd does."""
     return fnmatch.fnmatchcase(hostname, glob)
+
+
+# systemd.time(7) units as `systemctl show` prints a time span, in seconds.
+_TIMESPAN_UNITS = {
+    "us": 1e-6,
+    "ms": 1e-3,
+    "s": 1.0,
+    "min": 60.0,
+    "h": 3600.0,
+    "d": 86400.0,
+    "w": 604800.0,
+}
+_TIMESPAN_TOKEN = re.compile(r"(\d+(?:\.\d+)?)(us|ms|s|min|h|d|w)")
+
+
+def parse_timespan_s(text: str) -> float | None:
+    """A time span as ``systemctl show`` prints it, in seconds; None when unknown.
+
+    ``14h``, ``30min``, ``1min 30s`` and ``1d 2h`` parse. ``infinity`` (no
+    timeout at all), an empty value and anything else return None, which the
+    caller must read as "unknown", never as a pass: an unparseable timeout is
+    not evidence that the night fits.
+
+    Example::
+
+        parse_timespan_s("1min 30s")   # -> 90.0
+        parse_timespan_s("infinity")   # -> None
+    """
+    tokens = text.split()
+    if not tokens:
+        return None
+    total = 0.0
+    for token in tokens:
+        m = _TIMESPAN_TOKEN.fullmatch(token)
+        if not m:
+            return None
+        total += float(m.group(1)) * _TIMESPAN_UNITS[m.group(2)]
+    return total
+
+
+@dataclass(frozen=True)
+class UnitTimeouts:
+    """The collection unit's timeouts as systemd LOADED them (issue #389).
+
+    Read through ``systemctl show``, so a hand-written drop-in and a copy that
+    was never ``daemon-reload``ed are both what this reports -- which is the
+    point: the repo's unit file says nothing about either. ``None`` is unknown.
+    """
+
+    load_state: str
+    start_raw: str
+    stop_raw: str
+    start_s: float | None
+    stop_s: float | None
+
+
+def collection_unit_timeouts(run: Runner) -> UnitTimeouts:
+    """One ``show`` of the collection unit's ``TimeoutStartUSec``/``TimeoutStopUSec``.
+
+    A unit that is not loaded reports no usable timeout: systemd prints its
+    defaults for a unit it does not know, so ``start_s`` is None then.
+    """
+    out = run(
+        [
+            "show",
+            HOST_UNIT,
+            "-p",
+            "LoadState",
+            "-p",
+            "TimeoutStartUSec",
+            "-p",
+            "TimeoutStopUSec",
+        ]
+    ).stdout
+    props: dict[str, str] = {}
+    for line in out.splitlines():
+        key, sep, value = line.partition("=")
+        if sep:
+            props[key.strip()] = value.strip()
+    load_state = props.get("LoadState", "")
+    start_raw = props.get("TimeoutStartUSec", "")
+    stop_raw = props.get("TimeoutStopUSec", "")
+    loaded = load_state == "loaded"
+    return UnitTimeouts(
+        load_state=load_state,
+        start_raw=start_raw,
+        stop_raw=stop_raw,
+        start_s=parse_timespan_s(start_raw) if loaded else None,
+        stop_s=parse_timespan_s(stop_raw) if loaded else None,
+    )
 
 
 def manager_reachable(run: Runner) -> bool:
