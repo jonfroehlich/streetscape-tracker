@@ -48,7 +48,8 @@ per reason in the summary:
   locations must be hit. A tolerance, not exact 9-decimal keys, so the check
   cannot refuse a series over a sub-ULP difference with a message that reads
   like a refreshed network. Since issue #425 `fileutils.load_city_csv_file`
-  reads coordinates correctly rounded (`float_precision="round_trip"`), so on
+  reads coordinates correctly rounded (`float_precision="round_trip"` before
+  pandas 3.1, the default parser from 3.1), so on
   every CSV the collectors write the tolerance is never needed: the CSV text is
   `repr` of the sample float and parses back to it exactly. A sample that
   matches only within the tolerance is still accepted and COUNTED (`n_noise`),
