@@ -840,7 +840,7 @@ def test_an_unhoisted_resumer_still_runs_when_the_reserve_fills_the_allowance(
     assert (f, "kartaview") not in launches
     # The fully reserved allowance is never announced as a whole-run hold.
     assert _messages(caplog, "for this run", logging.WARNING) == []
-    assert "2 city(ies) exempt as paid-for work" in _done_line(caplog)
+    assert "2 city(ies) exempt with a checkpoint or cached census there" in _done_line(caplog)
 
 
 def test_the_done_clause_carries_the_numbers_and_never_the_held_token(
@@ -866,7 +866,8 @@ def test_the_done_clause_carries_the_numbers_and_never_the_held_token(
     assert (
         f"; ALLOWANCE {LABEL}: 56 of 40 min in launches (fresh 31 of 15 min over 1 "
         f"launch(es); resumes 25 min over 1; 1 resume(s) 25 min reserved), 1 launch(es) "
-        f"left for a later night, 0 city(ies) exempt as paid-for work, cities stay due"
+        f"left for a later night, 0 city(ies) exempt with a checkpoint or cached census "
+        f"there, cities stay due"
     ) in done
     assert "HELD" not in done
     assert report._HELD_RE.search(done) is None
@@ -954,7 +955,10 @@ def test_an_exempt_city_run_twice_is_counted_once(conn, monkeypatch, tmp_path):
         launches, _ = _city_channels(monkeypatch, conn, cfg, a, ["kartaview_streets"], breaker)
         assert launches == ["kartaview_streets"]
     assert breaker.allowance_exempt == {HOST_KARTAVIEW: {a}}
-    assert "1 city(ies) exempt as paid-for work" in sched._allowance_summary_note(breaker)
+    assert (
+        "1 city(ies) exempt with a checkpoint or cached census there"
+        in sched._allowance_summary_note(breaker)
+    )
 
 
 def test_a_launch_on_the_pool_path_is_charged(conn, monkeypatch, tmp_path, caplog):

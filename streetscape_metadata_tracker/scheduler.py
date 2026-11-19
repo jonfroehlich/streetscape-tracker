@@ -395,8 +395,9 @@ class HostHolds:
     (:meth:`charge`, through ``HostBreaker.start_charge``/``end_charge``); a
     resume of a live checkpoint is charged as paid and never spends the fresh
     allowance. Because it starts mid-run it is read once per city like a
-    cooldown, through :func:`_city_holds`, which also exempts a city that is
-    paid-for work. It is per run and in memory: every ``run-due`` starts at 0.
+    cooldown, through :func:`_city_holds`, which also exempts a city with a
+    checkpoint or a cached census on the host. It is per run and in memory:
+    every ``run-due`` starts at 0.
 
     The empty instance (no arguments) holds nothing, which is what every caller
     that predates #444 gets.
@@ -591,7 +592,7 @@ def _allowance_checkpoint(cfg: "SchedulerConfig", city: db.CityRow, channel: str
 def _paid_for_on_host(
     cfg: "SchedulerConfig", city: db.CityRow, channels: Sequence[str], host: str
 ) -> bool:
-    """Is ``city`` PAID-FOR work on ``host`` tonight? (issue #464)
+    """Is ``city`` exempt from a spent allowance on ``host`` tonight? (issue #464)
 
     True when any of ``channels`` touching ``host`` has a checkpoint or a
     cached census (a walk that collects for 0 requests, #290). Judged per city
@@ -607,6 +608,12 @@ def _paid_for_on_host(
     allowance is spent, silently. One past ``CHECKPOINT_MAX_AGE_S`` that the
     arm lets through is a fresh crawl and is charged as one
     (:func:`_allowance_charge`).
+
+    So "exempt" means HAS A CHECKPOINT, not "paid-for work": a dead checkpoint
+    (past ``CHECKPOINT_MAX_AGE_S`` and fitting, or with no first-commit stamp)
+    exempts a crawl that starts from zero and spends the allowance without
+    being held by it (review round 4, finding A). Once per dead checkpoint:
+    the new crawl stamps a fresh first commit.
     """
     window_s = _census_reuse_window_s(cfg)
     for channel in channels:
@@ -10793,8 +10800,10 @@ def cmd_run_due(
                 f"of launches; {usage.reserved_n} city(ies) resume a live checkpoint "
                 f"(~{usage.reserved_s / 60:.0f} min reserved), "
                 f"{usage.fresh_allowance_s / 60:.0f} min left for fresh crawls. Priced here at "
-                f"the configured pace; the night charges measured wall clock, so it can hold "
-                f"cities this preview lists (issue #464)"
+                f"the configured pace and can differ from the night either way: the night "
+                f"charges measured wall clock, and a fresh pair's walk is charged here as a "
+                f"second crawl where the night collects it free from its grid's cache "
+                f"(issue #464)"
             )
         # Read per CITY (issue #464): the preview charges its own `holds` as it
         # goes, so a night allowance can be spent part-way down the slate, and
@@ -11595,8 +11604,9 @@ def _run_city_channels(
         blocked_hosts.allowance_exempt.setdefault(host, set()).add(city.city_id)
         logger.info(
             f"{city.city_id}: {HOST_LABELS.get(host, host)} night allowance is spent, but "
-            f"this city has a checkpoint there (resumed, or judged at the age wall) or a "
-            f"cached census, so it is not held (issue #464)."
+            f"this city has a checkpoint there (resumed, judged at the age wall, or "
+            f"discarded by the child and crawled fresh) or a cached census, so it is not "
+            f"held (issue #464)."
         )
     # ...and the walks the batch deadline deferred (issue #373), stranded
     # below when their grid sibling landed in this same call.
@@ -15054,7 +15064,7 @@ def _allowance_summary_note(breaker: HostBreaker, sep: str = "; ") -> str:
     ``; ALLOWANCE the KartaView API (api.kartaview.org): 372 of 360 min in
     launches (fresh 157 of 138 min over 6 launch(es); resumes 215 min over 9;
     9 resume(s) 222 min reserved), 212 launch(es) left for a later night, 3
-    city(ies) exempt as paid-for work, cities stay due``.
+    city(ies) exempt with a checkpoint or cached census there, cities stay due``.
 
     The minutes are the MEASURED wall clock of the launches charged to the
     allowance -- not the host-presence span the ``on ...`` clause prints,
@@ -15079,7 +15089,7 @@ def _allowance_summary_note(breaker: HostBreaker, sep: str = "; ") -> str:
             f"min over {usage.fresh_n} launch(es); resumes {usage.paid_s / 60:.0f} min over "
             f"{usage.paid_n}; {usage.reserved_n} resume(s) {usage.reserved_s / 60:.0f} min "
             f"reserved), {skipped} launch(es) left for a later night, {exempt} city(ies) "
-            f"exempt as paid-for work, cities stay due"
+            f"exempt with a checkpoint or cached census there, cities stay due"
         )
     return "".join(f"{sep}{part}" for part in parts)
 
