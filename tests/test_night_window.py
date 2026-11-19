@@ -580,6 +580,55 @@ def test_no_retry_when_too_little_of_the_stop_timeout_is_left(conn, monkeypatch,
     assert rc == 1
 
 
+def test_a_publish_that_started_after_the_sigterm_is_not_retried(
+    conn, monkeypatch, default_sigterm
+):
+    """The signal lands in the aggregate rebuild, before the publish starts, and
+    the publish then fails: that rsync was never signalled (systemd signals the
+    unit's processes at the instant it sends), so it failed of something else
+    and a retry would not fix it. One publish call, and the mail says nothing
+    about a retry (#389 review round 2)."""
+    alerts: list[tuple[str, str]] = []
+    monkeypatch.setattr(sched, "_is_nightly_unit", lambda: True)
+    monkeypatch.setattr(sched, "send_alert", lambda a, s, b: alerts.append((s, b)) or True)
+    cfg = SchedulerConfig(publish_enabled=True, max_cities_per_day=5)
+    rc, _window_s, tail = _drive_one_city_night(
+        conn,
+        monkeypatch,
+        cfg,
+        on_aggregate=lambda: os.kill(os.getpid(), signal.SIGTERM),
+        publish=lambda **kw: 23,
+    )
+    assert tail.count("publish") == 1
+    [(subject, body)] = alerts
+    assert "PUBLISH FAILED" in subject and "SIGTERM IN THE TAIL" in subject
+    assert "retry" not in body
+    assert rc == 1
+
+
+def test_publish_passes_a_shorter_timeout_to_the_child_and_never_a_longer_one(
+    monkeypatch, tmp_path
+):
+    """The retry's bound reaches the rsync: `_publish(timeout_s=...)` hands the
+    child that bound when it is shorter than PUBLISH_TIMEOUT_S, and
+    PUBLISH_TIMEOUT_S when it is longer. Every retry test above stubs
+    `_publish`, so without this a refactor dropping the pass-through would let
+    a retry against a wedged docroot run into the SIGKILL and lose the alert
+    (#389 review round 2)."""
+    waits: list[float] = []
+
+    def child(cmd, fh, timeout_s):
+        waits.append(timeout_s)
+        return sched.subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(sched, "_run_publish_child", child)
+    cfg = SchedulerConfig(publish_enabled=True, log_dir=str(tmp_path))
+    assert sched._publish(cfg, "ctx", alert_on_failure=False, timeout_s=5) == 0
+    assert sched._publish(cfg, "ctx", alert_on_failure=False, timeout_s=9999) == 0
+    assert sched._publish(cfg, "ctx", alert_on_failure=False) == 0
+    assert waits == [5, sched.PUBLISH_TIMEOUT_S, sched.PUBLISH_TIMEOUT_S]
+
+
 def test_a_hand_runs_failed_publish_is_never_retried(conn, monkeypatch):
     """No guard, no signal record: a hand run's failed publish is reported as
     before, once."""
