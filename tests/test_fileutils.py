@@ -21,7 +21,11 @@ from datetime import date
 import pandas as pd
 
 from streetscape_metadata_tracker.analysis import OUT_OF_RADIUS, calculate_run_stats
-from streetscape_metadata_tracker.fileutils import load_city_csv_file
+from streetscape_metadata_tracker.fileutils import (
+    PANDAS_PARSES_FLOATS_EXACTLY,
+    _pandas_parses_floats_exactly,
+    load_city_csv_file,
+)
 from streetscape_metadata_tracker.naming import generate_run_filename, generate_streetwalk_filename
 from tests.conftest import make_city_df, make_mapillary_city_df, write_city_csv_gz
 
@@ -223,12 +227,17 @@ def test_a_coordinate_the_default_parser_misplaces_loads_as_its_own_text(data_di
         make_city_df([("p1", "2024-01-01")], run_date=RUN_DATE, grid_origin=(BOUNDARY_LAT, exact)),
         path,
     )
-    # The premise, re-measured: the default parser gets this text wrong. If this
-    # assertion ever fails, pandas fixed its parser; retire the premise and keep
-    # the contract below.
+    # The premise, re-measured on the installed pandas, in whichever direction
+    # the loader relies on. Before 3.1 the default parser gets this text wrong,
+    # which is why the loader passes float_precision="round_trip". From 3.1 on
+    # the default parser is exact, which is why the loader may omit the option
+    # pandas deprecated there (issue #458).
     default = pd.read_csv(path, usecols=["query_lon"])["query_lon"].iloc[0]
-    assert default != exact, "pandas' default C parser now round-trips this text"
-    assert round(float(default), 9) != round(exact, 9)
+    if PANDAS_PARSES_FLOATS_EXACTLY:
+        assert default == exact, "this pandas' default parser is NOT exact: fix the version gate"
+    else:
+        assert default != exact, "this pandas' default parser IS exact: fix the version gate"
+        assert round(float(default), 9) != round(exact, 9)
 
     for raw in (False, True):
         loaded = load_city_csv_file(path, raw=raw)
@@ -236,3 +245,26 @@ def test_a_coordinate_the_default_parser_misplaces_loads_as_its_own_text(data_di
         assert lon == exact
         assert lat == BOUNDARY_LAT
         assert (round(lat, 9), round(lon, 9)) == (round(BOUNDARY_LAT, 9), round(exact, 9))
+
+
+def test_the_float_precision_gate_opens_at_pandas_3_1():
+    """3.1.0 is where pandas made every float parse exact and deprecated the
+    option; the gate reads only major.minor, so a pre-release or a local build
+    of either side lands on the right side."""
+    assert not _pandas_parses_floats_exactly("2.2.0")
+    assert not _pandas_parses_floats_exactly("3.0.3")
+    assert _pandas_parses_floats_exactly("3.1.0")
+    assert _pandas_parses_floats_exactly("3.1.0rc0")
+    assert _pandas_parses_floats_exactly("3.1rc0")  # two components: must not raise
+    assert not _pandas_parses_floats_exactly("unknown")  # keeps the option, as before
+    assert _pandas_parses_floats_exactly("3.10.2")
+    assert _pandas_parses_floats_exactly("4.0.0.dev0+12.gabc")
+
+
+def test_the_loader_raises_no_pandas_deprecation_warning(data_dir, recwarn):
+    """Passing float_precision on pandas >= 3.1 warns that the argument is going
+    away; the loader must not be the caller that breaks when it does."""
+    path = os.path.join(data_dir, "walk.csv.gz")
+    write_city_csv_gz(make_city_df([("p1", "2024-01-01")], run_date=RUN_DATE), path)
+    load_city_csv_file(path)
+    assert [str(w.message) for w in recwarn if "float_precision" in str(w.message)] == []
