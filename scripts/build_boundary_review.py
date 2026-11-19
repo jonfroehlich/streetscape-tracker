@@ -45,9 +45,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from streetscape_metadata_tracker import db  # noqa: E402
 
-# The key is read from the frontend module by the shared helper (one key, one
-# reader); re-exported here because the tests and callers address it as bbr.*.
-from streetscape_metadata_tracker.basemap import carto_basemap_key  # noqa: E402, F401
+# The key is read from the frontend module by the shared helper, so this viewer
+# and the vis.py maps cannot drift apart (the tests address it as bbr.*).
+from streetscape_metadata_tracker.basemap import carto_basemap_key  # noqa: E402
 from streetscape_metadata_tracker.boundary_audit import (  # noqa: E402
     frozen_rect_bounds,
     rect_polygon_coverage,

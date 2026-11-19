@@ -446,13 +446,26 @@ def _tile_urls(folium_map):
 
 
 def _assert_every_carto_layer_is_keyed(folium_map):
+    from urllib.parse import quote
+
     from streetscape_metadata_tracker.basemap import carto_basemap_key
 
+    # The code URL-encodes the key, so compare against the encoded form: a
+    # rotated key holding "+", "/" or "=" must not fail a correct URL.
+    keyed = f"?key={quote(carto_basemap_key(), safe='')}"
     urls = _tile_urls(folium_map)
     assert urls, "the map has no tile layer at all"
     for url in urls:
         assert "basemaps.cartocdn.com" in url
-        assert url.endswith(f"?key={carto_basemap_key()}"), url
+        assert url.endswith(keyed), url
+
+    # The saved HTML is what a reader opens, so check the rendered page too, and
+    # that it keeps CARTO's zoom 20 rather than folium's generic 18 (adjacent
+    # coverage-map points sit ~20 m apart and separate only past zoom 18).
+    html = folium_map.get_root().render()
+    assert keyed in html
+    assert '"maxZoom": 20' in html
+    assert '"subdomains": "abcd"' in html
 
 
 def test_search_area_preview_basemap_carries_the_carto_key():

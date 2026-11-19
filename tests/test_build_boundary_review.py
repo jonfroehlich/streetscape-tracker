@@ -8,6 +8,7 @@ delegated to boundary_audit.frozen_rect_bounds, so we assert the two agree.
 
 import importlib.util
 import os
+from urllib.parse import quote
 
 import pytest
 
@@ -398,7 +399,8 @@ def test_render_html_substitutes_the_frontend_carto_key():
     ]
     html = bbr.render_html(payloads)
     assert bbr.CARTO_KEY_PLACEHOLDER not in html
-    assert f"?key={bbr.carto_basemap_key()}" in html
+    # render_html URL-encodes the key, so compare against the encoded form.
+    assert f"?key={quote(bbr.carto_basemap_key(), safe='')}" in html
 
 
 def test_carto_key_comes_from_the_frontend_module_not_a_second_copy():
