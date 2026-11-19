@@ -900,6 +900,8 @@ refusal_cooldown_h = 36
 # it frees go to other hosts within their own budgets and holds (Panoramax
 # and Overpass included), so set it outside #405's measurement window or
 # record it there as a confounder.
+# BEFORE SETTING IT, land #477: the resume reserve is never reconciled against
+# actual launches, and a checkpoint the child will discard still exempts its city.
 # [hosts.kartaview]
 # max_night_minutes = 480
 
