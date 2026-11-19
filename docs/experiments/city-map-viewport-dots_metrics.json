@@ -1,0 +1,3658 @@
+{
+ "generated_by": "python scripts/measure_city_map_render.py --www before=<outside-repo> --www after=www --sizes 60000,200000,1000000 --repeats 5 --work-dir <outside-repo> --out docs/experiments/city-map-viewport-dots_metrics.json",
+ "commit": "56b35231a45f4c17064bfcd405409904a0227782",
+ "www_tree": "1c4b237dc7546dd11ba7039c9c79e0756bc2bf34",
+ "www_dirty": false,
+ "main_commit": "e9c4528f2059ac99235e6048ceba7ad1fe0dd03d",
+ "platform": "Darwin 24.5.0 arm64",
+ "viewport": {
+  "width": 1440,
+  "height": 900
+ },
+ "street_zoom": 16,
+ "pans_per_load": 6,
+ "pan_px": 300,
+ "copies": [
+  {
+   "label": "before",
+   "www": "<outside-repo>"
+  },
+  {
+   "label": "after",
+   "www": "www"
+  }
+ ],
+ "results": [
+  {
+   "copy": "before",
+   "n_panos": 60000,
+   "csv_bytes": 930701,
+   "summary": {
+    "load_ms": {
+     "n": 5,
+     "min": 943.7,
+     "p25": 970.9,
+     "p50": 978.6,
+     "p75": 980.5,
+     "p90": 1049.0,
+     "p95": 1071.9,
+     "max": 1094.7
+    },
+    "heap_mb": {
+     "n": 5,
+     "min": 101.6,
+     "p25": 101.6,
+     "p50": 101.6,
+     "p75": 101.6,
+     "p90": 101.6,
+     "p95": 101.6,
+     "max": 101.6
+    },
+    "zoom_plus_2": {
+     "sync_ms": {
+      "n": 5,
+      "min": 36.4,
+      "p25": 37.4,
+      "p50": 38.2,
+      "p75": 38.2,
+      "p90": 38.44,
+      "p95": 38.52,
+      "max": 38.6
+     },
+     "paint_ms": {
+      "n": 5,
+      "min": 50.1,
+      "p25": 51.4,
+      "p50": 51.6,
+      "p75": 52.5,
+      "p90": 52.8,
+      "p95": 52.9,
+      "max": 53
+     }
+    },
+    "street_view": {
+     "sync_ms": {
+      "n": 5,
+      "min": 4.5,
+      "p25": 4.5,
+      "p50": 4.7,
+      "p75": 4.8,
+      "p90": 4.92,
+      "p95": 4.96,
+      "max": 5
+     },
+     "paint_ms": {
+      "n": 5,
+      "min": 11.7,
+      "p25": 12.3,
+      "p50": 12.3,
+      "p75": 15.8,
+      "p90": 16.1,
+      "p95": 16.2,
+      "max": 16.3
+     }
+    },
+    "pan": {
+     "sync_ms": {
+      "n": 30,
+      "min": 3.7,
+      "p25": 4.43,
+      "p50": 4.8,
+      "p75": 4.9,
+      "p90": 5.11,
+      "p95": 5.48,
+      "max": 6.4
+     },
+     "paint_ms": {
+      "n": 30,
+      "min": 10.3,
+      "p25": 11.33,
+      "p50": 12.4,
+      "p75": 12.6,
+      "p90": 12.81,
+      "p95": 14.99,
+      "max": 18
+     },
+     "drawn_in_view": {
+      "n": 30,
+      "min": 2182,
+      "p25": 3176.0,
+      "p50": 4462.0,
+      "p75": 4844.0,
+      "p90": 4851.0,
+      "p95": 4851.0,
+      "max": 4851
+     }
+    }
+   },
+   "repeats": [
+    {
+     "load_ms": 1094.7000002861023,
+     "heap_bytes": 106554288,
+     "fitted": {
+      "zoom": 14,
+      "on_map": 40000,
+      "drawn_in_view": 40000,
+      "true_in_view": null,
+      "tier": null
+     },
+     "index_ms": null,
+     "index_level": null,
+     "index_cells": null,
+     "index_bytes": null,
+     "moves": [
+      {
+       "move": "zoom_plus_2",
+       "sync_ms": 37.40000009536743,
+       "paint_ms": 51.40000009536743,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 4849,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "street_view",
+       "sync_ms": 4.5,
+       "paint_ms": 15.799999713897705,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 4849,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_0",
+       "sync_ms": 4.800000190734863,
+       "paint_ms": 12.5,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 4844,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_1",
+       "sync_ms": 4.599999904632568,
+       "paint_ms": 12.400000095367432,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 4851,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_2",
+       "sync_ms": 4.900000095367432,
+       "paint_ms": 12.599999904632568,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 4751,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_3",
+       "sync_ms": 4.300000190734863,
+       "paint_ms": 11.300000190734863,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 4172,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_4",
+       "sync_ms": 4.099999904632568,
+       "paint_ms": 11.400000095367432,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 3176,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_5",
+       "sync_ms": 4.900000095367432,
+       "paint_ms": 11.900000095367432,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 2182,
+       "true_in_view": null,
+       "tier": null
+      }
+     ],
+     "heap_bytes_after_moves": 106691600
+    },
+    {
+     "load_ms": 980.5,
+     "heap_bytes": 106558496,
+     "fitted": {
+      "zoom": 14,
+      "on_map": 40000,
+      "drawn_in_view": 40000,
+      "true_in_view": null,
+      "tier": null
+     },
+     "index_ms": null,
+     "index_level": null,
+     "index_cells": null,
+     "index_bytes": null,
+     "moves": [
+      {
+       "move": "zoom_plus_2",
+       "sync_ms": 38.200000286102295,
+       "paint_ms": 51.60000038146973,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 4849,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "street_view",
+       "sync_ms": 4.699999809265137,
+       "paint_ms": 16.300000190734863,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 4849,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_0",
+       "sync_ms": 4.900000095367432,
+       "paint_ms": 12.599999904632568,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 4844,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_1",
+       "sync_ms": 4.799999713897705,
+       "paint_ms": 12.5,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 4851,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_2",
+       "sync_ms": 4.900000095367432,
+       "paint_ms": 12.400000095367432,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 4751,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_3",
+       "sync_ms": 4.400000095367432,
+       "paint_ms": 11.199999809265137,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 4172,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_4",
+       "sync_ms": 4.300000190734863,
+       "paint_ms": 10.300000190734863,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 3176,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_5",
+       "sync_ms": 4.800000190734863,
+       "paint_ms": 12.599999904632568,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 2182,
+       "true_in_view": null,
+       "tier": null
+      }
+     ],
+     "heap_bytes_after_moves": 106693456
+    },
+    {
+     "load_ms": 970.8999996185303,
+     "heap_bytes": 106558824,
+     "fitted": {
+      "zoom": 14,
+      "on_map": 40000,
+      "drawn_in_view": 40000,
+      "true_in_view": null,
+      "tier": null
+     },
+     "index_ms": null,
+     "index_level": null,
+     "index_cells": null,
+     "index_bytes": null,
+     "moves": [
+      {
+       "move": "zoom_plus_2",
+       "sync_ms": 36.40000009536743,
+       "paint_ms": 50.09999990463257,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 4849,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "street_view",
+       "sync_ms": 4.5,
+       "paint_ms": 11.699999809265137,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 4849,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_0",
+       "sync_ms": 4.900000095367432,
+       "paint_ms": 18,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 4844,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_1",
+       "sync_ms": 4.800000190734863,
+       "paint_ms": 12.5,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 4851,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_2",
+       "sync_ms": 4.900000095367432,
+       "paint_ms": 12.400000095367432,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 4751,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_3",
+       "sync_ms": 4.099999904632568,
+       "paint_ms": 10.599999904632568,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 4172,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_4",
+       "sync_ms": 4,
+       "paint_ms": 11.699999809265137,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 3176,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_5",
+       "sync_ms": 3.6999998092651367,
+       "paint_ms": 12.5,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 2182,
+       "true_in_view": null,
+       "tier": null
+      }
+     ],
+     "heap_bytes_after_moves": 106688692
+    },
+    {
+     "load_ms": 943.6999998092651,
+     "heap_bytes": 106563776,
+     "fitted": {
+      "zoom": 14,
+      "on_map": 40000,
+      "drawn_in_view": 40000,
+      "true_in_view": null,
+      "tier": null
+     },
+     "index_ms": null,
+     "index_level": null,
+     "index_cells": null,
+     "index_bytes": null,
+     "moves": [
+      {
+       "move": "zoom_plus_2",
+       "sync_ms": 38.59999990463257,
+       "paint_ms": 53,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 4849,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "street_view",
+       "sync_ms": 5,
+       "paint_ms": 12.299999713897705,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 4849,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_0",
+       "sync_ms": 5.099999904632568,
+       "paint_ms": 16.700000286102295,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 4844,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_1",
+       "sync_ms": 4.899999618530273,
+       "paint_ms": 12.599999904632568,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 4851,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_2",
+       "sync_ms": 5.200000286102295,
+       "paint_ms": 12.800000190734863,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 4751,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_3",
+       "sync_ms": 4.5,
+       "paint_ms": 11.300000190734863,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 4172,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_4",
+       "sync_ms": 4.800000190734863,
+       "paint_ms": 12.100000381469727,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 3176,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_5",
+       "sync_ms": 6.399999618530273,
+       "paint_ms": 11.199999809265137,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 2182,
+       "true_in_view": null,
+       "tier": null
+      }
+     ],
+     "heap_bytes_after_moves": 106701488
+    },
+    {
+     "load_ms": 978.5999999046326,
+     "heap_bytes": 106500712,
+     "fitted": {
+      "zoom": 14,
+      "on_map": 40000,
+      "drawn_in_view": 40000,
+      "true_in_view": null,
+      "tier": null
+     },
+     "index_ms": null,
+     "index_level": null,
+     "index_cells": null,
+     "index_bytes": null,
+     "moves": [
+      {
+       "move": "zoom_plus_2",
+       "sync_ms": 38.200000286102295,
+       "paint_ms": 52.5,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 4849,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "street_view",
+       "sync_ms": 4.799999713897705,
+       "paint_ms": 12.299999713897705,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 4849,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_0",
+       "sync_ms": 5,
+       "paint_ms": 12.900000095367432,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 4844,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_1",
+       "sync_ms": 4.900000095367432,
+       "paint_ms": 12.699999809265137,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 4851,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_2",
+       "sync_ms": 4.800000190734863,
+       "paint_ms": 12.600000381469727,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 4751,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_3",
+       "sync_ms": 4.299999713897705,
+       "paint_ms": 11.099999904632568,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 4172,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_4",
+       "sync_ms": 5,
+       "paint_ms": 11,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 3176,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_5",
+       "sync_ms": 5.700000286102295,
+       "paint_ms": 12,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 2182,
+       "true_in_view": null,
+       "tier": null
+      }
+     ],
+     "heap_bytes_after_moves": 106690072
+    }
+   ]
+  },
+  {
+   "copy": "before",
+   "n_panos": 200000,
+   "csv_bytes": 3084614,
+   "summary": {
+    "load_ms": {
+     "n": 5,
+     "min": 1875.9,
+     "p25": 1897.1,
+     "p50": 1918.2,
+     "p75": 1929.3,
+     "p90": 1945.4,
+     "p95": 1950.7,
+     "max": 1956.1
+    },
+    "heap_mb": {
+     "n": 5,
+     "min": 292.9,
+     "p25": 292.9,
+     "p50": 292.9,
+     "p75": 292.9,
+     "p90": 292.9,
+     "p95": 292.9,
+     "max": 292.9
+    },
+    "zoom_plus_2": {
+     "sync_ms": {
+      "n": 5,
+      "min": 47.7,
+      "p25": 52.4,
+      "p50": 52.5,
+      "p75": 53.1,
+      "p90": 53.16,
+      "p95": 53.18,
+      "max": 53.2
+     },
+     "paint_ms": {
+      "n": 5,
+      "min": 58.6,
+      "p25": 63.2,
+      "p50": 63.4,
+      "p75": 63.5,
+      "p90": 64.1,
+      "p95": 64.3,
+      "max": 64.5
+     }
+    },
+    "street_view": {
+     "sync_ms": {
+      "n": 5,
+      "min": 39.5,
+      "p25": 42.1,
+      "p50": 42.2,
+      "p75": 43.3,
+      "p90": 43.48,
+      "p95": 43.54,
+      "max": 43.6
+     },
+     "paint_ms": {
+      "n": 5,
+      "min": 43.8,
+      "p25": 46.5,
+      "p50": 46.5,
+      "p75": 47.8,
+      "p90": 47.86,
+      "p95": 47.88,
+      "max": 47.9
+     }
+    },
+    "pan": {
+     "sync_ms": {
+      "n": 30,
+      "min": 4.5,
+      "p25": 5.2,
+      "p50": 5.6,
+      "p75": 6.2,
+      "p90": 6.62,
+      "p95": 6.91,
+      "max": 7.1
+     },
+     "paint_ms": {
+      "n": 30,
+      "min": 8.1,
+      "p25": 9.3,
+      "p50": 9.9,
+      "p75": 12.43,
+      "p90": 16.05,
+      "p95": 16.55,
+      "max": 17.3
+     },
+     "drawn_in_view": {
+      "n": 30,
+      "min": 1454,
+      "p25": 1454.0,
+      "p50": 1483.0,
+      "p75": 1486.0,
+      "p90": 1486.0,
+      "p95": 1486.0,
+      "max": 1486
+     }
+    }
+   },
+   "repeats": [
+    {
+     "load_ms": 1956.0999999046326,
+     "heap_bytes": 307169252,
+     "fitted": {
+      "zoom": 13,
+      "on_map": 40000,
+      "drawn_in_view": 40000,
+      "true_in_view": null,
+      "tier": null
+     },
+     "index_ms": null,
+     "index_level": null,
+     "index_cells": null,
+     "index_bytes": null,
+     "moves": [
+      {
+       "move": "zoom_plus_2",
+       "sync_ms": 52.5,
+       "paint_ms": 63.19999980926514,
+       "zoom": 15,
+       "on_map": 40000,
+       "drawn_in_view": 5771,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "street_view",
+       "sync_ms": 42.19999980926514,
+       "paint_ms": 46.5,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 1455,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_0",
+       "sync_ms": 7.099999904632568,
+       "paint_ms": 10.799999713897705,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 1454,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_1",
+       "sync_ms": 7,
+       "paint_ms": 16,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 1486,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_2",
+       "sync_ms": 5.899999618530273,
+       "paint_ms": 9.599999904632568,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 1483,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_3",
+       "sync_ms": 6.099999904632568,
+       "paint_ms": 16.5,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 1486,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_4",
+       "sync_ms": 5.599999904632568,
+       "paint_ms": 9.299999713897705,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 1483,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_5",
+       "sync_ms": 5.400000095367432,
+       "paint_ms": 9,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 1454,
+       "true_in_view": null,
+       "tier": null
+      }
+     ],
+     "heap_bytes_after_moves": 307135092
+    },
+    {
+     "load_ms": 1918.2000002861023,
+     "heap_bytes": 307161816,
+     "fitted": {
+      "zoom": 13,
+      "on_map": 40000,
+      "drawn_in_view": 40000,
+      "true_in_view": null,
+      "tier": null
+     },
+     "index_ms": null,
+     "index_level": null,
+     "index_cells": null,
+     "index_bytes": null,
+     "moves": [
+      {
+       "move": "zoom_plus_2",
+       "sync_ms": 52.40000009536743,
+       "paint_ms": 63.40000009536743,
+       "zoom": 15,
+       "on_map": 40000,
+       "drawn_in_view": 5771,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "street_view",
+       "sync_ms": 43.59999990463257,
+       "paint_ms": 47.90000009536743,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 1455,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_0",
+       "sync_ms": 6.199999809265137,
+       "paint_ms": 10.599999904632568,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 1454,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_1",
+       "sync_ms": 6.799999713897705,
+       "paint_ms": 10.799999713897705,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 1486,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_2",
+       "sync_ms": 5.900000095367432,
+       "paint_ms": 11.599999904632568,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 1483,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_3",
+       "sync_ms": 5.5,
+       "paint_ms": 9.599999904632568,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 1486,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_4",
+       "sync_ms": 5.599999904632568,
+       "paint_ms": 16.59999990463257,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 1483,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_5",
+       "sync_ms": 5.800000190734863,
+       "paint_ms": 9.300000190734863,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 1454,
+       "true_in_view": null,
+       "tier": null
+      }
+     ],
+     "heap_bytes_after_moves": 307127804
+    },
+    {
+     "load_ms": 1929.2999997138977,
+     "heap_bytes": 307179068,
+     "fitted": {
+      "zoom": 13,
+      "on_map": 40000,
+      "drawn_in_view": 40000,
+      "true_in_view": null,
+      "tier": null
+     },
+     "index_ms": null,
+     "index_level": null,
+     "index_cells": null,
+     "index_bytes": null,
+     "moves": [
+      {
+       "move": "zoom_plus_2",
+       "sync_ms": 53.09999990463257,
+       "paint_ms": 63.5,
+       "zoom": 15,
+       "on_map": 40000,
+       "drawn_in_view": 5771,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "street_view",
+       "sync_ms": 42.09999990463257,
+       "paint_ms": 46.5,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 1455,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_0",
+       "sync_ms": 6.599999904632568,
+       "paint_ms": 9.800000190734863,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 1454,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_1",
+       "sync_ms": 6.5,
+       "paint_ms": 11.599999904632568,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 1486,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_2",
+       "sync_ms": 6.200000286102295,
+       "paint_ms": 12.200000286102295,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 1483,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_3",
+       "sync_ms": 5.200000286102295,
+       "paint_ms": 8.599999904632568,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 1486,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_4",
+       "sync_ms": 5.199999809265137,
+       "paint_ms": 8.699999809265137,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 1483,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_5",
+       "sync_ms": 5.099999904632568,
+       "paint_ms": 10,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 1454,
+       "true_in_view": null,
+       "tier": null
+      }
+     ],
+     "heap_bytes_after_moves": 307173592
+    },
+    {
+     "load_ms": 1875.9000000953674,
+     "heap_bytes": 307176788,
+     "fitted": {
+      "zoom": 13,
+      "on_map": 40000,
+      "drawn_in_view": 40000,
+      "true_in_view": null,
+      "tier": null
+     },
+     "index_ms": null,
+     "index_level": null,
+     "index_cells": null,
+     "index_bytes": null,
+     "moves": [
+      {
+       "move": "zoom_plus_2",
+       "sync_ms": 53.200000286102295,
+       "paint_ms": 64.5,
+       "zoom": 15,
+       "on_map": 40000,
+       "drawn_in_view": 5771,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "street_view",
+       "sync_ms": 43.30000019073486,
+       "paint_ms": 47.80000019073486,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 1455,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_0",
+       "sync_ms": 6.300000190734863,
+       "paint_ms": 12.900000095367432,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 1454,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_1",
+       "sync_ms": 6.299999713897705,
+       "paint_ms": 12.5,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 1486,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_2",
+       "sync_ms": 6,
+       "paint_ms": 14.700000286102295,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 1483,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_3",
+       "sync_ms": 5,
+       "paint_ms": 8.600000381469727,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 1486,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_4",
+       "sync_ms": 5.300000190734863,
+       "paint_ms": 9.699999809265137,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 1483,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_5",
+       "sync_ms": 4.799999713897705,
+       "paint_ms": 8.400000095367432,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 1454,
+       "true_in_view": null,
+       "tier": null
+      }
+     ],
+     "heap_bytes_after_moves": 307158284
+    },
+    {
+     "load_ms": 1897.0999999046326,
+     "heap_bytes": 307177812,
+     "fitted": {
+      "zoom": 13,
+      "on_map": 40000,
+      "drawn_in_view": 40000,
+      "true_in_view": null,
+      "tier": null
+     },
+     "index_ms": null,
+     "index_level": null,
+     "index_cells": null,
+     "index_bytes": null,
+     "moves": [
+      {
+       "move": "zoom_plus_2",
+       "sync_ms": 47.700000286102295,
+       "paint_ms": 58.60000038146973,
+       "zoom": 15,
+       "on_map": 40000,
+       "drawn_in_view": 5771,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "street_view",
+       "sync_ms": 39.5,
+       "paint_ms": 43.799999713897705,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 1455,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_0",
+       "sync_ms": 5.599999904632568,
+       "paint_ms": 9.400000095367432,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 1454,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_1",
+       "sync_ms": 5.5,
+       "paint_ms": 9.599999904632568,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 1486,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_2",
+       "sync_ms": 4.599999904632568,
+       "paint_ms": 15.799999713897705,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 1483,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_3",
+       "sync_ms": 4.900000095367432,
+       "paint_ms": 8.699999809265137,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 1486,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_4",
+       "sync_ms": 4.700000286102295,
+       "paint_ms": 17.300000190734863,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 1483,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_5",
+       "sync_ms": 4.5,
+       "paint_ms": 8.100000381469727,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 1454,
+       "true_in_view": null,
+       "tier": null
+      }
+     ],
+     "heap_bytes_after_moves": 307154120
+    }
+   ]
+  },
+  {
+   "copy": "before",
+   "n_panos": 1000000,
+   "csv_bytes": 15425255,
+   "summary": {
+    "load_ms": {
+     "n": 5,
+     "min": 7261.7,
+     "p25": 7373.8,
+     "p50": 7405.9,
+     "p75": 7433.0,
+     "p90": 7481.6,
+     "p95": 7497.8,
+     "max": 7514
+    },
+    "heap_mb": {
+     "n": 5,
+     "min": 1335.3,
+     "p25": 1335.3,
+     "p50": 1335.3,
+     "p75": 1335.4,
+     "p90": 1335.4,
+     "p95": 1335.4,
+     "max": 1335.4
+    },
+    "zoom_plus_2": {
+     "sync_ms": {
+      "n": 5,
+      "min": 76,
+      "p25": 77.2,
+      "p50": 77.2,
+      "p75": 78.3,
+      "p90": 79.08,
+      "p95": 79.34,
+      "max": 79.6
+     },
+     "paint_ms": {
+      "n": 5,
+      "min": 85.6,
+      "p25": 86.2,
+      "p50": 86.2,
+      "p75": 87.6,
+      "p90": 88.2,
+      "p95": 88.4,
+      "max": 88.6
+     }
+    },
+    "street_view": {
+     "sync_ms": {
+      "n": 5,
+      "min": 56.5,
+      "p25": 57.2,
+      "p50": 60.2,
+      "p75": 60.5,
+      "p90": 61.4,
+      "p95": 61.7,
+      "max": 62
+     },
+     "paint_ms": {
+      "n": 5,
+      "min": 59.5,
+      "p25": 60.3,
+      "p50": 63.1,
+      "p75": 63.3,
+      "p90": 64.38,
+      "p95": 64.74,
+      "max": 65.1
+     }
+    },
+    "pan": {
+     "sync_ms": {
+      "n": 30,
+      "min": 4.9,
+      "p25": 5.3,
+      "p50": 5.5,
+      "p75": 5.77,
+      "p90": 5.94,
+      "p95": 6.3,
+      "max": 6.5
+     },
+     "paint_ms": {
+      "n": 30,
+      "min": 6.9,
+      "p25": 10.9,
+      "p50": 14.1,
+      "p75": 15.0,
+      "p90": 15.52,
+      "p95": 15.81,
+      "max": 15.9
+     },
+     "drawn_in_view": {
+      "n": 30,
+      "min": 279,
+      "p25": 281.0,
+      "p50": 287.0,
+      "p75": 288.0,
+      "p90": 288.0,
+      "p95": 288.0,
+      "max": 288
+     }
+    }
+   },
+   "repeats": [
+    {
+     "load_ms": 7405.89999961853,
+     "heap_bytes": 1400142236,
+     "fitted": {
+      "zoom": 12,
+      "on_map": 40000,
+      "drawn_in_view": 40000,
+      "true_in_view": null,
+      "tier": null
+     },
+     "index_ms": null,
+     "index_level": null,
+     "index_cells": null,
+     "index_bytes": null,
+     "moves": [
+      {
+       "move": "zoom_plus_2",
+       "sync_ms": 77.19999980926514,
+       "paint_ms": 86.19999980926514,
+       "zoom": 14,
+       "on_map": 40000,
+       "drawn_in_view": 4619,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "street_view",
+       "sync_ms": 56.5,
+       "paint_ms": 59.5,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 288,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_0",
+       "sync_ms": 5.699999809265137,
+       "paint_ms": 10.199999809265137,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 287,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_1",
+       "sync_ms": 5.900000095367432,
+       "paint_ms": 12.300000190734863,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 288,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_2",
+       "sync_ms": 5.199999809265137,
+       "paint_ms": 14.5,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 281,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_3",
+       "sync_ms": 5.299999713897705,
+       "paint_ms": 14.5,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 279,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_4",
+       "sync_ms": 5.299999713897705,
+       "paint_ms": 15.5,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 288,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_5",
+       "sync_ms": 5.299999713897705,
+       "paint_ms": 15.5,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 287,
+       "true_in_view": null,
+       "tier": null
+      }
+     ],
+     "heap_bytes_after_moves": 1400318296
+    },
+    {
+     "load_ms": 7261.699999809265,
+     "heap_bytes": 1400297944,
+     "fitted": {
+      "zoom": 12,
+      "on_map": 40000,
+      "drawn_in_view": 40000,
+      "true_in_view": null,
+      "tier": null
+     },
+     "index_ms": null,
+     "index_level": null,
+     "index_cells": null,
+     "index_bytes": null,
+     "moves": [
+      {
+       "move": "zoom_plus_2",
+       "sync_ms": 77.19999980926514,
+       "paint_ms": 86.19999980926514,
+       "zoom": 14,
+       "on_map": 40000,
+       "drawn_in_view": 4619,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "street_view",
+       "sync_ms": 60.5,
+       "paint_ms": 63.30000019073486,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 288,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_0",
+       "sync_ms": 5.899999618530273,
+       "paint_ms": 11.5,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 287,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_1",
+       "sync_ms": 5.5,
+       "paint_ms": 13.200000286102295,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 288,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_2",
+       "sync_ms": 5.699999809265137,
+       "paint_ms": 15.099999904632568,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 281,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_3",
+       "sync_ms": 5.599999904632568,
+       "paint_ms": 14.400000095367432,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 279,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_4",
+       "sync_ms": 5.099999904632568,
+       "paint_ms": 15.900000095367432,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 288,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_5",
+       "sync_ms": 5.5,
+       "paint_ms": 14,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 287,
+       "true_in_view": null,
+       "tier": null
+      }
+     ],
+     "heap_bytes_after_moves": 1400311052
+    },
+    {
+     "load_ms": 7514,
+     "heap_bytes": 1400132672,
+     "fitted": {
+      "zoom": 12,
+      "on_map": 40000,
+      "drawn_in_view": 40000,
+      "true_in_view": null,
+      "tier": null
+     },
+     "index_ms": null,
+     "index_level": null,
+     "index_cells": null,
+     "index_bytes": null,
+     "moves": [
+      {
+       "move": "zoom_plus_2",
+       "sync_ms": 78.30000019073486,
+       "paint_ms": 87.60000038146973,
+       "zoom": 14,
+       "on_map": 40000,
+       "drawn_in_view": 4619,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "street_view",
+       "sync_ms": 62,
+       "paint_ms": 65.09999990463257,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 288,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_0",
+       "sync_ms": 6.299999713897705,
+       "paint_ms": 13.5,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 287,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_1",
+       "sync_ms": 5.900000095367432,
+       "paint_ms": 14.199999809265137,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 288,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_2",
+       "sync_ms": 5.399999618530273,
+       "paint_ms": 7.399999618530273,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 281,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_3",
+       "sync_ms": 5.400000095367432,
+       "paint_ms": 10.299999713897705,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 279,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_4",
+       "sync_ms": 5.599999904632568,
+       "paint_ms": 15.900000095367432,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 288,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_5",
+       "sync_ms": 5.5,
+       "paint_ms": 14.700000286102295,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 287,
+       "true_in_view": null,
+       "tier": null
+      }
+     ],
+     "heap_bytes_after_moves": 1400308936
+    },
+    {
+     "load_ms": 7373.800000190735,
+     "heap_bytes": 1400308136,
+     "fitted": {
+      "zoom": 12,
+      "on_map": 40000,
+      "drawn_in_view": 40000,
+      "true_in_view": null,
+      "tier": null
+     },
+     "index_ms": null,
+     "index_level": null,
+     "index_cells": null,
+     "index_bytes": null,
+     "moves": [
+      {
+       "move": "zoom_plus_2",
+       "sync_ms": 79.59999990463257,
+       "paint_ms": 88.59999990463257,
+       "zoom": 14,
+       "on_map": 40000,
+       "drawn_in_view": 4619,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "street_view",
+       "sync_ms": 57.19999980926514,
+       "paint_ms": 60.299999713897705,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 288,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_0",
+       "sync_ms": 5.900000095367432,
+       "paint_ms": 10.900000095367432,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 287,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_1",
+       "sync_ms": 5.5,
+       "paint_ms": 9.800000190734863,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 288,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_2",
+       "sync_ms": 5.099999904632568,
+       "paint_ms": 15.699999809265137,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 281,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_3",
+       "sync_ms": 4.900000095367432,
+       "paint_ms": 6.900000095367432,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 279,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_4",
+       "sync_ms": 5.200000286102295,
+       "paint_ms": 12.800000190734863,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 288,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_5",
+       "sync_ms": 5.099999904632568,
+       "paint_ms": 15.400000095367432,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 287,
+       "true_in_view": null,
+       "tier": null
+      }
+     ],
+     "heap_bytes_after_moves": 1400323404
+    },
+    {
+     "load_ms": 7433,
+     "heap_bytes": 1400145564,
+     "fitted": {
+      "zoom": 12,
+      "on_map": 40000,
+      "drawn_in_view": 40000,
+      "true_in_view": null,
+      "tier": null
+     },
+     "index_ms": null,
+     "index_level": null,
+     "index_cells": null,
+     "index_bytes": null,
+     "moves": [
+      {
+       "move": "zoom_plus_2",
+       "sync_ms": 76,
+       "paint_ms": 85.60000038146973,
+       "zoom": 14,
+       "on_map": 40000,
+       "drawn_in_view": 4619,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "street_view",
+       "sync_ms": 60.19999980926514,
+       "paint_ms": 63.09999990463257,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 288,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_0",
+       "sync_ms": 6.5,
+       "paint_ms": 9.299999713897705,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 287,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_1",
+       "sync_ms": 6.299999713897705,
+       "paint_ms": 8.900000095367432,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 288,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_2",
+       "sync_ms": 5.799999713897705,
+       "paint_ms": 10.899999618530273,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 281,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_3",
+       "sync_ms": 5.300000190734863,
+       "paint_ms": 15,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 279,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_4",
+       "sync_ms": 5.700000286102295,
+       "paint_ms": 14.600000381469727,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 288,
+       "true_in_view": null,
+       "tier": null
+      },
+      {
+       "move": "pan_5",
+       "sync_ms": 5.5,
+       "paint_ms": 15,
+       "zoom": 16,
+       "on_map": 40000,
+       "drawn_in_view": 287,
+       "true_in_view": null,
+       "tier": null
+      }
+     ],
+     "heap_bytes_after_moves": 1400331656
+    }
+   ]
+  },
+  {
+   "copy": "after",
+   "n_panos": 60000,
+   "csv_bytes": 930701,
+   "summary": {
+    "load_ms": {
+     "n": 5,
+     "min": 986.7,
+     "p25": 997.2,
+     "p50": 1002.0,
+     "p75": 1006.2,
+     "p90": 1020.1,
+     "p95": 1024.8,
+     "max": 1029.4
+    },
+    "heap_mb": {
+     "n": 5,
+     "min": 98.5,
+     "p25": 98.5,
+     "p50": 98.5,
+     "p75": 98.5,
+     "p90": 98.5,
+     "p95": 98.5,
+     "max": 98.5
+    },
+    "index_ms": {
+     "n": 5,
+     "min": 8,
+     "p25": 8.0,
+     "p50": 8.2,
+     "p75": 8.8,
+     "p90": 9.04,
+     "p95": 9.12,
+     "max": 9.2
+    },
+    "zoom_plus_2": {
+     "sync_ms": {
+      "n": 5,
+      "min": 102,
+      "p25": 102.1,
+      "p50": 102.8,
+      "p75": 104.3,
+      "p90": 105.08,
+      "p95": 105.34,
+      "max": 105.6
+     },
+     "paint_ms": {
+      "n": 5,
+      "min": 134.5,
+      "p25": 134.9,
+      "p50": 135.0,
+      "p75": 137.0,
+      "p90": 137.48,
+      "p95": 137.64,
+      "max": 137.8
+     }
+    },
+    "street_view": {
+     "sync_ms": {
+      "n": 5,
+      "min": 7.1,
+      "p25": 7.3,
+      "p50": 7.3,
+      "p75": 7.5,
+      "p90": 7.5,
+      "p95": 7.5,
+      "max": 7.5
+     },
+     "paint_ms": {
+      "n": 5,
+      "min": 17.5,
+      "p25": 17.5,
+      "p50": 17.6,
+      "p75": 17.7,
+      "p90": 17.94,
+      "p95": 18.02,
+      "max": 18.1
+     }
+    },
+    "pan": {
+     "sync_ms": {
+      "n": 30,
+      "min": 4.8,
+      "p25": 6.53,
+      "p50": 9.95,
+      "p75": 13.28,
+      "p90": 14.13,
+      "p95": 14.51,
+      "max": 15.1
+     },
+     "paint_ms": {
+      "n": 30,
+      "min": 16.8,
+      "p25": 22.83,
+      "p50": 31.85,
+      "p75": 37.1,
+      "p90": 38.22,
+      "p95": 38.73,
+      "max": 41
+     },
+     "drawn_in_view": {
+      "n": 30,
+      "min": 3239,
+      "p25": 4714.0,
+      "p50": 6615.0,
+      "p75": 7180.0,
+      "p90": 7195.0,
+      "p95": 7195.0,
+      "max": 7195
+     },
+     "true_in_view": {
+      "n": 30,
+      "min": 3239,
+      "p25": 4714.0,
+      "p50": 6615.0,
+      "p75": 7180.0,
+      "p90": 7195.0,
+      "p95": 7195.0,
+      "max": 7195
+     }
+    }
+   },
+   "repeats": [
+    {
+     "load_ms": 1029.4000000953674,
+     "heap_bytes": 103248700,
+     "fitted": {
+      "zoom": 14,
+      "on_map": 40000,
+      "drawn_in_view": 40000,
+      "true_in_view": null,
+      "tier": "sampled"
+     },
+     "index_ms": 9.199999809265137,
+     "index_level": 16,
+     "index_cells": 199,
+     "index_bytes": 488955,
+     "moves": [
+      {
+       "move": "zoom_plus_2",
+       "sync_ms": 104.30000019073486,
+       "paint_ms": 137,
+       "zoom": 16,
+       "on_map": 10486,
+       "drawn_in_view": 7195,
+       "true_in_view": 7195,
+       "tier": "complete"
+      },
+      {
+       "move": "street_view",
+       "sync_ms": 7.300000190734863,
+       "paint_ms": 17.5,
+       "zoom": 16,
+       "on_map": 10486,
+       "drawn_in_view": 7195,
+       "true_in_view": 7195,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_0",
+       "sync_ms": 14.400000095367432,
+       "paint_ms": 37.700000286102295,
+       "zoom": 16,
+       "on_map": 10486,
+       "drawn_in_view": 7180,
+       "true_in_view": 7180,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_1",
+       "sync_ms": 14.099999904632568,
+       "paint_ms": 38.39999961853027,
+       "zoom": 16,
+       "on_map": 10634,
+       "drawn_in_view": 7195,
+       "true_in_view": 7195,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_2",
+       "sync_ms": 13.300000190734863,
+       "paint_ms": 37.09999990463257,
+       "zoom": 16,
+       "on_map": 10429,
+       "drawn_in_view": 7041,
+       "true_in_view": 7041,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_3",
+       "sync_ms": 8,
+       "paint_ms": 28.5,
+       "zoom": 16,
+       "on_map": 8606,
+       "drawn_in_view": 6189,
+       "true_in_view": 6189,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_4",
+       "sync_ms": 7,
+       "paint_ms": 23.90000009536743,
+       "zoom": 16,
+       "on_map": 6802,
+       "drawn_in_view": 4714,
+       "true_in_view": 4714,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_5",
+       "sync_ms": 5.400000095367432,
+       "paint_ms": 17.59999990463257,
+       "zoom": 16,
+       "on_map": 4812,
+       "drawn_in_view": 3239,
+       "true_in_view": 3239,
+       "tier": "complete"
+      }
+     ],
+     "heap_bytes_after_moves": 108959524
+    },
+    {
+     "load_ms": 1006.1999998092651,
+     "heap_bytes": 103270048,
+     "fitted": {
+      "zoom": 14,
+      "on_map": 40000,
+      "drawn_in_view": 40000,
+      "true_in_view": null,
+      "tier": "sampled"
+     },
+     "index_ms": 8,
+     "index_level": 16,
+     "index_cells": 199,
+     "index_bytes": 488955,
+     "moves": [
+      {
+       "move": "zoom_plus_2",
+       "sync_ms": 102.09999990463257,
+       "paint_ms": 134.5,
+       "zoom": 16,
+       "on_map": 10486,
+       "drawn_in_view": 7195,
+       "true_in_view": 7195,
+       "tier": "complete"
+      },
+      {
+       "move": "street_view",
+       "sync_ms": 7.5,
+       "paint_ms": 18.09999990463257,
+       "zoom": 16,
+       "on_map": 10486,
+       "drawn_in_view": 7195,
+       "true_in_view": 7195,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_0",
+       "sync_ms": 12.699999809265137,
+       "paint_ms": 36.799999713897705,
+       "zoom": 16,
+       "on_map": 10486,
+       "drawn_in_view": 7180,
+       "true_in_view": 7180,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_1",
+       "sync_ms": 14.099999904632568,
+       "paint_ms": 37.69999980926514,
+       "zoom": 16,
+       "on_map": 10634,
+       "drawn_in_view": 7195,
+       "true_in_view": 7195,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_2",
+       "sync_ms": 12.600000381469727,
+       "paint_ms": 37.10000038146973,
+       "zoom": 16,
+       "on_map": 10429,
+       "drawn_in_view": 7041,
+       "true_in_view": 7041,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_3",
+       "sync_ms": 6.699999809265137,
+       "paint_ms": 27,
+       "zoom": 16,
+       "on_map": 8606,
+       "drawn_in_view": 6189,
+       "true_in_view": 6189,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_4",
+       "sync_ms": 5.900000095367432,
+       "paint_ms": 22.5,
+       "zoom": 16,
+       "on_map": 6802,
+       "drawn_in_view": 4714,
+       "true_in_view": 4714,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_5",
+       "sync_ms": 4.799999713897705,
+       "paint_ms": 16.799999713897705,
+       "zoom": 16,
+       "on_map": 4812,
+       "drawn_in_view": 3239,
+       "true_in_view": 3239,
+       "tier": "complete"
+      }
+     ],
+     "heap_bytes_after_moves": 108981236
+    },
+    {
+     "load_ms": 1002,
+     "heap_bytes": 103259308,
+     "fitted": {
+      "zoom": 14,
+      "on_map": 40000,
+      "drawn_in_view": 40000,
+      "true_in_view": null,
+      "tier": "sampled"
+     },
+     "index_ms": 8,
+     "index_level": 16,
+     "index_cells": 199,
+     "index_bytes": 488955,
+     "moves": [
+      {
+       "move": "zoom_plus_2",
+       "sync_ms": 105.59999990463257,
+       "paint_ms": 137.80000019073486,
+       "zoom": 16,
+       "on_map": 10486,
+       "drawn_in_view": 7195,
+       "true_in_view": 7195,
+       "tier": "complete"
+      },
+      {
+       "move": "street_view",
+       "sync_ms": 7.099999904632568,
+       "paint_ms": 17.5,
+       "zoom": 16,
+       "on_map": 10486,
+       "drawn_in_view": 7195,
+       "true_in_view": 7195,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_0",
+       "sync_ms": 12.400000095367432,
+       "paint_ms": 35.200000286102295,
+       "zoom": 16,
+       "on_map": 10486,
+       "drawn_in_view": 7180,
+       "true_in_view": 7180,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_1",
+       "sync_ms": 15.099999904632568,
+       "paint_ms": 41,
+       "zoom": 16,
+       "on_map": 10634,
+       "drawn_in_view": 7195,
+       "true_in_view": 7195,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_2",
+       "sync_ms": 13.300000190734863,
+       "paint_ms": 38.200000286102295,
+       "zoom": 16,
+       "on_map": 10429,
+       "drawn_in_view": 7041,
+       "true_in_view": 7041,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_3",
+       "sync_ms": 7.100000381469727,
+       "paint_ms": 27.600000381469727,
+       "zoom": 16,
+       "on_map": 8606,
+       "drawn_in_view": 6189,
+       "true_in_view": 6189,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_4",
+       "sync_ms": 6.5,
+       "paint_ms": 23.199999809265137,
+       "zoom": 16,
+       "on_map": 6802,
+       "drawn_in_view": 4714,
+       "true_in_view": 4714,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_5",
+       "sync_ms": 5.099999904632568,
+       "paint_ms": 17.59999990463257,
+       "zoom": 16,
+       "on_map": 4812,
+       "drawn_in_view": 3239,
+       "true_in_view": 3239,
+       "tier": "complete"
+      }
+     ],
+     "heap_bytes_after_moves": 108973028
+    },
+    {
+     "load_ms": 986.7000002861023,
+     "heap_bytes": 103249280,
+     "fitted": {
+      "zoom": 14,
+      "on_map": 40000,
+      "drawn_in_view": 40000,
+      "true_in_view": null,
+      "tier": "sampled"
+     },
+     "index_ms": 8.800000190734863,
+     "index_level": 16,
+     "index_cells": 199,
+     "index_bytes": 488955,
+     "moves": [
+      {
+       "move": "zoom_plus_2",
+       "sync_ms": 102,
+       "paint_ms": 135,
+       "zoom": 16,
+       "on_map": 10486,
+       "drawn_in_view": 7195,
+       "true_in_view": 7195,
+       "tier": "complete"
+      },
+      {
+       "move": "street_view",
+       "sync_ms": 7.300000190734863,
+       "paint_ms": 17.700000286102295,
+       "zoom": 16,
+       "on_map": 10486,
+       "drawn_in_view": 7195,
+       "true_in_view": 7195,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_0",
+       "sync_ms": 14.599999904632568,
+       "paint_ms": 39,
+       "zoom": 16,
+       "on_map": 10486,
+       "drawn_in_view": 7180,
+       "true_in_view": 7180,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_1",
+       "sync_ms": 12.600000381469727,
+       "paint_ms": 36.30000019073486,
+       "zoom": 16,
+       "on_map": 10634,
+       "drawn_in_view": 7195,
+       "true_in_view": 7195,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_2",
+       "sync_ms": 13.799999713897705,
+       "paint_ms": 37.5,
+       "zoom": 16,
+       "on_map": 10429,
+       "drawn_in_view": 7041,
+       "true_in_view": 7041,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_3",
+       "sync_ms": 7.300000190734863,
+       "paint_ms": 26.800000190734863,
+       "zoom": 16,
+       "on_map": 8606,
+       "drawn_in_view": 6189,
+       "true_in_view": 6189,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_4",
+       "sync_ms": 6.399999618530273,
+       "paint_ms": 22.699999809265137,
+       "zoom": 16,
+       "on_map": 6802,
+       "drawn_in_view": 4714,
+       "true_in_view": 4714,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_5",
+       "sync_ms": 5.299999713897705,
+       "paint_ms": 17.799999713897705,
+       "zoom": 16,
+       "on_map": 4812,
+       "drawn_in_view": 3239,
+       "true_in_view": 3239,
+       "tier": "complete"
+      }
+     ],
+     "heap_bytes_after_moves": 108876492
+    },
+    {
+     "load_ms": 997.1999998092651,
+     "heap_bytes": 103240696,
+     "fitted": {
+      "zoom": 14,
+      "on_map": 40000,
+      "drawn_in_view": 40000,
+      "true_in_view": null,
+      "tier": "sampled"
+     },
+     "index_ms": 8.199999809265137,
+     "index_level": 16,
+     "index_cells": 199,
+     "index_bytes": 488955,
+     "moves": [
+      {
+       "move": "zoom_plus_2",
+       "sync_ms": 102.80000019073486,
+       "paint_ms": 134.90000009536743,
+       "zoom": 16,
+       "on_map": 10486,
+       "drawn_in_view": 7195,
+       "true_in_view": 7195,
+       "tier": "complete"
+      },
+      {
+       "move": "street_view",
+       "sync_ms": 7.5,
+       "paint_ms": 17.59999990463257,
+       "zoom": 16,
+       "on_map": 10486,
+       "drawn_in_view": 7195,
+       "true_in_view": 7195,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_0",
+       "sync_ms": 13.200000286102295,
+       "paint_ms": 35.700000286102295,
+       "zoom": 16,
+       "on_map": 10486,
+       "drawn_in_view": 7180,
+       "true_in_view": 7180,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_1",
+       "sync_ms": 12.300000190734863,
+       "paint_ms": 35.30000019073486,
+       "zoom": 16,
+       "on_map": 10634,
+       "drawn_in_view": 7195,
+       "true_in_view": 7195,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_2",
+       "sync_ms": 11.900000095367432,
+       "paint_ms": 35.40000009536743,
+       "zoom": 16,
+       "on_map": 10429,
+       "drawn_in_view": 7041,
+       "true_in_view": 7041,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_3",
+       "sync_ms": 7.199999809265137,
+       "paint_ms": 26.800000190734863,
+       "zoom": 16,
+       "on_map": 8606,
+       "drawn_in_view": 6189,
+       "true_in_view": 6189,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_4",
+       "sync_ms": 6.600000381469727,
+       "paint_ms": 22.700000286102295,
+       "zoom": 16,
+       "on_map": 6802,
+       "drawn_in_view": 4714,
+       "true_in_view": 4714,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_5",
+       "sync_ms": 5.5,
+       "paint_ms": 17.300000190734863,
+       "zoom": 16,
+       "on_map": 4812,
+       "drawn_in_view": 3239,
+       "true_in_view": 3239,
+       "tier": "complete"
+      }
+     ],
+     "heap_bytes_after_moves": 108890900
+    }
+   ]
+  },
+  {
+   "copy": "after",
+   "n_panos": 200000,
+   "csv_bytes": 3084614,
+   "summary": {
+    "load_ms": {
+     "n": 5,
+     "min": 1903.3,
+     "p25": 1920.2,
+     "p50": 1926.9,
+     "p75": 1938.9,
+     "p90": 1957.6,
+     "p95": 1963.9,
+     "max": 1970.1
+    },
+    "heap_mb": {
+     "n": 5,
+     "min": 281.5,
+     "p25": 281.5,
+     "p50": 281.5,
+     "p75": 281.5,
+     "p90": 281.5,
+     "p95": 281.5,
+     "max": 281.5
+    },
+    "index_ms": {
+     "n": 5,
+     "min": 19.6,
+     "p25": 20.1,
+     "p50": 20.1,
+     "p75": 20.4,
+     "p90": 20.7,
+     "p95": 20.8,
+     "max": 20.9
+    },
+    "zoom_plus_2": {
+     "sync_ms": {
+      "n": 5,
+      "min": 51.8,
+      "p25": 52.4,
+      "p50": 53.3,
+      "p75": 53.7,
+      "p90": 56.22,
+      "p95": 57.06,
+      "max": 57.9
+     },
+     "paint_ms": {
+      "n": 5,
+      "min": 63,
+      "p25": 63.7,
+      "p50": 64.3,
+      "p75": 68.8,
+      "p90": 69.16,
+      "p95": 69.28,
+      "max": 69.4
+     }
+    },
+    "street_view": {
+     "sync_ms": {
+      "n": 5,
+      "min": 113.8,
+      "p25": 115.3,
+      "p50": 116.7,
+      "p75": 117.5,
+      "p90": 120.08,
+      "p95": 120.94,
+      "max": 121.8
+     },
+     "paint_ms": {
+      "n": 5,
+      "min": 138.7,
+      "p25": 139.7,
+      "p50": 142.9,
+      "p75": 144.1,
+      "p90": 147.4,
+      "p95": 148.5,
+      "max": 149.6
+     }
+    },
+    "pan": {
+     "sync_ms": {
+      "n": 30,
+      "min": 11.6,
+      "p25": 12.6,
+      "p50": 12.9,
+      "p75": 13.35,
+      "p90": 13.75,
+      "p95": 15.85,
+      "max": 18.6
+     },
+     "paint_ms": {
+      "n": 30,
+      "min": 34.1,
+      "p25": 35.48,
+      "p50": 36.3,
+      "p75": 37.37,
+      "p90": 38.18,
+      "p95": 41.21,
+      "max": 45.1
+     },
+     "drawn_in_view": {
+      "n": 30,
+      "min": 7264,
+      "p25": 7264.0,
+      "p50": 7402.0,
+      "p75": 7418.0,
+      "p90": 7418.0,
+      "p95": 7418.0,
+      "max": 7418
+     },
+     "true_in_view": {
+      "n": 30,
+      "min": 7264,
+      "p25": 7264.0,
+      "p50": 7402.0,
+      "p75": 7418.0,
+      "p90": 7418.0,
+      "p95": 7418.0,
+      "max": 7418
+     }
+    }
+   },
+   "repeats": [
+    {
+     "load_ms": 1926.9000000953674,
+     "heap_bytes": 295142808,
+     "fitted": {
+      "zoom": 13,
+      "on_map": 40000,
+      "drawn_in_view": 40000,
+      "true_in_view": null,
+      "tier": "sampled"
+     },
+     "index_ms": 20.899999618530273,
+     "index_level": 16,
+     "index_cells": 598,
+     "index_bytes": 1626910,
+     "moves": [
+      {
+       "move": "zoom_plus_2",
+       "sync_ms": 52.40000009536743,
+       "paint_ms": 63.69999980926514,
+       "zoom": 15,
+       "on_map": 40000,
+       "drawn_in_view": 5771,
+       "true_in_view": null,
+       "tier": "sampled"
+      },
+      {
+       "move": "street_view",
+       "sync_ms": 115.2999997138977,
+       "paint_ms": 139.69999980926514,
+       "zoom": 16,
+       "on_map": 10368,
+       "drawn_in_view": 7280,
+       "true_in_view": 7280,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_0",
+       "sync_ms": 13.5,
+       "paint_ms": 36.700000286102295,
+       "zoom": 16,
+       "on_map": 10386,
+       "drawn_in_view": 7264,
+       "true_in_view": 7264,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_1",
+       "sync_ms": 13.199999809265137,
+       "paint_ms": 37.5,
+       "zoom": 16,
+       "on_map": 10386,
+       "drawn_in_view": 7418,
+       "true_in_view": 7418,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_2",
+       "sync_ms": 13.400000095367432,
+       "paint_ms": 37.30000019073486,
+       "zoom": 16,
+       "on_map": 10218,
+       "drawn_in_view": 7402,
+       "true_in_view": 7402,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_3",
+       "sync_ms": 13.700000286102295,
+       "paint_ms": 36.200000286102295,
+       "zoom": 16,
+       "on_map": 10218,
+       "drawn_in_view": 7418,
+       "true_in_view": 7418,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_4",
+       "sync_ms": 13.099999904632568,
+       "paint_ms": 36.40000009536743,
+       "zoom": 16,
+       "on_map": 10386,
+       "drawn_in_view": 7402,
+       "true_in_view": 7402,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_5",
+       "sync_ms": 13.399999618530273,
+       "paint_ms": 37.69999980926514,
+       "zoom": 16,
+       "on_map": 10386,
+       "drawn_in_view": 7264,
+       "true_in_view": 7264,
+       "tier": "complete"
+      }
+     ],
+     "heap_bytes_after_moves": 306122344
+    },
+    {
+     "load_ms": 1903.3000001907349,
+     "heap_bytes": 295124308,
+     "fitted": {
+      "zoom": 13,
+      "on_map": 40000,
+      "drawn_in_view": 40000,
+      "true_in_view": null,
+      "tier": "sampled"
+     },
+     "index_ms": 20.09999990463257,
+     "index_level": 16,
+     "index_cells": 598,
+     "index_bytes": 1626910,
+     "moves": [
+      {
+       "move": "zoom_plus_2",
+       "sync_ms": 53.700000286102295,
+       "paint_ms": 69.40000009536743,
+       "zoom": 15,
+       "on_map": 40000,
+       "drawn_in_view": 5771,
+       "true_in_view": null,
+       "tier": "sampled"
+      },
+      {
+       "move": "street_view",
+       "sync_ms": 113.80000019073486,
+       "paint_ms": 138.7000002861023,
+       "zoom": 16,
+       "on_map": 10368,
+       "drawn_in_view": 7280,
+       "true_in_view": 7280,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_0",
+       "sync_ms": 12.799999713897705,
+       "paint_ms": 36,
+       "zoom": 16,
+       "on_map": 10386,
+       "drawn_in_view": 7264,
+       "true_in_view": 7264,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_1",
+       "sync_ms": 12.400000095367432,
+       "paint_ms": 36.59999990463257,
+       "zoom": 16,
+       "on_map": 10386,
+       "drawn_in_view": 7418,
+       "true_in_view": 7418,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_2",
+       "sync_ms": 13,
+       "paint_ms": 35.200000286102295,
+       "zoom": 16,
+       "on_map": 10218,
+       "drawn_in_view": 7402,
+       "true_in_view": 7402,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_3",
+       "sync_ms": 12.599999904632568,
+       "paint_ms": 35.09999990463257,
+       "zoom": 16,
+       "on_map": 10218,
+       "drawn_in_view": 7418,
+       "true_in_view": 7418,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_4",
+       "sync_ms": 12.800000190734863,
+       "paint_ms": 36.200000286102295,
+       "zoom": 16,
+       "on_map": 10386,
+       "drawn_in_view": 7402,
+       "true_in_view": 7402,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_5",
+       "sync_ms": 11.799999713897705,
+       "paint_ms": 35.19999980926514,
+       "zoom": 16,
+       "on_map": 10386,
+       "drawn_in_view": 7264,
+       "true_in_view": 7264,
+       "tier": "complete"
+      }
+     ],
+     "heap_bytes_after_moves": 306108552
+    },
+    {
+     "load_ms": 1938.8999996185303,
+     "heap_bytes": 295142244,
+     "fitted": {
+      "zoom": 13,
+      "on_map": 40000,
+      "drawn_in_view": 40000,
+      "true_in_view": null,
+      "tier": "sampled"
+     },
+     "index_ms": 19.59999990463257,
+     "index_level": 16,
+     "index_cells": 598,
+     "index_bytes": 1626910,
+     "moves": [
+      {
+       "move": "zoom_plus_2",
+       "sync_ms": 53.299999713897705,
+       "paint_ms": 64.2999997138977,
+       "zoom": 15,
+       "on_map": 40000,
+       "drawn_in_view": 5771,
+       "true_in_view": null,
+       "tier": "sampled"
+      },
+      {
+       "move": "street_view",
+       "sync_ms": 117.5,
+       "paint_ms": 142.90000009536743,
+       "zoom": 16,
+       "on_map": 10368,
+       "drawn_in_view": 7280,
+       "true_in_view": 7280,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_0",
+       "sync_ms": 14.199999809265137,
+       "paint_ms": 38.90000009536743,
+       "zoom": 16,
+       "on_map": 10386,
+       "drawn_in_view": 7264,
+       "true_in_view": 7264,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_1",
+       "sync_ms": 12.700000286102295,
+       "paint_ms": 37.30000019073486,
+       "zoom": 16,
+       "on_map": 10386,
+       "drawn_in_view": 7418,
+       "true_in_view": 7418,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_2",
+       "sync_ms": 12.599999904632568,
+       "paint_ms": 36,
+       "zoom": 16,
+       "on_map": 10218,
+       "drawn_in_view": 7402,
+       "true_in_view": 7402,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_3",
+       "sync_ms": 12.900000095367432,
+       "paint_ms": 34.80000019073486,
+       "zoom": 16,
+       "on_map": 10218,
+       "drawn_in_view": 7418,
+       "true_in_view": 7418,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_4",
+       "sync_ms": 11.900000095367432,
+       "paint_ms": 35.299999713897705,
+       "zoom": 16,
+       "on_map": 10386,
+       "drawn_in_view": 7402,
+       "true_in_view": 7402,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_5",
+       "sync_ms": 11.700000286102295,
+       "paint_ms": 35.30000019073486,
+       "zoom": 16,
+       "on_map": 10386,
+       "drawn_in_view": 7264,
+       "true_in_view": 7264,
+       "tier": "complete"
+      }
+     ],
+     "heap_bytes_after_moves": 306106720
+    },
+    {
+     "load_ms": 1920.1999998092651,
+     "heap_bytes": 295149996,
+     "fitted": {
+      "zoom": 13,
+      "on_map": 40000,
+      "drawn_in_view": 40000,
+      "true_in_view": null,
+      "tier": "sampled"
+     },
+     "index_ms": 20.40000009536743,
+     "index_level": 16,
+     "index_cells": 598,
+     "index_bytes": 1626910,
+     "moves": [
+      {
+       "move": "zoom_plus_2",
+       "sync_ms": 51.799999713897705,
+       "paint_ms": 63,
+       "zoom": 15,
+       "on_map": 40000,
+       "drawn_in_view": 5771,
+       "true_in_view": null,
+       "tier": "sampled"
+      },
+      {
+       "move": "street_view",
+       "sync_ms": 116.7000002861023,
+       "paint_ms": 144.09999990463257,
+       "zoom": 16,
+       "on_map": 10368,
+       "drawn_in_view": 7280,
+       "true_in_view": 7280,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_0",
+       "sync_ms": 18.600000381469727,
+       "paint_ms": 45.10000038146973,
+       "zoom": 16,
+       "on_map": 10386,
+       "drawn_in_view": 7264,
+       "true_in_view": 7264,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_1",
+       "sync_ms": 12.899999618530273,
+       "paint_ms": 37.69999980926514,
+       "zoom": 16,
+       "on_map": 10386,
+       "drawn_in_view": 7418,
+       "true_in_view": 7418,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_2",
+       "sync_ms": 12.200000286102295,
+       "paint_ms": 35.700000286102295,
+       "zoom": 16,
+       "on_map": 10218,
+       "drawn_in_view": 7402,
+       "true_in_view": 7402,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_3",
+       "sync_ms": 12.900000095367432,
+       "paint_ms": 36.59999990463257,
+       "zoom": 16,
+       "on_map": 10218,
+       "drawn_in_view": 7418,
+       "true_in_view": 7418,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_4",
+       "sync_ms": 12.800000190734863,
+       "paint_ms": 35.40000009536743,
+       "zoom": 16,
+       "on_map": 10386,
+       "drawn_in_view": 7402,
+       "true_in_view": 7402,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_5",
+       "sync_ms": 11.599999904632568,
+       "paint_ms": 34.09999990463257,
+       "zoom": 16,
+       "on_map": 10386,
+       "drawn_in_view": 7264,
+       "true_in_view": 7264,
+       "tier": "complete"
+      }
+     ],
+     "heap_bytes_after_moves": 306115116
+    },
+    {
+     "load_ms": 1970.0999999046326,
+     "heap_bytes": 295146272,
+     "fitted": {
+      "zoom": 13,
+      "on_map": 40000,
+      "drawn_in_view": 40000,
+      "true_in_view": null,
+      "tier": "sampled"
+     },
+     "index_ms": 20.09999990463257,
+     "index_level": 16,
+     "index_cells": 598,
+     "index_bytes": 1626910,
+     "moves": [
+      {
+       "move": "zoom_plus_2",
+       "sync_ms": 57.90000009536743,
+       "paint_ms": 68.7999997138977,
+       "zoom": 15,
+       "on_map": 40000,
+       "drawn_in_view": 5771,
+       "true_in_view": null,
+       "tier": "sampled"
+      },
+      {
+       "move": "street_view",
+       "sync_ms": 121.80000019073486,
+       "paint_ms": 149.59999990463257,
+       "zoom": 16,
+       "on_map": 10368,
+       "drawn_in_view": 7280,
+       "true_in_view": 7280,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_0",
+       "sync_ms": 17.199999809265137,
+       "paint_ms": 43.09999990463257,
+       "zoom": 16,
+       "on_map": 10386,
+       "drawn_in_view": 7264,
+       "true_in_view": 7264,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_1",
+       "sync_ms": 13,
+       "paint_ms": 37.39999961853027,
+       "zoom": 16,
+       "on_map": 10386,
+       "drawn_in_view": 7418,
+       "true_in_view": 7418,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_2",
+       "sync_ms": 12.799999713897705,
+       "paint_ms": 37.09999990463257,
+       "zoom": 16,
+       "on_map": 10218,
+       "drawn_in_view": 7402,
+       "true_in_view": 7402,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_3",
+       "sync_ms": 13.400000095367432,
+       "paint_ms": 38.09999990463257,
+       "zoom": 16,
+       "on_map": 10218,
+       "drawn_in_view": 7418,
+       "true_in_view": 7418,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_4",
+       "sync_ms": 12.899999618530273,
+       "paint_ms": 35.69999980926514,
+       "zoom": 16,
+       "on_map": 10386,
+       "drawn_in_view": 7402,
+       "true_in_view": 7402,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_5",
+       "sync_ms": 11.699999809265137,
+       "paint_ms": 36.19999980926514,
+       "zoom": 16,
+       "on_map": 10386,
+       "drawn_in_view": 7264,
+       "true_in_view": 7264,
+       "tier": "complete"
+      }
+     ],
+     "heap_bytes_after_moves": 306107756
+    }
+   ]
+  },
+  {
+   "copy": "after",
+   "n_panos": 1000000,
+   "csv_bytes": 15425255,
+   "summary": {
+    "load_ms": {
+     "n": 5,
+     "min": 7382.4,
+     "p25": 7532.9,
+     "p50": 7765.9,
+     "p75": 7995.3,
+     "p90": 8057.2,
+     "p95": 8077.9,
+     "max": 8098.5
+    },
+    "heap_mb": {
+     "n": 5,
+     "min": 1285.6,
+     "p25": 1285.6,
+     "p50": 1285.6,
+     "p75": 1285.6,
+     "p90": 1285.6,
+     "p95": 1285.6,
+     "max": 1285.6
+    },
+    "index_ms": {
+     "n": 5,
+     "min": 90.7,
+     "p25": 93.3,
+     "p50": 93.6,
+     "p75": 95.3,
+     "p90": 97.52,
+     "p95": 98.26,
+     "max": 99
+    },
+    "zoom_plus_2": {
+     "sync_ms": {
+      "n": 5,
+      "min": 76.1,
+      "p25": 76.2,
+      "p50": 79.3,
+      "p75": 83.8,
+      "p90": 85.6,
+      "p95": 86.2,
+      "max": 86.8
+     },
+     "paint_ms": {
+      "n": 5,
+      "min": 85.4,
+      "p25": 85.8,
+      "p50": 88.7,
+      "p75": 93.1,
+      "p90": 95.02,
+      "p95": 95.66,
+      "max": 96.3
+     }
+    },
+    "street_view": {
+     "sync_ms": {
+      "n": 5,
+      "min": 142.4,
+      "p25": 145.1,
+      "p50": 149.7,
+      "p75": 151.4,
+      "p90": 156.68,
+      "p95": 158.44,
+      "max": 160.2
+     },
+     "paint_ms": {
+      "n": 5,
+      "min": 167.6,
+      "p25": 170.4,
+      "p50": 175.2,
+      "p75": 177.9,
+      "p90": 183.18,
+      "p95": 184.94,
+      "max": 186.7
+     }
+    },
+    "pan": {
+     "sync_ms": {
+      "n": 30,
+      "min": 11.4,
+      "p25": 12.8,
+      "p50": 13.1,
+      "p75": 13.95,
+      "p90": 14.9,
+      "p95": 14.95,
+      "max": 16.5
+     },
+     "paint_ms": {
+      "n": 30,
+      "min": 35.4,
+      "p25": 36.9,
+      "p50": 37.5,
+      "p75": 39.08,
+      "p90": 41.88,
+      "p95": 42.87,
+      "max": 44.6
+     },
+     "drawn_in_view": {
+      "n": 30,
+      "min": 7041,
+      "p25": 7056.0,
+      "p50": 7180.0,
+      "p75": 7180.0,
+      "p90": 7195.0,
+      "p95": 7195.0,
+      "max": 7195
+     },
+     "true_in_view": {
+      "n": 30,
+      "min": 7041,
+      "p25": 7056.0,
+      "p50": 7180.0,
+      "p75": 7180.0,
+      "p90": 7195.0,
+      "p95": 7195.0,
+      "max": 7195
+     }
+    }
+   },
+   "repeats": [
+    {
+     "load_ms": 7765.900000095367,
+     "heap_bytes": 1348002996,
+     "fitted": {
+      "zoom": 12,
+      "on_map": 40000,
+      "drawn_in_view": 40000,
+      "true_in_view": null,
+      "tier": "sampled"
+     },
+     "index_ms": 95.30000019073486,
+     "index_level": 16,
+     "index_cells": 2856,
+     "index_bytes": 8128520,
+     "moves": [
+      {
+       "move": "zoom_plus_2",
+       "sync_ms": 79.30000019073486,
+       "paint_ms": 88.7000002861023,
+       "zoom": 14,
+       "on_map": 40000,
+       "drawn_in_view": 4619,
+       "true_in_view": null,
+       "tier": "sampled"
+      },
+      {
+       "move": "street_view",
+       "sync_ms": 149.7000002861023,
+       "paint_ms": 175.2000002861023,
+       "zoom": 16,
+       "on_map": 10486,
+       "drawn_in_view": 7195,
+       "true_in_view": 7195,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_0",
+       "sync_ms": 13.700000286102295,
+       "paint_ms": 39.10000038146973,
+       "zoom": 16,
+       "on_map": 10486,
+       "drawn_in_view": 7180,
+       "true_in_view": 7180,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_1",
+       "sync_ms": 13.699999809265137,
+       "paint_ms": 38.799999713897705,
+       "zoom": 16,
+       "on_map": 10634,
+       "drawn_in_view": 7195,
+       "true_in_view": 7195,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_2",
+       "sync_ms": 14.099999904632568,
+       "paint_ms": 39,
+       "zoom": 16,
+       "on_map": 10653,
+       "drawn_in_view": 7041,
+       "true_in_view": 7041,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_3",
+       "sync_ms": 14,
+       "paint_ms": 38.700000286102295,
+       "zoom": 16,
+       "on_map": 10653,
+       "drawn_in_view": 7056,
+       "true_in_view": 7056,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_4",
+       "sync_ms": 12.800000190734863,
+       "paint_ms": 36.09999990463257,
+       "zoom": 16,
+       "on_map": 10653,
+       "drawn_in_view": 7180,
+       "true_in_view": 7180,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_5",
+       "sync_ms": 13.199999809265137,
+       "paint_ms": 37,
+       "zoom": 16,
+       "on_map": 10486,
+       "drawn_in_view": 7180,
+       "true_in_view": 7180,
+       "tier": "complete"
+      }
+     ],
+     "heap_bytes_after_moves": 1360111968
+    },
+    {
+     "load_ms": 7382.400000095367,
+     "heap_bytes": 1348013668,
+     "fitted": {
+      "zoom": 12,
+      "on_map": 40000,
+      "drawn_in_view": 40000,
+      "true_in_view": null,
+      "tier": "sampled"
+     },
+     "index_ms": 93.2999997138977,
+     "index_level": 16,
+     "index_cells": 2856,
+     "index_bytes": 8128520,
+     "moves": [
+      {
+       "move": "zoom_plus_2",
+       "sync_ms": 76.2000002861023,
+       "paint_ms": 85.40000009536743,
+       "zoom": 14,
+       "on_map": 40000,
+       "drawn_in_view": 4619,
+       "true_in_view": null,
+       "tier": "sampled"
+      },
+      {
+       "move": "street_view",
+       "sync_ms": 142.40000009536743,
+       "paint_ms": 167.59999990463257,
+       "zoom": 16,
+       "on_map": 10486,
+       "drawn_in_view": 7195,
+       "true_in_view": 7195,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_0",
+       "sync_ms": 13,
+       "paint_ms": 37.299999713897705,
+       "zoom": 16,
+       "on_map": 10486,
+       "drawn_in_view": 7180,
+       "true_in_view": 7180,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_1",
+       "sync_ms": 12.599999904632568,
+       "paint_ms": 36,
+       "zoom": 16,
+       "on_map": 10634,
+       "drawn_in_view": 7195,
+       "true_in_view": 7195,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_2",
+       "sync_ms": 12.5,
+       "paint_ms": 36.90000009536743,
+       "zoom": 16,
+       "on_map": 10653,
+       "drawn_in_view": 7041,
+       "true_in_view": 7041,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_3",
+       "sync_ms": 13,
+       "paint_ms": 36.59999990463257,
+       "zoom": 16,
+       "on_map": 10653,
+       "drawn_in_view": 7056,
+       "true_in_view": 7056,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_4",
+       "sync_ms": 11.399999618530273,
+       "paint_ms": 35.39999961853027,
+       "zoom": 16,
+       "on_map": 10653,
+       "drawn_in_view": 7180,
+       "true_in_view": 7180,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_5",
+       "sync_ms": 12.599999904632568,
+       "paint_ms": 36.40000009536743,
+       "zoom": 16,
+       "on_map": 10486,
+       "drawn_in_view": 7180,
+       "true_in_view": 7180,
+       "tier": "complete"
+      }
+     ],
+     "heap_bytes_after_moves": 1360112812
+    },
+    {
+     "load_ms": 8098.5,
+     "heap_bytes": 1348011944,
+     "fitted": {
+      "zoom": 12,
+      "on_map": 40000,
+      "drawn_in_view": 40000,
+      "true_in_view": null,
+      "tier": "sampled"
+     },
+     "index_ms": 99,
+     "index_level": 16,
+     "index_cells": 2856,
+     "index_bytes": 8128520,
+     "moves": [
+      {
+       "move": "zoom_plus_2",
+       "sync_ms": 83.80000019073486,
+       "paint_ms": 93.10000038146973,
+       "zoom": 14,
+       "on_map": 40000,
+       "drawn_in_view": 4619,
+       "true_in_view": null,
+       "tier": "sampled"
+      },
+      {
+       "move": "street_view",
+       "sync_ms": 160.2000002861023,
+       "paint_ms": 186.7000002861023,
+       "zoom": 16,
+       "on_map": 10486,
+       "drawn_in_view": 7195,
+       "true_in_view": 7195,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_0",
+       "sync_ms": 14.899999618530273,
+       "paint_ms": 42.59999990463257,
+       "zoom": 16,
+       "on_map": 10486,
+       "drawn_in_view": 7180,
+       "true_in_view": 7180,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_1",
+       "sync_ms": 14.799999713897705,
+       "paint_ms": 41,
+       "zoom": 16,
+       "on_map": 10634,
+       "drawn_in_view": 7195,
+       "true_in_view": 7195,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_2",
+       "sync_ms": 14.899999618530273,
+       "paint_ms": 41.799999713897705,
+       "zoom": 16,
+       "on_map": 10653,
+       "drawn_in_view": 7041,
+       "true_in_view": 7041,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_3",
+       "sync_ms": 16.5,
+       "paint_ms": 44.59999990463257,
+       "zoom": 16,
+       "on_map": 10653,
+       "drawn_in_view": 7056,
+       "true_in_view": 7056,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_4",
+       "sync_ms": 13.700000286102295,
+       "paint_ms": 40.10000038146973,
+       "zoom": 16,
+       "on_map": 10653,
+       "drawn_in_view": 7180,
+       "true_in_view": 7180,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_5",
+       "sync_ms": 15,
+       "paint_ms": 43.09999990463257,
+       "zoom": 16,
+       "on_map": 10486,
+       "drawn_in_view": 7180,
+       "true_in_view": 7180,
+       "tier": "complete"
+      }
+     ],
+     "heap_bytes_after_moves": 1360107876
+    },
+    {
+     "load_ms": 7532.900000095367,
+     "heap_bytes": 1348017192,
+     "fitted": {
+      "zoom": 12,
+      "on_map": 40000,
+      "drawn_in_view": 40000,
+      "true_in_view": null,
+      "tier": "sampled"
+     },
+     "index_ms": 90.7000002861023,
+     "index_level": 16,
+     "index_cells": 2856,
+     "index_bytes": 8128520,
+     "moves": [
+      {
+       "move": "zoom_plus_2",
+       "sync_ms": 76.09999990463257,
+       "paint_ms": 85.7999997138977,
+       "zoom": 14,
+       "on_map": 40000,
+       "drawn_in_view": 4619,
+       "true_in_view": null,
+       "tier": "sampled"
+      },
+      {
+       "move": "street_view",
+       "sync_ms": 145.09999990463257,
+       "paint_ms": 170.40000009536743,
+       "zoom": 16,
+       "on_map": 10486,
+       "drawn_in_view": 7195,
+       "true_in_view": 7195,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_0",
+       "sync_ms": 13,
+       "paint_ms": 37.59999990463257,
+       "zoom": 16,
+       "on_map": 10486,
+       "drawn_in_view": 7180,
+       "true_in_view": 7180,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_1",
+       "sync_ms": 12.799999713897705,
+       "paint_ms": 37.299999713897705,
+       "zoom": 16,
+       "on_map": 10634,
+       "drawn_in_view": 7195,
+       "true_in_view": 7195,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_2",
+       "sync_ms": 13,
+       "paint_ms": 37,
+       "zoom": 16,
+       "on_map": 10653,
+       "drawn_in_view": 7041,
+       "true_in_view": 7041,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_3",
+       "sync_ms": 13.100000381469727,
+       "paint_ms": 37.5,
+       "zoom": 16,
+       "on_map": 10653,
+       "drawn_in_view": 7056,
+       "true_in_view": 7056,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_4",
+       "sync_ms": 11.800000190734863,
+       "paint_ms": 35.80000019073486,
+       "zoom": 16,
+       "on_map": 10653,
+       "drawn_in_view": 7180,
+       "true_in_view": 7180,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_5",
+       "sync_ms": 12.900000095367432,
+       "paint_ms": 37.09999990463257,
+       "zoom": 16,
+       "on_map": 10486,
+       "drawn_in_view": 7180,
+       "true_in_view": 7180,
+       "tier": "complete"
+      }
+     ],
+     "heap_bytes_after_moves": 1360118976
+    },
+    {
+     "load_ms": 7995.299999713898,
+     "heap_bytes": 1348043596,
+     "fitted": {
+      "zoom": 12,
+      "on_map": 40000,
+      "drawn_in_view": 40000,
+      "true_in_view": null,
+      "tier": "sampled"
+     },
+     "index_ms": 93.60000038146973,
+     "index_level": 16,
+     "index_cells": 2856,
+     "index_bytes": 8128520,
+     "moves": [
+      {
+       "move": "zoom_plus_2",
+       "sync_ms": 86.80000019073486,
+       "paint_ms": 96.30000019073486,
+       "zoom": 14,
+       "on_map": 40000,
+       "drawn_in_view": 4619,
+       "true_in_view": null,
+       "tier": "sampled"
+      },
+      {
+       "move": "street_view",
+       "sync_ms": 151.40000009536743,
+       "paint_ms": 177.90000009536743,
+       "zoom": 16,
+       "on_map": 10486,
+       "drawn_in_view": 7195,
+       "true_in_view": 7195,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_0",
+       "sync_ms": 14,
+       "paint_ms": 38.700000286102295,
+       "zoom": 16,
+       "on_map": 10486,
+       "drawn_in_view": 7180,
+       "true_in_view": 7180,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_1",
+       "sync_ms": 13.799999713897705,
+       "paint_ms": 39.39999961853027,
+       "zoom": 16,
+       "on_map": 10634,
+       "drawn_in_view": 7195,
+       "true_in_view": 7195,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_2",
+       "sync_ms": 13.099999904632568,
+       "paint_ms": 36.59999990463257,
+       "zoom": 16,
+       "on_map": 10653,
+       "drawn_in_view": 7041,
+       "true_in_view": 7041,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_3",
+       "sync_ms": 12.799999713897705,
+       "paint_ms": 36.90000009536743,
+       "zoom": 16,
+       "on_map": 10653,
+       "drawn_in_view": 7056,
+       "true_in_view": 7056,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_4",
+       "sync_ms": 13.399999618530273,
+       "paint_ms": 37.89999961853027,
+       "zoom": 16,
+       "on_map": 10653,
+       "drawn_in_view": 7180,
+       "true_in_view": 7180,
+       "tier": "complete"
+      },
+      {
+       "move": "pan_5",
+       "sync_ms": 12.599999904632568,
+       "paint_ms": 37.5,
+       "zoom": 16,
+       "on_map": 10486,
+       "drawn_in_view": 7180,
+       "true_in_view": 7180,
+       "tier": "complete"
+      }
+     ],
+     "heap_bytes_after_moves": 1360128288
+    }
+   ]
+  }
+ ],
+ "chromium": "149.0.7827.55"
+}

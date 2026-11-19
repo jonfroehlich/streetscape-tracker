@@ -1724,6 +1724,46 @@ Every assertion above was mutation-checked; the table is in the PR body.
 `streetscape-utils.test.js` pins `adaptCityRecord.capture_history`: the gsv block's own pointer, null for the same city's Mapillary view (a record-level read fails it), and null — never undefined — on v1 and unharvested records; and that a harvest filename resolves to no provider and is not a valid run.
 The Python half of that last pin is `test_a_history_artifact_is_not_a_run_file_in_either_language` in `tests/test_naming.py`, which runs the JS `RUN_FILENAME_RE` itself (widening its token class to `[a-z_]+` fails it).
 
+### The viewport-true dot tier (issue #77)
+
+`pano-overview.test.js` pins the index and the planner; every assertion below was mutation-checked, and the table is in the PR body.
+
+- **The cell is the slippy-map tile.**
+  `mercatorCell` is held to `www/js/__tests__/pano-cell-golden.json` at twelve levels (a transposed x/y fails it), and `tests/test_pano_cell_golden.py` holds the same file to `download_common.lonlat_to_tile_frac`, so the two languages are pinned to one table rather than to each other's source (flipping the Python y fails it).
+  The golden includes a 3×3 cluster around a zoom-8 tile corner, so a point on each side of a coarse boundary is in it.
+  `mercatorCell keeps x and y inside 0..2^z-1` fails when `unitToCell` drops its clamp; "every point's index cell IS the slippy-map cell" fails on a transposed `mortonEncode` or `mortonDecode`, and on `mortonAtLevel` forgetting that a JS shift is mod 32.
+- **The sort key is exact.** `indexLayout` must leave every packed key under 2^52 (claiming 54 bits fails it), and the comparator fallback, forced with `forceComparatorSort`, must order exactly as the packed sort does (comparing ids only fails it).
+- **Counting is exact, not cell-whole.** `countInBounds` equals a brute-force count on seeded random views under every mode and year filter (counting an edge cell whole fails it); `idsInBounds` is exactly the points in view with the view's edges included (returning whole cell ranges, or exclusive edges, fails it); a pano at the Mercator limit is counted where it really is (trusting a limit cell fails it).
+- **`populationFilter` is the mode and year rule** (ignoring Google-only fails it).
+- **The planner.**
+  A city at or under the budget never counts a view (`>=` instead of `>` fails it); a view within the budget draws every pano in it (entering strictly below fails it); the hysteresis band (no band fails it).
+  One announcement per real tier change, never on the first plan (announcing the first fails it); an auto-pan never re-tiers and keeps the open popup's pano (ignoring the freeze, or dropping the pinned item, fails it).
+  Flat-only points follow their own switch (gating them on the Panoramas layer fails it); the layer off keeps the tier so turning it on is silent (forgetting it fails it); a selected date only adds (filtering by it fails it).
+  `drawnNoticeText` names the state in words (giving the complete tier the sample's text fails it).
+- **Added by the PR's first review.**
+  "an open popup's pano is kept on every re-plan" runs the pin through a move, a date, the flat toggle and a Render-all round trip in both tiers, and drops it when it leaves the population (ignoring `inPopulation`, or never adding the pin, fails it).
+  "a re-plan in the same sample reuses its set" requires the same Set object with `sampleItems` never called on a pan that stays sampled, and a rebuild for another sample, date or pin (always rebuilding, or ignoring any one of the three keys, fails it).
+  "drawnNoticeText makes no claim the sampled tier's own band falsifies" is the review's reproduction (1,791 in view, 2,577 in the padded area, budget 2,000, still sampled): the old "all are drawn once N or fewer are in view" fails it.
+- **Added by the PR's second review.**
+  "drawnNoticeText says, in words" also requires the complete tier under a year to say "of this year in view" (dropping the `yearFiltered` clause fails it).
+- **Added by the PR's third review.**
+  "a 'complete' from mode all earns no band" is the review's reproduction (a 45,000-pano city drawn whole under a year filter, then the filter cleared on the same view): the next plan must be sampled, after "Render all" too and on a frozen auto-pan, while a "complete" the view earned keeps its band and the Panoramas layer off and on preserves either (`completeFromView` always true fails it; so does a hidden plan that forgets the plan it hid).
+- **Added by the PR's fourth review.**
+  The same test requires the frozen auto-pan that `completeFromView` refused to announce its change to sampled (suppressing every announcement on a frozen move, as before, fails it).
+  "under a year filter the announcement says 'of this year'" requires the year wording for both tier changes and for a year that fits the cap (mode "all"), and the same mode and tier with or without it (ignoring `yearFiltered` fails it); "drawnNoticeText says, in words" also requires the sampled notice under a year to say "of this year" (dropping that clause fails it).
+
+The browser half is nine e2e tests in `tests/e2e/test_smoke.py` over a 60,000-pano dense synthetic GSV city and a 45,000-pano Mapillary one with 2,000 flat-only points (`build_fixture.write_dense_city`, written per session, never committed).
+`test_zooming_into_a_dense_city_draws_every_pano_in_view` fails when the dot tier keeps the stride sample, when the first plan counts Leaflet's default view and the fit re-tiers, when the notice is not patched, when the live region is never written, and when a pan that stays sampled rebuilds the set.
+`test_an_open_popup_survives_its_auto_pan_and_a_pan_away` fails when `city.js` never pins, when it pins only across moves (a real-click Render-all round trip with the pin outside the drawn area), and when legend clicks reach the map; `test_flat_only_points_stay_independent_of_the_panoramas_layer` asserts the pin itself (`pinnedMarker` stays null while a flat marker's popup is open) and fails when a flat marker can be pinned or the layer gates them, while the planner's population check is the other layer of the same rule; `test_a_city_under_the_cap_never_counts_a_view` fails when every city counts its view.
+`test_the_dot_tier_wiring_follows_year_date_mode_and_render_all` serves `streetscape-utils.js` with `RENDER_CAP` lowered to 2,000 (`_route_render_cap`), so one year of the city is over it, and after every step compares the drawn set and each dot's date style against a brute-force set built from `city.js`'s own caches, never through the index or planner.
+It fails when the per-cell counts are keyed on the mode only (a z16 view where the year fits and the run does not, with whole cells inside it), when a move restyles nothing it added under a date, when the whole-population path or the sample ignores the year.
+`test_a_click_while_the_run_streams_decides_no_tier` holds the CSV, fires a background click, and requires no tier and no announcement after the load; restoring the pre-review code fails it.
+`test_a_popup_auto_pan_while_the_run_streams_freezes_no_later_move` holds the CSV, fires `autopanstart` and a pan, releases it, and requires the freeze flag cleared and a later zoom to street level to reach the complete tier; consuming the flag after the `mapReady` guard, as the first review's code did, fails it.
+`test_a_year_filter_round_trip_leaves_no_band_behind` (third review) toggles a year that fits the cap on and off on the 45,000-pano city's fitted view and requires the sample back, at most `RENDER_CAP` dots and the sampled announcement; the second review's planner, which banded mode "all"'s "complete", fails it (all 45,000 drawn, mode "view").
+Since the fourth review it also requires the year filter's own announcement to say "of this year", which pins `city.js` passing `yearFiltered` to the planner.
+`test_the_flat_toggle_acts_on_points_streamed_before_it` (third review) holds the CSV, wraps `buildFlatOnlyPopupHtml` so the stream itself toggles flat-only on at the 700th flat point and off at the 1,400th, and requires 999 flat points on the map at the 1,000th and none after the load; the second review's `city.js` fails it (300 at the 1,000th, since the toggle did nothing to the points already streamed).
+`test_the_dense_city_is_named_by_the_generator_and_holds_what_it_says` (fast suite, `tests/test_e2e_fixture.py`) fails on a hand-built filename and on a city with no contributor district.
+
 ## Generated maps carry the CARTO key
 
 `tests/test_vis.py` builds both `vis.py` maps, the `--check-boundary` preview (`test_search_area_preview_basemap_carries_the_carto_key`) and the coverage map (`test_coverage_map_basemap_carries_the_carto_key`), and requires every tile layer to point at `basemaps.cartocdn.com` and end in `?key=` plus the URL-encoded key that `basemap.carto_basemap_key` reads from `www/js/streetscape-utils.js`.

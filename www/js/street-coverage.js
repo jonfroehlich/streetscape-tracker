@@ -574,7 +574,8 @@ function streetLegendSectionHtml(state) {
  * dots. The dots are reconciled individually by city.js (not a LayerGroup), so
  * this empty group only RELAYS: Leaflet fires `add`/`remove` on it when the
  * control's checkbox flips, and `setVisible` routes that through the reconcile
- * model, which is the only path that hides N markers in ≤ RENDER_CAP work.
+ * model, which hides the dots in work proportional to what is drawn, never to
+ * the city's whole pano count.
  *
  * @example
  *   const panoLayer = panoVisibilityLayer((v) => { panoDotsHidden = !v; applyDesired(); })

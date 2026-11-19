@@ -264,8 +264,58 @@ The Color-by group is a `role="radiogroup"` of `role="radio"` / `aria-checked` b
 Its container is deliberately NOT `.gsv-mode-toggle`: that class means "this run has the Google-only filter", and the e2e suite asserts its absence on Panoramax and KartaView runs, which have walks.
 
 **Panoramas is a proxy layer.**
-The pano dots are reconciled individually (`reconcile()`), not held in a LayerGroup, and the reconcile model is the only path that hides N markers in ≤ `RENDER_CAP` work.
-So `panoVisibilityLayer(setVisible)` is an empty `L.layerGroup()` whose `add`/`remove` events drive `panoDotsHidden` through `applyDesired()`; re-showing respects the mode, year, date and cap.
+The pano dots are reconciled individually (`reconcile()`), not held in a LayerGroup, and the reconcile model hides them in work proportional to what is drawn, never to the city's whole pano count.
+So `panoVisibilityLayer(setVisible)` is an empty `L.layerGroup()` whose `add`/`remove` events drive `panoDotsHidden` through `applyDesired()`; re-showing respects the mode, year, date and the view (see the next section).
+Hiding the dots never hides the flat-only points: those have their own legend toggle.
+
+## Every pano in view is drawn on a city over the render cap (issue #77)
+
+Before #77 a city over `RENDER_CAP` (40,000) drew ONE global spatial-stride sample at every zoom, so zooming in never showed more: at street level on a 60,000-pano synthetic city, 4,849 of the 7,195 panoramas in view were drawn (`docs/experiments/city-map-viewport-dots.md`).
+The dot tier is now **view-dependent** for such a city.
+`planMapView` (`www/js/pano-overview.js`, pure and node-tested) decides on every `moveend`:
+
+- **complete** — the map's area padded 10% each side (`DRAWN_AREA_PAD`) holds at most `RENDER_CAP` in-mode panoramas, so every one of them is drawn, and the legend says "Showing all N panoramas in view." with N counted over the visible map, not the padded area.
+  Under a year filter it says "Showing all N panoramas of this year in view.", because N then counts only that year's panoramas and the bare form would read as every panorama there (review 2 of the PR).
+- **sampled** — more than that, so the old global stride sample is drawn, and the legend says how many of how many and "Zoom in to see every panorama."
+  It quotes **no threshold**: the tier is counted over the padded area (1.44 × the visible one) with hysteresis, so "every pano once 40,000 or fewer are in view" was false for any view holding about 28,000 to 40,000 that is still sampled (review 1 of the PR).
+- A city at or under the cap is never view-dependent (`isViewDependent`): it draws everything, never counts a view and never builds the index, exactly as before.
+
+Rules that must survive without a read:
+
+- **Hysteresis.** Leaving complete needs `TIER_LEAVE_FACTOR` (1.25) × the budget; entering needs the budget. Without the band a view near 40,000 flips tier on every small pan.
+  **The band holds only a "complete" a view earned** (`completeFromView`): mode "all" is also "complete", but it drew the whole population because the population fit (a year filter, "Render all"), so after it the next view-dependent plan enters at the budget like a first one.
+  Banding it drew all 45,000 panos of the dense Mapillary city at every zoom once a year filter had been toggled on and off, and more than the cap with no "Render all" (review 3 of the PR).
+  **Only the year-filter and "Render all" routes were closed.**
+  A zoom round trip reaches the same end state by design: zoom in until a view earns "complete", zoom back out, and the band holds it, so a city of at most 1.25 × the cap (40,001–50,000 panos) then draws every pano at every zoom for the session, with a truthful "Showing all N panoramas in view." (review 4 of the PR).
+  The band is anti-flicker, and a view did earn the tier; holding it only while the zoom is unchanged is a possible follow-up, not a fix this PR makes.
+  So without "Render all" the map draws more than `RENDER_CAP` pano dots only inside that band, at most 1.25 × the cap, plus a selected date's panoramas and an open popup's.
+- **An open popup's auto-pan never re-tiers** (`autopanstart` freezes the tier for that move), and the open popup's pano is kept in the drawn set on **every** re-plan while it is open — a move, a date, the flat toggle, Render all — because removing a Leaflet marker closes its popup.
+  The planner drops it only when it leaves the population (a year or imagery mode that excludes it) or the Panoramas layer goes off.
+  Only pano markers are pinned (`options.panoIdx`), never a flat-only point.
+  **The freeze flag is consumed before the `mapReady` guard** in the `moveend` handler: an auto-pan while the run still streams returns early, and a flag consumed after that return would survive to freeze the first real move once the run had loaded, leaving a street-level view sampled (review 2 of the PR).
+  This is event-order wiring in `city.js`, not planner logic, so it is guarded by an e2e test, not a node one.
+- **Legend clicks stop at the legend** (`L.DomEvent.on(div, "click", stopPropagation)`), not only through `disableClickPropagation`: most legend buttons rebuild the legend in their own handler, so the click reached the map with a detached target, Leaflet's walk up to the legend's mark failed, and it read as a background click that closes popups.
+- **A pan that stays sampled reuses the drawn set** (`plan.reused`): same sample (`sampleKey`, which names the filter and the mode caches' build), same date, same pin, so nothing is rebuilt or re-diffed.
+- **Nothing is planned until the run has streamed** (`mapReady`): a background click mid-stream once recorded a tier for an empty population, and the dense city then announced a change on load.
+  **So the flat-only toggle acts directly** (`toggleFlatOnly` calls `setFlatShown`, not only `applyDesired`), and the stream adds each flat point by `flatOnMap`, the layer's own state: otherwise a toggle mid-stream did nothing to the points already streamed, and on-then-off left the points streamed in between on the map with the toggle off (review 3 of the PR).
+- **A selected date only adds.** Its in-mode panoramas are unioned into the drawn set in every tier, as before #77; it never decides the tier and never narrows the set.
+- **A tier change is announced once** through the polite live region `#map-tier-status` (`TIER_ANNOUNCEMENTS`), never on the first plan, and never on a move whose tier the freeze held; a freeze `completeFromView` refused changed what is drawn, so it is announced (review 4 of the PR).
+  Under a year filter the announcement says "of this year" (`TIER_ANNOUNCEMENTS_YEAR`), as the legend's notice does in every tier, the sampled one included, so the live region never claims more than the visible text (review 4 of the PR).
+  The legend's notice `#map-drawn-notice` is patched in place on every move, without rebuilding the legend.
+- **The first plan runs after `fitBounds`** (non-animated) on the fitted view, so a dense city is never counted at Leaflet's default view and re-tiered a frame later.
+- **"Render all" stays** as the opt-in override (its label back is "Limit to view"), and the diff overlay is untouched: it still stride-samples at `RENDER_CAP / 4` at every zoom.
+
+**The index is the slippy-map pyramid, not an extent grid.**
+Each pano's cell is its Web Mercator tile at the index level (`mercatorCell`, a floor of Leaflet's own projection), Morton-coded so a cell is one contiguous id range after a sort.
+The level is 16 up to 2^20 panos, 15 up to 2^22, 14 above (`indexLayout`), so the cell count stays small while the sort key packs Morton code and id into one Float64 (`SORT_KEY_BITS` 52); past 2^24 panos it falls back to a comparator sort at level 14.
+Because the cells are global tiles, anything later built on them (an overview layer, a pipeline-emitted artifact) lands under the dots instead of beside them; `www/js/__tests__/pano-cell-golden.json` pins the JS cell to the repo's Python tile math (`download_common.lonlat_to_tile_frac`) from both languages.
+`countInBounds` is EXACT: interior cells are summed from per-cell counts (one filter cached at a time), and edge cells, plus every cell on the Mercator limit (latitude beyond ±85.05°, longitude 180°), are walked point by point.
+The index is built lazily on the first view-dependent plan and measured as the `pano-index` performance entry.
+
+**What this does not do.**
+Every pano is still an eager Leaflet marker built during streaming, so a large city loads no faster and takes no less memory than before; only what is drawn per view changed.
+The index adds to it: 19 bytes of columns per pano, retained as 19 to 38 (the buffers grow by doubling and `finish()` keeps views), one marker reference per pano in `panoMarkersById`, and the index's own arrays (8 MB at 1,000,000 panos).
+The overview layer for wide views, lazy markers and a pipeline-emitted index are named follow-ups on #77.
 
 **The control is `collapsed: false`.**
 Leaflet's collapsed control expands on hover, which is the part keyboard and touch users lose; expanded, each overlay is a natively labelled checkbox.

@@ -196,8 +196,9 @@
 }
 
 /* ── Render-cap notice (issues #77/#58) ─────────────────────── */
-/* Shown for cities above RENDER_CAP: reports drawn-vs-total and the opt-in
-   "Render all" override. Reuses .legend-meta typography and the .gsv-mode-btn
+/* Shown for cities above RENDER_CAP: says what the dots show (every pano in
+   view, or a spatial sample with drawn-vs-total), patched on every map move,
+   and the opt-in "Render all" override. Reuses .legend-meta typography and the .gsv-mode-btn
    pill (which gets a real focus outline and hover/active styling for free). */
 .legend-cap-notice {
   display: flex;

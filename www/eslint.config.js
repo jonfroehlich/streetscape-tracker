@@ -268,6 +268,17 @@ module.exports = [
     rules: browserRules,
   },
   {
+    // The viewport-true dot tier (issue #77): pure index and planner, no
+    // globals consumed. Node export shim (`module`) for the unit tests.
+    files: ["js/pano-overview.js"],
+    languageOptions: {
+      ecmaVersion: 2022,
+      sourceType: "script",
+      globals: { ...globals.browser, module: "readonly" },
+    },
+    rules: browserRules,
+  },
+  {
     // Harvested capture-history legend section (issue #109): consumes
     // streetscape-utils.js globals (escapeHtml, getColor,
     // buildFilledHistogram) and Chart.js, and defines the section's builders
@@ -306,6 +317,16 @@ module.exports = [
         // capture-history.js (issue #109), also loaded by city.html only.
         captureHistoryLegendHtml: "readonly",
         rebuildCaptureHistoryChart: "readonly",
+        // pano-overview.js (issue #77), also loaded by city.html only.
+        createPanoColumns: "readonly",
+        populationFilter: "readonly",
+        buildPanoIndex: "readonly",
+        countPerCell: "readonly",
+        countInBounds: "readonly",
+        idsInBounds: "readonly",
+        isViewDependent: "readonly",
+        planMapView: "readonly",
+        drawnNoticeText: "readonly",
       },
     },
   },

@@ -39,6 +39,9 @@
   </header>
 
   <div id="map" role="application" aria-label="City panorama age map"></div>
+  <!-- Says, once per change, whether the dots are every panorama in view or a
+       spatial sample (issue #77); the legend carries the same in words. -->
+  <div id="map-tier-status" class="visually-hidden" role="status" aria-live="polite"></div>
 
   <!-- Bottom-right panel stack: the street-type chart (issue #104) above the
        capture-date chart. Each panel collapses on its own; the chart panel
@@ -97,6 +100,7 @@
           integrity="sha512-dfX5uYVXzyU8+KHqj8bjo7UkOdg18PaOtpa48djpNbZHwExddghZ+ZmzWT06R5v6NSk3ZUfsH6FNEDepLx9hPQ=="
           crossorigin="anonymous"></script>
   <script src="js/streetscape-utils.js"></script>
+  <script src="js/pano-overview.js"></script>
   <script src="js/street-coverage.js"></script>
   <script src="js/diff-overlay.js"></script>
   <script src="js/capture-history.js"></script>

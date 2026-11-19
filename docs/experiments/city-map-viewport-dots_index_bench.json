@@ -1,0 +1,201 @@
+{
+ "generated_by": "node scripts/bench_pano_index.js --sizes 1000000,2700000,15000000 --repeats 3 --out docs/experiments/city-map-viewport-dots_index_bench.json",
+ "node": "v24.22.1",
+ "platform": "darwin 24.5.0 arm64",
+ "cpu": "Apple M1 Max",
+ "box": {
+  "south": 29.56,
+  "north": 29.96,
+  "west": -95.62,
+  "east": -95.1
+ },
+ "distribution": "seeded uniform (mulberry32, seed 77); 90% official",
+ "sizes": [
+  {
+   "n": 1000000,
+   "columns_bytes": 19000000,
+   "runs": [
+    {
+     "build_ms": 173.30629100000002,
+     "count_per_cell_ms": 3.1462080000000014,
+     "level": 16,
+     "cells": 8160,
+     "index_bytes": 8367200,
+     "cell_counts_bytes": 32640,
+     "count_city_ms": 1.4687079999999924,
+     "count_city": 900354,
+     "count_street_ms": 0.3825840000000085,
+     "count_street": 599,
+     "ids_street_ms": 0.3481249999999818,
+     "ids_street": 599
+    },
+    {
+     "build_ms": 158.84783300000004,
+     "count_per_cell_ms": 2.51641699999999,
+     "level": 16,
+     "cells": 8160,
+     "index_bytes": 8367200,
+     "cell_counts_bytes": 32640,
+     "count_city_ms": 0.4712079999999901,
+     "count_city": 900354,
+     "count_street_ms": 0.46949999999998226,
+     "count_street": 599,
+     "ids_street_ms": 0.1833329999999478,
+     "ids_street": 599
+    },
+    {
+     "build_ms": 150.65366699999993,
+     "count_per_cell_ms": 2.217999999999961,
+     "level": 16,
+     "cells": 8160,
+     "index_bytes": 8367200,
+     "cell_counts_bytes": 32640,
+     "count_city_ms": 1.0425000000000182,
+     "count_city": 900354,
+     "count_street_ms": 0.18508299999996325,
+     "count_street": 599,
+     "ids_street_ms": 0.09229100000004564,
+     "ids_street": 599
+    }
+   ],
+   "median": {
+    "build_ms": 158.84783300000004,
+    "count_per_cell_ms": 2.51641699999999,
+    "level": 16,
+    "cells": 8160,
+    "index_bytes": 8367200,
+    "cell_counts_bytes": 32640,
+    "count_city_ms": 1.0425000000000182,
+    "count_city": 900354,
+    "count_street_ms": 0.3825840000000085,
+    "count_street": 599,
+    "ids_street_ms": 0.1833329999999478,
+    "ids_street": 599
+   }
+  },
+  {
+   "n": 2700000,
+   "columns_bytes": 51300000,
+   "runs": [
+    {
+     "build_ms": 441.21604200000013,
+     "count_per_cell_ms": 12.520708000000013,
+     "level": 15,
+     "cells": 2064,
+     "index_bytes": 21692880,
+     "cell_counts_bytes": 8256,
+     "count_city_ms": 6.285334000000148,
+     "count_city": 2430484,
+     "count_street_ms": 0.22137500000008004,
+     "count_street": 1603,
+     "ids_street_ms": 0.39495800000008785,
+     "ids_street": 1603
+    },
+    {
+     "build_ms": 435.407792,
+     "count_per_cell_ms": 12.334292000000005,
+     "level": 15,
+     "cells": 2064,
+     "index_bytes": 21692880,
+     "cell_counts_bytes": 8256,
+     "count_city_ms": 9.329750000000104,
+     "count_city": 2430484,
+     "count_street_ms": 0.344333000000006,
+     "count_street": 1603,
+     "ids_street_ms": 0.38475000000016735,
+     "ids_street": 1603
+    },
+    {
+     "build_ms": 422.7837079999997,
+     "count_per_cell_ms": 11.122041999999965,
+     "level": 15,
+     "cells": 2064,
+     "index_bytes": 21692880,
+     "cell_counts_bytes": 8256,
+     "count_city_ms": 4.25670799999989,
+     "count_city": 2430484,
+     "count_street_ms": 0.16016700000000128,
+     "count_street": 1603,
+     "ids_street_ms": 0.11620799999991505,
+     "ids_street": 1603
+    }
+   ],
+   "median": {
+    "build_ms": 435.407792,
+    "count_per_cell_ms": 12.334292000000005,
+    "level": 15,
+    "cells": 2064,
+    "index_bytes": 21692880,
+    "cell_counts_bytes": 8256,
+    "count_city_ms": 6.285334000000148,
+    "count_city": 2430484,
+    "count_street_ms": 0.22137500000008004,
+    "count_street": 1603,
+    "ids_street_ms": 0.38475000000016735,
+    "ids_street": 1603
+   }
+  },
+  {
+   "n": 15000000,
+   "columns_bytes": 285000000,
+   "runs": [
+    {
+     "build_ms": 2766.8385829999997,
+     "count_per_cell_ms": 121.81362499999977,
+     "level": 14,
+     "cells": 528,
+     "index_bytes": 120023760,
+     "cell_counts_bytes": 2112,
+     "count_city_ms": 60.20862500000021,
+     "count_city": 13501410,
+     "count_street_ms": 3.848457999999482,
+     "count_street": 9157,
+     "ids_street_ms": 7.342499999999745,
+     "ids_street": 9157
+    },
+    {
+     "build_ms": 2762.2140419999996,
+     "count_per_cell_ms": 122.55716699999903,
+     "level": 14,
+     "cells": 528,
+     "index_bytes": 120023760,
+     "cell_counts_bytes": 2112,
+     "count_city_ms": 58.522790999999415,
+     "count_city": 13501410,
+     "count_street_ms": 3.874832999999853,
+     "count_street": 9157,
+     "ids_street_ms": 7.287082999999257,
+     "ids_street": 9157
+    },
+    {
+     "build_ms": 2729.435707999999,
+     "count_per_cell_ms": 123.23737499999879,
+     "level": 14,
+     "cells": 528,
+     "index_bytes": 120023760,
+     "cell_counts_bytes": 2112,
+     "count_city_ms": 57.947541999999885,
+     "count_city": 13501410,
+     "count_street_ms": 3.818708000000697,
+     "count_street": 9157,
+     "ids_street_ms": 3.483541999999943,
+     "ids_street": 9157
+    }
+   ],
+   "median": {
+    "build_ms": 2762.2140419999996,
+    "count_per_cell_ms": 122.55716699999903,
+    "level": 14,
+    "cells": 528,
+    "index_bytes": 120023760,
+    "cell_counts_bytes": 2112,
+    "count_city_ms": 58.522790999999415,
+    "count_city": 13501410,
+    "count_street_ms": 3.848457999999482,
+    "count_street": 9157,
+    "ids_street_ms": 7.287082999999257,
+    "ids_street": 9157
+   }
+  }
+ ]
+}

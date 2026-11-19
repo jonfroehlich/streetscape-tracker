@@ -642,3 +642,37 @@ def test_every_fixture_mapillary_record_carries_a_quality_block():
         assert block["pct_ge_good"] == 50.0 and block["pct_lt_poor"] == 50.0
         assert block["p50_on_foot"] == 0.92 and block["p50_vehicle"] == 0.58
         assert (block["n_on_foot"], block["n_foot_known"]) == (1, 2)
+
+
+@pytest.mark.parametrize(
+    ("provider", "n_flat_only"),
+    [("gsv", 0), ("mapillary", 50)],
+)
+def test_the_dense_city_is_named_by_the_generator_and_holds_what_it_says(
+    tmp_path, provider, n_flat_only
+):
+    """Issue #77: ``write_dense_city`` is what the e2e suite and the measurement
+    script open as a city over RENDER_CAP, so its filename must parse back to the
+    same city, geometry, date and provider (a hand-built name is how two providers
+    once collided on one file), and its rows must be the counts it reports.
+    """
+    info = build_fixture.write_dense_city(
+        str(tmp_path), 2_000, provider=provider, n_flat_only=n_flat_only
+    )
+    parsed = naming.parse_filename(info["csv"])
+    assert parsed.slug == build_fixture._DENSE_CITY[provider][0]
+    assert parsed.run_date == date(2026, 4, 15)
+    assert parsed.provider == provider
+    assert parsed.width_meters == parsed.height_meters > 0
+    assert (tmp_path / info["csv"].replace(".csv.gz", ".json.gz")).is_file()
+
+    df = load_city_csv_file(str(tmp_path / info["csv"]))
+    ok = df[df["status"] == "OK"]
+    assert len(ok) == info["n_panos"] == 2_000
+    assert ok["pano_id"].is_unique
+    assert (df["status"] == "FLAT_ONLY").sum() == n_flat_only
+    assert (df["status"] == "ZERO_RESULTS").sum() >= build_fixture.DENSE_N_ZERO_RESULTS
+    contributor = (ok["copyright_info"] != "© Google").sum() if provider == "gsv" else 0
+    assert contributor == info["n_contributor"]
+    if provider == "gsv":
+        assert 0 < contributor < len(ok)
