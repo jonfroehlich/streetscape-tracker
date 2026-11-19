@@ -372,8 +372,18 @@ def test_city_page_shows_the_harvested_capture_history(page: Page, base_url):
 
     canvas = page.locator("#capture-history-chart")
     expect(canvas).to_be_visible()
-    box = canvas.bounding_box()
-    assert box and box["width"] > 0 and box["height"] > 0
+    # A Chart.js instance on the canvas, not a nonzero box: a bare <canvas>
+    # lays out at 300x150 whether or not anything drew on it, which the
+    # visibility check above already covers. Polled in the page rather than
+    # read once through the locator, because updateLegend swaps the legend's
+    # innerHTML on repaint and a canvas replaced between two one-shot reads is
+    # gone by the second (issue #458).
+    page.wait_for_function(
+        """() => {
+            const canvas = document.querySelector("#capture-history-chart");
+            return !!canvas && !!Chart.getChart(canvas);
+        }"""
+    )
 
     legend = page.locator(".legend")
     expect(legend).to_contain_text("across 4 years")
@@ -2638,12 +2648,19 @@ def test_a_stored_collapse_applies_before_the_data_loads(page: Page, base_url, p
     page.set_viewport_size({"width": 1440, "height": 900})
     h1_left = "() => document.querySelector('.streets-main h1').getBoundingClientRect().left"
 
-    page.route("**/streetscape-tracker/data/**", lambda route: route.abort())
+    # A NAMED handler, removed by name. unroute(pattern) alone removes every
+    # route for the pattern, the autouse fixture route included, and the second
+    # load then fetched the live production site: green while it answered, red
+    # the day it did not (issue #458).
+    def abort(route):
+        route.abort()
+
+    page.route("**/streetscape-tracker/data/**", abort)
     page.goto(f"{base_url}/{path}")
     expect(page.locator(".table-sidebar")).to_have_count(0)
     before = page.evaluate(h1_left)
     assert page.evaluate("() => document.documentElement.dataset.sidebar") == "collapsed"
-    page.unroute("**/streetscape-tracker/data/**")
+    page.unroute("**/streetscape-tracker/data/**", abort)
 
     page.goto(f"{base_url}/{path}")
     expect(page.locator(".streets-table tbody tr").first).to_be_visible()
