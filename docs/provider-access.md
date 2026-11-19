@@ -679,6 +679,26 @@ The record is in `docs/experiments/kartaview-endpoint-move.md`, and #452 is the 
 They were resumed on 2026-11-09 by that config PR; the resume plan and its dry runs are in that writeup's Resolution section and production JSON.
 The host lock's key is `HOST_KARTAVIEW = "kartaview"`, a lock name, untouched by the move.
 
+**At 1.5/min the backlog filled the night (#464, read from the production log and catalog on 2026-11-13).**
+The pace was not violated; what changed was the length of the daily presence on a host with no forum.
+
+| Night (UTC date) | Cities | Night length | KartaView host in use (span) | KartaView requests, both channels | Those requests at 1.5/min | Fill |
+|---|---|---|---|---|---|---|
+| 2026-11-10 | 42 | 11.84 h, stopped at the deadline | 11.4 h | 775 | 8.6 h | not reached |
+| 2026-11-11 (Mapillary rest night) | 28 | 11.33 h | 11.3 h | 1,041 | 11.6 h | 0 cities |
+| 2026-11-12 | 63 | 11.42 h | 11.4 h | 779 | 8.7 h | 0 cities |
+
+The span is first launch to last finish, so it overstates KartaView's own time; the request column divided by the pace is the better reading of it.
+One 37-request launch measured 23.3 min (Elko, Nevada, 2026-11-13), so launches reach about the full pace.
+#464 adds an OPTIONAL `[hosts.kartaview].max_night_minutes`, a nightly wall-clock allowance for FRESH KartaView crawls (`docs/scheduler.md`), and ships it **unset**: with the key unset nothing about how, how often, how fast or from where KartaView is called changes.
+**When an operator sets it, it LOWERS KartaView's nightly request volume and launch minutes**, and it leaves the rate at 1.5/min with one talker.
+What it bounds is the due phase's FRESH crawls, at about 1.5 × the allowance less tonight's reserve, plus the city in flight when it is spent.
+Three kinds of launch run outside that bound, because the exemption is "has a checkpoint", not "paid-for work": every resume of a live checkpoint, including the fill's resumes of its own paused crawls, which are not in the reserve; a fresh grid in a city exempt only because its walk has a checkpoint; and a crawl over a checkpoint the child discards (past the 7-day wall but fitting, or with no first-commit stamp), which starts from zero.
+That last kind is charged as fresh, so it spends the allowance without being held by it, once per dead checkpoint (the new crawl stamps a fresh one); it is most common right after a KartaView outage longer than 7 days.
+It does not shorten the presence span: exempt resumes, cached walks, the stranded-walk retry and the fill's KartaView launches still run late in the night.
+The minutes it frees go to the other channels within their existing budgets and holds: Mapillary stays bounded by the tile CDN's rolling-24h pool, Panoramax only by its daily budgets, so its nightly volume can rise inside #405's staged-raise window, and Overpass has no budget at all.
+Set it outside #405's measurement window, or record it there as a confounder.
+
 ## Panoramax documents no limit at all, but is the one locked host with a staffed community (surveyed 2026-09-04, issue #316)
 
 Panoramax became a collection channel in [#335](https://github.com/jonfroehlich/streetscape-tracker/issues/335), and this section predates it: it exists because the top-of-file rule is about *before*, and phase 1 of [#316](https://github.com/jonfroehlich/streetscape-tracker/issues/316) put read-only traffic on the host while the answer was still open.

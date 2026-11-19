@@ -150,6 +150,21 @@ a geocode that lands on a city the catalog already holds (a second spelling of a
 
 `tests/test_register_frame.py` pins the bulk-registration safety rails — overlap reuse, `enabled = 0` until vetted, the GeoNames center guard against a province-centroid geocode, dry-run-by-default writing nothing, idempotent re-runs — with the geocoding seam monkeypatched, so no network.
 It pins `--notes-label` by MUTATING it rather than by asserting the default: a case that only read `cities.notes` after a default run would stay green while the flag was dropped on the floor, and that label is how the vetting and enable steps select one batch out of the catalog.
+The dry run's in-batch report (#460) is pinned against `--execute` itself, not against its own wording:
+two manifest rows 5.5 km apart print `REUSE IN-BATCH` at `--overlap-km 6`, and the same manifest then really aliases the second row under `--execute`, with the same `reused-existing` and `newly-registered` counts in both summaries;
+at `--overlap-km 5` the pair prints a `WARNING`, and a 0.6 km drift of the first row's geocoded centre really aliases the second;
+rows farther apart than `--overlap-km` + `--max-center-km` print nothing;
+a row the dry run would alias still warns later rows, with the three-row chain run under `--execute` to show the alias it warns about;
+a catalog reuse prints a NOTE when an earlier row of the batch could become the nearer target, and a 1.1 km drift of that row under `--execute` really takes the alias from the catalog city.
+The report is distance-only: rows that `--execute` merges by name (a shared query, or a shared city/admin/country) are not previewed (#467).
+
+`tests/test_reregister.py` pins the manual-resize guard (#459) with its premise: the same Kuna-shaped city is RESIZEd without the note and DEFERred with it.
+Its advisory recommendation is the CURRENT grid with a basis that says why (the review page shows the basis in place of the reason, and offers any other rectangle as a one-click choice),
+on every deferring branch and not only the would-be RESIZE (over-threshold, `NO_POLYGON` and `WRONG_PLACE` are parametrized, each against the same city without the note);
+there the basis carries the audit's own reason and its generic advice, the advice labelled as written for a grid that was not fitted by hand.
+The guard diverts only a would-be RESIZE (NOCHANGE, SKIP and the over-threshold DEFER are unchanged), including one that would only have recentered a hand fit larger than its bbox.
+`load_current_geometry` reads the note that `resize_city.py --execute` really writes, appended after another note or onto NULL notes.
+The same catalog then drives the script's dry run: its summary counts the kept hand fits among the deferrals, and prints no such line when there are none.
 
 `tests/test_mapillary_360_cities_manifest.py` IS the provenance of `mapillary_360_cities.csv`.
 The city list is curated, but its values are a GeoNames join keyed by `geonameid` and there is no generator script to name in a `generated_by`, so the test re-runs that join in reverse: city, admin, country, continent, population and coordinates must match the vendored records, and `query_string` must equal what `build_worldwide_frame.query_string` writes, so a query here behaves exactly like a frame query at the geocoder.
@@ -1046,6 +1061,10 @@ one shipped timer file missing from `~/.config/systemd/user/` is that timer's `N
 every live manager state (`degraded` above all, the state a failed nightly service leaves) is reachable, and `offline`, `unknown` or silence is not;
 `--wait-s` polls until BOTH the manager answers and the unit files are visible, gives up inside its budget (fake clock) still writing the heartbeat, treats 0 as exactly one check, and a negative wait, a non-positive poll or a non-finite value of either exits 64 before any call;
 `--alert` is silent on a quiet day, mails on a re-arm (with the `regenerate-aggregate --publish` hint) and on a failure, and never changes the exit status;
+the collection unit's bracket (#389) is read once, AFTER the timers and any re-arm's `daemon-reload`, only when the manager answered and the unit files are visible.
+`test_timer_status_reports_the_collection_units_bracket_without_changing_its_verdict` gives a 16 h config an 18 h unit (`ok`, no mail), a `17h 35min` one (exactly the need, `ok`; red with `<` for `<=`), a 14 h one (`VIOLATED`, its body true with the variable absent as well, never "only when"), `infinity` and a not-loaded unit (both `unknown`, never `ok`), mails on the last three with `unknown` worded on its own (never "VIOLATED", "cannot hold" or "shortened"), and keeps the exit status and the heartbeat's `healthy` unchanged in all four (killed by dropping the comparison, by reading `unknown` as `ok`, by dropping the bracket from `--alert`, or by letting the line change the exit status);
+A bracket-only mail on healthy timers opens by saying so and carries no REARMED advice, while the REARMED mail keeps both (#389 review; red with the old fixed opening).
+`test_timer_status_reads_the_bracket_after_the_rearms_daemon_reload` is the #369 reboot shape — every unit, the service included, not-found until `daemon-reload` — and requires the read after the reload, an `ok` line and a REARMED mail with nothing about the bracket (red with the read moved back before `check_and_rearm`); `test_systemd_time_spans_parse_and_infinity_is_unknown` pins the span parser;
 the heartbeat carries the verdict;
 a write broken midway (a faked `json.dump` that writes half and raises) leaves the previous heartbeat intact and no staging file behind, which is what pins atomicity;
 the staging name is per-pid — another writer's in-flight staging file, its path derived through `_staging_path` under a faked pid, is left alone;
@@ -1054,11 +1073,40 @@ and `main()` forwards `--rearm`, `--alert`, `--wait-s` and `--poll-s`, each with
 `tests/test_timer_watchdog_crontab.py` pins the crontab: exactly `MAILTO=""`, `CRON_TZ`, one `@reboot` and one daily line;
 both commands `cd` to the collection unit's `ReadWritePaths`, run the units' interpreter, and parse under `build_parser()` as `timer-status --rearm --alert` with the prod config;
 the `@reboot` wait is bounded between 10 and 60 minutes and the daily line does not wait;
-the daily slot shares the timers' zone, precedes the backup-check timer, and leaves a `Persistent` catch-up night room to end before the next 02:00;
+the daily slot shares the timers' zone, precedes the backup-check timer, and leaves a `Persistent` catch-up night room to end before the next 02:00, bounded by the prefreeze tests' `_night_length_minutes` (#389);
 both lines log to `logs/timer_watchdog.log`;
 `deploy/README.md` appends the file guarded by the marker its first line carries;
 and no doc or package docstring pauses a timer with the `stop` verb on a `.timer`, as a command or in prose, which the daily re-arm would undo.
 In `tests/test_scheduler.py`, `backup-status` gates on the heartbeat only when `[schedule].timer_watchdog_max_age_h > 0` (NEVER RAN, fresh, and 50 h STALE), the age limit is inclusive and the report echoes the heartbeat's own verdict, a stale backup outranks a stale watchdog in the subject while the body carries both, the key round-trips through the loader, and prod sets it between 24 and 72 h.
+
+## The night's length (issue #389)
+
+`tests/test_night_window.py` pins the bracket between `config/scheduler.makelab1.toml` and the shipped units, the runtime clamp, and the tail's SIGTERM guard.
+Each line names the mutation that turns it red.
+
+- `test_the_night_plus_its_overrun_and_margin_fits_the_units_start_timeout` — prod `max_batch_hours × 3600 + NIGHT_OVERRUN_S + NIGHT_MARGIN_S <= TimeoutStartSec`; red at prod `max_batch_hours = 12.5`, which the whole-hours pin it replaced (in `test_makelab1_production_config_is_wired`) accepted.
+- `test_the_tail_allowance_is_the_units_stop_timeout` — `NIGHT_TAIL_ALLOWANCE_S` equals the unit's `TimeoutStopSec`; red when either moves alone.
+- `test_the_unit_tells_the_scheduler_its_own_start_timeout` — `STREETSCAPE_UNIT_TIMEOUT_START_S` is in the unit and equals `TimeoutStartSec`; red when `TimeoutStartSec` is raised without it.
+- `test_the_start_timeouts_kill_lands_clear_of_the_next_fire` — fire slack + `TimeoutStartSec` + `TimeoutStopSec` <= 23 h for an on-time night; red at `TimeoutStartSec=23h`.
+- `test_prod_keeps_its_daytime_ops_window` — at least `OPS_WINDOW_HOURS` (6, a test constant, not config) between the night's end and the next fire; red at prod `max_batch_hours = 20`.
+- `test_an_on_time_night_ends_inside_its_utc_date[PST|PDT]` — the 02:00 fire plus slack, `h` and one clamped child ends on its starting UTC date, read through `zoneinfo` for a January and a July date; red in PST only at `max_batch_hours = 13.75`, which is why both seasons run.
+- `night_window_seconds`: a nightly under a too-short unit is shortened to the unit less the overrun and margin, and the note names both numbers (red when the configured window is returned unconditionally); an 18 h unit is believed (red when the variable is ignored); not set, `""`, `abc`, `60`, `nan`, `inf` and `-inf` all mean the legacy 14 h (red without the `math.isfinite` check, for `nan` and `inf`); a window that fits, exactly at the ceiling included, is left alone (red with `<` for `<=`); a hand run is never shortened (red without the `is_nightly` test); and ten minutes before the loop come out of the window (red when `pre_loop_s` is dropped).
+  The note names the cause: with 12.3 h under 14 h the unit holds the window and only the ten-minute start broke it, so the note says the unit needs no change and gives no unit fix (`test_time_spent_before_the_loop_comes_out_of_the_window`), while 16 h would not fit with no pre-loop at all and gets the unit fix (`test_a_window_the_unit_cannot_hold_even_without_a_pre_loop_blames_the_unit`); red when either note is used for both.
+- `test_a_shortened_night_alerts_and_runs_to_the_shorter_deadline` — `cmd_run_due` as a nightly under a pre-#389 unit, configured for 16 h, ten minutes after `_PROCESS_STARTED_MONOTONIC`: the loop's deadline (spied from `_run_city_loop`, a float, not a formatted string) is 14 h less the overrun, the margin and those ten minutes, one `night shortened` alert is sent, ending `the installed unit cannot hold max_batch_hours`, and the opening line's `max_batch_hours=` parses to the same window; red when `_fit_night_to_unit` alerts without replacing the config, or ignores the pre-loop time.
+- `test_a_night_shortened_by_a_slow_start_does_not_blame_the_unit` — the same drive at 12.3 h under the 14 h unit's variable with a ten-minute start: shortened, but the subject ends `a slow start before the city loop, not the unit` and the body promises no VIOLATED `timer-status` (red when the subject is always the unit's).
+- `test_a_dry_run_is_never_clamped_and_never_alerts` — `cmd_run_due(dry_run=True)` as a nightly under a unit that cannot hold 16 h: `_fit_night_to_unit` is never called and nothing mails (red when the `if not dry_run` guard is removed).
+- `test_a_sigterm_during_the_tail_is_logged_once_and_the_tail_runs_on`, `test_the_tail_guard_restores_the_handler_when_a_tail_step_raises`, `test_a_sigterm_in_the_nights_tail_does_not_cost_the_publish` — a handler that raises stands in for the default disposition (which would end pytest); under `_tail_survives_sigterm` two SIGTERMs are one WARNING and every later step runs, the previous handler is back afterwards and after a raising step, and end to end a SIGTERM during a NIGHTLY's aggregate leaves that step unfailed, logs the guard's WARNING once, and still reaches the manifest and the publish
+  (the step list alone cannot tell: without the guard the stand-in raises inside the aggregate and the tail reports it and goes on).
+  Red when the guard installs nothing, when it restores outside a `finally`, and when the `with` is dropped at `cmd_run_due`'s call site respectively.
+- `test_a_sigterm_in_the_nights_tail_does_not_cost_the_publish` also pins that a caught SIGTERM mails `SIGTERM IN THE TAIL` and exits 1, with no retry for a publish that started after it (red when `cmd_run_due` drops the yielded `_TailSigterm`); `test_a_sigterm_between_the_loop_and_the_tail_is_caught_too` sends it from the quarantine claim, before `_finish_batch` (red when the guard is entered at the `_finish_batch` call again).
+- The publish retry (#389 review): a SIGTERM during the publish retries it once with `timeout_s` bounded by the stop timeout left (`test_a_publish_the_tail_sigterm_killed_is_retried_once_inside_the_stop_timeout`, red with no bound or with `PUBLISH FAILED` kept after a good retry), a failing retry is reported and not repeated (`test_a_retry_that_fails_too_is_reported_and_never_repeated`, red with a loop), no retry under 60 s of room (`test_no_retry_when_too_little_of_the_stop_timeout_is_left`), none on a hand run (`test_a_hand_runs_failed_publish_is_never_retried`), and the alert note and the retry degrade to a sentence rather than raising (`test_the_sigterm_alert_and_the_retry_never_raise`).
+  A publish that started after the signal is not retried and its mail says nothing about one (`test_a_publish_that_started_after_the_sigterm_is_not_retried`, red with the condition reduced to `received_at is None`), and the real `_publish` hands `_run_publish_child` a shorter `timeout_s` and never a longer one than `PUBLISH_TIMEOUT_S` (`test_publish_passes_a_shorter_timeout_to_the_child_and_never_a_longer_one`, red with the pass-through dropped or the `min` cap removed); both mutation-checked, #389 review round 2, since every other retry test stubs `_publish`.
+- `test_a_hand_run_is_never_clamped_and_never_alerts_end_to_end` — `cmd_run_due` as a hand run at 16 h with no unit variable: the loop gets 57,600 s and no `night shortened` mail; red when `_fit_night_to_unit` passes `is_nightly=True` (mutation-checked, #389 review), which the pure-function test cannot see.
+- `test_a_set_but_unusable_unit_variable_is_warned_about_even_when_the_window_fits[abc|60]` — a set but unusable `STREETSCAPE_UNIT_TIMEOUT_START_S` is logged although 12 h fits the 14 h fallback, an absent one is not, and neither mails.
+- `test_a_hand_runs_tail_keeps_the_default_sigterm` — the same drive as a hand run: the guard is the nightly's only (no systemd SIGKILL follows a hand run), so the SIGTERM reaches the stand-in default disposition, the aggregate step fails, the night is unhealthy and no guard WARNING is logged (red when the guard is entered unconditionally).
+- The city loop's SIGTERM wind-down is unchanged and is NOT duplicated here: `test_sigterm_winds_the_batch_down_instead_of_killing_the_publish` and `test_sigterm_stops_the_city_mid_channel_instead_of_finishing_its_channels` in `tests/test_scheduler.py` pin it, the first including the handler's restoration after the night.
+
+In `test_makelab1_production_config_is_wired`, `max_batch_hours == 12` is replaced by the relation it stood for: each GSV budget is the window's spend at the channel's pace (`[download]`'s when unset, as `city_timeout_seconds` reads it) or at most 5% above it, so a raise of the hours without the budgets is red, and so is a budget of 60M.
 
 ## Per-IP hardening: Mapillary, Overpass and the host lock
 
@@ -1185,10 +1233,10 @@ In `tests/test_scheduler.py`, `backup-status` gates on the heartbeat only when `
   `--nights >= 2`, `--limit` between the production city cap and Overpass's 100/day regular-application figure, and `--pause-s` at least the default;
   the collection unit naming the service on BOTH `OnSuccess=` and `OnFailure=` (a night with one failed city is the common exit), and its commented opt-in notify `OnFailure=` still present and, once uncommented, accumulating beside the chain rather than displacing it;
   no `.timer` shipping for it and no `[Install]` section on the service;
-  the pass's `TimeoutStartSec` ending it an hour before the next 02:00 from the night's latest end — the nightly delay, `max_batch_hours` and, as a deliberately conservative stand-in for the night's tail, the collection unit's `TimeoutStopSec`, itself re-checked against `BACKUP_TIMEOUT_S + PUBLISH_TIMEOUT_S` so the stand-in stays an over-estimate — the assert that fails at `max_batch_hours = 20` by design;
+  the pass's `TimeoutStartSec` ending it an hour before the next 02:00 from the night's latest end — `_night_length_minutes`, since #389 the SAME terms the runtime uses: the fire slack (`NIGHTLY_FIRE_SLACK`, 16 min), `max_batch_hours` and `scheduler.NIGHT_OVERRUN_S` (the tail allowance, equal to the collection unit's `TimeoutStopSec` and re-checked against `BACKUP_TIMEOUT_S + PUBLISH_TIMEOUT_S` so the stand-in stays an over-estimate, plus one clamped in-flight child) — the assert that fails at `max_batch_hours = 20` by design;
   the script's fire-time constants equal to the nightly timer's `OnCalendar`;
   every shipped unit installed by a `cp` line in `deploy/README.md`, and CLAUDE.md's unit count matching the directory.
-  The same file pins the weekly Panoramax screen timer at both ends: after the night's latest end by the same bound, and its own latest end (delay plus `TimeoutStartSec`) an hour before the next 02:00. It shares the nightly's Panoramax host lock; its Monday 12:00 slot sat inside a full 12 h night (moved to 18:00 on 2026-09-25), and 18:00 would sit inside a 16 h one (moved to 23:00 by #389, which fails the first assert past ~20.25 h).
+  The same file pins the weekly Panoramax screen timer at both ends: after the night's latest end by the same bound, and its own latest end (delay plus `TimeoutStartSec`) an hour before the next 02:00. It shares the nightly's Panoramax host lock; its Monday 12:00 slot sat inside a full 12 h night (moved to 18:00 on 2026-09-25), and 18:00 would sit inside a 16 h one (moved to 23:00 by #389, which fails the first assert past ~20.15 h).
 - `collect --estimate` on a cold city says the network **was** fetched from Overpass and frozen, on a frozen one says no requests were issued, with `--refresh` on a frozen one says it was re-fetched, and with `--refresh` on a cold one still says fetched, never re-fetched (issue #341).
 
 - Request jitter (issue #292: the spaced pacer sleeps exactly the **shifted exponential** of the injected draw — floor `(1 − j) × mean` plus `j × mean × draw` — keeps the configured **mean** rate and reaches `CV = jitter` over 20,000 real draws, has no burst credit after an idle, exceeds the old uniform draw's hard ceiling (the property the change exists for), `jitter = 0` never draws randomness and sleeps exactly as the bucket did, disabled pacing ignores it, and `[1, ∞)` or a negative is refused by the class, the shared `jitter_fraction` argparse type and `coerce_jitter` alike;
@@ -1262,6 +1310,37 @@ A hold keeps a host's channels from launching without anything having refused us
   - `test_probe_host_refuses_an_unknown_host_and_a_missing_token`, `test_probe_host_is_wired_into_the_cli`.
   - `test_the_production_fetch_never_follows_a_redirect` (`allow_redirects=False` reaches `requests.get`) and `test_the_token_comes_from_the_existing_loader`.
 - `test_the_done_line_names_each_metered_hosts_presence_and_the_gap_before_it` — first launch to last finish on the tile CDN, the gap back to the newest ledger stamp from BEFORE the run (tonight's own stamps are seeded and must be ignored), and neither GSV nor Overpass named; killed by marking the launch after the inline child, by dropping the finish mark, by reading tonight's stamps, and by letting Overpass in.
+
+## The KartaView night allowance (issue #464)
+
+`tests/test_kartaview_night_allowance.py`.
+Its fake child MOVES the frozen UTC clock by the minutes a launch should take, which is what the allowance charges, and it fakes checkpoints and cached censuses at their two readers (`_sweep_checkpoint_progress`, `channel_census_cache_marker`).
+Each docstring names the one-line mutation that turns it red; all were run red before the PR.
+
+- Config: `test_a_night_allowance_loads_for_the_kartaview_host`; `test_an_invalid_night_allowance_fails_closed` (0, −5, a bool, a string, 1441, and a valid value on the tile CDN and on Panoramax: exit 64 before connecting); `test_makelab1_ships_the_allowance_commented_out` (prod unset, the commented line present).
+- `test_an_unset_allowance_probes_nothing_and_leaves_the_night_as_it_was` — both probes RAISE for a census channel on a Mapillary rest night with the key unset, and the launches and the HELD clause are the pre-change values; killed by computing the paid-for set before the short-circuit.
+- The hold: `test_a_spent_allowance_leaves_fresh_crawls_due_and_takes_no_slot` (no attempt, no failure, no alert, still due, one crossing WARNING; the unset control launches the city); `test_a_spent_allowance_is_never_counted_as_attempted` (a two-city night where the held city must not take the gsv city's slot; the hoist order is asserted).
+- Pairing and paid-for work: `test_an_allowance_spent_mid_city_never_splits_the_grid_from_its_walk` (killed by a per-launch read); `test_a_resumed_grid_that_completes_is_followed_by_its_free_walk` and `test_a_resumed_grid_that_pauses_still_defers_its_walk` (the fake grid clears its checkpoint and promotes the census, or exits 83); `test_a_cached_walk_is_exempt_and_a_fresh_one_is_not`; `test_the_stranded_walk_retry_is_exempt_through_the_retry_pass` (driven through `_retry_stranded_walks` itself); `test_an_unhoisted_resumer_still_runs_when_the_reserve_fills_the_allowance`.
+- `test_an_unfinishable_city_is_skipped_as_unfinishable_never_held` — the #456 WARNING and `ceiling_skipped`, and `allowance_skipped` stays 0.
+- The reserve and the charge: `test_resumes_are_reserved_out_of_the_allowance_first` (killed by skipping the reserve); `test_a_resume_does_not_spend_the_fresh_allowance` (killed by charging every launch as fresh); `test_a_launch_on_the_pool_path_is_charged` (two lanes, as prod; killed by dropping `end_charge`).
+- Reporting: `test_the_done_clause_carries_the_numbers_and_never_the_held_token` (the exact clause, and `mapillary_night_report._HELD_RE` matches nothing); `test_a_rest_night_beside_a_spent_allowance_keeps_the_held_count_mapillarys` (the regex's `n` is the Mapillary launches alone); `test_the_dry_run_holds_what_the_night_would_hold`; `test_status_names_the_night_allowance`; `test_ignore_host_holds_lifts_the_night_allowance`.
+- `test_a_spent_night_allowance_leaves_kartaview_not_the_city` (`tests/test_fill_underfull_nights.py`) — through `_fill_admission`: `held_left` on a real night's backlog, `host_left` on the edge path, and a live checkpoint never left.
+- Review 1 of the PR added four more.
+  - `test_a_kartaview_rest_or_cooldown_outranks_its_spent_allowance` (rest and cooldown arms): the same host carries both holds, its reserve spends the allowance, and the live checkpoint is neither exempted nor launched. It is killed by reordering `HostHolds.active`.
+  - `test_an_exempt_city_run_twice_is_counted_once`: the exempt tally is distinct cities.
+  - `test_the_fill_names_a_spent_allowance_only_where_it_is_the_reason`: the unset test also pins the fill's decline line to the #444 text, byte for byte.
+  - `test_fill_admission_judges_the_allowance_exemption_over_what_it_launches` (in the fill file): a backlogged `kartaview` checkpoint does not exempt a `kartaview_streets` that has none.
+- Review 2 added five more.
+  - `test_the_fill_preview_charges_the_night_allowance` (in the fill file, with an unset control): the dry run's fill section charges the allowance as its due rows do.
+  - `test_the_reserve_counts_cities_not_channels`: a city with checkpoints on both channels reserves one launch.
+  - `test_the_reserve_is_silent_on_a_run_that_touches_no_kartaview_channel`.
+  - `test_the_dry_run_never_lists_a_spent_allowance_as_held_tonight`.
+- Review round 3 replaced one test, added three and extended four.
+  - `test_a_checkpoint_at_the_age_wall_reaches_the_age_wall_arm` (6.5 days and 7 days + 1 h, each unfinishable and fitting) replaces review 2's `test_a_checkpoint_past_the_age_wall_is_not_paid_for_work`, which pinned the opposite: a checkpoint of any age is never held, so the age-wall arm records its failure, and one past the discard that launches is charged fresh. It is killed by exempting on the aged predicate, and by charging on `progress is not None`.
+  - `test_a_checkpoint_with_no_first_commit_stamp_is_charged_fresh_not_crashed`: `age_s = None` raised `TypeError` in the city loop before the fix.
+  - `test_an_allowance_as_long_as_the_batch_window_is_warned_as_bounding_nothing` (720 and 719 min against a 12 h window).
+  - `test_an_unset_allowance_with_kartaview_enabled_leaves_the_night_as_it_was`: both KartaView channels enabled, a resumer, a fresh pair, a cached walk and a gsv city, with every #464-only helper patched to raise; the launches and the whole `Done:` line are literals, and the same file run against an extracted `origin/main` tree passes this test unchanged.
+  - It also extended four: `test_an_invalid_night_allowance_fails_closed` covers `assess-city`, `test_the_dry_run_holds_what_the_night_would_hold` counts allowance-only cities apart from #444's, `test_ignore_host_holds_lifts_the_night_allowance` pins the narrow `--provider` form in the WARNING, and the fill file's live-checkpoint arm asserts the city is admitted whole.
 
 ## The Mapillary night report (issue #444)
 
@@ -1684,6 +1763,18 @@ It fails when the per-cell counts are keyed on the mode only (a z16 view where t
 Since the fourth review it also requires the year filter's own announcement to say "of this year", which pins `city.js` passing `yearFiltered` to the planner.
 `test_the_flat_toggle_acts_on_points_streamed_before_it` (third review) holds the CSV, wraps `buildFlatOnlyPopupHtml` so the stream itself toggles flat-only on at the 700th flat point and off at the 1,400th, and requires 999 flat points on the map at the 1,000th and none after the load; the second review's `city.js` fails it (300 at the 1,000th, since the toggle did nothing to the points already streamed).
 `test_the_dense_city_is_named_by_the_generator_and_holds_what_it_says` (fast suite, `tests/test_e2e_fixture.py`) fails on a hand-built filename and on a city with no contributor district.
+
+## Generated maps carry the CARTO key
+
+`tests/test_vis.py` builds both `vis.py` maps, the `--check-boundary` preview (`test_search_area_preview_basemap_carries_the_carto_key`) and the coverage map (`test_coverage_map_basemap_carries_the_carto_key`), and requires every tile layer to point at `basemaps.cartocdn.com` and end in `?key=` plus the URL-encoded key that `basemap.carto_basemap_key` reads from `www/js/streetscape-utils.js`.
+Encoded, because the code encodes it: a rotated key holding `+`, `/` or `=` must not fail a correct URL.
+Each also renders the page with `get_root().render()`, since the saved HTML is what a reader opens, and requires the keyed URL there with CARTO's `maxZoom` 20 and `abcd` subdomains, which folium's generic 18 and `abc` would replace (drop `_CARTO_TILE_DEFAULTS`).
+The options are matched by a regex that tolerates folium's JSON spacing, since `requirements.txt` allows any folium from 0.15.1.
+Both require the CARTO and OpenStreetMap attribution links (the free tier's condition), and the coverage map its dark basemap's `opacity` 0.8.
+`test_python_carto_tile_url_matches_the_frontend_form` reads the URL template and key parameter out of `addBasemapLayer` in the JS and requires `carto_tile_url` to build the same URL: rename `key=` or the host on one side only and it goes red, where every other Python test stays green and the other side's maps are watermarked.
+Restore folium's bare tile names in `vis.py` (`tiles="CartoDB positron"`, `tiles="cartodbdark_matter"`) and both go red: those request the tile with no key, which CARTO answers with HTTP 200 and a watermark, so nothing else fails.
+The boundary-review viewer's equivalent is `test_render_html_substitutes_the_frontend_carto_key` and its neighbours in `tests/test_build_boundary_review.py`; the viewer's template carries a whole-URL placeholder and no `cartocdn.com` URL of its own, so a URL-form change in `carto_tile_url` reaches it too.
+Whether CARTO actually honours the key is a network question, answered only by the e2e `tests/e2e/test_basemap_key.py`.
 
 ## The pivoted data tables (issue #250)
 

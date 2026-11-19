@@ -38,13 +38,15 @@ import csv
 import json
 import logging
 import os
-import re
 import sys
-from urllib.parse import quote
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from streetscape_metadata_tracker import db  # noqa: E402
+
+# The keyed tile URL comes from the shared helper, which reads the key out of
+# the frontend module, so this viewer and the vis.py maps cannot drift apart.
+from streetscape_metadata_tracker.basemap import carto_tile_url  # noqa: E402
 from streetscape_metadata_tracker.boundary_audit import (  # noqa: E402
     frozen_rect_bounds,
     rect_polygon_coverage,
@@ -58,15 +60,9 @@ DEFAULT_AUDIT_DIR = os.path.join(_PROJECT_ROOT, "audit")
 TEMPLATE_PATH = os.path.join(_PROJECT_ROOT, "scripts", "boundary_review.template.html")
 DATA_PLACEHOLDER = "/*__DATA__*/"
 META_PLACEHOLDER = "/*__META__*/"
-CARTO_KEY_PLACEHOLDER = "__CARTO_KEY__"
+CARTO_TILE_URL_PLACEHOLDER = "__CARTO_TILE_URL__"
+CARTO_STYLE = "rastertiles/voyager"
 
-# The CARTO basemap key lives in exactly one place, the frontend module that
-# also serves it to the public site. This viewer is generated HTML that
-# cannot load that module, so the key is read out of it here rather than
-# pasted into the template -- a second copy is how one map silently keeps
-# rendering CARTO's "API KEY REQUIRED" watermark after the other is fixed.
-BASEMAP_KEY_SOURCE = os.path.join(_PROJECT_ROOT, "www", "js", "streetscape-utils.js")
-_CARTO_KEY_RE = re.compile(r'CARTO_BASEMAP_KEY\s*=\s*"([^"]+)"')
 
 # Coordinate precision for embedded polygons: ~1 m at the equator, small file.
 _COORD_DECIMALS = 5
@@ -427,21 +423,6 @@ def _json_for_script(obj) -> str:
     return json.dumps(obj, separators=(",", ":"), allow_nan=False).replace("</", "<\\/")
 
 
-def carto_basemap_key(source_path: str = BASEMAP_KEY_SOURCE) -> str:
-    """Read the CARTO basemap key out of the frontend module that owns it.
-
-    Raises rather than degrading: a missing or renamed const would otherwise
-    leave the viewer requesting tiles with a literal placeholder for a key,
-    and CARTO answers a bad key with HTTP 200 and a watermarked tile, so the
-    failure would reach a reviewer as a cosmetic oddity instead of an error.
-    """
-    with open(source_path, encoding="utf-8") as f:
-        match = _CARTO_KEY_RE.search(f.read())
-    if not match:
-        raise ValueError(f"no CARTO_BASEMAP_KEY const found in {source_path}")
-    return match.group(1)
-
-
 def render_html(
     payloads: list, template_path: str = TEMPLATE_PATH, meta: dict | None = None
 ) -> str:
@@ -450,10 +431,10 @@ def render_html(
         template = f.read()
     if DATA_PLACEHOLDER not in template:
         raise ValueError(f"template missing {DATA_PLACEHOLDER!r} placeholder")
-    if CARTO_KEY_PLACEHOLDER not in template:
-        raise ValueError(f"template missing {CARTO_KEY_PLACEHOLDER!r} placeholder")
+    if CARTO_TILE_URL_PLACEHOLDER not in template:
+        raise ValueError(f"template missing {CARTO_TILE_URL_PLACEHOLDER!r} placeholder")
     html = template.replace(DATA_PLACEHOLDER, _json_for_script(payloads))
-    html = html.replace(CARTO_KEY_PLACEHOLDER, quote(carto_basemap_key(), safe=""))
+    html = html.replace(CARTO_TILE_URL_PLACEHOLDER, carto_tile_url(CARTO_STYLE))
     if META_PLACEHOLDER in html:
         html = html.replace(META_PLACEHOLDER, _json_for_script(meta or {}))
     return html

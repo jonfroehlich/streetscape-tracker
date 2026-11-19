@@ -27,6 +27,7 @@ Config: TOML (see config/scheduler.toml). Requires Python 3.11+ (tomllib).
 import argparse
 import concurrent.futures
 import contextlib
+import dataclasses
 import gzip
 import json
 import logging
@@ -44,7 +45,8 @@ import time
 import tomllib
 import traceback
 from collections import Counter, defaultdict
-from collections.abc import Callable, Collection, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -309,6 +311,34 @@ HOST_RECHECKS: dict[str, Callable[[], bool]] = {
 # records a failure or changes the exit status. The cities stay due.
 HOLD_REST = "rest night"
 HOLD_COOLDOWN = "cooling down"
+# The third kind (issue #464): the host's nightly wall-clock allowance for
+# FRESH crawls is spent. Unlike the other two it STARTS mid-run, which is why
+# it is read once per city (`_city_holds`) and never per launch: a city that
+# starts under the allowance runs its grid and its walk together.
+HOLD_ALLOWANCE = "night allowance spent"
+
+
+class AllowanceUsage(NamedTuple):
+    """One host's night allowance and what this run has charged to it (issue #464).
+
+    Every figure is seconds of wall clock, except the two launch counts and
+    ``reserved_n`` (cities). ``fresh_s`` is what FRESH crawls used, the only
+    term the hold compares; ``paid_s`` is resumes of a live checkpoint,
+    reported but never limited.
+    """
+
+    allowance_s: float
+    reserved_s: float
+    reserved_n: int
+    fresh_s: float
+    fresh_n: int
+    paid_s: float
+    paid_n: int
+
+    @property
+    def fresh_allowance_s(self) -> float:
+        """What is left for fresh crawls once tonight's resumes are reserved."""
+        return max(0.0, self.allowance_s - self.reserved_s)
 
 
 @dataclass(frozen=True)
@@ -327,6 +357,12 @@ class HostHold:
         if self.reason == HOLD_COOLDOWN:
             return f"{label}: {self.reason} {self.detail}"
         return f"{label}: {self.reason} ({self.detail})"
+
+
+# The held hosts the fill's judges read: a plain set of host names (#444's
+# callers), or one city's ``_city_holds`` reading, host -> its hold, whose
+# reasons name a spent night allowance (issue #464).
+_HeldHosts = AbstractSet[str] | Mapping[str, HostHold]
 
 
 def _utc_minute(when: datetime) -> str:
@@ -352,6 +388,18 @@ class HostHolds:
     it counts from were all recorded before the run began, and a refusal
     tonight is the breaker's to handle.
 
+    The NIGHT ALLOWANCE (issue #464, ``[hosts.kartaview].max_night_minutes``)
+    is the third kind, and the only one that STARTS mid-run: it holds once the
+    wall clock FRESH crawls have used on the host this run reaches the
+    allowance less tonight's resume reserve (:meth:`reserve`, set once before
+    the night). The launch site charges each launch's measured wall clock
+    (:meth:`charge`, through ``HostBreaker.start_charge``/``end_charge``); a
+    resume of a live checkpoint is charged as paid and never spends the fresh
+    allowance. Because it starts mid-run it is read once per city like a
+    cooldown, through :func:`_city_holds`, which also exempts a city with a
+    checkpoint or a cached census on the host. It is per run and in memory:
+    every ``run-due`` starts at 0.
+
     The empty instance (no arguments) holds nothing, which is what every caller
     that predates #444 gets.
     """
@@ -361,6 +409,7 @@ class HostHolds:
         rest: dict[str, str] | None = None,
         cooldowns: dict[str, tuple[datetime, datetime]] | None = None,
         now: Callable[[], datetime] | None = None,
+        allowances_s: dict[str, float] | None = None,
     ):
         # host -> the weekday name it rests on tonight. Only hosts resting
         # TONIGHT are here; the config's full weekday list is not needed.
@@ -370,10 +419,79 @@ class HostHolds:
         # Read at call time, never bound at import, so a frozen test clock
         # (`clock._utc_clock`) reaches it.
         self._now = now or (lambda: clock.utc_now())
+        # host -> the night allowance in seconds (issue #464), and what this
+        # run has reserved and charged against it.
+        self._allowance_s = dict(allowances_s or {})
+        self._reserved: dict[str, tuple[float, int]] = {}
+        self._fresh: dict[str, tuple[float, int]] = {}
+        self._paid: dict[str, tuple[float, int]] = {}
 
     def active(self, host: str) -> HostHold | None:
-        """The hold on ``host`` right now, or None. A rest night outranks a cooldown."""
-        return self.rest(host) or self.cooldown(host)
+        """The hold on ``host`` right now, or None.
+
+        A rest night outranks a cooldown, and both outrank a spent allowance.
+        """
+        return self.rest(host) or self.cooldown(host) or self.allowance(host)
+
+    def has_allowance(self) -> bool:
+        """Is a night allowance configured on any host? (issue #464)"""
+        return bool(self._allowance_s)
+
+    def allowance_hosts(self) -> set[str]:
+        """The hosts with a night allowance this run."""
+        return set(self._allowance_s)
+
+    def reserve(self, host: str, seconds: float, cities: int) -> None:
+        """Reserve ``seconds`` of ``host``'s allowance for tonight's resumes (issue #464).
+
+        Set once per run, before the night. A no-op on a host with no allowance.
+        """
+        if host in self._allowance_s:
+            self._reserved[host] = (max(0.0, float(seconds)), int(cities))
+
+    def charge(self, host: str, seconds: float, *, fresh: bool) -> bool:
+        """Charge one finished launch's wall clock to ``host`` (issue #464).
+
+        Returns True when this charge is the one that SPENT the fresh
+        allowance, so the caller can log the crossing once. A no-op (False)
+        on a host with no allowance.
+        """
+        if host not in self._allowance_s:
+            return False
+        was_spent = self.allowance(host) is not None
+        book = self._fresh if fresh else self._paid
+        used, n = book.get(host, (0.0, 0))
+        book[host] = (used + max(0.0, float(seconds)), n + 1)
+        return fresh and not was_spent and self.allowance(host) is not None
+
+    def usage(self, host: str) -> AllowanceUsage | None:
+        """``host``'s allowance and this run's charges, or None with no allowance."""
+        if host not in self._allowance_s:
+            return None
+        reserved_s, reserved_n = self._reserved.get(host, (0.0, 0))
+        fresh_s, fresh_n = self._fresh.get(host, (0.0, 0))
+        paid_s, paid_n = self._paid.get(host, (0.0, 0))
+        return AllowanceUsage(
+            self._allowance_s[host], reserved_s, reserved_n, fresh_s, fresh_n, paid_s, paid_n
+        )
+
+    def fresh_allowance_s(self, host: str) -> float | None:
+        """Seconds left for fresh crawls once resumes are reserved, or None."""
+        usage = self.usage(host)
+        return None if usage is None else usage.fresh_allowance_s
+
+    def allowance(self, host: str) -> HostHold | None:
+        """The spent-allowance hold on ``host`` right now, or None (issue #464)."""
+        usage = self.usage(host)
+        if usage is None or usage.fresh_s < usage.fresh_allowance_s:
+            return None
+        return HostHold(
+            host,
+            HOLD_ALLOWANCE,
+            f"fresh crawls used {usage.fresh_s / 60:.0f} of {usage.fresh_allowance_s / 60:.0f} "
+            f"min: {usage.allowance_s / 60:g} min allowance less {usage.reserved_s / 60:.0f} "
+            f"reserved for {usage.reserved_n} resume(s)",
+        )
 
     def rest(self, host: str) -> HostHold | None:
         """The rest-night hold on ``host`` for this run's date, or None."""
@@ -399,7 +517,7 @@ class HostHolds:
 
     def hosts(self) -> set[str]:
         """Every host this instance could hold (an expired cooldown included)."""
-        return set(self._rest) | set(self._cooldowns)
+        return set(self._rest) | set(self._cooldowns) | set(self._allowance_s)
 
     def current(self) -> dict[str, HostHold]:
         """Every hold in force right now, by host."""
@@ -431,8 +549,11 @@ def _host_holds(
     it: one positive probe is evidence the wall is down, not that full volume
     is safe again. No ``conn``, or no refusal on record, means no cooldown.
 
-    ``ignore`` (``run-due --ignore-host-holds``) returns the empty instance;
-    the caller logs that it did so.
+    A night allowance (``[hosts.kartaview].max_night_minutes``, issue #464)
+    is passed through in seconds; nothing is reserved or charged yet.
+
+    ``ignore`` (``run-due --ignore-host-holds``) returns the empty instance,
+    which lifts the night allowance too; the caller logs that it did so.
     """
     if ignore:
         return HostHolds()
@@ -448,7 +569,213 @@ def _host_holds(
             if refused_at.tzinfo is None:
                 refused_at = refused_at.replace(tzinfo=UTC)
             cooldowns[host] = (refused_at, refused_at + timedelta(hours=hours))
-    return HostHolds(rest=rest, cooldowns=cooldowns)
+    return HostHolds(
+        rest=rest,
+        cooldowns=cooldowns,
+        allowances_s={host: minutes * 60.0 for host, minutes in cfg.host_night_minutes.items()},
+    )
+
+
+def _allowance_checkpoint(cfg: "SchedulerConfig", city: db.CityRow, channel: str) -> bool:
+    """Does ``channel`` have a checkpoint tonight's launch would RESUME? (issue #464)
+
+    :func:`_sweep_checkpoint_progress`, less one aged past
+    ``CHECKPOINT_MAX_AGE_S`` or carrying no first-commit stamp (a KartaView v1
+    store, #272): the child discards either and crawls fresh, so it is neither
+    reserved nor charged as paid. The CHARGE class and the reserve read this;
+    the hold's exemption does not (:func:`_paid_for_on_host`).
+    """
+    progress = _sweep_checkpoint_progress(cfg, city, channel)
+    age_s = None if progress is None else progress.get("age_s")
+    return age_s is not None and age_s < CHECKPOINT_MAX_AGE_S
+
+
+def _paid_for_on_host(
+    cfg: "SchedulerConfig", city: db.CityRow, channels: Sequence[str], host: str
+) -> bool:
+    """Is ``city`` exempt from a spent allowance on ``host`` tonight? (issue #464)
+
+    True when any of ``channels`` touching ``host`` has a checkpoint or a
+    cached census (a walk that collects for 0 requests, #290). Judged per city
+    and host, never per channel, so a city's two KartaView channels are always
+    held or exempted together.
+
+    ANY readable checkpoint, aged or not -- the predicate
+    :func:`_city_channel_unfinishable` and the launch plan use -- so a
+    checkpoint at or past the age wall still reaches
+    :func:`_sweep_launch_plan`'s age-wall arm, which records the failure that
+    feeds the alert and the quarantine (review round 3, finding 1). Held
+    instead, it would be "left for a later night" every night the fresh
+    allowance is spent, silently. One past ``CHECKPOINT_MAX_AGE_S`` that the
+    arm lets through is a fresh crawl and is charged as one
+    (:func:`_allowance_charge`).
+
+    So "exempt" means HAS A CHECKPOINT, not "paid-for work": a dead checkpoint
+    (past ``CHECKPOINT_MAX_AGE_S`` and fitting, or with no first-commit stamp)
+    exempts a crawl that starts from zero and spends the allowance without
+    being held by it (review round 4, finding A). Once per dead checkpoint:
+    the new crawl stamps a fresh first commit.
+    """
+    window_s = _census_reuse_window_s(cfg)
+    for channel in channels:
+        if host not in CHANNEL_HOSTS.get(channel, ()):
+            continue
+        if _sweep_checkpoint_progress(cfg, city, channel) is not None:
+            return True
+        if channel_census_cache_marker(city, channel, max_age_s=window_s) is not None:
+            return True
+    return False
+
+
+def _city_holds(
+    cfg: "SchedulerConfig", city: db.CityRow, channels: Sequence[str], holds: HostHolds
+) -> tuple[dict[str, HostHold], set[str]]:
+    """The holds in force for ONE city, and the hosts it is exempt on (issue #464).
+
+    ``holds.current()``, less a spent night allowance on a host where the
+    city is paid-for work (:func:`_paid_for_on_host`): a live checkpoint must
+    be resumed on consecutive nights or it ages out at the 7-day wall as a
+    recorded failure, one at the wall is the age-wall arm's to judge, and a
+    cached census costs no requests at all. THE ONE
+    reading the launch gate, the dry run and the fill all take, so none of
+    them can disagree about which city is held.
+
+    With no allowance configured this is ``(holds.current(), set())`` and
+    reads nothing from disk, so an unset key leaves the night as it was.
+    The checkpoint and cache probes run only when an allowance is SPENT.
+    """
+    current = holds.current()
+    if not holds.has_allowance():
+        return current, set()
+    exempt = {
+        host
+        for host, hold in current.items()
+        if hold.reason == HOLD_ALLOWANCE and _paid_for_on_host(cfg, city, channels, host)
+    }
+    return {host: hold for host, hold in current.items() if host not in exempt}, exempt
+
+
+def _allowance_charge(
+    cfg: "SchedulerConfig", city: db.CityRow, provider: str, est: int, holds: HostHolds
+) -> bool | None:
+    """How one LAUNCH is charged to the night allowance (issue #464).
+
+    None: not charged at all -- the channel touches no allowance host, or
+    ``est == 0`` (a cached census sends no KartaView requests, and its wall
+    clock may be an Overpass fetch). False: paid-for, a resume of a live
+    checkpoint on THIS channel. True: a fresh crawl. Judged from the
+    channel's own state at launch, not the city's, so a fresh grid behind a
+    walk-only checkpoint is still charged as fresh.
+    """
+    if not holds.allowance_hosts() & set(CHANNEL_HOSTS.get(provider, ())):
+        return None
+    if est <= 0:
+        return None
+    return not _allowance_checkpoint(cfg, city, provider)
+
+
+def _charge_preview_allowance(
+    cfg: "SchedulerConfig", city: db.CityRow, provider: str, spend: int, holds: HostHolds
+) -> None:
+    """Charge one PREVIEWED launch to the night allowance (issue #464).
+
+    The dry run's way of :func:`_allowance_charge`: the requests at the
+    configured pace, where the night charges measured wall clock. Shared by
+    the due rows and the fill section, so the preview spends the allowance
+    where the night does. A no-op with no allowance configured.
+    """
+    charge = _allowance_charge(cfg, city, provider, spend, holds)
+    if charge is None:
+        return
+    pace = _channel_pace_per_min(cfg, provider)
+    for host in holds.allowance_hosts() & set(CHANNEL_HOSTS.get(provider, ())):
+        holds.charge(host, spend * 60.0 / pace if pace else 0.0, fresh=charge)
+
+
+def _channel_pace_per_min(cfg: "SchedulerConfig", channel: str) -> float | None:
+    """A resumable channel's configured pace in requests a minute, or None if unpaced."""
+    pc = (cfg.providers or {}).get(channel)
+    configured = pc.max_requests_per_minute if pc else None
+    rate = _crawl_pricing(channel).default_rate if configured is None else configured
+    return rate if rate > 0 else None
+
+
+def _allowance_launch_s(cfg: "SchedulerConfig", host: str) -> float:
+    """One paced launch on ``host``, in seconds: what the resume reserve prices (issue #464).
+
+    ``min(ceiling, per_night x 60 / rate)`` from the per-city ceiling window,
+    over the configured channels on the host (the larger, should they
+    differ). At prod's 1.5/min: ``min(3600, 37 x 60 / 1.5) = 1480`` s, about
+    24.7 min, against 23.3 min measured for one 37-request launch. 0 when no
+    channel on the host has a ceiling or a pace.
+    """
+    longest = 0.0
+    for channel, hosts in CHANNEL_HOSTS.items():
+        if host not in hosts or channel not in (cfg.providers or {}):
+            continue
+        window = _ceiling_window(channel, cfg.providers[channel])
+        rate = _channel_pace_per_min(cfg, channel)
+        if window is None or rate is None:
+            continue
+        longest = max(longest, min(float(window.ceiling_s), window.per_night * 60.0 / rate))
+    return longest
+
+
+def _reserve_allowance_resumes(
+    cfg: "SchedulerConfig",
+    holds: HostHolds,
+    due: Sequence[db.CityRow],
+    providers_for_city: dict[str, list[str]],
+    providers: Sequence[str],
+) -> None:
+    """Reserve tonight's resumes out of each night allowance, once per run (issue #464).
+
+    A paused sweep must be resumed on consecutive nights or its checkpoint
+    ages out at the 7-day wall, a recorded failure. So the cities on the slate
+    with a live checkpoint on any due channel touching the host are counted
+    (cities, not channels: a walk behind its grid's checkpoint defers, so the
+    pair is one launch), priced at one paced launch each
+    (:func:`_allowance_launch_s`), and only the remainder goes to fresh crawls.
+    The slate is never truncated, so this counts resumers past the city cap
+    too: an over-estimate, in the safe direction. Reads nothing with no
+    allowance configured, and neither reserves nor logs for a host none of
+    the run's ``providers`` touches (a ``--provider mapillary`` hand run).
+    """
+    run_hosts = {h for p in providers for h in CHANNEL_HOSTS.get(p, ())}
+    for host in sorted(holds.allowance_hosts() & run_hosts):
+        resumers = sum(
+            1
+            for city in due
+            if any(
+                host in CHANNEL_HOSTS.get(c, ()) and _allowance_checkpoint(cfg, city, c)
+                for c in providers_for_city.get(city.city_id, ())
+            )
+        )
+        launch_s = _allowance_launch_s(cfg, host)
+        holds.reserve(host, resumers * launch_s, resumers)
+        usage = holds.usage(host)
+        assert usage is not None
+        if usage.allowance_s >= cfg.max_batch_hours * 3600:
+            # Accepted (the loader's bound is a units-typo guard, a day), but a
+            # run cannot launch for longer than its own batch window, so this
+            # allowance can never be spent (review round 3, finding 5).
+            logger.warning(
+                f"{HOST_LABELS.get(host, host)} night allowance "
+                f"{usage.allowance_s / 60:g} min is at least the "
+                f"{cfg.max_batch_hours:g} h batch window, so it bounds nothing; "
+                f"lower [hosts.{host}].{_HOST_ALLOWANCE_KEY} or unset it (issue #464)."
+            )
+        logger.info(
+            f"{HOST_LABELS.get(host, host)} night allowance {usage.allowance_s / 60:g} min: "
+            f"{resumers} city(ies) resume a live checkpoint tonight "
+            f"(~{usage.reserved_s / 60:.0f} min reserved); "
+            + (
+                "the reserve meets the allowance, so fresh crawls are held from the start"
+                if usage.fresh_allowance_s <= 0
+                else f"{usage.fresh_allowance_s / 60:.0f} min left for fresh crawls"
+            )
+            + " (issue #464)."
+        )
 
 
 class HostBreaker(set):
@@ -542,6 +869,22 @@ class HostBreaker(set):
         # ledger's per-child stamps cannot say (each child stamps once, at its
         # end). Wall-clock UTC instants.
         self.presence: dict[str, list[datetime]] = {}
+        # The night allowance (issue #464), kept apart from `held` and
+        # `held_launches` on purpose: those feed the Done line's HELD clause,
+        # which `scripts/mapillary_night_report.py` reads as the tile CDN's
+        # rest-night series, and hundreds of KartaView allowance holds there
+        # would corrupt it. The usage itself lives in `holds.usage()`, the one
+        # source of truth; here are host -> launches left for a later night,
+        # and host -> the DISTINCT city ids that ran past a spent allowance as
+        # paid-for work (a set, so a city the #380 retry or the fill runs
+        # again is counted once).
+        self.allowance_skipped: Counter[str] = Counter()
+        self.allowance_exempt: dict[str, set[str]] = {}
+        # (host, channel) -> (launch instant, charged as fresh) for each launch
+        # in flight that the allowance charges. Keyed by channel too, so a
+        # stale entry is replaced by the next launch of that channel rather
+        # than ever being charged as one long launch.
+        self._open_charges: dict[tuple[str, str], tuple[datetime, bool]] = {}
         self.cooldown_s = HOST_RECHECK_COOLDOWN_S if cooldown_s is None else cooldown_s
         self.max_rechecks = HOST_RECHECKS_PER_NIGHT if max_rechecks is None else max_rechecks
         self._clock = clock
@@ -680,12 +1023,47 @@ class HostBreaker(set):
                 span[0] = min(span[0], now)
             span[1] = max(span[1], now)
 
+    def start_charge(self, provider: str, *, fresh: bool) -> None:
+        """Open a launch of ``provider`` the night allowance charges (issue #464).
+
+        ``fresh`` says which tally its wall clock goes to at
+        :meth:`end_charge`. A no-op for a channel touching no allowance host.
+        """
+        now = clock.utc_now()
+        for host in CHANNEL_HOSTS.get(provider, ()):
+            if host in self.holds.allowance_hosts():
+                self._open_charges[(host, provider)] = (now, fresh)
+
+    def end_charge(self, provider: str) -> None:
+        """Charge the finished launch of ``provider`` opened by :meth:`start_charge`.
+
+        Logs ONE WARNING on the charge that spends the fresh allowance.
+        Nothing happens for a launch that was never opened (not charged).
+        """
+        now = clock.utc_now()
+        for host in CHANNEL_HOSTS.get(provider, ()):
+            opened = self._open_charges.pop((host, provider), None)
+            if opened is None:
+                continue
+            started, fresh = opened
+            if self.holds.charge(host, (now - started).total_seconds(), fresh=fresh):
+                hold = self.holds.allowance(host)
+                channels = sorted(c for c, hs in CHANNEL_HOSTS.items() if host in hs)
+                logger.warning(
+                    f"{hold.describe() if hold else HOST_LABELS.get(host, host)} -- fresh "
+                    f"{', '.join(channels)} crawls are left for a later night. Live "
+                    f"checkpoints and cached censuses still run. Not a refusal and not a "
+                    f"failure: no alert, no breaker trip, and the cities stay due (issue #464)."
+                )
+
     def holding(self, hosts, snapshot: dict[str, HostHold] | None = None) -> dict[str, HostHold]:
         """The hosts among ``hosts`` held right now (issue #444), each with its hold.
 
         Records each hold in ``held`` the first time it is seen, so the
         ``Done:`` line can name it. Counting the launch it costs is the
         caller's, because only the caller knows whether a launch was asked.
+        A spent night allowance (issue #464) is returned but NEVER recorded
+        in ``held``; ``holds.usage()`` is what the ``Done:`` line reads.
 
         ``snapshot`` (``holds.current()`` taken once per city) answers instead
         of the wall clock, so a cooldown that ends between a city's grid
@@ -696,7 +1074,8 @@ class HostBreaker(set):
             hold = self.holds.active(host) if snapshot is None else snapshot.get(host)
             if hold is not None:
                 found[host] = hold
-                self.held.setdefault(host, hold)
+                if hold.reason != HOLD_ALLOWANCE:
+                    self.held.setdefault(host, hold)
         return found
 
     def note_holds(self, hosts) -> dict[str, HostHold]:
@@ -708,6 +1087,10 @@ class HostBreaker(set):
         """
         found = self.holding(hosts)
         for host, hold in found.items():
+            if hold.reason == HOLD_ALLOWANCE:
+                # "holding X for this run" would be false: resumes and cached
+                # censuses still run. The reserve's own INFO line says it.
+                continue
             held_channels = sorted(c for c, hs in CHANNEL_HOSTS.items() if host in hs)
             logger.warning(
                 f"{hold.describe()} -- holding {', '.join(held_channels)} for this run. "
@@ -1148,6 +1531,16 @@ UNWIRED_CHANNELS: dict[str, str] = {}
 
 logger = logging.getLogger("streetscape_scheduler")
 
+# When this process started, as near as the module can tell (issue #389).
+# TimeoutStartSec counts from the unit's start, not from the city loop's, so a
+# nightly's window is measured from here: the catalog connect (which can
+# migrate), the `ps` scan and the holds all run before `batch_started` and
+# spend the unit's clock. What precedes this line -- interpreter start-up and
+# this module's imports, a few seconds -- is uncounted and sits inside
+# NIGHT_MARGIN_S. A module global rather than a main() local so cmd_run_due
+# reads it without a new parameter, and a test can move it.
+_PROCESS_STARTED_MONOTONIC = time.monotonic()
+
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG_PATH = _PROJECT_ROOT / "config" / "scheduler.toml"
 
@@ -1245,13 +1638,14 @@ class SchedulerConfig:
     city_timeout_minutes: int = 180
     # Wall-clock ceiling on the CITY LOOP, leaving the tail (aggregate,
     # manifest, catalog backup, publish) room to run inside whatever budget the
-    # supervisor allows. The unit is Type=oneshot under TimeoutStartSec, so a
-    # batch that overruns is killed mid-loop and publishes NOTHING — every city
-    # it already collected stays invisible on the public site until someone runs
-    # regenerate-aggregate by hand (issue #167; on 2026-07-29 a batch died at
-    # exactly 12 h having collected most of the night). Keep this comfortably
-    # below the unit's TimeoutStartSec so this deadline, not systemd, ends a
-    # long night.
+    # supervisor allows. The unit is Type=oneshot under TimeoutStartSec, whose
+    # SIGTERM is a wind-down in the loop but loses an in-flight publish in the
+    # tail. (Issue #167's 2026-07-29 night was the then-12 h timeout killing
+    # the loop before this deadline or any SIGTERM handler existed; the tail
+    # band is derived, not observed.) The bracket this
+    # must fit is defined once, beside NIGHT_OVERRUN_S, and a nightly whose
+    # installed unit cannot hold it is shortened by night_window_seconds
+    # (issue #389).
     max_batch_hours: float = 10.0
     # How many of ONE city's channels may be in flight at once (issue #240).
     # 1 is the historical behaviour — channels back-to-back on the main thread,
@@ -1388,6 +1782,11 @@ class SchedulerConfig:
     # launches. Empty (the default) means no cooldown: a host refused last night
     # is asked again tonight, exactly as before #444.
     host_refusal_cooldown_h: dict[str, float] = field(default_factory=dict)
+    # [hosts.kartaview].max_night_minutes (issue #464): host -> minutes of
+    # launches one run-due may spend starting FRESH crawls on it, tonight's
+    # resumes reserved first. Empty (the default) means no allowance: the
+    # night is exactly what it was before #464.
+    host_night_minutes: dict[str, float] = field(default_factory=dict)
     # [alerts] — operator email on unhealthy runs (off by default)
     alerts: AlertConfig = field(default_factory=AlertConfig)
     # [resource_guard] — load/RAM-aware concurrency backoff on shared hosts
@@ -1721,7 +2120,19 @@ _HOST_REST_KEY = "rest_weekdays"
 # into a block. Bounded at a week, so a units typo (minutes, seconds) is caught.
 _HOST_COOLDOWN_KEY = "refusal_cooldown_h"
 _HOST_COOLDOWN_MAX_H = 7 * 24
-_HOST_KEYS = (_HOST_BUDGET_KEY, _HOST_REST_KEY, _HOST_COOLDOWN_KEY)
+# Minutes of KartaView launches one `run-due` may spend starting FRESH crawls
+# (issue #464). Named beside `[providers.kartaview*].max_city_minutes`, its
+# per-launch sibling. Bounded at a day, so a units typo (seconds) is caught.
+_HOST_ALLOWANCE_KEY = "max_night_minutes"
+_HOST_ALLOWANCE_MAX_MIN = 24 * 60
+_HOST_KEYS = (_HOST_BUDGET_KEY, _HOST_REST_KEY, _HOST_COOLDOWN_KEY, _HOST_ALLOWANCE_KEY)
+# The hosts a night allowance may be set on: KartaView's only, for the reason
+# `_CEILING_CHANNELS` is KartaView's only. A spent allowance reaches the fill
+# as a held host, and the fill's leave-to-due exception (#456 review) exists
+# only for KartaView, the least important provider. An allowance on the tile
+# CDN would end the fill for every Mapillary-member city (#443), and one on
+# Panoramax would decline every Panoramax member's fill city whole.
+_ALLOWANCE_HOSTS = frozenset({HOST_KARTAVIEW})
 # Indexed by `date.weekday()`: Monday is 0.
 WEEKDAY_NAMES = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 
@@ -1732,6 +2143,7 @@ class _HostSettings(NamedTuple):
     budgets: dict[str, int]
     rest_weekdays: dict[str, tuple[str, ...]]
     cooldown_h: dict[str, float]
+    night_minutes: dict[str, float]
     errors: list[str]
 
 
@@ -1802,6 +2214,12 @@ def _host_settings(table: Any, config_path) -> _HostSettings:
     at most a week, refused rather than dropped, since dropping it would let the
     nightly re-probe a blocked IP the cooldown exists to leave alone.
 
+    ``max_night_minutes`` (issue #464) likewise: a positive number of minutes,
+    at most a day, and only on a host in ``_ALLOWANCE_HOSTS``. Refused rather
+    than dropped, since dropping it would run the unbounded night -- the
+    fail-OPEN direction for a key whose only effect is less traffic. Zero is
+    refused too: to stop the channels, set ``enabled = false``.
+
     A section must hold at least one known key and nothing else, and every key
     in a section must be valid for ANY of it to load: a half-applied section is
     harder to reason about than a refused one.
@@ -1810,12 +2228,13 @@ def _host_settings(table: Any, config_path) -> _HostSettings:
     budgets: dict[str, int] = {}
     rest: dict[str, tuple[str, ...]] = {}
     cooldown: dict[str, float] = {}
+    night_minutes: dict[str, float] = {}
     errors: list[str] = []
     if table is None:
-        return _HostSettings(budgets, rest, cooldown, errors)
+        return _HostSettings(budgets, rest, cooldown, night_minutes, errors)
     if not isinstance(table, dict):
         errors.append(f"[hosts] in {config_path} is not a table of [hosts.<token>] sections.")
-        return _HostSettings(budgets, rest, cooldown, errors)
+        return _HostSettings(budgets, rest, cooldown, night_minutes, errors)
     for token, section in table.items():
         where = f"[hosts.{token}] in {config_path}"
         if token not in metered:
@@ -1852,6 +2271,25 @@ def _host_settings(table: Any, config_path) -> _HostSettings:
                 f"{where}: {_HOST_COOLDOWN_KEY}={hours!r} is not a number of hours in "
                 f"(0, {_HOST_COOLDOWN_MAX_H}]."
             )
+        minutes = section.get(_HOST_ALLOWANCE_KEY)
+        if _HOST_ALLOWANCE_KEY in section:
+            if token not in _ALLOWANCE_HOSTS:
+                section_errors.append(
+                    f"{where}: {_HOST_ALLOWANCE_KEY} is accepted only on "
+                    f"{', '.join(sorted(_ALLOWANCE_HOSTS))}: a spent allowance holds the "
+                    f"host for the fill, whose leave-to-due exception is KartaView's alone "
+                    f"(issue #464)."
+                )
+            elif (
+                isinstance(minutes, bool)
+                or not isinstance(minutes, int | float)
+                or not 0 < minutes <= _HOST_ALLOWANCE_MAX_MIN
+            ):
+                section_errors.append(
+                    f"{where}: {_HOST_ALLOWANCE_KEY}={minutes!r} is not a number of minutes "
+                    f"in (0, {_HOST_ALLOWANCE_MAX_MIN}]; to stop the host's channels set "
+                    f"[providers.<channel>].enabled = false instead."
+                )
         if section_errors:
             errors.extend(section_errors)
             continue
@@ -1861,7 +2299,9 @@ def _host_settings(table: Any, config_path) -> _HostSettings:
             rest[token] = days
         if _HOST_COOLDOWN_KEY in section:
             cooldown[token] = float(hours)
-    return _HostSettings(budgets, rest, cooldown, errors)
+        if _HOST_ALLOWANCE_KEY in section:
+            night_minutes[token] = float(minutes)
+    return _HostSettings(budgets, rest, cooldown, night_minutes, errors)
 
 
 def _config_refusals(cfg: SchedulerConfig) -> list[str]:
@@ -2025,6 +2465,7 @@ def load_scheduler_config(path: str | None = None) -> SchedulerConfig:
         fill_host_ceilings=fill_host_ceilings,
         host_rest_weekdays=host_settings.rest_weekdays,
         host_refusal_cooldown_h=host_settings.cooldown_h,
+        host_night_minutes=host_settings.night_minutes,
         timer_watchdog_max_age_h=float(sched.get("timer_watchdog_max_age_h", 0.0)),
         batch_size=dl.get("batch_size", 100),
         connection_limit=dl.get("connection_limit", 50),
@@ -2965,6 +3406,98 @@ def _stop_on_sigterm():
         return
     try:
         yield requested
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
+class _TailSigterm(threading.Event):
+    """What ``_tail_survives_sigterm`` yields: whether a SIGTERM reached the tail, and when.
+
+    An ``Event`` so the tests and ``is_set()`` read as before, plus
+    ``received_at``, the ``time.monotonic()`` of the first signal: the SIGKILL
+    that follows a start timeout or a ``systemctl stop`` is ``TimeoutStopSec``
+    after it, which is what bounds the publish retry in ``_finish_batch``.
+    """
+
+    received_at: float | None = None
+
+
+@contextlib.contextmanager
+def _tail_survives_sigterm():
+    """Log and ignore a SIGTERM that arrives while the night's tail runs (issue #389).
+
+    ``_stop_on_sigterm`` covers the city loop and the fill and nothing else, so
+    before #389 the tail (``_finish_batch``: aggregate, manifests, driving-plan
+    summary, census and ledger prunes, catalog backup, publish, alert) ran under
+    the default disposition, and a SIGTERM there killed the process before the
+    publish. The usual sender is the unit's ``TimeoutStartSec``, whose SIGTERM is
+    the FIRST one systemd sends: a night whose deadline fired just before it
+    would receive that signal mid-tail and publish nothing, the outcome #167
+    recorded (by a different path: its night was killed mid-loop before any
+    handler existed). An operator's ``systemctl stop`` typed during the tail
+    was the other sender.
+
+    Ignoring it is safe for the two senders above because the tail is bounded:
+    for a start timeout or a ``systemctl stop``, systemd follows with SIGKILL
+    after ``TimeoutStopSec``, which the tail is sized to fit. A bare
+    ``systemctl kill`` (SIGTERM by default) queues no stop job, so nothing
+    escalates it: it is ignored and the tail runs to its end, which is why the
+    documented emergency kill is ``systemctl --user kill -s SIGKILL``. Two things
+    this cannot do, stated rather than implied:
+
+    - Under ``KillMode=control-group`` the same SIGTERM reaches every process in
+      the unit, so a publish rsync in flight at that instant still dies.
+      ``_finish_batch`` retries that publish once, inside what is left of
+      ``TimeoutStopSec`` (``_retry_publish_after_tail_sigterm``); if the retry
+      fails too, the night alerts and ``regenerate-aggregate --publish``
+      recovers it.
+    - A SIGKILL after ``TimeoutStopSec`` is unchanged: nothing survives it.
+
+    A caught SIGTERM is never silent: ``_finish_batch`` reads the yielded
+    ``_TailSigterm``, names it in the alert subject and forces the alert,
+    because its usual sender is the start timeout the bracket exists to keep
+    clear of the tail, and that breach would otherwise be one log line.
+
+    ``cmd_run_due`` enters it only on the nightly unit (``_is_nightly_unit``),
+    because that safety argument is systemd's: a hand run from a shell has no
+    SIGKILL behind an ignored SIGTERM and an unbounded tail, so there the
+    default disposition stays and an operator's ``kill`` still ends it.
+
+    Nothing about the city loop or the fill changes: they are inside
+    ``_stop_on_sigterm``, whose handler replaces this one and restores it on
+    exit. ``cmd_run_due`` enters this one on the statement right after that
+    context closes, so the ``Done:`` summary and the quarantine claim between
+    the loop and ``_finish_batch`` are covered too (#389 review).
+
+    The WARNING is logged from the handler itself, once, so it is on disk even if
+    the SIGKILL comes before the tail ends. That is safe here: a handler runs on
+    the main thread between bytecodes, logging's handler locks are re-entrant,
+    and a re-entrant write to an interrupted stream raises inside
+    ``Handler.emit``, which catches it (``handleError``) rather than letting it
+    reach the tail. Restores the previous handler on every exit path, and
+    no-ops off the main thread, like ``_stop_on_sigterm``.
+    """
+    seen = _TailSigterm()
+
+    def handler(signum, frame):
+        if seen.is_set():
+            return
+        seen.received_at = time.monotonic()
+        seen.set()
+        logger.warning(
+            "SIGTERM received during the night's tail; ignoring it so the aggregate, "
+            "backup and publish can finish (issue #389). A publish rsync running at this "
+            "instant was signalled too and is retried once if it fails; systemd SIGKILLs "
+            "the unit if the tail outlasts TimeoutStopSec."
+        )
+
+    try:
+        previous = signal.signal(signal.SIGTERM, handler)
+    except ValueError:
+        yield seen
+        return
+    try:
+        yield seen
     finally:
         signal.signal(signal.SIGTERM, previous)
 
@@ -4273,6 +4806,46 @@ def _recent_log_tail(cfg: SchedulerConfig, n: int = 40) -> str:
 # test_stop_timeout_covers_the_publish_tail_it_waits_for pins that sum.
 PUBLISH_TIMEOUT_S = 600.0
 
+# ── The night's length, defined once (issue #389) ──────────────────────────
+#
+# The nightly unit runs under TimeoutStartSec. Reaching it sends SIGTERM, then
+# SIGKILL after TimeoutStopSec. A SIGTERM that lands in the CITY LOOP is the
+# #206 wind-down and the night still publishes. One that lands in the TAIL
+# (_finish_batch) is the cliff: before #389 the tail ran under the default
+# disposition and the publish would be lost (#167's outcome, derived for this
+# band rather than observed in it). _tail_survives_sigterm
+# now logs and ignores it there, but an in-flight publish rsync is in the same
+# cgroup and still dies, so the deadline is still sized to keep every night out
+# of the band  TimeoutStartSec - (tail + in-flight child) < h < TimeoutStartSec.
+#
+# The bracket, in seconds, with h = max_batch_hours * 3600:
+#     h + NIGHT_OVERRUN_S + NIGHT_MARGIN_S <= TimeoutStartSec
+# night_window_seconds enforces it at runtime (it shortens a nightly whose
+# installed unit cannot hold the configured window), and tests/test_night_window.py
+# pins it between config/scheduler.makelab1.toml and the shipped unit.
+#
+# The tail's allowance: equal to the collection unit's TimeoutStopSec, by test.
+# A wind-down's tail must already fit that, so a normal night's tail is held to
+# the same number rather than to a second, private one.
+NIGHT_TAIL_ALLOWANCE_S = 1800.0
+# What can run past the deadline: the tail, plus an in-flight child clamped to
+# the deadline but never under _MIN_CLAMPED_TIMEOUT_S. 2,100 s, about 0.583 h.
+NIGHT_OVERRUN_S = NIGHT_TAIL_ALLOWANCE_S + _MIN_CLAMPED_TIMEOUT_S
+# A margin on top, because the allowance is a stand-in, not a bound: the
+# aggregate rebuild is unbounded in code and was measured once (435 s on the
+# 19-city night of 2026-08-18; nights now run up to ~80 cities over a larger
+# catalog), and prune_census_cache is unbounded too. Keep it until the tail is
+# measured per night (the `Done:` timestamp to the `Published in` line).
+NIGHT_MARGIN_S = 3600.0
+# The collection unit states its own TimeoutStartSec here, in seconds (a test
+# pins the two equal), because a unit file is a copy: the scheduler cannot read
+# the installed one from inside the unit's sandbox, and the repo's copy says
+# nothing about what systemd loaded.
+UNIT_TIMEOUT_ENV_VAR = "STREETSCAPE_UNIT_TIMEOUT_START_S"
+# What every installed unit older than that variable carries. A nightly that
+# does not see the variable (or sees junk in it) is running under such a copy.
+LEGACY_UNIT_TIMEOUT_START_S = 14 * 3600.0
+
 # How long to wait for the publish child's process GROUP to actually die after
 # SIGKILL before giving up and letting the tail continue. subprocess.run's own
 # post-kill wait() is unbounded, which is the one thing about it this file must
@@ -4353,7 +4926,12 @@ def _run_publish_child(cmd: list[str], fh, timeout_s: float) -> subprocess.Compl
     return subprocess.CompletedProcess(cmd, returncode)
 
 
-def _publish(cfg: SchedulerConfig, context: str, alert_on_failure: bool = True) -> int:
+def _publish(
+    cfg: SchedulerConfig,
+    context: str,
+    alert_on_failure: bool = True,
+    timeout_s: float | None = None,
+) -> int:
     """
     Run the publish script (rsync data/ to the web server), returning its exit code.
 
@@ -4389,6 +4967,11 @@ def _publish(cfg: SchedulerConfig, context: str, alert_on_failure: bool = True) 
     is not a detail — see ``_run_publish_child``, where the rsync we are actually
     trying to stop is a grandchild.
 
+    ``timeout_s`` replaces that bound for one call, and only ever shortens it:
+    the tail's one retry after a SIGTERM (``_retry_publish_after_tail_sigterm``)
+    has to finish before systemd's SIGKILL, not 600 s later. ``None`` (every
+    other caller) reads ``PUBLISH_TIMEOUT_S`` at call time.
+
     One case the bound still does not cover, stated rather than implied: a child
     the KERNEL will not kill. Over SSH the child is in interruptible sleep and
     dies at once; on prod's ``--local`` path one blocked in an uninterruptible
@@ -4399,6 +4982,7 @@ def _publish(cfg: SchedulerConfig, context: str, alert_on_failure: bool = True) 
     the timeout and the ACTUAL elapsed separately, so a gap between them is
     visible rather than silent.
     """
+    timeout = PUBLISH_TIMEOUT_S if timeout_s is None else min(timeout_s, PUBLISH_TIMEOUT_S)
     cmd = ["bash", cfg.publish_script]
     if cfg.publish_local:
         cmd.append("--local")
@@ -4424,19 +5008,19 @@ def _publish(cfg: SchedulerConfig, context: str, alert_on_failure: bool = True) 
             fh.write(f"\n===== {datetime.now(UTC).isoformat()} =====\n")
             fh.write(redact_credentials(" ".join(cmd)) + "\n\n")
             fh.flush()
-            result = _run_publish_child(cmd, fh, PUBLISH_TIMEOUT_S)
+            result = _run_publish_child(cmd, fh, timeout)
     except subprocess.TimeoutExpired:
         elapsed = time.monotonic() - started
         # The bound and the actual elapsed are reported as two numbers, not one:
         # subprocess.run's post-kill wait() is unbounded, so `timed out at 600 s
         # after 742.3 s` is the signature of a SIGKILL the kernel deferred (see
         # the docstring), and there is no other place that shows.
-        detail = f"(timed out at {PUBLISH_TIMEOUT_S:.0f} s) after {elapsed:.1f} s"
+        detail = f"(timed out at {timeout:.0f} s) after {elapsed:.1f} s"
         # The alert carries BOTH numbers too, not just the bound: it is the first
         # thing an operator reads, and the gap between them is the whole signal
         # (see the docstring). Leaving the elapsed to the log tail lower in the
         # same email made the headline the one number that says least.
-        reason = f"timed out at {PUBLISH_TIMEOUT_S:.0f} s and was killed after {elapsed:.1f} s"
+        reason = f"timed out at {timeout:.0f} s and was killed after {elapsed:.1f} s"
         # The same 1 the OSError branch below already returns. _finish_batch has
         # only an int to act on, so a bespoke status here would put a second
         # meaning on a number no caller can interpret; the reason travels in the
@@ -4706,6 +5290,14 @@ def _host_hold_status_lines(cfg: SchedulerConfig, conn, today: date) -> list[str
         lines.append(
             f"{HOST_LABELS.get(host, host)} rests on {', '.join(days)} (UTC snapshot date); "
             f"today ({today}, {weekday}) is {state}."
+        )
+    for host, minutes in sorted(cfg.host_night_minutes.items()):
+        # Usage is per run and in memory, so status can only name the setting.
+        lines.append(
+            f"{HOST_LABELS.get(host, host)} night allowance: {minutes:g} min of launches per "
+            f"run-due for fresh crawls, tonight's resumes reserved first; live checkpoints "
+            f"and cached censuses are never held (issue #464). Usage is on each night's "
+            f"Done: line."
         )
     return lines
 
@@ -6692,6 +7284,11 @@ def cmd_timer_status(
     verdict is unhealthy OR something was re-armed: a re-arm means a reboot (or
     similar) happened, and the night before it may sit unpublished.
 
+    It also prints the collection unit's bracket as systemd loaded it (issue
+    #389; ``_collection_unit_bracket``), the one check that sees a drop-in or
+    an un-reloaded copy, and ``alert`` mails when that reads ``VIOLATED`` or
+    ``unknown``. That line never changes the exit status or the heartbeat.
+
     On a host that does not match the collection unit's ``ConditionHost=`` it
     does nothing at all (makelab1 shares the NFS home but has no linger), and
     every run that reaches the check writes the heartbeat ``backup-status``
@@ -6725,10 +7322,23 @@ def cmd_timer_status(
         clock=clock,
         user_unit_dir=user_timers.USER_UNIT_DIR,
     )
+    # The collection unit's bracket as systemd LOADED it (issue #389), read only
+    # when the timers are (an unmounted home already alerts, and the manager
+    # would report the unit not-found), and only AFTER check_and_rearm: on the
+    # #369 reboot path the manager may hold the empty unit map of a scan that
+    # raced the mount until that call's daemon-reload, and read before it the
+    # unit is not-found and the line a false `unknown`. Reported and mailed on
+    # its own; it never touches `healthy`, the heartbeat or the exit status,
+    # which measure the timers and whether cron runs.
+    bracket_line, bracket_word = None, "ok"
     if reachable and visible:
         result = user_timers.check_and_rearm(run, names, rearm=rearm)
+        bracket_line, bracket_word = _collection_unit_bracket(
+            user_timers.collection_unit_timeouts(run), cfg.max_batch_hours
+        )
     else:
         result = user_timers.WatchdogResult()
+    bracket_bad = bracket_word != "ok"
     result.reachable, result.files_visible = reachable, visible
     result.waited_s, result.wait_budget_s = waited, wait_s
 
@@ -6742,6 +7352,8 @@ def cmd_timer_status(
         out.append(
             f"  unit files not visible under {user_timers.USER_UNIT_DIR} (is the home mounted?)"
         )
+    if bracket_line:
+        out.append(bracket_line)
     out.append(f"Verdict: {result.verdict}")
     report = "\n".join(out)
     print(report)
@@ -6755,17 +7367,88 @@ def cmd_timer_status(
         # the missing heartbeat on its own.
         print(f"heartbeat NOT written: {e}")
 
-    if alert and (not result.healthy or result.rearmed):
+    if alert and (not result.healthy or result.rearmed or bracket_bad):
+        # The timer paragraphs only when the timers are why it mails (#389
+        # review): a bracket-only mail on healthy timers must not open with
+        # "found or fixed something" and REARMED advice about nothing.
+        timers_news = not result.healthy or bool(result.rearmed)
+        opening = (
+            "The user-timer watchdog (issue #369) found or fixed something.\n\n"
+            if timers_news
+            else "The user timers are healthy; the collection unit's bracket check (issue #389) "
+            "is why this mailed.\n\n"
+        )
+        rearm_advice = (
+            "\n\nAfter a REARMED mail, check whether the night before published "
+            "(regenerate-aggregate --publish recovers it). See deploy/README.md, "
+            '"After a reboot: the timer watchdog".'
+            if timers_news
+            else ""
+        )
         send_alert(
             cfg.alerts,
-            f"user timers on {host} — {result.verdict}",
-            "The user-timer watchdog (issue #369) found or fixed something.\n\n"
-            + report
-            + "\n\nAfter a REARMED mail, check whether the night before published "
-            "(regenerate-aggregate --publish recovers it). See deploy/README.md, "
-            '"After a reboot: the timer watchdog".',
+            f"user timers on {host} — {result.verdict}" + _BRACKET_SUBJECT.get(bracket_word, ""),
+            opening + report + rearm_advice + _BRACKET_BODY.get(bracket_word, ""),
         )
     return 0 if result.healthy else 1
+
+
+# timer-status's mail wording per bracket word (issue #389). `unknown` gets its
+# own: an unreadable timeout is not evidence of a violation, and the nightly
+# clamp reads STREETSCAPE_UNIT_TIMEOUT_START_S, not the loaded timeout, so
+# neither word may claim a night IS being shortened.
+_BRACKET_SUBJECT = {
+    "VIOLATED": "; collection unit bracket VIOLATED",
+    "unknown": "; collection unit timeout unreadable",
+}
+_BRACKET_BODY = {
+    "VIOLATED": (
+        "\n\nThe collection unit line reads VIOLATED: the installed "
+        "streetscape-tracker.service's TimeoutStartSec cannot hold "
+        "[schedule].max_batch_hours with its tail and margin (issue #389). A nightly "
+        "shortens itself to the timeout its STREETSCAPE_UNIT_TIMEOUT_START_S states, "
+        "or to 14 h when the variable is absent; if the timeout loaded here is shorter "
+        "than that, a night that runs to its deadline can be SIGTERMed in its tail. "
+        "Re-copy the unit and daemon-reload between nights "
+        '(deploy/README.md, "Raising the night\'s length").'
+    ),
+    "unknown": (
+        "\n\nThe collection unit line reads unknown: systemd's TimeoutStartSec for "
+        "streetscape-tracker.service gave no bound to check (the unit is not loaded, the "
+        "value is infinity, or it is in a form this check does not parse), so the "
+        "bracket was not checked (issue #389). This is not a finding that the bracket "
+        "is violated. Run "
+        "`systemctl --user show streetscape-tracker.service -p LoadState "
+        "-p TimeoutStartUSec -p TimeoutStopUSec` and compare it with "
+        "deploy/systemd/streetscape-tracker.service."
+    ),
+}
+
+
+def _collection_unit_bracket(
+    timeouts: user_timers.UnitTimeouts, max_batch_hours: float
+) -> tuple[str, str]:
+    """``timer-status``'s line for the collection unit's bracket, and its word (#389).
+
+    The unit's loaded ``TimeoutStartSec`` must hold ``max_batch_hours`` plus
+    ``NIGHT_OVERRUN_S`` and ``NIGHT_MARGIN_S``: ``ok`` when it does,
+    ``VIOLATED`` when it does not, and ``unknown`` -- mailed, never ``ok``,
+    but never worded as a violation -- when the timeout gives no bound to
+    check (``infinity``, junk, a unit not loaded).
+    """
+    need_s = max_batch_hours * 3600.0 + NIGHT_OVERRUN_S + NIGHT_MARGIN_S
+    if timeouts.start_s is None:
+        word = "unknown"
+    elif need_s <= timeouts.start_s:
+        word = "ok"
+    else:
+        word = "VIOLATED"
+    line = (
+        f"  collection unit ({timeouts.load_state or 'load state unknown'}): "
+        f"TimeoutStartSec={timeouts.start_raw or '?'}, TimeoutStopSec={timeouts.stop_raw or '?'}; "
+        f"max_batch_hours={max_batch_hours:g} needs >= {need_s / 3600:.2f} h: {word}"
+    )
+    return line, word
 
 
 def cmd_restore_backup(cfg: SchedulerConfig, backup_path: str, dest: str | None) -> int:
@@ -9932,6 +10615,183 @@ def _is_nightly_unit() -> bool:
     return _nightly_unit_signals()[0]
 
 
+def night_window_seconds(
+    max_batch_hours: float,
+    *,
+    is_nightly: bool,
+    unit_timeout_env: str | None,
+    pre_loop_s: float = 0.0,
+) -> tuple[float, str | None]:
+    """
+    The seconds tonight's city loop may run, and why when that is less than configured.
+
+    A hand run has no systemd start timeout, so it gets the configured window
+    whatever the environment says. The nightly unit is sent SIGTERM at its
+    ``TimeoutStartSec``, and a SIGTERM that lands in the tail loses an in-flight
+    publish (see ``NIGHT_OVERRUN_S``), so its window is capped at::
+
+        TimeoutStartSec - NIGHT_OVERRUN_S - NIGHT_MARGIN_S - pre_loop_s
+
+    ``pre_loop_s`` is how much of the unit's clock was spent before the loop's
+    clock started (``batch_started`` less ``_PROCESS_STARTED_MONOTONIC``),
+    because ``TimeoutStartSec`` counts from the unit's start.
+
+    The unit passes its own ``TimeoutStartSec`` in ``UNIT_TIMEOUT_ENV_VAR``. A
+    nightly without it is running under an installed copy older than the
+    variable, so the copy carries ``LEGACY_UNIT_TIMEOUT_START_S`` (14 h). So
+    does one whose value is junk: not a number, not finite (``float`` accepts
+    ``nan`` and ``inf``, and every comparison with NaN is false), or too small
+    to leave any window at all.
+
+    Returns ``(window_s, None)`` when the configured window fits, else
+    ``(ceiling_s, note)``; the note names the configured hours, the timeout it
+    read and the elapsed pre-loop time, and says which of the two broke the
+    window: the unit (the configured window would not fit even with no
+    pre-loop at all, so the fix is the unit or the hours) or the pre-loop
+    alone (a slow connect, migration or mount; the unit needs no change). A
+    window that fits exactly is left alone. The ceiling is floored at 0: a
+    night whose pre-loop alone used the unit's clock runs no cities and goes
+    straight to the tail.
+
+    Example (prod: 12 h under the 14 h unit, 30 s before the loop)::
+
+        night_window_seconds(12, is_nightly=True, unit_timeout_env="50400", pre_loop_s=30)
+        # -> (43200.0, None): 43,200 <= 50,400 - 2,100 - 3,600 - 30 = 44,670
+        night_window_seconds(16, is_nightly=True, unit_timeout_env=None)
+        # -> (44700.0, "max_batch_hours = 16 h does not fit ...")
+    """
+    configured_s = max_batch_hours * 3600.0
+    if not is_nightly:
+        return configured_s, None
+    unit_s, source = _installed_unit_timeout_s(unit_timeout_env)
+    unit_room_s = _unit_room_s(unit_s)
+    ceiling_s = max(0.0, unit_room_s - pre_loop_s)
+    if configured_s <= ceiling_s:
+        return configured_s, None
+    elapsed = f"{pre_loop_s:.0f} s ({pre_loop_s / 60:.1f} min) passed before the city loop started"
+    if configured_s <= unit_room_s:
+        note = (
+            f"max_batch_hours = {max_batch_hours:g} h fits the installed unit ({source}, less "
+            f"the tail and in-flight allowance of {NIGHT_OVERRUN_S:.0f} s and the margin of "
+            f"{NIGHT_MARGIN_S:.0f} s), but {elapsed}, so tonight ends at "
+            f"{ceiling_s / 3600:.2f} h (issue #389). The unit needs no change: look in this "
+            f"night's log for what delayed the start (a slow catalog connect or migration, "
+            f"a slow mount)."
+        )
+    else:
+        note = (
+            f"max_batch_hours = {max_batch_hours:g} h does not fit the installed unit, so tonight "
+            f"ends at {ceiling_s / 3600:.2f} h: {source}, less the tail and in-flight allowance "
+            f"({NIGHT_OVERRUN_S:.0f} s) and the margin ({NIGHT_MARGIN_S:.0f} s), and {elapsed} "
+            f"(issue #389). It would not fit even with no time before the loop. Fix the unit, "
+            f"not the night: `diff ~/.config/systemd/user/streetscape-tracker.service "
+            f"deploy/systemd/streetscape-tracker.service`, then copy it over and "
+            f"`systemctl --user daemon-reload` between nights (deploy/README.md), or lower "
+            f"[schedule].max_batch_hours."
+        )
+    return ceiling_s, note
+
+
+def _installed_unit_timeout_s(unit_timeout_env: str | None) -> tuple[float, str]:
+    """The nightly unit's ``TimeoutStartSec`` in seconds, and where it came from (#389).
+
+    ``UNIT_TIMEOUT_ENV_VAR``'s value when it is a usable number, else
+    ``LEGACY_UNIT_TIMEOUT_START_S``; see :func:`night_window_seconds`.
+    """
+    unit_s = _usable_unit_timeout_s(unit_timeout_env)
+    if unit_s is None:
+        source = (
+            f"{UNIT_TIMEOUT_ENV_VAR} is {'not set' if unit_timeout_env is None else repr(unit_timeout_env)}, "
+            f"so assuming the pre-#389 unit's {LEGACY_UNIT_TIMEOUT_START_S / 3600:g} h"
+        )
+        return LEGACY_UNIT_TIMEOUT_START_S, source
+    return unit_s, f"{UNIT_TIMEOUT_ENV_VAR}={unit_s:g} s ({unit_s / 3600:g} h)"
+
+
+def _usable_unit_timeout_s(unit_timeout_env: str | None) -> float | None:
+    """``UNIT_TIMEOUT_ENV_VAR``'s value in seconds, or ``None`` when absent or unusable.
+
+    Unusable: not a number, not finite, or too small to leave any window.
+    """
+    try:
+        unit_s = float(unit_timeout_env) if unit_timeout_env is not None else None
+    except ValueError:
+        return None
+    if unit_s is None or not math.isfinite(unit_s) or unit_s <= NIGHT_OVERRUN_S + NIGHT_MARGIN_S:
+        return None
+    return unit_s
+
+
+def _unit_room_s(unit_s: float) -> float:
+    """The window a unit of ``unit_s`` holds with no time before the loop (#389)."""
+    return max(0.0, unit_s - NIGHT_OVERRUN_S - NIGHT_MARGIN_S)
+
+
+def _fit_night_to_unit(cfg: SchedulerConfig, *, batch_started: float) -> SchedulerConfig:
+    """
+    ``cfg`` with ``max_batch_hours`` shortened to what the installed unit can hold.
+
+    The nightly's half of :func:`night_window_seconds`: reads whether this is
+    the nightly and the unit's ``UNIT_TIMEOUT_ENV_VAR``, and, when the window
+    does not fit, logs a WARNING, mails an alert, and returns a copy of
+    ``cfg`` so every reader of the window agrees -- the deadline, the
+    ``Done:`` line's ``deadline (N h)``, the #373 never-fits test, the #290
+    census-reuse window. Returns ``cfg`` itself when nothing changes. The
+    alert's subject says which cause it was, the unit or a slow start, since
+    only the first is fixed in the unit.
+
+    A clamp rather than a refusal: refusing to start would lose the whole
+    night, while a shortened night loses only the hours it could not have
+    held and still publishes.
+
+    A variable that is SET but unusable is logged as a WARNING even when the
+    window fits (#389 review): the 14 h fallback is the conservative reading
+    of an absent variable, but a junk one in a unit shorter than 14 h is not
+    held to that unit. The loaded timeout itself is checked daily by
+    ``timer-status`` (``VIOLATED``), which does not read the variable.
+    """
+    unit_timeout_env = os.environ.get(UNIT_TIMEOUT_ENV_VAR)
+    if (
+        unit_timeout_env is not None
+        and _usable_unit_timeout_s(unit_timeout_env) is None
+        and _is_nightly_unit()
+    ):
+        logger.warning(
+            f"{UNIT_TIMEOUT_ENV_VAR}={unit_timeout_env!r} is not a usable timeout (a finite "
+            f"number of seconds above {NIGHT_OVERRUN_S + NIGHT_MARGIN_S:.0f}), so tonight "
+            f"assumes the pre-#389 unit's {LEGACY_UNIT_TIMEOUT_START_S / 3600:g} h; fix the "
+            f"Environment= line in the installed streetscape-tracker.service (issue #389)"
+        )
+    window_s, note = night_window_seconds(
+        cfg.max_batch_hours,
+        is_nightly=_is_nightly_unit(),
+        unit_timeout_env=unit_timeout_env,
+        pre_loop_s=max(0.0, batch_started - _PROCESS_STARTED_MONOTONIC),
+    )
+    if note is None:
+        return cfg
+    unit_s, _ = _installed_unit_timeout_s(unit_timeout_env)
+    unit_is_the_cause = cfg.max_batch_hours * 3600.0 > _unit_room_s(unit_s)
+    logger.warning("Night shortened: " + note)
+    if unit_is_the_cause:
+        cause = "the installed unit cannot hold max_batch_hours"
+        tail = (
+            "\n\nThe night runs to the shorter deadline and still publishes. If the installed "
+            "unit is the cause, the daily `timer-status --alert` (deploy/cron/) reports the "
+            "collection unit's bracket as VIOLATED until the unit is fixed, so expect that "
+            "mail too."
+        )
+    else:
+        cause = "a slow start before the city loop, not the unit"
+        tail = "\n\nThe night runs to the shorter deadline and still publishes."
+    send_alert(
+        cfg.alerts,
+        f"night shortened to {window_s / 3600:.2f} h on {socket.gethostname()}: {cause}",
+        note + tail,
+    )
+    return dataclasses.replace(cfg, max_batch_hours=window_s / 3600.0)
+
+
 def _describe_gsv_overlaps(overlaps: Sequence[tuple[RunDueProcess, list[str]]]) -> str:
     return "\n".join(
         f"  pid {proc.pid} (shared key: {', '.join(shared)}): {proc.args}"
@@ -10133,9 +10993,26 @@ def cmd_run_due(
                 if would_hold
                 else " (none would have been held)"
             )
+            + (
+                "; the night allowance ("
+                + ", ".join(
+                    f"{HOST_LABELS.get(h, h)} {m:g} min"
+                    for h, m in sorted(cfg.host_night_minutes.items())
+                )
+                + ") is lifted too (issue #464; to lift the allowance alone, run only "
+                "`--provider kartaview,kartaview_streets`, never a full run, which also "
+                "lifts the tile CDN's rest night and refusal cooldown)"
+                if cfg.host_night_minutes
+                else ""
+            )
             + ". An operator override; the nightly unit never passes it (issue #444)."
         )
     batch_started = time.monotonic()
+    # Before ANY reader of the window (issue #389): a nightly whose installed
+    # unit cannot hold max_batch_hours runs to the shorter deadline and alerts.
+    # Never on a preview, which is never the nightly.
+    if not dry_run:
+        cfg = _fit_night_to_unit(cfg, batch_started=batch_started)
     batch_deadline = batch_started + cfg.max_batch_hours * 3600.0
     # The instant the fill's backlog test reads attempts against (issue #404):
     # a due channel the night attempted carries a later last_attempt_at.
@@ -10192,6 +11069,10 @@ def cmd_run_due(
         only_city_ids=only_city_ids,
     )
     due, providers_for_city = slate.cities, slate.providers_for_city
+    # The night allowance's resume reserve (issue #464), from the slate,
+    # before the dry-run branch so the preview prices the same reserve.
+    if holds.has_allowance():
+        _reserve_allowance_resumes(cfg, holds, due, providers_for_city, providers)
     if only_city_ids is not None:
         for city_id in sorted(only_city_ids - set(providers_for_city)):
             # Said out loud, because a named city that silently collected
@@ -10264,6 +11145,11 @@ def cmd_run_due(
             if cfg.fill_min_days is not None
             else ""
         )
+        # The window this night ran under (issue #389), named like the key and
+        # AFTER _fit_night_to_unit, so a shortened night logs the value it really
+        # had. The night-length measurement compares across this knob, so it
+        # must be recoverable from the night's own record, like the lane count.
+        + f"; max_batch_hours={cfg.max_batch_hours:g}"
     )
     starved = [p for p in providers if not is_opt_in_channel(p)]
     if starved and hoisted and hoisted >= max_cities:
@@ -10337,13 +11223,38 @@ def cmd_run_due(
         print(f"DRY RUN — would process (budget remaining {left_str}):")
         run_hosts = {h for p in providers for h in CHANNEL_HOSTS.get(p, ())}
         for host, hold in holds.current().items():
-            if host in run_hosts:
+            if host in run_hosts and hold.reason != HOLD_ALLOWANCE:
                 print(f"  HELD tonight — {hold.describe()} (issue #444)")
-        current_holds = holds.current()
+        for host in sorted(holds.allowance_hosts() & run_hosts):
+            usage = holds.usage(host)
+            assert usage is not None
+            print(
+                f"  ALLOWANCE — {HOST_LABELS.get(host, host)}: {usage.allowance_s / 60:g} min "
+                f"of launches; {usage.reserved_n} city(ies) resume a live checkpoint "
+                f"(~{usage.reserved_s / 60:.0f} min reserved), "
+                f"{usage.fresh_allowance_s / 60:.0f} min left for fresh crawls. Priced here at "
+                f"the configured pace and can differ from the night either way: the night "
+                f"charges measured wall clock, and a fresh pair's walk is charged here as a "
+                f"second crawl where the night collects it free from its grid's cache "
+                f"(issue #464)"
+            )
+        # Read per CITY (issue #464): the preview charges its own `holds` as it
+        # goes, so a night allowance can be spent part-way down the slate, and
+        # a city that is paid-for work is exempt from it -- the live rule.
+        city_holds: dict[str, HostHold] = {}
 
-        def _held_by(provider: str) -> list[HostHold]:
+        def _held_by(provider: str, city: db.CityRow | None = None) -> list[HostHold]:
             hosts = CHANNEL_HOSTS.get(provider, ())
-            return [hold for host, hold in current_holds.items() if host in hosts]
+            found = [hold for host, hold in city_holds.items() if host in hosts]
+            if (
+                found
+                and city is not None
+                and all(h.reason == HOLD_ALLOWANCE for h in found)
+                and _city_channel_unfinishable(cfg, conn, city, provider) is not None
+            ):
+                # The live gate lets the #456 unfinishable skip take it.
+                return []
+            return found
 
         # Walk the queue the way the live loop does (issue #444 review): a city
         # whose every due channel is HELD launches nothing, so the night counts
@@ -10353,13 +11264,22 @@ def cmd_run_due(
         # night reaches. Its held pairs still hold the fill, as they do live.
         previewed = 0
         passed_over = 0
+        passed_over_allowance = 0
         passed_over_unfinishable = 0
         for city in due:
             if previewed >= day_cap:
                 break
             city_channels = providers_for_city[city.city_id]
-            if city_channels and all(_held_by(p) for p in city_channels):
-                passed_over += 1
+            city_holds = _city_holds(cfg, city, city_channels, holds)[0]
+            if city_channels and all(_held_by(p, city) for p in city_channels):
+                # Counted by reason (review round 3, finding 4): a city held
+                # by nothing but a spent night allowance is #464's, not #444's.
+                if all(
+                    h.reason == HOLD_ALLOWANCE for p in city_channels for h in _held_by(p, city)
+                ):
+                    passed_over_allowance += 1
+                else:
+                    passed_over += 1
                 for provider in city_channels:
                     preview_unfinished[provider] += 1
                 continue
@@ -10369,14 +11289,14 @@ def cmd_run_due(
             # move, so the night reaches the next city. Its rows still print
             # below, as the live loop logs the skips.
             if city_channels and all(
-                _held_by(p) or _city_channel_unfinishable(cfg, conn, city, p) is not None
+                _held_by(p, city) or _city_channel_unfinishable(cfg, conn, city, p) is not None
                 for p in city_channels
             ):
                 passed_over_unfinishable += 1
             else:
                 previewed += 1
             for provider in city_channels:
-                held_by = _held_by(provider)
+                held_by = _held_by(provider, city)
                 if held_by:
                     # The live gate's answer, asked of the same instance: a held
                     # channel launches nothing and spends nothing. It is due
@@ -10476,6 +11396,8 @@ def cmd_run_due(
                         else f"{fits} (cached census from {payer})"
                     )
                 print(f"  {city.city_id:60s} {provider:16s} ~{est:>9,} req  {fits}")
+                # The night allowance (issue #464), charged the preview's way.
+                _charge_preview_allowance(cfg, city, provider, spend, holds)
                 budget_left[provider] -= spend
                 for host in wanted:
                     host_spent[host] += spend
@@ -10494,6 +11416,12 @@ def cmd_run_due(
             print(
                 f"  ({passed_over:,} due city(ies) HELD on every channel passed over, as the "
                 f"night passes them: they take no city-cap slot; issue #444)"
+            )
+        if passed_over_allowance:
+            print(
+                f"  ({passed_over_allowance:,} due city(ies) left for a later night by the "
+                f"spent night allowance on every channel passed over, as the night passes "
+                f"them: they take no city-cap slot and stay due; issue #464)"
             )
         if passed_over_unfinishable:
             print(
@@ -10515,7 +11443,7 @@ def cmd_run_due(
                 host_spent=host_spent,
                 unfinished=preview_unfinished,
                 window_start=preview_now - HOST_BUDGET_WINDOW,
-                held_hosts=set(holds.current()),
+                holds=holds,
             )
         if cfg.driving_plan.enabled:
             print("Would also snapshot the GSV driving-plan feed (issue #176).")
@@ -10594,6 +11522,20 @@ def cmd_run_due(
             succeeded += fill_report.succeeded
             skipped_budget += fill_report.skipped_budget
             stop_reason = fill_report.stop_reason
+
+    # On the nightly unit, a SIGTERM from here on is logged and ignored rather
+    # than killing the tail (issue #389); see _tail_survives_sigterm for what it
+    # cannot save. Entered on the statement right after the loop's own handler
+    # is restored, so the Done: summary and the quarantine claim below are
+    # covered too, and closed by the `with tail_guard:` around _finish_batch. A
+    # hand run keeps the default disposition: no systemd SIGKILL follows there,
+    # so an operator's `kill` must still end it. Nothing between here and there
+    # raises by design (#167); if something ever did, the guard would stay
+    # installed until the process exited, which systemd's SIGKILL still bounds.
+    tail_guard = contextlib.ExitStack()
+    tail_sigterm = (
+        tail_guard.enter_context(_tail_survives_sigterm()) if _is_nightly_unit() else None
+    )
 
     if stop_reason:
         logger.info(f"Stopped early: {stop_reason}")
@@ -10688,6 +11630,9 @@ def cmd_run_due(
         # Apart from the refusal clause above (issue #444): nothing refused us
         # and nothing failed; a rest night or a cooldown held the host.
         + _held_summary_note(blocked_hosts)
+        # Apart from the HELD clause (issue #464): the night allowance is not a
+        # rest night, and its counts must never reach the #444 series.
+        + _allowance_summary_note(blocked_hosts)
         + _presence_note(conn, blocked_hosts, batch_started_iso)
         # The COUNT here and the names in the [alerts] mail (issue #341): a
         # stranded city has no route back for ~83 days, and "1 host(s)
@@ -10735,23 +11680,25 @@ def cmd_run_due(
         + (f"; {plan_error}" if plan_error else "")
     )
     logger.info("Done: " + summary)
-    return _finish_batch(
-        cfg,
-        conn,
-        summary,
-        succeeded,
-        attempted,
-        today,
-        errored=stop_reason in (_STOP_REASON_ERROR, _STOP_REASON_FILL_ERROR),
-        crashed="FILL" if stop_reason == _STOP_REASON_FILL_ERROR else "LOOP",
-        backup_error=backup_error,
-        plan_error=plan_error,
-        blocked_hosts=blocked_hosts,
-        busy_hosts=busy_hosts,
-        rejected_argv=rejected_argv,
-        quarantine_alerts=quarantine_alerts,
-        quarantine_error=quarantine_error or None,
-    )
+    with tail_guard:
+        return _finish_batch(
+            cfg,
+            conn,
+            summary,
+            succeeded,
+            attempted,
+            today,
+            errored=stop_reason in (_STOP_REASON_ERROR, _STOP_REASON_FILL_ERROR),
+            crashed="FILL" if stop_reason == _STOP_REASON_FILL_ERROR else "LOOP",
+            backup_error=backup_error,
+            plan_error=plan_error,
+            blocked_hosts=blocked_hosts,
+            busy_hosts=busy_hosts,
+            rejected_argv=rejected_argv,
+            quarantine_alerts=quarantine_alerts,
+            quarantine_error=quarantine_error or None,
+            tail_sigterm=tail_sigterm,
+        )
 
 
 def _host_budget_note(deferred_host_budget: Counter[str], sep: str = "; ") -> str:
@@ -11097,7 +12044,19 @@ def _run_city_channels(
     # read per launch could lift between the grid run and its walk, and the
     # walk would then run alone and pay a full census instead of the paired
     # cache hit. A hold that lifts mid-city takes effect from the next city.
-    city_holds = blocked_hosts.holds.current()
+    # A night allowance spent between a city's grid and its walk likewise
+    # takes effect from the next city (issue #464), and a city that is
+    # paid-for work on the host (a checkpoint, a cached census) is exempt
+    # from a spent allowance: `_city_holds` drops that hold for it.
+    city_holds, allowance_exempt = _city_holds(cfg, city, providers, blocked_hosts.holds)
+    for host in sorted(allowance_exempt):
+        blocked_hosts.allowance_exempt.setdefault(host, set()).add(city.city_id)
+        logger.info(
+            f"{city.city_id}: {HOST_LABELS.get(host, host)} night allowance is spent, but "
+            f"this city has a checkpoint there (resumed, judged at the age wall, or "
+            f"discarded by the child and crawled fresh) or a cached census, so it is not "
+            f"held (issue #464)."
+        )
     # ...and the walks the batch deadline deferred (issue #373), stranded
     # below when their grid sibling landed in this same call.
     lost_to_deadline: list[str] = []
@@ -11253,6 +12212,12 @@ def _run_city_channels(
                     # paid for, rather than propagating past a `finally` that
                     # would only wait for those children and then discard them.
                     try:
+                        # Set when a spent night allowance holds this channel but
+                        # the channel is unfinishable under the per-city ceiling
+                        # anyway (issue #464): it falls through to the #456 skip,
+                        # which names the operator's levers, rather than being
+                        # called "left for a later night" when no night can run it.
+                        allowance_fallthrough = False
                         # A host this channel needs already refused us during this
                         # run. A final skip (not a deferral): the other channels of
                         # this and later cities are still worth running. Deliberately
@@ -11294,6 +12259,23 @@ def _run_city_channels(
                         # same host is held too. A final skip with no
                         # `record_attempt` -- the city stays due.
                         held = blocked_hosts.holding(wanted, city_holds)
+                        if held and all(h.reason == HOLD_ALLOWANCE for h in held.values()):
+                            # A spent night allowance (issue #464). Its own
+                            # counters, never `held_skipped`/`held_launches`
+                            # (see HostBreaker.allowance_skipped). No attempt is
+                            # recorded and no cap slot is taken; it stays due.
+                            if _city_channel_unfinishable(cfg, conn, city, provider) is not None:
+                                allowance_fallthrough = True
+                                held = {}
+                            else:
+                                for host in held:
+                                    blocked_hosts.allowance_skipped[host] += 1
+                                logger.info(
+                                    f"{city.city_id} [{provider}]: left for a later night — "
+                                    + "; ".join(h.describe() for h in held.values())
+                                    + ". Not a failure; it stays due (issue #464)."
+                                )
+                                continue
                         if held:
                             for host in held:
                                 blocked_hosts.held_skipped[host] += 1
@@ -11654,8 +12636,25 @@ def _run_city_channels(
                             # what the whole batch is doing. A resumable channel took
                             # its own branch further up, where its cap needed the answer.
                             timeout_s = city_timeout_seconds(cfg, city, provider, conn=conn)
+                        if allowance_fallthrough:
+                            # Defensive (issue #464): the slate's unfinishable
+                            # predicate said the #456 skip would take this channel,
+                            # and it did not. A spent allowance still holds it.
+                            for host in blocked_hosts.holds.allowance_hosts() & wanted:
+                                blocked_hosts.allowance_skipped[host] += 1
+                            logger.info(
+                                f"{city.city_id} [{provider}]: left for a later night — "
+                                f"night allowance spent. Not a failure; it stays due (issue #464)."
+                            )
+                            continue
                         # Before the call, which runs the child INLINE at one lane.
                         blocked_hosts.mark_present(CHANNEL_HOSTS.get(provider, ()), launched=True)
+                        # The night allowance's tally (issue #464), judged from
+                        # THIS channel's own state: a cached census is not
+                        # charged, a resume is paid-for, anything else is fresh.
+                        charge = _allowance_charge(cfg, city, provider, est, blocked_hosts.holds)
+                        if charge is not None:
+                            blocked_hosts.start_charge(provider, fresh=charge)
                         future = _start(
                             provider,
                             connection_limit=conn_limit,
@@ -11721,6 +12720,7 @@ def _run_city_channels(
             for future in sorted(done, key=lambda f: providers.index(in_flight[f])):
                 provider = in_flight.pop(future)
                 blocked_hosts.mark_present(CHANNEL_HOSTS.get(provider, ()), launched=False)
+                blocked_hosts.end_charge(provider)
 
                 # One channel's outcome, classified in full or not at all.
                 # The `try` covers BOTH the worker's own exception and
@@ -13507,12 +14507,31 @@ def _fill_leaves_to_due_schedule(
     return est
 
 
+def _fill_held_reason(on_hold: set[str], held_hosts: _HeldHosts) -> str:
+    """Why the fill's held hosts are held, for the decline line.
+
+    "rest night or cooldown" -- the #444 wording, byte for byte -- unless
+    ``held_hosts`` maps a host in ``on_hold`` to a spent night allowance
+    (issue #464), so a host with no allowance is never said to have one.
+    """
+    reasons = (
+        {held_hosts[h].reason for h in on_hold if h in held_hosts}
+        if isinstance(held_hosts, Mapping)
+        else set()
+    )
+    if HOLD_ALLOWANCE not in reasons:
+        return "rest night or cooldown"
+    if reasons == {HOLD_ALLOWANCE}:
+        return "night allowance spent"
+    return "rest night or cooldown, or night allowance spent"
+
+
 def _fill_prebudget_refusal(
     cfg: "SchedulerConfig",
     city: db.CityRow,
     channels: Sequence[str],
     latched: set[str],
-    held_hosts: set[str] | frozenset[str] = frozenset(),
+    held_hosts: _HeldHosts = frozenset(),
 ) -> FillVerdict | None:
     """The two refusals that precede the budget rule, or None (issue #404).
 
@@ -13525,7 +14544,9 @@ def _fill_prebudget_refusal(
     A channel on a HELD host (issue #444, ``held_hosts``: a rest night or a
     refusal cooldown) is refused for the same reason -- the launch gate would
     hold it, and the city would land without it. The dry run passes the same
-    holds the night would see.
+    holds the night would see. ``held_hosts`` may be a mapping of host to
+    its :class:`HostHold` (what :func:`_city_holds` returns); a spent night
+    allowance (issue #464) is then named as the reason, and only then.
     """
     for channel in channels:
         wanted = set(CHANNEL_HOSTS.get(channel, ()))
@@ -13538,12 +14559,13 @@ def _fill_prebudget_refusal(
                     f"Overpass; the fill never adds Overpass traffic",
                 )
             wanted.discard(HOST_OVERPASS)
-        on_hold = wanted & held_hosts
+        on_hold = wanted & set(held_hosts)
         if on_hold:
             return FillVerdict(
                 False,
                 _FILL_BLOCKER_HOST_HELD,
-                f"{_host_names(on_hold)} is held tonight ({channel}): rest night or cooldown",
+                f"{_host_names(on_hold)} is held tonight ({channel}): "
+                f"{_fill_held_reason(on_hold, held_hosts)}",
                 hosts=frozenset(on_hold),
             )
         refused = wanted & latched
@@ -13570,7 +14592,8 @@ def _fill_judge(
     reserve: dict[str, int] | None = None,
     fill_spent: dict[str, int] | None = None,
     held: set[str] | frozenset[str] = frozenset(),
-    held_hosts: set[str] | frozenset[str] = frozenset(),
+    held_hosts: _HeldHosts = frozenset(),
+    holds: HostHolds | None = None,
 ) -> tuple[FillVerdict, dict[str, int]]:
     """Every admission question in order, against ledgers already read (#404).
 
@@ -13594,6 +14617,12 @@ def _fill_judge(
     ``backlog`` / the host refusal when that is what emptied it. Every other
     channel is still whole-or-nothing: the hold check and the pre-budget
     refusals are asked of ``run`` alone.
+
+    ``holds``, when given, replaces ``held_hosts`` with this city's own
+    reading (:func:`_city_holds`, issue #464), judged over the channels the
+    city could still launch once the ceiling and backlog have left theirs --
+    the same list the launch then hands ``_run_city_channels``, so admission
+    and launch cannot disagree about a paid-for exemption.
     """
     ceiling_left = {
         c: e
@@ -13606,6 +14635,9 @@ def _fill_judge(
         if c not in ceiling_left and _ceiling_window(c, (cfg.providers or {}).get(c)) is not None
     ]
     held_left = tuple(c for c in ceiled if c in held)
+    if holds is not None:
+        launchable = [c for c in channels if c not in ceiling_left and c not in held_left]
+        held_hosts = _city_holds(cfg, city, launchable, holds)[0]
     # Only a HOST refusal leaves the channel; an unfrozen walk still declines
     # the city, since that refusal is about Overpass traffic, not KartaView.
     host_left = tuple(
@@ -13722,7 +14754,9 @@ def _fill_admission(
         city,
         channels,
         latched=set(blocked_hosts.latched),
-        held_hosts=set(blocked_hosts.holds.current()),
+        # Per city (issue #464): a spent night allowance holds the host for a
+        # fresh KartaView crawl but not for paid-for work, the due phase's rule.
+        holds=blocked_hosts.holds,
         channel_room=channel_room,
         used_by_host=used,
         remaining_s=remaining_s,
@@ -13864,8 +14898,14 @@ def _print_fill_preview(
     unfinished: Counter[str],
     window_start: datetime,
     held_hosts: set[str] | frozenset[str] = frozenset(),
+    holds: HostHolds | None = None,
 ) -> None:
     """``run-due --dry-run``'s fill section (issue #404), through the live rule.
+
+    ``holds``, when given, is read per city through :func:`_city_holds` in
+    place of ``held_hosts``, so a spent night allowance (issue #464) leaves a
+    fresh KartaView crawl to its due schedule and exempts paid-for work, as
+    the night's fill does.
 
     Admission is :func:`_fill_judge` against the preview's SIMULATED ledgers
     (the due cities above already drew them down, and each admitted fill city
@@ -13917,6 +14957,7 @@ def _print_fill_preview(
             city_channels,
             latched=set(),
             held_hosts=held_hosts,
+            holds=holds,
             channel_room={c: budget_left[c] for c in city_channels},
             used_by_host={h: window_used[h] + host_spent[h] for h in hosts},
             remaining_s=None,
@@ -13938,6 +14979,9 @@ def _print_fill_preview(
                 left_to_due[channel] += 1
         for channel in city_channels if verdict.run is None else verdict.run:
             print(f"  {city.city_id:60s} {channel:16s} ~{est[channel]:>9,} req  {label}")
+            if holds is not None:
+                # As the due rows above: the night charges a fill launch too.
+                _charge_preview_allowance(cfg, city, channel, est[channel], holds)
             budget_left[channel] -= est[channel]
             host = CHANNEL_METERED_HOST.get(channel)
             if host is not None:
@@ -14463,6 +15507,42 @@ def _held_summary_note(breaker: HostBreaker, sep: str = "; ") -> str:
     return f"{sep}HELD {held}, {breaker.held_launches} launch(es) held, cities stay due"
 
 
+def _allowance_summary_note(breaker: HostBreaker, sep: str = "; ") -> str:
+    """The ``Done:`` line's night-allowance clause (issue #464), or ``""``.
+
+    ``; ALLOWANCE the KartaView API (api.kartaview.org): 372 of 360 min in
+    launches (fresh 157 of 138 min over 6 launch(es); resumes 215 min over 9;
+    9 resume(s) 222 min reserved), 212 launch(es) left for a later night, 3
+    city(ies) exempt with a checkpoint or cached census there, cities stay due``.
+
+    The minutes are the MEASURED wall clock of the launches charged to the
+    allowance -- not the host-presence span the ``on ...`` clause prints,
+    which runs from the first launch to the last finish and still reads long
+    when exempt resumes run late. Never the token ``HELD`` and never starting
+    with ``on ``, so ``scripts/mapillary_night_report.py`` reads none of it.
+    Empty with no allowance configured, or when the host neither launched nor
+    held anything tonight.
+    """
+    parts = []
+    for host in sorted(breaker.holds.allowance_hosts()):
+        usage = breaker.holds.usage(host)
+        assert usage is not None
+        skipped = breaker.allowance_skipped[host]
+        exempt = len(breaker.allowance_exempt.get(host, ()))
+        if not (usage.fresh_n or usage.paid_n or skipped or exempt):
+            continue
+        parts.append(
+            f"ALLOWANCE {HOST_LABELS.get(host, host)}: "
+            f"{(usage.fresh_s + usage.paid_s) / 60:.0f} of {usage.allowance_s / 60:g} min in "
+            f"launches (fresh {usage.fresh_s / 60:.0f} of {usage.fresh_allowance_s / 60:.0f} "
+            f"min over {usage.fresh_n} launch(es); resumes {usage.paid_s / 60:.0f} min over "
+            f"{usage.paid_n}; {usage.reserved_n} resume(s) {usage.reserved_s / 60:.0f} min "
+            f"reserved), {skipped} launch(es) left for a later night, {exempt} city(ies) "
+            f"exempt with a checkpoint or cached census there, cities stay due"
+        )
+    return "".join(f"{sep}{part}" for part in parts)
+
+
 def _presence_note(conn, breaker: HostBreaker, run_started_iso: str) -> str:
     """The ``Done:`` line's per-host presence clause (issue #444), or ``""``.
 
@@ -14969,6 +16049,90 @@ def _rejected_argv_alert_note(rejected: ArgvRejections) -> str:
     )
 
 
+# The publish retry after a SIGTERM in the tail (issue #389 review). What the
+# retry must leave before systemd's SIGKILL: the reap grace of a retry that
+# times out, the alert's own send (its transports time out at 30 s), and slack.
+_TAIL_RETRY_RESERVE_S = _PUBLISH_REAP_GRACE_S + 90.0
+# Below this much room the retry is not attempted: a healthy publish took
+# 12-25 s (PUBLISH_TIMEOUT_S's measurement), so less than this cannot finish one.
+_PUBLISH_RETRY_MIN_S = 60.0
+
+
+def _retry_publish_after_tail_sigterm(
+    cfg: SchedulerConfig,
+    summary: str,
+    tail_sigterm: _TailSigterm | None,
+    publish_started: float,
+) -> tuple[int | None, str]:
+    """Retry a publish the tail's SIGTERM killed, once, inside the time left (#389 review).
+
+    Only when the signal arrived AFTER the publish started: under
+    ``KillMode=control-group`` systemd signals the processes in the unit at
+    that instant, so the rsync that was running died of it, while a publish
+    started after the signal was never signalled and failed of something else,
+    which a retry would not fix. One retry, never a loop, bounded by what is
+    left of ``NIGHT_TAIL_ALLOWANCE_S`` (equal to ``TimeoutStopSec``, by test)
+    since the signal, less ``_TAIL_RETRY_RESERVE_S``, and by
+    ``PUBLISH_TIMEOUT_S``.
+
+    Returns ``(rc, note)``: the retry's exit status, or ``None`` when no retry
+    was made, and a sentence for the alert (``""`` when the signal did not
+    reach the publish). Never raises: it runs in the tail.
+    """
+    try:
+        if tail_sigterm is None or not tail_sigterm.is_set():
+            return None, ""
+        received_at = tail_sigterm.received_at
+        if received_at is None or received_at < publish_started:
+            return None, ""
+        room_s = NIGHT_TAIL_ALLOWANCE_S - (time.monotonic() - received_at) - _TAIL_RETRY_RESERVE_S
+        if room_s < _PUBLISH_RETRY_MIN_S:
+            logger.warning(
+                f"Not retrying the publish the SIGTERM killed: {max(room_s, 0.0):.0f} s left "
+                f"before the unit's SIGKILL, under the {_PUBLISH_RETRY_MIN_S:.0f} s a publish "
+                f"needs (issue #389)"
+            )
+            return None, (
+                "It arrived while the publish rsync was running, which failed; there was not "
+                "time left before the SIGKILL to retry it."
+            )
+        timeout_s = min(PUBLISH_TIMEOUT_S, room_s)
+        logger.warning(
+            f"Retrying the publish once, bounded at {timeout_s:.0f} s: the SIGTERM reached the "
+            f"rsync in flight (issue #389)"
+        )
+        rc = _publish(cfg, summary, alert_on_failure=False, timeout_s=timeout_s)
+    except Exception as exc:  # the tail reports, never propagates (#167)
+        logger.exception("Publish retry after the tail's SIGTERM failed to run")
+        return None, f"It arrived while the publish rsync was running; the retry raised ({exc!r})."
+    outcome = "succeeded" if rc == 0 else f"failed too (status {rc})"
+    return rc, (
+        f"It arrived while the publish rsync was running, which failed; the one retry {outcome}."
+    )
+
+
+def _tail_sigterm_alert_note(tail_sigterm: _TailSigterm | None, retry_note: str) -> str:
+    """The alert paragraph for a SIGTERM caught in the tail, or ``""`` (#389 review).
+
+    Never raises, since it decides whether the night's only alert is sent.
+    """
+    try:
+        if tail_sigterm is None or not tail_sigterm.is_set():
+            return ""
+        return (
+            "A SIGTERM reached the nightly during its tail and was ignored so the tail could "
+            "finish (issue #389). The usual sender is the unit's TimeoutStartSec, which means "
+            "this night overran its bracket: compare the opening line's max_batch_hours and "
+            "the Done: timestamp with `systemctl --user show streetscape-tracker.service "
+            "-p TimeoutStartUSec -p Result` (Result=timeout confirms it), and read "
+            "docs/scheduler.md, \"The night's length\". The other senders are an operator's "
+            "`systemctl --user stop` or a bare `kill` typed during the tail. systemd SIGKILLs "
+            "the unit TimeoutStopSec after the signal." + (f" {retry_note}" if retry_note else "")
+        )
+    except Exception:
+        return "A SIGTERM reached the nightly during its tail (issue #389)."
+
+
 def _finish_batch(
     cfg: SchedulerConfig,
     conn,
@@ -14985,6 +16149,7 @@ def _finish_batch(
     crashed: str = "LOOP",
     quarantine_alerts: Sequence | None = None,
     quarantine_error: str | None = None,
+    tail_sigterm: _TailSigterm | None = None,
 ) -> int:
     """Rebuild the published indexes, back up the catalog, publish, alert.
 
@@ -15045,6 +16210,13 @@ def _finish_batch(
     already carries it as a clause; it is passed separately because it alerts on
     its own, as ``QUARANTINE CHECK FAILED``: a failed claim is exactly the night
     an alert goes unsent (it is claimed the next night instead).
+
+    ``tail_sigterm`` is what the nightly's ``_tail_survives_sigterm`` yielded
+    (``None`` on a hand run). A SIGTERM it caught alerts unconditionally, as
+    ``SIGTERM IN THE TAIL``, and exits nonzero: its usual sender is the start
+    timeout, a bracket breach no other signal reports (the unit's
+    ``OnFailure=`` mail is not wired). A publish it killed in flight is retried
+    once (``_retry_publish_after_tail_sigterm``).
     """
     # Every index rebuild goes through _tail_artifact, which reports a failure
     # instead of propagating it — see there for why a lost tail is the worse
@@ -15160,8 +16332,16 @@ def _finish_batch(
     # bare "publish script FAILED" and dropped the tail_errors, the backup
     # failure and the host conditions that explain it. One complete email.
     publish_error: str | None = None
+    publish_retry_note = ""
     if cfg.publish_enabled and succeeded > 0:
+        publish_started = time.monotonic()
         rc = _publish(cfg, summary, alert_on_failure=False)
+        if rc != 0:
+            retry_rc, publish_retry_note = _retry_publish_after_tail_sigterm(
+                cfg, summary, tail_sigterm, publish_started
+            )
+            if retry_rc is not None:
+                rc = retry_rc
         if rc != 0:
             # Deliberately NOT "(exit {rc})": _publish returns 1 for a timeout
             # and for an unwritable log, neither of which is a status the rsync
@@ -15220,6 +16400,7 @@ def _finish_batch(
     rejected_note = _rejected_argv_alert_note(rejected_argv)
     quarantine_alerts = list(quarantine_alerts or ())
     quarantine_note = _quarantine_alert_note(cfg, quarantine_alerts)
+    sigterm_note = _tail_sigterm_alert_note(tail_sigterm, publish_retry_note)
 
     failures = attempted - succeeded
     unhealthy = (
@@ -15239,6 +16420,9 @@ def _finish_batch(
         # ...and the night the claim or the standing-set read failed, for the
         # same reason.
         quarantine_error,
+        # A SIGTERM the nightly's tail caught (issue #389 review): usually the
+        # start timeout landing in the tail, which nothing else reports.
+        sigterm_note,
         # Deliberately NOT `blocked_hosts.stranded` (issue #373): a host
         # stranding already alerts through its host condition, and a DEADLINE
         # stranding alone is routine once nights end on the deadline -- the
@@ -15301,6 +16485,8 @@ def _finish_batch(
             parts.append(f"{len(quarantine_alerts)} QUARANTINED")
         if quarantine_error:
             parts.append("QUARANTINE CHECK FAILED")
+        if sigterm_note:
+            parts.append("SIGTERM IN THE TAIL")
         # The failure count is the subject on an ordinary bad night, and noise
         # ("0 failed collection(s)") when something above already carries it.
         if failures or not any(unhealthy):
@@ -15320,6 +16506,7 @@ def _finish_batch(
             + (f"\n\n{busy_recovered_note}" if busy_recovered_note else "")
             + (f"\n\n{rejected_note}" if rejected_note else "")
             + (f"\n\n{quarantine_note}" if quarantine_note else "")
+            + (f"\n\n{sigterm_note}" if sigterm_note else "")
         )
         send_alert(
             cfg.alerts,
@@ -15601,8 +16788,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--ignore-host-holds",
         action="store_true",
         help="Launch on hosts this run would otherwise HOLD: a [hosts.*].rest_weekdays "
-        "rest night or a refusal_cooldown_h cooldown (issue #444). Logged at WARNING; "
-        "an operator override the nightly unit never passes.",
+        "rest night or a refusal_cooldown_h cooldown (issue #444), or a spent "
+        "[hosts.kartaview].max_night_minutes night allowance (issue #464). Logged at "
+        "WARNING; an operator override the nightly unit never passes.",
     )
     p_probe = sub.add_parser(
         "probe-host",

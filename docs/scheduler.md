@@ -234,9 +234,11 @@ The helper is silent on an empty list either way, so a stop landing on a city's 
 Note also what a stop does **not** suppress: the three unconditional alerts (host refused, backup failed, driving-plan fetch failed) still fire and still exit nonzero, so a `host(s) UNAVAILABLE` email after a deliberate stop is the wind-down working.
 **The installed unit on makelab2 is a copy, not a symlink**, so all of this stays inert until someone re-copies it and runs `daemon-reload`
 — verify with `systemctl --user show streetscape-tracker.service -p TimeoutStopUSec`, which must read `30min` rather than `1min 30s`.
-One known gap, deliberately left: `_finish_batch` runs *outside* the `_stop_on_sigterm` context, so a **second** `systemctl stop` during the tail kills the publish with the default handler. systemd sends SIGTERM once and then SIGKILL, so this is not the deployed failure mode — but do not type `stop` twice.
-This deadline must stay **below the unit's `TimeoutStartSec` (14 h)** — a test asserts the two files agree
-— because reaching the systemd limit means a SIGKILL mid-loop, which is exactly how 2026-07-29 collected most of a night and published none of it (#167).
+`_finish_batch` runs *outside* the `_stop_on_sigterm` context, and until #389 that was a real gap: a SIGTERM during the tail killed the publish with the default handler.
+It was filed as "do not type `stop` twice", but the likelier sender is the unit's own `TimeoutStartSec`, whose SIGTERM is the first one and would land in the tail whenever the deadline fired just before it.
+That band is derived, not observed.
+On 2026-07-29 the unit's `TimeoutStartSec` was 12 h and neither a deadline nor a SIGTERM handler existed (both arrived the next day with #170, which also raised the timeout to 14 h), so that night's timeout killed the batch in the city loop and the publish after it never ran (#167); the tail band is the remaining path to the same outcome.
+The tail now logs and ignores it (`_tail_survives_sigterm`; an in-flight publish rsync still dies with the cgroup), and the deadline is held below the unit's `TimeoutStartSec` with its tail, in-flight and margin terms, pinned and enforced at runtime: see "The night's length" at the end of this file.
 A child that exits with a `HOST_EXIT_CODES` status trips the per-IP **host breaker** (`HostBreaker`, and see the host-lock section of [`provider-access.md`](provider-access.md)): that host's channels are skipped, no city is marked failed, and the night alerts unconditionally and exits nonzero while still publishing.
 **The latch is no longer all-night for Overpass (issue #341).**
 `blocking(hosts)` — the one call the launch pass makes — re-checks a latched host that has a positive reset test in `HOST_RECHECKS` (Overpass only), at least 45 min after the trip or the last failed re-check and at most four times a night, and a host that answers is un-latched from that launch on (for Overpass, "answers" means a tiny `/api/interpreter` query executed, never a `/status` read, #356); the set itself stays monotone, so `bool(blocked_hosts)` still means "refused tonight" for the alert and the exit status.
@@ -276,7 +278,7 @@ So the `Done:` count, the subject and the named cities are what is STILL strande
 A refusal whose stranded walks the pass all landed likewise still alerts `REFUSED then recovered` and exits nonzero, because the breaker's host set is monotone.
 
 **Night-length measurements include the pass**: on a night that strands a walk, the `Done:` line's elapsed hours (and so `scripts/night_length_analyze.py`'s `hours`) now include the retry pass and its at most one re-check wait, so such nights are longer by design, not from slower collection.
-Retries count in `attempted`/`succeeded`, never in `processed`, and each carries tonight's UTC `--run-date` — a 02:15 Pacific start plus the 12 h `max_batch_hours` ends at 14:15 Pacific, before the UTC rollover in both PDT and PST; never backdate it.
+Retries count in `attempted`/`succeeded`, never in `processed`, and each carries tonight's UTC `--run-date` — an ON-TIME night (the 02:00 fire) ends before the UTC rollover in both PDT and PST at 12 h, a property `tests/test_night_window.py` pins rather than a coincidence of the number (a catch-up start already crosses it; see "The night's length"); never backdate it.
 **Pairing by date is best-effort; cost reuse holds for 7 days.**
 Nothing in `json_summarizer.py`, `analysis.py` or `www/js` joins a walk to its grid run by date: what a shared date buys is the #290 census reuse, which already tolerates `CENSUS_REUSE_MAX_AGE_S` (= `CHECKPOINT_MAX_AGE_S`, 7 days), so a census walk within a week of its grid run is still free, while `gsv_streets` pays per sample either way.
 A refusal that recovered still makes the night unhealthy, with a subject that says `REFUSED then recovered` rather than `UNAVAILABLE`, since the operator's next move differs.
@@ -645,6 +647,98 @@ Pre-#444 code refuses a v22 catalog, so a rollback needs `PRAGMA user_version = 
 The migration backfills nothing: refusals before the deploy are in the logs only, so the first cooldown a v22 night can see counts from a refusal recorded after it.
 If the host is mid-block at deploy time, hold its channels by hand (as for a lost refusal record, above) until `refusal_cooldown_h` after the newest refusal in the logs — not with `probe-host`, which would send a request into the live block.
 
+## The KartaView night allowance (issue #464, added 2026-11-14)
+
+**`[hosts.kartaview].max_night_minutes` bounds the minutes one `run-due` spends starting FRESH KartaView crawls**, both channels together.
+It is optional and shipped UNSET on prod; unset, the night is exactly what it was, and the launch path reads no checkpoint or census cache it did not read before.
+It exists because at the anonymous 1.5 requests/min (#452) KartaView launches filled the night: on 2026-11-10..12 the host was in use for 11.3 to 11.4 h of each 12 h window and the fill refreshed nothing (#464).
+
+**It is a third kind of hold, beside the rest night and the cooldown**, and the only kind that STARTS mid-run.
+`HostHolds` charges each finished KartaView launch its measured wall clock (`HostBreaker.start_charge`/`end_charge`, read on `clock.utc_now()` at launch and when the main thread classifies the finished child).
+Once FRESH crawls have used the allowance less tonight's resume reserve, a fresh KartaView crawl is left for a later night: no `record_attempt`, no failure, no breaker trip, no alert, no city-cap slot, and the pair stays due.
+The hold is read once per city (`_city_holds`), so a city that starts under the allowance runs its grid and its walk together, and one spent part-way through a city takes effect from the next city.
+A channel the per-city ceiling cannot finish is never called held: it falls through to the #456 unfinishable skip, whose WARNING names the operator's levers.
+
+**A city with a checkpoint is never held, because a strict bound would age checkpoints out.**
+A paused sweep has to be resumed on consecutive nights, and a checkpoint at the 7-day wall that cannot finish is a recorded failure and a discarded crawl.
+So a city is exempt from a spent allowance when any of its channels on the host has a checkpoint or a cached census (#290); the exemption is per city and host, never per channel, so a resumed grid that completes tonight is followed by its free walk, and a walk whose grid landed earlier (the #380 stranded-walk retry's case) still collects for 0 requests.
+Each LAUNCH is classed from its own channel's state: a cached census (`est == 0`) is not charged at all, since it sends no KartaView requests and its wall clock may be an Overpass fetch; a resume of a live checkpoint on that channel is charged as paid; anything else is fresh.
+**The exemption takes ANY readable checkpoint, aged or not, and the charge only a live one** (review round 3).
+The exemption is the predicate `_city_channel_unfinishable` and the launch plan use, so a checkpoint at the age wall still reaches the age-wall arm, which records the failure that feeds the alert and the quarantine; held instead, it would be left for a later night every night the fresh allowance is spent, and nothing would alert.
+A checkpoint past `CHECKPOINT_MAX_AGE_S`, or one with no first-commit stamp (a KartaView v1 store, #272), is discarded by the child, so when the arm lets it launch it is charged as fresh and it is not reserved.
+So the exemption means "has a checkpoint", not "paid-for work": such a dead checkpoint exempts a crawl that starts from zero, which spends the allowance without being held by it (review round 4).
+Its reach is one launch per dead checkpoint, since the new crawl stamps a fresh first commit, and it is largest right after a KartaView outage longer than 7 days.
+A fresh walk on a network that is not yet frozen is charged whole, its Overpass fetch included (up to the ~7.5 min retry window): the measured wall clock is the one honest reading the launch site has, and the error is in the conservative direction.
+
+**Tonight's resumes are reserved first** (`_reserve_allowance_resumes`, once per run, before the dry-run branch).
+The reserve is R × l: R is the number of slate cities with a live checkpoint on a due KartaView channel (cities, not channels, since a walk behind its grid's checkpoint defers), and l is one paced launch, `min(ceiling, per_night × 60 / rate)`, which at prod's 1.5/min is `min(3600, 37 × 40) = 1480` s, about 24.7 min (the issue measured 23.3 min for one 37-request launch).
+Fresh crawls get `allowance − R × l`, and nothing when the reserve meets the allowance.
+Without the reserve, fresh crawls could spend the whole allowance and the exempt resumes run on top, adding checkpoints every night until the night is long again.
+The slate is never truncated, so R counts resumers past the city cap too, and a checkpoint 6 to 7 days old that the age wall will refuse: an over-estimate, in the safe direction.
+The reserve is never reconciled against what actually launched, so on a night with many live checkpoints it can hold every fresh crawl from the start even when few resumers run; that is a known limit, not a bug.
+
+**What it reports.**
+The run's start logs one INFO line with the allowance, R and the reserve.
+The crossing logs one WARNING; each held launch logs at INFO, `left for a later night`.
+The `Done:` line gets its own clause: `ALLOWANCE the KartaView API (api.kartaview.org): 56 of 40 min in launches (fresh 31 of 15 min over 1 launch(es); resumes 25 min over 1; 1 resume(s) 25 min reserved), 1 launch(es) left for a later night, 0 city(ies) exempt with a checkpoint or cached census there, cities stay due`.
+It never contains `HELD`, and the counts never reach `held_launches`, because `scripts/mapillary_night_report.py` reads the HELD clause as the tile CDN's rest-night series.
+**These minutes are launch wall clock, not the host-presence span.**
+The `on the KartaView API ... (N h)` clause is first launch to last finish, and it will still read long: exempt resumes behind the gsv block, cached walks, the stranded-walk retry and the fill's KartaView launches all run late.
+So this change reduces KartaView's volume and launch minutes; it is never to be read as shortening or concentrating its presence.
+`run-due --dry-run` prints the allowance and the reserve, charges its own preview at the configured pace, and prints a held channel `HELD (night allowance spent)`.
+The preview can differ from the night in either direction: the night charges measured wall clock, and the preview charges a fresh pair's walk as a second crawl where the night collects it free from its grid's cache.
+A city passed over because the spent allowance holds every channel it is due on is counted on its own line, `left for a later night by the spent night allowance`, never in #444's `HELD on every channel passed over` count.
+`scheduler status` names the setting; usage is per run and in memory, so it is on each night's `Done:` line only.
+
+**It is a soft bound.**
+It is read once per city, so the city in flight finishes both channels (at worst two launches at the 60-minute ceiling), and the reserve is priced at the paced rate, so a slower host overruns it.
+**It is per run and in memory**: every `run-due` starts at zero, including a hand run, the timer watchdog's catch-up night, a re-run after a crash, and each pasted recovery command (`docs/operations.md`).
+`--ignore-host-holds` lifts it for one invocation, logged at WARNING.
+It is the only way to lift the allowance, and it lifts every hold, so the safe form is `run-due --provider kartaview,kartaview_streets --ignore-host-holds`: a full run with it also launches on the tile CDN on a rest night or inside a refusal cooldown, and the WARNING says so.
+For the fill, a spent allowance is a held host for a fresh KartaView crawl and not for a city with a checkpoint or a cached census there, read through the same `_city_holds`; on a real night the held KartaView pairs are unattempted, so the fill already leaves them as a backlog (`held_left`), and `host_left` is only the edge path when no held pair is left to count.
+
+**Accepted only on `[hosts.kartaview]`**, for the reason `max_city_minutes` is KartaView-only: a spent allowance holds the host for the fill, whose leave-to-due exception is KartaView's alone.
+On the tile CDN it would end the fill for every Mapillary-member city (#443), and on Panoramax it would decline every Panoramax member's fill city whole.
+A value that is not a number of minutes in (0, 1440], or the key on any other host, fails CLOSED like every `[hosts.*]` key: `run-due` and `assess-city` exit 64.
+A value of at least `max_batch_hours × 60` is accepted but can never be spent, so each run logs a WARNING that it bounds nothing.
+
+**Choosing the value needs two prod reads, and is the Maintainer's.**
+
+- **S, KartaView's steady-state need**: `enrolled / 83 × mean requests per completed sweep`.
+  Read the enrolled count from `scheduler enroll-city --channel kartaview --list`.
+  The mean in the repo is 38.9 requests (12,180 grid requests over the 313 never-collected cities, the prod config's RESUMED 2026-11-09 note); the issue's median of 16 understates it.
+  At about 853 enrolled cities that is about 400 requests a day, about 267 min at 1.5/min, for the grid alone (a paired walk is free, an unpaired one adds).
+- **R, tonight's live checkpoints**, from the `ALLOWANCE` line of a prod `run-due --dry-run`.
+
+Nights to drain a backlog are `backlog_requests / (1.5 × A − S)`, A in minutes; S already counts every crawl's resumed launches, and the reserve is carved out of A, not added to it.
+**Any value below S never drains**, and KartaView refreshes then miss their cycle, which this project counts as permanent holes.
+360 min is about 1.35 × S: 1.5 × 360 − 400 = 140 requests a night against a backlog of about 9,000, so it drains in roughly two months.
+When R × 24.7 min exceeds A, fresh crawls get nothing at all and the drain stalls until the resumers finish.
+Cities first collected from 2026-08-28 start coming due again on their 83-day wall around 2026-11-19, so S arrives during the drain.
+The recommendation recorded with #464 is at least S plus a backlog margin, about 420 to 480 min on today's numbers; if R × 24.7 min is at or above the candidate value, leave the key unset and measure KartaView minutes from the child logs first.
+
+**What setting it does not fix.**
+
+1. It does not by itself reopen the fill: on 2026-11-12 the fill was also held by `mapillary` and `mapillary_streets` backlogs, and a tile CDN with no room ends the fill for every Mapillary-member city (#443).
+2. Once KartaView stops consuming the clock, `max_cities_per_day` may become the binding stop, and a night that ends on the city cap does not run the fill at all; unhoisted resumers past the cap keep aging toward the 7-day checkpoint wall.
+3. The backlog drains more slowly, roughly in proportion to the allowance.
+4. The first nights after the key is set stay long while existing live checkpoints drain; fresh crawls are held during them.
+5. KartaView still leads the night: the hoist is unchanged.
+6. More date un-pairing between KartaView and the other providers: a city's GSV run lands tonight and its held KartaView pair on a later night, as on a Mapillary rest night (#443).
+
+**What it changes for the other hosts.**
+Setting the key LOWERS KartaView's nightly requests and launch minutes and leaves its rate at 1.5/min with one talker.
+The hours it frees go to the other channels within their existing budgets and holds: Mapillary is still bounded by the tile CDN's rolling-24h pool, Panoramax only by its daily budgets (so its nightly volume can rise inside #405's staged-raise measurement window), and Overpass has no budget at all.
+So set it outside #405's measurement window, or record it there as a confounder.
+
+**Why not the alternatives.**
+
+- **Lowering `[providers.kartaview*].daily_request_budget`**: the two channels have separate budgets against one host, a grid floor-skipped for budget leaves no checkpoint so the walk launches its own full sweep (un-pairing), and it starves live checkpoints, which the age wall then records as failures.
+- **`[hosts.kartaview].rolling_24h_request_budget`**: the window is rolling, so at 02:00 the previous night's stamps are still inside it, and the head of the slate, where the resumers lead, defers first.
+- **A per-channel share of `opt_in_cities_per_day`**: it cannot bound anything, because the due list is never truncated (there is deliberately no `due = due[:limit]`) and a paused (exit 83) launch takes no cap slot, so the loop walks the whole union until the deadline.
+- **A separate `run-due --provider kartaview,kartaview_streets` process beside the nightly**: the `streetwalks.json.gz` writers share one fixed `.tmp` path and assume one street child alive, the tail (aggregate, manifests, backup, publish) would run twice, and a filtered run advances only its own clocks and un-pairs every city it collects.
+- **A KartaView lane across cities (Option 3 in #464)**: the city is the join point by design (one run date per city, no child outliving its city, one street child for the manifest writers, every catalog read on one thread), and `kartaview_streets` also needs Overpass, which admits one talker; a redesign, worth it only if S turns out larger than any allowance that also bounds the night.
+
 ## What a capped night spends its slots on (issue #308, added 2026-09-02)
 
 **Breadth-first was never a decision; it was the shape of a tiebreak, and this section is that tiebreak given a name and a lever.**
@@ -714,9 +808,9 @@ Describe partial coverage accordingly.
 `max_cities_per_day` 20 → 40: 20 bound only on *light* nights and threw away wall clock the deadline had already granted — 2026-08-30 stopped at 20 cities after **6.77 h** of a 10 h window, while 2026-08-27 hit the deadline at 14 cities and never reached the cap at all (#304).
 `max_batch_hours` is the real governor — it stops starting cities, clamps the in-flight child (or, since #373, defers a non-resumable one that would not fit) and still runs the tail — so the cap is now high enough to let it be the only one, and more cities *sequentially* does not raise peak memory (one collection child at a time at `max_concurrent_channels = 1`), leaving #305's `MemoryHigh` headroom untouched.
 That last clause is about the **cap**, not about the knob, and it stopped describing production on 2026-09-21: at `max_concurrent_channels = 2` a city runs up to two collection children at once, so the headroom is no longer untouched — it is spent deliberately, against the measurement recorded in the lanes section above.
-`max_batch_hours` 10 → 12: 10 was a "comfortably below `TimeoutStartSec`" figure with nothing behind it, and the real bracket is `TimeoutStopSec` (30 min) < `max_batch_hours` < `TimeoutStartSec` (14 h) less the bounded tail (`PUBLISH_TIMEOUT_S` + `_MEASURED_TAIL_AGGREGATE_S` + `BACKUP_TIMEOUT_S` = 1,635 s ≈ 0.45 h).
-12 clears both with 1.55 h spare and needs **no** change to the systemd unit; past ~13.5 h `TimeoutStartSec` has to move first, and two costs come with it — the publish lands later in the working day, and a longer nightly window is more sustained hours against the per-IP metered hosts, the axis Mapillary's blocks are currently suspected on (`docs/provider-access.md`).
-Step 2 of #389 moved both daytime timers out of that bracket's way (the prefreeze is chained to the night's end; the screen sits at Mon 23:00), so the next raise moves `TimeoutStartSec` and nothing else.
+`max_batch_hours` 10 → 12: 10 was a "comfortably below `TimeoutStartSec`" figure with nothing behind it.
+12 needed **no** change to the systemd unit; the bracket it sits in is now defined once, with a tail, an in-flight and a margin term, in "The night's length" at the end of this file.
+Step 2 of #389 moved both daytime timers out of that bracket's way (the prefreeze is chained to the night's end; the screen sits at Mon 23:00), but the next raise moves more than `TimeoutStartSec`: that section lists what it must settle first.
 Note the second-order effect the 12 h batch has on #273's cap arithmetic, recorded above: at 10 h the clock was the smaller of the two ceilings and the budget remainder was unreachable, and at 12 h that has swapped.
 
 **The GSV daily budget followed a year later than it should have (2026-09-13, #304).**
@@ -812,6 +906,7 @@ The log, the `Done:` line and the dry run say what was reserved: `reserved 812 o
 Per channel rather than the whole fill, now that the fill runs opt-in channels too: Panoramax is budget-bound on its own most nights, and a Panoramax deferral says nothing about a city with no Panoramax enrolment.
 **So while any due KartaView sweep is paused (exit 83 — a multi-night metro), every KartaView-enrolled fill candidate has its KartaView channel LEFT to its due schedule and fills on the rest** (`held_left`, #456 third round; before it the candidate was declined whole), which still keeps the fill from stacking a second KartaView crawl on the host the paused one is waiting to finish on; only a candidate whose sole remaining channel is the held one is declined, as `backlog`, and the `Done:` line names the hold whatever else the fill did: `holding kartaview (1 due not attempted)`.
 A KartaView host that refused this machine or is held tonight leaves the channel the same way (`host_left`, #456 fourth round) — for Mapillary a latched host ends the fill on purpose (#443), but the KartaView exception rests on it being the least important provider, and declining its members whole for a KartaView refusal was the same loss through a third door.
+A spent KartaView night allowance (#464) reaches the fill the same way, read per city, so it leaves a fresh KartaView crawl and never a city with a checkpoint or a cached census there; on a real night those pairs are already `held_left` as a backlog, so `host_left` is only its edge path.
 A failure records an attempt and is not a backlog.
 Nor does a pair no night like this one could run (`_never_fits_tonight`), each logged as such: a non-resumable channel priced over its whole daily budget, one whose need exceeds the whole `max_batch_hours` window (#373), **every other channel of a city whose first grid channel exceeds that window** (the #373 gate defers the whole city with it to keep the pair, so its resumable mapillary is never attempted either), a walk waiting behind its grid sibling's in-flight checkpoint (the sibling's own pair is the backlog there),
 and a resumable channel whose fresh crawl the per-city ceiling cannot finish before the checkpoint wall (the launch skips it, not a failure, every night it stays that size; #456 third round). Held on those, one oversized city would switch the fill off for good.
@@ -1016,6 +1111,7 @@ The command writes and publishes `provider_screen.json.gz` itself, and the night
 
 **Production reads `config/scheduler.makelab1.toml`, not `config/scheduler.toml`** (passed via `--config`; the filename is historical — the service itself runs on makelab2, guarded by `ConditionHost=makelab2*`).
 The two diverge materially — budgets, absolute paths, `[publish].enabled`/`[publish].local` — so an operational change edited only into the repo default changes nothing in production, and vice versa: keep any comment-level rationale in step across both files.
+The KartaView night allowance (#464) is the one `[hosts.*]` key shipped commented out in both: the prod file carries the derivation a value has to come from, and a test pins it unset.
 
 ## The user timers after a reboot (issue #369, added 2026-09-26)
 
@@ -1079,3 +1175,189 @@ The prefreeze has no timer since #389 — it is chained from the collection unit
 
 **Unmeasured.**
 The 30-minute `@reboot` wait budget (generous against the 5 s gap measured, and against a slow ZFS import) and the 48 h heartbeat gate (one missed daily run, like `STALE_AFTER_HOURS`) are judgement numbers.
+
+## The night's length: the bracket, and how a raise is staged (issue #389, added 2026-11-14)
+
+`[schedule].max_batch_hours = 12` was inherited, not derived.
+This section is its derivation, the code that enforces it, and the list of what has to be settled before it moves.
+It changes no length, rate or volume: the night is still 12 h, and every number below is today's.
+
+### What `TimeoutStartSec` actually does
+
+Reaching the collection unit's `TimeoutStartSec` sends **SIGTERM**, then SIGKILL after `TimeoutStopSec` (systemd's default `TimeoutStartFailureMode=terminate`), not a SIGKILL outright.
+Where that SIGTERM lands decides what it costs:
+
+- **In the city loop or the fill** it is the #206 wind-down: `_stop_on_sigterm` turns it into a stop request, the in-flight child dies with the cgroup and is not counted as a failure, and the tail still runs and publishes.
+- **In the tail** (`_finish_batch`: aggregate, manifests, driving-plan summary, census and ledger prunes, catalog backup, publish, alert) it used to run under the default disposition and would kill the process before the publish, the outcome #167 recorded.
+  That is derived, not observed: #167's own night (2026-07-29) was the timeout killing the city loop before any deadline or SIGTERM handler existed (both arrived with #170).
+  That band is `TimeoutStartSec - (tail + in-flight child) < h < TimeoutStartSec`: the deadline fires, the tail starts, and the start timeout's SIGTERM, the **first** one systemd sends, lands in it.
+
+Since #389, `_tail_survives_sigterm` logs a SIGTERM that arrives during `_finish_batch` once at WARNING and ignores it, so the in-process steps finish inside `TimeoutStopSec`.
+It is entered **on the nightly unit only** (`_is_nightly_unit`): ignoring a SIGTERM is safe because systemd follows it with a SIGKILL, and a hand `run-due` from a shell has no SIGKILL behind it and an unbounded tail, so there the default disposition stays and a `kill` still ends it.
+What it cannot save, stated rather than implied:
+
+- `KillMode` is the default `control-group`, so systemd signals every process in the unit: **a publish rsync in flight at that instant still dies**.
+  `_finish_batch` retries that publish once (`_retry_publish_after_tail_sigterm`, #389 review), only when the signal arrived after the publish started (a later rsync was never signalled), bounded by what is left of `TimeoutStopSec` since the signal less a 120 s reserve, and by `PUBLISH_TIMEOUT_S`, and not at all under 60 s; if the retry fails too, the night reports `PUBLISH FAILED` and `regenerate-aggregate --publish` recovers it.
+  `KillMode` is deliberately unchanged, because the same cgroup signal is what ends an in-flight child promptly on a `stop`.
+- A SIGKILL after `TimeoutStopSec` is unchanged: nothing survives it.
+- The guard is entered on the statement after the loop's `_stop_on_sigterm` context closes (#389 review), so building the `Done:` summary and the quarantine claim are covered too; the gap left is between two consecutive statements.
+
+A caught SIGTERM is never silent (#389 review): the night alerts with a `SIGTERM IN THE TAIL` subject part and exits nonzero, because its usual sender is the start timeout landing in the tail, the breach this section exists to prevent, and the unit's `OnFailure=` mail is not wired.
+An operator's `systemctl stop` typed during the tail mails the same way, since the two senders cannot be told apart from inside the process.
+- The city loop's and the fill's SIGTERM handling is unchanged.
+
+The deadline is still sized to keep every night out of that band, because the publish is the step the guard protects least.
+
+### The bracket, defined once
+
+With `h = max_batch_hours`, all from `streetscape_metadata_tracker/scheduler.py` beside `PUBLISH_TIMEOUT_S`:
+
+```
+NIGHT_TAIL_ALLOWANCE_S = 1800 s  = the unit's TimeoutStopSec (pinned equal)
+NIGHT_OVERRUN_S        = 2100 s  = the tail allowance + one in-flight child clamped to >= 300 s
+NIGHT_MARGIN_S         = 3600 s  = because the tail allowance is a stand-in, not a bound
+fire slack             = 16 min  = RandomizedDelaySec 15 min + systemd's default AccuracySec 1 min
+
+floor : TimeoutStopSec < h
+unit  : h + NIGHT_OVERRUN_S + NIGHT_MARGIN_S <= TimeoutStartSec     enforced at runtime, and pinned
+kill  : slack + TimeoutStartSec + TimeoutStopSec <= 23 h              a hung on-time night dies an hour before the next fire
+ops   : 24 h - slack - h - NIGHT_OVERRUN_S >= 6 h                     the daytime ops window, a policy figure
+utc   : an ON-TIME night's last child (slack + h + 300 s) ends inside its UTC date, in PST and in PDT
+```
+
+**Why a margin.**
+The aggregate and manifest rebuild has no bound in code and was measured once, 435 s on the 19-city night of 2026-08-18; nights now run up to 80 cities over a larger catalog, and `prune_census_cache` is unbounded too.
+The margin stays until the tail is measured per night (below).
+
+| `max_batch_hours` | needs `TimeoutStartSec` >= | under the 14 h unit | under an 18 h unit | daytime ops window left | on-time night inside its UTC date |
+|---|---|---|---|---|---|
+| 12 | 13.58 h | ok, 0.42 h spare | ok | 11.15 h (~14:51 to 02:00) | yes, both seasons |
+| 13.5 | 15.08 h | **violates** | ok, 2.92 h spare | 9.65 h | yes (PST is the tight one: h <= 13.65) |
+| 16 | 17.58 h | violates | ok, 0.42 h spare | 7.15 h (~18:51 to 02:00) | **no**, in either season |
+| 20 | 21.58 h | violates | violates (needs 22 h) | 3.15 h | no |
+
+The ops window is smaller than it looks for anything needing Overpass: the chained prefreeze holds that lock for a further ~1.5 to 3 h after the night (`--limit 40 --pause-s 120`).
+It is a test constant (`OPS_WINDOW_HOURS = 6` in `tests/test_night_window.py`), deliberately not a config key, because nothing at runtime would read it.
+
+### Enforcement: the pins, the runtime clamp, and `timer-status`
+
+Tests compare the REPO's unit file with the REPO's config.
+The failure a raise invites is the other one: the installed unit is a copy (`deploy/README.md`), while `git pull` makes a new `max_batch_hours` live at the next 02:00 whether or not the copy was refreshed.
+So the bracket is enforced in three places.
+
+- **Pins** (`tests/test_night_window.py`): every line above, read from `config/scheduler.makelab1.toml`, the collection unit and its timer.
+  The followers (prefreeze, screen, watchdog) read the same night end, `_night_length_minutes` in `tests/test_prefreeze_unit.py`: the fire slack, `h`, and `NIGHT_OVERRUN_S`.
+- **The runtime clamp** (`night_window_seconds`, called from `cmd_run_due` through `_fit_night_to_unit` before anything reads the window).
+  The unit states its own timeout as `Environment=STREETSCAPE_UNIT_TIMEOUT_START_S=50400`, pinned equal to `TimeoutStartSec`, because nothing inside the sandbox can read the installed unit.
+  A nightly that does not see the variable, or sees junk in it (`nan`, `inf`, too small to leave a window), is under a pre-#389 copy and assumes 14 h.
+  The window is capped at that less `NIGHT_OVERRUN_S`, `NIGHT_MARGIN_S` and the time the process spent before the loop's clock started (`_PROCESS_STARTED_MONOTONIC`, captured at module import, because `TimeoutStartSec` counts from the unit's start and a catalog migration on connect spends it).
+  A night that does not fit is **shortened, not refused**: refusing loses the whole night, shortening loses only the hours the unit could not have held.
+  It logs `Night shortened:` at WARNING, mails `night shortened to N h on <host>: <cause>`, and replaces `max_batch_hours` in the night's config, so the deadline, the `Done:` line's `deadline (N h)`, the #373 never-fits test and the #290 census-reuse window all agree.
+  The cause is named, because only one of the two is fixed in the unit: `the installed unit cannot hold max_batch_hours` when the configured window would not fit even with no time before the loop (the note then gives the unit fix), and `a slow start before the city loop, not the unit` when the unit holds it and the elapsed pre-loop time alone broke it (a slow connect, migration or mount; the note says the unit needs no change).
+  Either note names the pre-loop time.
+  A hand run and a `--dry-run` are never shortened, and neither alerts.
+  The opening line now ends `; max_batch_hours=N`, the value the night actually ran under.
+- **`timer-status`** prints the collection unit's bracket as systemd LOADED it (`systemctl --user show streetscape-tracker.service -p TimeoutStartUSec -p TimeoutStopUSec`), the only check that sees a hand-written drop-in or an un-reloaded copy: `ok`, `VIOLATED`, or `unknown` (an `infinity` or unparseable timeout, or a unit not loaded), which is never read as `ok`.
+  It is read **after** the watchdog's re-arm, so after its one `daemon-reload`: on the #369 reboot path the manager can hold the empty unit map of a scan that raced the mount until then, and a read before it would report the unit not-found.
+  With `--alert` it mails on `VIOLATED` or `unknown`, each with its own wording: `unknown` says the timeout gave no bound to check (not loaded, `infinity`, or unparseable) and what to run, and never that the bracket is violated or that a night is shortened.
+  Neither word claims a night IS shortened, because the clamp reads `STREETSCAPE_UNIT_TIMEOUT_START_S`, not the loaded timeout.
+  It changes neither `healthy`, the heartbeat nor the exit status.
+  The clamp's alert says so, because a stale unit then mails twice a day: the nightly clamp and the 08:30 watchdog.
+
+### The UTC date line, and an existing defect it exposes
+
+The snapshot date is UTC (`clock.snapshot_date_today()`), read once when `run-due` starts and passed as `--run-date` to every child.
+An on-time night starts by 02:16 Pacific, which is 10:16 UTC in PST and 09:16 UTC in PDT, so at 12 h its last child ends inside that UTC date (22:21 UTC in PST), and does so up to `h` = 13.65 h in PST.
+`test_an_on_time_night_ends_inside_its_utc_date` pins exactly that, and only that.
+**It does not say every night ends inside its UTC date, because catch-up nights already do not**: a `Persistent=true` start on the next boot, the 08:30 watchdog re-arm (`deploy/cron/`) and a hand `systemctl --user start` all start the same unit later, and an 08:30 PST start crosses UTC midnight 7.5 h in.
+
+That crossing costs census re-reads today, at 12 h:
+
+- The consumer refuses a cached census whose `completed_at` UTC date is later than its own `run_date` (`checkpointing.load_census_cache_marker`, the `observed_until > run_date` branch).
+  So a grid crawl that completes after UTC midnight is refused by its own paired walk, dated the night's start, which **re-crawls the same tiles against the same per-IP host**.
+- The scheduler's probe, `checkpointing.census_cache_probe` (reached through `channel_census_cache_marker`), has **no run-date check**.
+  So the scheduler prices that walk at 0 (`est == 0`): it is exempt from the sibling and floor arms, the fill's whole-city host sum under-prices it, and the child then re-crawls up to its request cap.
+  For KartaView the re-crawl also holds the sequential city loop for up to `max_city_minutes`.
+- Total spend stays bounded by each channel's budget and the Mapillary rolling pool; admission is not, because the walk is priced at 0.
+
+It is recorded here rather than fixed, and is the first item below.
+The read for it is `grep -c 'Not reusing the cached census' logs/collect_*_<date>.log` on a catch-up night.
+
+### What a raise must settle first
+
+In this order, each with its evidence.
+
+1. **The census cache's UTC date line (above).**
+   A 16 h night crosses it on every on-time night, in both seasons, so every city whose grid crawl completes in the night's last hours would pay its walk's census twice.
+   The fix belongs in `checkpointing.py`, in its own issue and review: record the producer's `run_date` in the marker and reuse an entry on equality, and give `census_cache_probe` the same rule, so the price and the load agree.
+   Only then does `test_an_on_time_night_ends_inside_its_utc_date` have a reason to move.
+2. **The tail, measured per night**, so the margin can shrink.
+   The allowance rests on one 435 s measurement; read the `Done:` timestamp to the `Published in` line on every night for a week.
+3. **`max_cities_per_day = 80` and its two reservations will likely bind before a 16 h deadline.**
+   2026-11-12 ran 63 cities in 11.42 h with 17 slots left (#464); 63 × 16 / 11.42 is about 88, and the fill counts against the same cap.
+   A cap-ended night is a different population (`scripts/night_length_analyze.py` classes it `truncated`), so a step that hits the cap measures the cap, not the night.
+   Raising the cap is a Mapillary per-IP volume step, which `docs/provider-access.md` requires to be staged, and `opt_in_cities_per_day` and `refresh_slots` are set explicitly and have to be re-decided with it (their sum bounds what the plain queue governs).
+4. **#464's KartaView bound must be live at its final value first.**
+   The host was in use about 11.4 h of each 12 h night after KartaView resumed at 1.5/min, so four more hours today would be four more KartaView hours, not the backlog this issue is about.
+   Any value of that bound chosen as a share of 12 h (half the window, or the whole of it) is a function of `max_batch_hours` and must be re-decided at the new length.
+5. **The unit: 17 h or 18 h for a 16 h night, and what a hung catch-up costs.**
+   Under today's margin a 16 h night needs `TimeoutStartSec` >= 17.58 h, so it is 18 h unless item 2 shrinks the margin below 25 min (17 − 16 − 0.583 h).
+   The cost of 18 h falls on catch-up nights: an 08:30 catch-up starts by about 08:46, and a hung one is sent SIGTERM at 08:46 + `TimeoutStartSec` and SIGKILL up to `TimeoutStopSec` (30 min) later.
+   Under 18 h that is 02:46 and 03:16, past the next 02:00 fire, so that night is skipped (the timer's start finds the unit still activating).
+   Under 17 h it is 01:46 and 02:16: a night that winds down on the SIGTERM is clear of the fire, but a truly hung process can still hold the unit through it.
+   Under today's 14 h it is 22:46 and 23:16.
+   `test_the_start_timeouts_kill_lands_clear_of_the_next_fire` checks only the on-time night.
+6. **The GSV budgets are wall-clock proxies.**
+   GSV metadata is free and has no daily quota, so the `[providers.gsv]` and `[providers.gsv_streets]` budgets are sized just above the window's spend at 48,000/min, so that the deadline rather than the budget ends the night.
+   `test_makelab1_production_config_is_wired` pins that relation (`window_spend <= budget <= 1.05 × window_spend`) for both channels, so a raise of `max_batch_hours` without them fails.
+
+| Where | Today | At 13.5 h | At 16 h | Arithmetic |
+|---|---|---|---|---|
+| `[providers.gsv].daily_request_budget` | 35,000,000 | 40,000,000 | 47,000,000 | h × 60 × 48,000 = 34.56M / 38.88M / 46.08M (ratio 1.013 / 1.029 / 1.020) |
+| `[providers.gsv_streets].daily_request_budget` | 35,000,000 | 40,000,000 | 47,000,000 | the same, at that block's own 48,000/min |
+| Collection `TimeoutStartSec` | 14 h | 18 h | 18 h | h + 1.583 h (item 5) |
+| Prefreeze `TimeoutStartSec=6h` ends | 20:51 | 22:21 | 00:51, 9 min clear of the hour before the fire | the night's end + 6 h |
+| Screen timer, Mon 23:00 | 8.15 h after the night | 6.65 h | 4.15 h | fails past h ≈ 20.15 h |
+| Watchdog 08:30 catch-up ends | 21:21 | 22:51 | 01:21 | 08:30 + 16 min + h + 35 min |
+| KartaView pace ceiling per night | 1,080 | 1,215 | 1,440 | h × 60 × 1.5 |
+| Census reuse window (`_census_reuse_window_s`) | 7 d − 12 h | 7 d − 13.5 h | 7 d − 16 h | automatic |
+| Quiet gap before the next fire | 11.73 h | 10.23 h | 7.73 h | 24 h − slack − h |
+| Mapillary rest-day gap (Tue night's end to Thu 02:00) | >= 35.73 h | >= 34.23 h | >= 31.73 h | 48 h − slack − h |
+| `MemoryHigh=40G`/`MemoryMax=48G`, `CPUQuota=400%` held for | up to 12.6 h | 14.1 h | 16.6 h of every 24 | values unchanged; `cgroup peak` is the read |
+
+For 20 h, three more things move first, and the suite already refuses two of them: the prefreeze's timeout or `--limit` (`test_a_chained_pass_ends_well_before_the_next_night`), the watchdog's 08:30 slot (`test_the_daily_slot_precedes_the_backup_check_and_lets_a_catch_up_night_finish`), and a 22 h unit.
+
+Provider access, for every step: a longer night adds no rate anywhere; it adds **hours of presence** against every per-IP host and lets more cities run, so realized daily volume rises toward budgets that do not move.
+For Mapillary the quiet gap and the rest-day gap shrink (above), and sustained hours is the axis the blocks are suspected on (`docs/provider-access.md`).
+For KartaView, which has no forum and so no early warning, an unbounded 16 h night is up to about 15.4 h a day of traffic; that is why item 4 comes first.
+
+### Deploying a raise, and what to read for a week after each step
+
+The deploy order is in `deploy/README.md`, "Raising the night's length": the unit first (copied, `daemon-reload`ed and verified, between nights), the config raise later as a config-only pull.
+Got the wrong way round, the night is shortened and mails rather than reaching the tail band.
+
+**Design.** A baseline of at least 7 consecutive nights at 12 h with this section's code deployed and **#464's KartaView bound live at its final value**, with no other knob moved; then one step; then at least 7 nights.
+Change nothing else in either window: no cap, lane, reservation, budget, enrolment tranche, #405 stage or #464 knob.
+Record each deploy instant (`git log -1 --format=%cI` on prod) in the writeup, which is `docs/experiments/night-length.md` (#277) and does not exist yet.
+Known confounders: two lanes (#352, 2026-09-21), the 80-city cap (#372, 2026-09-25), the GSV engine (#399), the fill (#411), KartaView's resumption at 1.5/min (2026-11-10, #461), the Overpass overload of 2026-11-07..11, Mapillary tranche 3 (#457), whichever #405 stage is live, and #464.
+
+**What to read**, from makelab2 read-only, through one ssh master and batched into one call:
+
+| Question | Source |
+|---|---|
+| Hours, what ended the night, cities, runs, fill | `grep 'Done: ' logs/streetscape_scheduler.log*`; `scripts/night_length_analyze.py` (populations full / filtered / truncated; `hours` and `hours_per_city`) |
+| Which window a night ran under, and whether it was shortened | the opening line's `max_batch_hours=`; `grep 'Night shortened'` |
+| The tail's duration per night | the `Done:` line's timestamp to the `Published in N.N s` line (item 2) |
+| A SIGTERM in the tail | `grep "SIGTERM received during the night's tail"` |
+| Mapillary served per UTC night, deferrals, holds, refusals | `scripts/mapillary_night_report.py --config config/scheduler.makelab1.toml --since DATE` |
+| KartaView and Panoramax requests per night | `api_usage` by (date, provider), `sqlite3 -readonly` |
+| Hours each per-IP host was in use | first and last timestamp of each `logs/collect_*_<channel>_<date>.log`, per host (#464's 11.4 h) |
+| Refusals and throttles | exits 75/76/81/84/87/89/90 on the `Done:` line; new `host_refusals` rows; Panoramax 403/429 in child logs |
+| Census re-reads after UTC midnight (item 1) | `grep -c 'Not reusing the cached census' logs/collect_*_<date>.log` |
+| Overpass queries per 24 h | the prefreeze's `Froze N of M` lines in `logs/streetscape_service_console.log` plus the night's cold fetches |
+| Memory | `grep 'cgroup peak' logs/streetscape_scheduler.log` (any nonzero `high` counter is a stop) |
+| Did anyone need the daytime lock | busy exits 79/80/82/85, `REFUSED: ... GSV key` lines (#412), prefreeze exit 64 |
+| Followers | `systemctl --user show streetscape-prefreeze.service -p ExecMainStartTimestamp -p ExecMainExitTimestamp -p Result`; Monday's screen exit (85 means it met the night); `logs/timer_watchdog.log` |
+
+**Stop rules** (the revert is config-only: put the previous `max_batch_hours` and budgets back and pull): any Blocked-family exit on Mapillary, KartaView or Panoramax the baseline week did not have; exit 87 above the baseline's rate; a `memory.events high` above 0; a night shortened or killed by the unit; the prefreeze stopped by its cutoff or its timeout on an ordinary night; the Monday screen exiting 85.
+Report distributions (n, median, p10/p90, max), never a mean alone, and `hours_per_city` beside `hours`.

@@ -156,7 +156,10 @@ scheduler host (makelab2), after the merged code is deployed there.
 
 1. **Register + freeze geometry** (no download, no provider API calls):
    `python scripts/register_frame.py` previews (dry run is the default;
-   overlap detection needs no geocoding, so the preview is instant), then
+   overlap detection needs no geocoding, so the preview is instant; rows of
+   the same manifest are compared at their manifest coordinates, and a
+   `REUSE IN-BATCH` or `WARNING` line means `--execute` may alias one row onto
+   an earlier one once that row is geocoded, #460), then
    `--execute` geocodes each genuinely new city once (rate-limited Nominatim)
    and freezes its grid via the same helpers a real run uses
    (`cli._resolve_geometry`'s new-city branch). Idempotent; `--limit N` does a
