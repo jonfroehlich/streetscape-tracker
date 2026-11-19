@@ -3556,3 +3556,59 @@ def test_a_popup_auto_pan_while_the_run_streams_freezes_no_later_move(
     assert s["tier"] == "complete", s
     assert s["drawnInView"] == s["inViewTotal"] > 0
     assert errors == []
+
+
+def test_a_year_filter_round_trip_leaves_no_band_behind(page: Page, base_url, dense_cities):
+    """A whole-population plan earns the view no hysteresis band (review 3, finding 1).
+
+    The 45,000-pano census city loads sampled. A year filter fits the cap, so it
+    is drawn whole (mode "all", tier "complete"); clearing the filter on the same
+    view used to keep "complete" through the 1.25x band and draw all 45,000 dots,
+    more than RENDER_CAP, at every zoom from then on.
+    """
+    errors = _capture_errors(page)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    page.goto(f"{base_url}/city.html?file={dense_cities['census']['csv']}")
+    expect(page.locator("#map-drawn-notice")).to_be_visible()
+    assert _dense_state(page)["tier"] == "sampled"
+
+    year = page.evaluate("inModeAll[0].options.captureDate.getFullYear()")
+    page.evaluate(f"toggleYear({year})")
+    assert page.evaluate("lastPlan.mode") == "all", "precondition: the year fits the cap"
+    page.evaluate(f"toggleYear({year})")
+    s = _dense_state(page)
+    assert (s["tier"], s["mode"]) == ("sampled", "sample"), s
+    assert s["onMap"] <= page.evaluate("RENDER_CAP"), s
+    assert s["status"] == _SAMPLED
+    assert errors == []
+
+
+def test_the_flat_toggle_acts_on_points_streamed_before_it(page: Page, base_url, dense_cities):
+    """The flat-only toggle works while the run streams (review 3, finding 2).
+
+    `applyDesired` plans nothing before `mapReady`, and the stream added flat
+    points by `showFlatOnly` without recording `flatOnMap`: toggling on and then
+    off mid-stream left the points streamed in between on the map with the
+    toggle off. The toggle is driven from inside the stream by wrapping the
+    flat popup builder, which the stream calls once per flat point.
+    """
+    errors = _capture_errors(page)
+    release = _open_with_the_run_held(page, base_url, dense_cities["census"]["csv"])
+    page.evaluate("""() => {
+      const original = buildFlatOnlyPopupHtml;
+      let n = 0;
+      window.buildFlatOnlyPopupHtml = (...args) => {
+        n++;
+        if (n === 700 || n === 1400) toggleFlatOnly();
+        if (n === 1000) window.flatShownMidStream = flatOnlyMarkers.filter((m) => map.hasLayer(m)).length;
+        return original(...args);
+      };
+    }""")
+    release()
+    expect(page.locator("#map-drawn-notice")).to_be_visible()
+    assert page.evaluate("showFlatOnly") is False
+    # On at the 700th point: the 699 already streamed are shown at once.
+    assert page.evaluate("window.flatShownMidStream") == 999
+    s = _dense_state(page)
+    assert s["flatsOnMap"] == 0, s
+    assert errors == []

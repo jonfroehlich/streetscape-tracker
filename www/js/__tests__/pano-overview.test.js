@@ -28,6 +28,7 @@ const {
   countInBounds,
   idsInBounds,
   isViewDependent,
+  completeFromView,
   planMapView,
   drawnNoticeText,
 } = require("../pano-overview.js");
@@ -367,6 +368,52 @@ test("planner: hysteresis — enter at the budget, stay through the band, leave 
   const left = planMapView(state({ prevTier: "complete", countInView: () => LEAVE + 1 }));
   assert.equal(left.tier, "sampled");
   assert.equal(LEAVE, 50000);
+});
+
+test("planner: a 'complete' from mode all earns no band — the view re-enters at the budget", () => {
+  // PR #470 review 3, the reproduced case: a 45,000-pano city. A year filter
+  // (or Render all) drew it whole in mode "all", tier "complete"; clearing the
+  // filter must not then hold 45,000 dots in the band at every zoom.
+  const size = 45000;
+  const all = planMapView(state({ populationSize: BUDGET - 1, prevTier: "sampled" }));
+  assert.equal(all.mode, "all");
+  assert.equal(all.tier, "complete");
+  assert.equal(completeFromView(all), false);
+  const back = planMapView(state({
+    populationSize: size, prevTier: all.tier, prevPlan: all, countInView: () => size,
+  }));
+  assert.equal(back.tier, "sampled");
+  assert.equal(back.mode, "sample");
+  assert.deepEqual([...back.desired], ["s1", "s2"]);
+  assert.equal(back.announce, TIER_ANNOUNCEMENTS.sampled);
+  // Render all off, the same.
+  const renderAll = planMapView(state({ populationSize: size, renderAll: true }));
+  const capped = planMapView(state({
+    populationSize: size, prevTier: renderAll.tier, prevPlan: renderAll, countInView: () => size,
+  }));
+  assert.equal(capped.tier, "sampled");
+  // A frozen tier (a popup's auto-pan) holds no "all"-earned "complete" either.
+  const frozen = planMapView(state({
+    populationSize: size, prevTier: "complete", prevPlan: all, freezeTier: true, countInView: () => size,
+  }));
+  assert.equal(frozen.tier, "sampled");
+  // The band still holds a "complete" the view earned...
+  const entered = planMapView(state({ populationSize: size, prevTier: "sampled", countInView: () => BUDGET }));
+  assert.equal(entered.mode, "view");
+  assert.equal(completeFromView(entered), true);
+  const held = planMapView(state({
+    populationSize: size, prevTier: entered.tier, prevPlan: entered, countInView: () => size,
+  }));
+  assert.equal(held.tier, "complete");
+  assert.equal(held.announce, null);
+  // ...and turning the Panoramas layer off and on keeps or withholds it as before.
+  for (const [prev, want] of [[all, "sampled"], [entered, "complete"]]) {
+    const hidden = planMapView(state({ panosHidden: true, prevTier: prev.tier, prevPlan: prev }));
+    const shown = planMapView(state({
+      populationSize: size, prevTier: hidden.tier, prevPlan: hidden, countInView: () => size,
+    }));
+    assert.equal(shown.tier, want, `after ${prev.mode}`);
+  }
 });
 
 test("planner: announces once per actual tier change, never on the first plan or a plain pan", () => {

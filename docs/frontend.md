@@ -283,6 +283,9 @@ The dot tier is now **view-dependent** for such a city.
 Rules that must survive without a read:
 
 - **Hysteresis.** Leaving complete needs `TIER_LEAVE_FACTOR` (1.25) × the budget; entering needs the budget. Without the band a view near 40,000 flips tier on every small pan.
+  **The band holds only a "complete" a view earned** (`completeFromView`): mode "all" is also "complete", but it drew the whole population because the population fit (a year filter, "Render all"), so after it the next view-dependent plan enters at the budget like a first one.
+  Banding it drew all 45,000 panos of the dense Mapillary city at every zoom once a year filter had been toggled on and off, and more than the cap with no "Render all" (review 3 of the PR).
+  So without "Render all" the map draws more than `RENDER_CAP` pano dots only inside that band, at most 1.25 × the cap, plus a selected date's panoramas and an open popup's.
 - **An open popup's auto-pan never re-tiers** (`autopanstart` freezes the tier for that move), and the open popup's pano is kept in the drawn set on **every** re-plan while it is open — a move, a date, the flat toggle, Render all — because removing a Leaflet marker closes its popup.
   The planner drops it only when it leaves the population (a year or imagery mode that excludes it) or the Panoramas layer goes off.
   Only pano markers are pinned (`options.panoIdx`), never a flat-only point.
@@ -291,6 +294,7 @@ Rules that must survive without a read:
 - **Legend clicks stop at the legend** (`L.DomEvent.on(div, "click", stopPropagation)`), not only through `disableClickPropagation`: most legend buttons rebuild the legend in their own handler, so the click reached the map with a detached target, Leaflet's walk up to the legend's mark failed, and it read as a background click that closes popups.
 - **A pan that stays sampled reuses the drawn set** (`plan.reused`): same sample (`sampleKey`, which names the filter and the mode caches' build), same date, same pin, so nothing is rebuilt or re-diffed.
 - **Nothing is planned until the run has streamed** (`mapReady`): a background click mid-stream once recorded a tier for an empty population, and the dense city then announced a change on load.
+  **So the flat-only toggle acts directly** (`toggleFlatOnly` calls `setFlatShown`, not only `applyDesired`), and the stream adds each flat point by `flatOnMap`, the layer's own state: otherwise a toggle mid-stream did nothing to the points already streamed, and on-then-off left the points streamed in between on the map with the toggle off (review 3 of the PR).
 - **A selected date only adds.** Its in-mode panoramas are unioned into the drawn set in every tier, as before #77; it never decides the tier and never narrows the set.
 - **A tier change is announced once** through the polite live region `#map-tier-status` (`TIER_ANNOUNCEMENTS`), never on the first plan, and never on a frozen move; the legend's notice `#map-drawn-notice` is patched in place on every move, without rebuilding the legend.
 - **The first plan runs after `fitBounds`** (non-animated) on the fitted view, so a dense city is never counted at Leaflet's default view and re-tiered a frame later.

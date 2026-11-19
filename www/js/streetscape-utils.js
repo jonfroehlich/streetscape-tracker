@@ -88,12 +88,16 @@ function addBasemapLayer(map) {
 }
 
 /**
- * Max pano dots the city map draws at once (issues #77/#58). Dense cities hold
+ * The pano-dot budget of the city map (issues #77/#58). Dense cities hold
  * 10^5–10^6 panos; drawing one Leaflet marker layer each makes the map
  * unreadable at low zoom and freezes on every interaction. For a city over this
  * count the pano dots are view-dependent (planMapView, pano-overview.js): a
  * view whose padded area holds at most this many draws every pano in it, and a
  * wider view draws a deterministic spatial subsample (spatialStrideSample).
+ * Once a view has entered that every-pano tier it stays in it up to
+ * TIER_LEAVE_FACTOR (1.25) × this count, so a pan across the threshold does
+ * not flicker; that band is the one way more than this many are drawn without
+ * "Render all" (plus a selected date's panos, which are always drawn).
  * "Render all" stays as the opt-in override. The diff overlay (diff-overlay.js)
  * still stride-samples, at a quarter of this cap, at every zoom. Reported
  * stats/counts/plot always use the FULL in-memory set — only the drawn dots are

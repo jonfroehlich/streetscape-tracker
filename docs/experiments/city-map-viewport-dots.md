@@ -8,8 +8,10 @@ Numbers here come from two committed files:
 
 - [`city-map-viewport-dots_metrics.json`](city-map-viewport-dots_metrics.json), produced by `scripts/measure_city_map_render.py` in headless Chromium 149 (1440×900, Apple M1 Max, macOS).
   "Before" is `git archive` of `www/` at main `e9c4528`, "after" is this branch's `www/`, served side by side to the same browser.
-  The record names the after copy by `www_tree` (`git rev-parse <commit>:www`, the content hash of the committed `www/`) and `www_dirty: false`, so it can be checked against whichever commit it lands in.
+  The record names the after copy by `www_tree` (`git rev-parse <commit>:www`, the content hash of the committed `www/`) and `www_dirty: false`, so it can be checked against the commit it measured.
   It was re-run in full after the PR's first review, whose fixes changed the sampled tier's per-move work; the first run's record is in the history at `c70d1f3`.
+  The `www_tree` it records, `1c4b237`, is the `www/` of `da91d51` (that first review's fixes), not of the commit this lands in: the PR's later review rounds changed `www/` again and were not re-measured.
+  Those changes touch only paths the script never drives — a popup's auto-pan (it opens no popup), the legend notice under a year filter (it sets none), the tier after a whole-population plan (each load starts over the cap with no year filter or "Render all", so every plan it times is view-dependent), and the flat-only toggle (it never clicks it) — so the numbers below are expected to stand, but they were measured on `da91d51`.
 - [`city-map-viewport-dots_index_bench.json`](city-map-viewport-dots_index_bench.json), produced by `node scripts/bench_pano_index.js` (Node 24), which calls the page's own `buildPanoIndex`, `countPerCell`, `countInBounds` and `idsInBounds` on seeded uniform points over a Houston-sized box, to reach sizes a browser load cannot.
 
 No imagery provider, Overpass or Nominatim was contacted, and no catalog was read: the cities are written by `tests/e2e/build_fixture.write_dense_city`, the page's libraries load from cdnjs as in the e2e suite, and basemap tiles and analytics are aborted.

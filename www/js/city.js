@@ -970,6 +970,10 @@ function toggleStreetGaps(on) {
  */
 function toggleFlatOnly() {
   showFlatOnly = !showFlatOnly;
+  // Directly, not only through the plan: applyDesired plans nothing while the
+  // run streams, and the toggle must still act on the points streamed so far
+  // (PR #470 review 3). The stream adds each new point by `flatOnMap`.
+  setFlatShown(showFlatOnly);
   applyDesired();
   updateLegend(Object.keys(markersByYear).map(Number));
 }
@@ -2130,7 +2134,9 @@ async function loadData() {
           flatMarker.bindPopup(
             buildFlatOnlyPopupHtml(row.pano_id, row.copyright_info, row));
           flatOnlyMarkers.push(flatMarker);
-          if (showFlatOnly) flatMarker.addTo(map);
+          // By `flatOnMap`, the layer's own state, so a later setFlatShown
+          // (the toggle) removes or keeps exactly what this added.
+          if (flatOnMap) flatMarker.addTo(map);
           continue;
         }
         // Row admission (status, date, id, position, and the #367 GSV query

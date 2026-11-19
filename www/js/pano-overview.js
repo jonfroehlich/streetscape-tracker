@@ -610,6 +610,28 @@ function isViewDependent({ populationSize, budget, renderAll }) {
 }
 
 /**
+ * Whether the previous plan's "complete" tier was earned by a view's count,
+ * so the leave band (and a frozen tier) may hold it. Mode "all" is also
+ * "complete", but it drew the whole population because the POPULATION fit
+ * (or Render all), which says nothing about how many panos a view holds:
+ * banding it would let a city of up to TIER_LEAVE_FACTOR × budget panos draw
+ * every one at every zoom, depending only on history (PR #470 review 3).
+ *
+ * @example
+ *   completeFromView({ mode: "view" });  // true
+ *   completeFromView({ mode: "all" });   // false
+ *   completeFromView(null);              // true: no history, trust prevTier
+ *
+ * @param {?Object} prevPlan - The plan the map shows now, or null.
+ * @returns {boolean}
+ */
+function completeFromView(prevPlan) {
+  if (prevPlan == null) return true;
+  if (prevPlan.mode === "hidden") return prevPlan.completeFromView !== false;
+  return prevPlan.mode !== "all";
+}
+
+/**
  * Decide what the pano layer draws. Pure: the expensive inputs are thunks, so
  * a plan only pays for what its branch needs, and a test can assert that the
  * under-cap path never counts a view.
@@ -624,7 +646,13 @@ function isViewDependent({ populationSize, budget, renderAll }) {
  * The tier rule, counted over the same padded bounds that are drawn: enter
  * "complete" at a count <= budget, and once in it stay until the count passes
  * TIER_LEAVE_FACTOR × budget. A plan with `freezeTier` (the move was a
- * popup's own auto-pan) keeps the previous tier whatever the count.
+ * popup's own auto-pan) keeps the previous tier whatever the count. Both hold
+ * only a "complete" tier a VIEW earned (completeFromView): mode "all" is
+ * "complete" too, but its population count says nothing about this view, so
+ * after it the next view-dependent plan enters at the budget like a first one.
+ * A view-dependent plan therefore draws at most TIER_LEAVE_FACTOR × budget
+ * panos (plus the date's and the pin), and more than the budget only while
+ * staying in a "complete" tier that a view holding at most the budget entered.
  *
  * The selected capture date never decides the tier or narrows the set: its
  * panos are unioned in, as before #77, so the map cannot under-show the
@@ -678,15 +706,19 @@ function isViewDependent({ populationSize, budget, renderAll }) {
  * @param {?string} [s.dateKey] - Names the selected date, or null.
  * @returns {{mode: string, tier: ?string, desired: Set, inViewCount: ?number,
  *   announce: ?string, flatShown: boolean, reused: boolean, sampleKey: ?string,
- *   dateKey: ?string, pinnedItem: *}}
+ *   dateKey: ?string, pinnedItem: *, completeFromView?: boolean}} A "hidden"
+ *   plan also carries `completeFromView`, the plan it hid's, so turning the
+ *   layer back on keeps or withholds the band exactly as before.
  */
 function planMapView(s) {
   const flatShown = Boolean(s.flatOn);
   const dateKey = s.dateKey ?? null;
+  const fromView = completeFromView(s.prevPlan);
   if (s.panosHidden) {
     return {
       mode: "hidden", tier: s.prevTier, desired: new Set(), inViewCount: null, announce: null,
       flatShown, reused: false, sampleKey: null, dateKey, pinnedItem: null,
+      completeFromView: fromView,
     };
   }
   const pinnedItem = s.pinnedItem != null && (!s.inPopulation || s.inPopulation(s.pinnedItem))
@@ -702,10 +734,11 @@ function planMapView(s) {
     desired = new Set(s.populationItems());
   } else {
     inViewCount = s.countInView();
-    if (s.freezeTier && s.prevTier) {
+    const viewComplete = s.prevTier === "complete" && fromView;
+    if (s.freezeTier && s.prevTier && (s.prevTier !== "complete" || fromView)) {
       tier = s.prevTier;
     } else {
-      const limit = s.prevTier === "complete" ? Math.floor(s.budget * TIER_LEAVE_FACTOR) : s.budget;
+      const limit = viewComplete ? Math.floor(s.budget * TIER_LEAVE_FACTOR) : s.budget;
       tier = inViewCount <= limit ? "complete" : "sampled";
     }
     mode = tier === "complete" ? "view" : "sample";
@@ -800,6 +833,7 @@ if (typeof module !== "undefined" && module.exports) {
     countInBounds,
     idsInBounds,
     isViewDependent,
+    completeFromView,
     planMapView,
     drawnNoticeText,
   };
