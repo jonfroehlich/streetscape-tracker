@@ -107,7 +107,6 @@ STEP = 20
 # which artifacts actually moved — and on a fixture commit that question is the
 # whole review. ``_normalize_for_commit`` below zeroes the gzip mtime and
 # rewrites this field; together they make the directory content-addressed.
-#
 FIXTURE_GENERATED_AT = "2026-04-20T00:00:00+00:00"
 
 # The date ``driving_plan.json.gz`` judges every plan window and capture age

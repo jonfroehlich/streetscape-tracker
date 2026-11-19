@@ -20,7 +20,10 @@ from streetscape_metadata_tracker.fileutils import PANDAS_PARSES_FLOATS_EXACTLY
 
 # The script measures the gap between pandas' default float parser and the
 # round-trip one. pandas 3.1 closed that gap (every mode is one exact
-# converter), so on 3.1+ the two tests that count a gap have nothing to count.
+# converter), so on 3.1+ the tests that call ``measure_walk_csv`` are skipped:
+# one has no gap to count, and both would pass the ``float_precision`` option
+# 3.1 deprecated, which becomes a TypeError once pandas removes it. ``main``
+# refuses to run there, so nothing reaches that function outside these tests.
 # tests/test_fileutils.py checks the claim itself on the installed pandas.
 needs_inexact_default_parser = pytest.mark.skipif(
     PANDAS_PARSES_FLOATS_EXACTLY,
@@ -66,6 +69,7 @@ def test_a_coordinate_one_ulp_across_the_half_way_point_is_counted_as_a_key_shif
     assert out["max_lon_err_deg"] == pytest.approx(1.42e-14, rel=0.01)
 
 
+@needs_inexact_default_parser
 def test_the_round_trip_premise_is_checked_not_assumed(tmp_path, monkeypatch):
     """If the 'exact' read ever stops being float() of the text, the script
     refuses rather than reporting a comparison against the wrong reference."""
