@@ -1625,7 +1625,7 @@ def _plan_block(summary: plan_match.PlanSummary, tier: str) -> dict[str, Any]:
     return block
 
 
-def generate_driving_plan_summary(conn, data_dir: str) -> dict[str, Any]:
+def generate_driving_plan_summary(conn, data_dir: str, today: date | None = None) -> dict[str, Any]:
     """
     Build and write ``driving_plan.json.gz`` — Google's published driving plan
     joined against the imagery we have actually observed (issue #176).
@@ -1661,11 +1661,16 @@ def generate_driving_plan_summary(conn, data_dir: str) -> dict[str, Any]:
     Args:
         conn: open catalog connection (db.connect).
         data_dir: directory the artifact is written to (alongside cities.json.gz).
+        today: the date every plan window and capture date is judged against.
+            Defaults to the local calendar date; tests pin it, because a
+            fixture window that is open today is closed a few months later
+            (issue #458).
 
     Returns:
         The summary dict.
     """
-    today = date.today()
+    if today is None:
+        today = date.today()
     entries = db.get_active_driving_plans(conn, country=None)
     index = plan_match.build_index(entries)
 

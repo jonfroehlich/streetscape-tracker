@@ -107,13 +107,19 @@ STEP = 20
 # which artifacts actually moved — and on a fixture commit that question is the
 # whole review. ``_normalize_for_commit`` below zeroes the gzip mtime and
 # rewrites this field; together they make the directory content-addressed.
-#
-# What is NOT frozen, and is worth knowing before reading a stray one-line
-# diff: ``driving_plan.json.gz`` carries values derived from ``date.today()``
-# (``years_since_newest_capture``, and in principle a verdict whose window has
-# since closed), because ``generate_driving_plan_summary`` reads the clock
-# itself and the fixture runs the REAL summarizer on purpose.
 FIXTURE_GENERATED_AT = "2026-04-20T00:00:00+00:00"
+
+# The date ``driving_plan.json.gz`` judges every plan window and capture age
+# against (issue #458 review).
+#
+# The fixture runs the REAL ``generate_driving_plan_summary`` on purpose, and
+# until #458 that function read the clock itself, so each rebuild rewrote
+# ``years_since_newest_capture`` and, from 2026-11-02, flipped Zerostate's
+# verdict from ``planned_open`` to ``closed`` (its window ends 2026-11-01).
+# The value is the day the committed artifact was generated, so pinning it
+# reproduces those bytes exactly; move it only together with a regenerated
+# fixture and the e2e assertions that read its verdicts.
+FIXTURE_TODAY = date(2026, 9, 21)
 
 # Providers deliberately left OUT of the fixture, each mapped to the reason.
 #
@@ -1066,7 +1072,7 @@ def build():
         # into FIXTURE_DIR (as the real pipeline does).
         summary = generate_aggregate_v2(conn, FIXTURE_DIR)
         generate_streetwalk_manifest(conn, FIXTURE_DIR)
-        generate_driving_plan_summary(conn, FIXTURE_DIR)
+        generate_driving_plan_summary(conn, FIXTURE_DIR, today=FIXTURE_TODAY)
         generate_provider_screen_summary(conn, FIXTURE_DIR)
     finally:
         conn.close()

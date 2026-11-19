@@ -33,7 +33,10 @@ from scripts.recompute_streetwalk_stats import (
 )
 from streetscape_metadata_tracker import db
 from streetscape_metadata_tracker import download_gsv as dg
-from streetscape_metadata_tracker.fileutils import load_city_csv_file
+from streetscape_metadata_tracker.fileutils import (
+    PANDAS_PARSES_FLOATS_EXACTLY,
+    load_city_csv_file,
+)
 from streetscape_metadata_tracker.naming import (
     generate_streetwalk_diff_filename,
     network_cache_path,
@@ -105,7 +108,11 @@ def _graph(extra_edge=False, footway=False, node_offset=0):
 # C float parser puts the CSV's copy of it on the OTHER side, while Python's
 # correctly rounded float() of the same text reproduces the sample exactly --
 # which is why fileutils.load_city_csv_file reads round-trip (#425). The test
-# re-measures this premise.
+# re-measures this premise, and it does NOT hold everywhere: the sample's own
+# float depends on the platform's projection maths, and the parser moves its
+# key only at this exact float (one ULP either way and it does not). It holds
+# on macOS arm64 and held on CI's ubuntu-24.04 image; on ubuntu-26.04 it does
+# not, and the test then reports SKIPPED after its other assertions (#458).
 BOUNDARY_NORTH_LAT = 44.0501200169994
 
 
@@ -546,8 +553,9 @@ def test_a_sample_the_default_parser_would_misplace_is_scored_covered_by_collect
     tmp_path, monkeypatch, capsys, provider
 ):
     """A REAL collector run whose one boundary sample pandas' default C float
-    parser would read one ULP across quantize_coord's half-way point (issue
-    #425). The loader reads round-trip, so the collector's key join hits it and
+    parser (before pandas 3.1, and where the searched premise holds) would read
+    one ULP across quantize_coord's half-way point (issue #425). The loader
+    reads round-trip, so the collector's key join hits it and
     scores that edge covered; the recompute agrees, needing no tolerance-only
     match, and equals a --force collection under the same definition.
 
@@ -562,16 +570,26 @@ def test_a_sample_the_default_parser_would_misplace_is_scored_covered_by_collect
     csv_path = os.path.join(data_dir, before["csv_filename"])
 
     # The premise, measured on this run's own CSV: its text is exact, and the
-    # DEFAULT parser moves exactly one key -- the boundary sample's.
+    # DEFAULT parser of a pandas before 3.1 moves at most one key -- the
+    # boundary sample's.
     samples = generate_samples(dsn.graph_to_edges(ox.load_graphml(graph_path)), 15)
     sample_keys = _keys(samples["lat"], samples["lon"])
     with gzip.open(csv_path, "rt") as fh:
         default = pd.read_csv(fh)
     missed_by_default = set(sample_keys) - set(_keys(default["query_lat"], default["query_lon"]))
-    assert len(missed_by_default) == 1, "pandas' default C parser now round-trips this text"
-    (boundary,) = samples[[k in missed_by_default for k in sample_keys]].itertuples()
-    assert boundary.edge_id == "1_2"
+    (boundary,) = samples[samples["edge_id"] == "1_2"].itertuples()
     assert float(repr(boundary.lat)) == boundary.lat
+    if PANDAS_PARSES_FLOATS_EXACTLY:
+        # pandas >= 3.1: the default parser is exact too, so there is no
+        # misplaced key to defend against and the loader passes no option
+        # (issue #458). The contract below still holds and is still checked.
+        assert missed_by_default == set()
+    else:
+        # Before 3.1 the default parser can move only the boundary sample's
+        # key, and moves it only where the searched premise holds (see
+        # BOUNDARY_NORTH_LAT). Where it does not, the assertions below still
+        # run, and the test ends SKIPPED so the lost guard is visible.
+        assert missed_by_default <= {quantize_coord(boundary.lat, boundary.lon)}
 
     # The contract: the loader hands back every sample's own key.
     loaded = load_city_csv_file(csv_path)
@@ -599,6 +617,17 @@ def test_a_sample_the_default_parser_would_misplace_is_scored_covered_by_collect
     assert recomputed_artifact == _artifact(data_dir, D1, provider=provider)
     edge = next(f for f in recomputed_artifact["features"] if f["properties"]["edge_id"] == "1_2")
     assert edge["properties"]["coverage_fraction"] == 1.0
+
+    if not PANDAS_PARSES_FLOATS_EXACTLY and not missed_by_default:
+        # Everything above passed, but on this platform it would also pass
+        # with the loader's float_precision option removed, so do not report
+        # it as a guard that ran. tests/test_fileutils.py's literal still
+        # guards the option here.
+        pytest.skip(
+            "the boundary sample's key is not moved by the default parser on this "
+            "platform (issue #458), so this run cannot detect a loader that drops "
+            "float_precision; assertions above all passed"
+        )
 
 
 def test_duplicate_csv_rows_are_accepted_and_counted(tmp_path, monkeypatch, capsys):
