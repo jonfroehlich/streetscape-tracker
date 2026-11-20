@@ -891,10 +891,15 @@ rest_weekdays = ["Wed", "Sun"]
 refusal_cooldown_h = 36
 
 # KartaView night allowance (issue #464) -- SHIPPED UNSET, deliberately. When
-# set, it bounds the minutes one run-due spends starting FRESH KartaView crawls
-# (both channels together); tonight's resumes of live checkpoints are reserved
-# out of it first and never held, and a city whose census is cached is never
-# held. A held crawl is no attempt and no failure; the city stays due. It
+# set, FRESH KartaView crawls (both channels together) are held once one
+# run-due's KartaView launches, resumes of live checkpoints INCLUDED, have
+# used it (issue #477: no reserve). A city with a live checkpoint or a cached
+# census is never held, so every resume launched after the allowance is spent
+# runs on top of it: the night can overshoot it by up to one launch per live
+# checkpoint, and the Done line reports those minutes as "over the
+# allowance". A dead checkpoint (7 days or older, or unstamped) is held as the
+# fresh crawl it is, after the age wall has had its say. A held crawl is no
+# attempt and no failure; the city stays due. It
 # lowers KartaView's nightly volume and launch minutes. It does NOT shorten
 # KartaView's presence span on the Done line: exempt resumes, cached walks,
 # the stranded-walk retry and the fill's KartaView launches still run late.
@@ -904,21 +909,24 @@ refusal_cooldown_h = 36
 #     Enrolled from `scheduler enroll-city --channel kartaview --list`; the
 #     mean is 12,180 grid requests / 313 cities = 38.9 (the RESUMED 2026-11-09
 #     note above). At ~853 enrolled: ~400 requests/day = ~267 min at 1.5/min.
-#   R, live checkpoints tonight, from `run-due --dry-run`'s ALLOWANCE line.
+#   R, live checkpoints tonight, from `run-due --dry-run`'s ALLOWANCE line;
+#     R x ~25 min is the worst case the night runs past the allowance.
 # Nights to drain = backlog requests / (1.5 x A - S); S already counts resumed
 # launches. Below S (in minutes) the backlog NEVER drains and KartaView
 # refreshes miss their cycle: permanent holes. 360 is ~1.35 x S: 540 - 400 =
-# 140 requests a night, ~2 months; if R x ~24.7 min exceeds A, fresh crawls
-# get nothing and the drain stalls until the resumers finish. Cities
+# 140 requests a night, ~2 months; resumes are charged inside A, so if the
+# resumes a night reaches first already use A, fresh crawls get nothing and
+# the drain stalls until the resumers finish. Cities
 # first collected from 2026-08-28 come due again from ~2026-11-19, so S
 # arrives during the drain. Recommended: S plus a backlog margin, ~420-480 on
-# today's numbers; if R x ~24.7 min is at or above the candidate, leave it
+# today's numbers; read the first nights' "over the allowance" minutes, and if
+# A plus them is more than the night can give KartaView, lower A or leave it
 # unset and measure KartaView minutes from the child logs first. The minutes
 # it frees go to other hosts within their own budgets and holds (Panoramax
 # and Overpass included), so set it outside #405's measurement window or
 # record it there as a confounder.
-# BEFORE SETTING IT, land #477: the resume reserve is never reconciled against
-# actual launches, and a checkpoint the child will discard still exempts its city.
+# #477 (the two blockers recorded here) removed the resume reserve and the
+# dead-checkpoint exemption; size the value from a prod `run-due --dry-run`.
 # [hosts.kartaview]
 # max_night_minutes = 480
 
