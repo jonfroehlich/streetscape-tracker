@@ -1,0 +1,106 @@
+{
+ "_about": {
+  "generated_by": "scripts/mapillary_discovery_rescore/overlaps_tranche4.py",
+  "catalog_snapshot": "production, exported read-only 2026-11-05, plus tranche 3's registration grids from mapillary-discovery-screen_tranche3_overlaps.json"
+ },
+ "rows": [
+  {
+   "geonameid": "5245193",
+   "city": "Beaver Dam",
+   "grid": [
+    43.473321,
+    -88.824776,
+    6371,
+    9754
+   ],
+   "catalog_overlaps": {},
+   "nearest_catalog": "lowell--wisconsin--united-states",
+   "nearest_catalog_km": 13.176,
+   "gsv_lattice_points": 155672
+  },
+  {
+   "geonameid": "5259169",
+   "city": "Lake Geneva",
+   "grid": [
+    42.58032,
+    -88.42649,
+    5401,
+    7727
+   ],
+   "catalog_overlaps": {
+    "como--wisconsin--united-states": 0.057
+   },
+   "nearest_catalog": "como--wisconsin--united-states",
+   "nearest_catalog_km": 4.609,
+   "gsv_lattice_points": 104877,
+   "nearest_earlier_row": "Beaver Dam",
+   "nearest_earlier_row_km": 103.065
+  },
+  {
+   "geonameid": "5279098",
+   "city": "Williams Bay",
+   "grid": [
+    42.580361,
+    -88.545174,
+    4273,
+    3801
+   ],
+   "catalog_overlaps": {},
+   "nearest_catalog": "como--wisconsin--united-states",
+   "nearest_catalog_km": 6.12,
+   "gsv_lattice_points": 40874,
+   "nearest_earlier_row": "Lake Geneva",
+   "nearest_earlier_row_km": 9.373
+  },
+  {
+   "geonameid": "5254150",
+   "city": "Genoa City",
+   "grid": [
+    42.511852,
+    -88.323158,
+    4261,
+    3803
+   ],
+   "catalog_overlaps": {
+    "tranche3:Pell Lake": 0.113
+   },
+   "nearest_catalog": "tranche3:Pell Lake",
+   "nearest_catalog_km": 4.795,
+   "gsv_lattice_points": 40874,
+   "nearest_earlier_row": "Lake Geneva",
+   "nearest_earlier_row_km": 12.165
+  },
+  {
+   "geonameid": "5277801",
+   "city": "Walworth",
+   "grid": [
+    42.531491,
+    -88.587745,
+    3548,
+    2541
+   ],
+   "catalog_overlaps": {},
+   "nearest_catalog": "delavan-lake--wisconsin--united-states",
+   "nearest_catalog_km": 6.491,
+   "gsv_lattice_points": 22784,
+   "nearest_earlier_row": "Williams Bay",
+   "nearest_earlier_row_km": 7.057
+  },
+  {
+   "geonameid": "5024719",
+   "city": "Duluth",
+   "grid": [
+    46.764865,
+    -92.110708,
+    29108,
+    25725
+   ],
+   "catalog_overlaps": {},
+   "nearest_catalog": "carlton--minnesota--united-states",
+   "nearest_catalog_km": 26.709,
+   "gsv_lattice_points": 1873872,
+   "nearest_earlier_row": "Beaver Dam",
+   "nearest_earlier_row_km": 449.068
+  }
+ ]
+}

@@ -1,0 +1,3 @@
+n,city,geonameid,geocode_query,osm_match,center_lat,center_lon,width_m,height_m,gsv_points,gsv_streets_samples,mapillary_z14_tiles,kartaview_requests,panoramax_z15_tiles,offset_km,center,flags
+1,Walworth,5277801,"Walworth, Walworth County, Wisconsin, United States",boundary/administrative,42.531491,-88.587745,3548,2541,22784,4477,9,10,20,1.0,geocoded,
+2,Walworth,5277801,,,,,,,,,,,,,,FAILED: geocoded center is 20 km from the GeoNames coordinates (> 10 km) — likely a province centroid; re-run with --center-from-geonames or fix by hand
