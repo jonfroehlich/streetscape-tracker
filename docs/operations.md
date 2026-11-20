@@ -848,7 +848,8 @@ python scripts/register_frame.py --manifest mapillary_discovery_cities_tranche4.
   Lake Geneva's GeoNames point is 4.61 km from Como's frozen centre (tranche 2), and Genoa City's is 4.80 km from Pell Lake's (tranche 3); 3 km leaves every margin at least 1.5 km of headroom (`_tranche4_overlaps.json`, pinned by the manifest's test).
   The nearest in-batch pair is Walworth, 7.06 km from Williams Bay's vetted centre.
   The dry run since #460 warns about a row within `--overlap-km` + `--max-center-km` (13 km) of an earlier one by manifest points, so expect `WARNING` lines for Williams Bay (8.9 km from Lake Geneva) and Walworth (7.1 km from Williams Bay).
-  The two binding margins run from a GeoNames point to a centre already frozen, so no geocode on the day can move them; the only margin a geocode can move is in-batch, and it would take more than 4 km of drift to close.
+  Neither binding margin depends on a geocode made on the day; the only margin one can move is in-batch, and it would take more than 4 km of drift to close.
+  Como's centre is the frozen one from the 2026-11-05 snapshot; Pell Lake's is tranche 3's VETTED centre, since that snapshot predates its registration, and the boundary audit can move a frozen centre away from a vetted one.
   So a nonzero `reused-existing` means the catalog holds a city within 3 km that the overlap record's catalog did not; stop and find which.
 - `--max-center-km 10`: every row geocoded 0.4–2.1 km from its GeoNames point at vetting.
   Walworth carries a county-qualified query, because the bare name matched Walworth County, 16 km off.
@@ -864,13 +865,16 @@ Duluth's fresh crawl (718 requests) is also over the 222-request window a fresh 
 `enable-city` never overwrites a membership that is already set, and an exclusion can be pre-set on a disabled city:
 
 ```bash
+echo $IDS | wc -w   # 6; an empty $IDS makes the loop a silent no-op, so re-derive it as in step 3 if this is a new shell
 for c in $IDS; do
   python -m streetscape_metadata_tracker.scheduler --config config/scheduler.makelab1.toml enroll-city "$c" --channel kartaview --remove
   python -m streetscape_metadata_tracker.scheduler --config config/scheduler.makelab1.toml enroll-city "$c" --channel kartaview_streets --remove
 done
 ```
 
-`$IDS` is the audit step's id list; confirm afterwards with `enroll-city --channel kartaview --list --excluded`.
+`$IDS` is the audit step's id list.
+Confirm afterwards with `scheduler --config config/scheduler.makelab1.toml enroll-city --channel kartaview --list --excluded`, and the same for `kartaview_streets`: each must list all six ids.
+Step 5's `enable-city --dry-run` must then report both KartaView channels as already set, not as enrolled; stop if it says otherwise.
 Clear the exclusions (`--clear`) when KartaView widening resumes.
 
 **5. Enable, one night at a time; then freeze the networks** exactly as tranche 2's steps 4 and 5.

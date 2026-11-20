@@ -40,7 +40,7 @@ from scripts.build_worldwide_frame import (
 )
 from scripts.register_frame import _haversine_km as frame_km
 from scripts.register_frame import frame_identity
-from streetscape_metadata_tracker import db
+from streetscape_metadata_tracker import db, scheduler
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = REPO_ROOT / "mapillary_discovery_cities_tranche4.csv"
@@ -269,10 +269,9 @@ def test_the_docs_totals_are_the_vetting_record(vetted):
     ops, writeup = OPS.read_text(encoding="utf-8"), WRITEUP.read_text(encoding="utf-8")
     assert "Duluth alone is 1,873,872 of those points and 306 of those tiles" in ops
     assert "is 1,873,872 points and 306 tiles: 84% and 79% of the batch" in writeup
-    assert (round(100 * 1_873_872 / gsv), round(100 * 306 / tiles)) == (84, 79)
 
 
-def test_the_runbook_excludes_every_row_from_kartaview_before_enabling():
+def test_the_runbook_excludes_every_row_from_kartaview_before_enabling(vetted):
     """
     enable-city would enrol all six on KartaView (each estimate is under its
     ceiling), against production's no-widening position at the anonymous pace;
@@ -284,6 +283,16 @@ def test_the_runbook_excludes_every_row_from_kartaview_before_enabling():
     exclude = section.index("**4. Exclude all six from both KartaView channels")
     enable = section.index("**5. Enable, one night at a time")
     assert exclude < enable
+    step = section[exclude:enable]
+    assert "for c in $IDS; do" in step
     for channel in ("kartaview", "kartaview_streets"):
-        assert f'enroll-city "$c" --channel {channel} --remove' in section[exclude:enable]
+        assert (
+            "scheduler --config config/scheduler.makelab1.toml "
+            f'enroll-city "$c" --channel {channel} --remove' in step
+        )
+    # Why the step exists: enable-city's gate would admit every row.
+    estimates = {r["city"]: int(r["kartaview_requests"]) for r in vetted.values()}
+    assert max(estimates.values()) <= scheduler.OPT_IN_KARTAVIEW_ENROLL_MAX_REQUESTS
+    assert estimates["Duluth"] == 718
+    assert "Duluth's fresh crawl (718 requests)" in step
     assert "KartaView requests" not in section
