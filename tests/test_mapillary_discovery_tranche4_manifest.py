@@ -38,6 +38,7 @@ from scripts.build_worldwide_frame import (
     load_countries,
     query_string,
 )
+from scripts.register_frame import _haversine_km as frame_km
 from scripts.register_frame import frame_identity
 from streetscape_metadata_tracker import db
 
@@ -68,7 +69,8 @@ QUERY_OVERRIDES = {"5277801": "Walworth, Walworth County, Wisconsin, United Stat
 SUPPLEMENT_IDS = {"5259169", "5279098", "5254150", "5277801"}
 
 # The runbook's --overlap-km, and the headroom every reuse margin must keep
-# above it (tranche 3's rule: a geocode may drift on the day).
+# above it (tranche 3's figure, kept as plain conservatism: the binding margins
+# here run to centres already frozen, which no geocode on the day can move).
 OVERLAP_KM = 3.0
 HEADROOM_KM = 1.5
 
@@ -171,6 +173,9 @@ def test_walworths_bare_query_is_recorded_as_the_county(manifest_rows):
     with open(VET, encoding="utf-8") as f:
         first = {r["geonameid"]: r for r in csv.DictReader(f)}
     assert first["5277801"]["width_m"] == ""
+    with open(VET_RETRY, encoding="utf-8") as f:
+        retried = {r["geonameid"] for r in csv.DictReader(f)}
+    assert retried == set(QUERY_OVERRIDES)
     assert "16 km from the GeoNames coordinates" in first["5277801"]["flags"]
 
 
@@ -197,6 +202,21 @@ def test_registration_reuse_margins_leave_headroom_at_the_runbooks_radius(
         r["nearest_earlier_row_km"] for r in overlap_rows.values() if "nearest_earlier_row_km" in r
     ]
     assert min(margins) >= OVERLAP_KM + HEADROOM_KM
+    # The in-batch margins, recomputed with register_frame's own haversine from
+    # the committed manifest points and vetted centres rather than trusted.
+    earlier = []
+    for row in manifest_rows:
+        lat, lon = float(row["lat"]), float(row["lon"])
+        if earlier:
+            name, km = min(
+                ((n, frame_km(lat, lon, clat, clon)) for n, clat, clon in earlier),
+                key=lambda x: x[1],
+            )
+            recorded = overlap_rows[row["geonameid"]]
+            assert recorded["nearest_earlier_row"] == name, row["city"]
+            assert recorded["nearest_earlier_row_km"] == pytest.approx(km, abs=0.001), row["city"]
+        v = vetted[row["geonameid"]]
+        earlier.append((row["city"], float(v["center_lat"]), float(v["center_lon"])))
     # The margin that sets the radius: tranche 3's 4 km would leave 0.6 km.
     lake_geneva = overlap_rows["5259169"]
     assert lake_geneva["nearest_catalog"] == "como--wisconsin--united-states"
@@ -226,18 +246,13 @@ def test_the_runbooks_night_table_is_the_vetting_record(manifest_rows, vetted):
     ops = OPS.read_text(encoding="utf-8")
     for night, names in NIGHTS.items():
         rows = [vetted[by_name[n]] for n in names.split(", ")]
-        gsv, tiles, kv, px = (
+        gsv, tiles, px = (
             sum(int(r[k]) for r in rows)
-            for k in (
-                "gsv_points",
-                "mapillary_z14_tiles",
-                "kartaview_requests",
-                "panoramax_z15_tiles",
-            )
+            for k in ("gsv_points", "mapillary_z14_tiles", "panoramax_z15_tiles")
         )
         line = (
             f"| {night} | {names} | {gsv:,} ({gsv / 48000 / 60:.2f}) | {tiles} | "
-            f"≤ {kv:,} | ≤ {px:,} ({round(px / 60)}) |"
+            f"≤ {px:,} ({round(px / 60)}) |"
         )
         assert line in ops, line
 
@@ -251,4 +266,24 @@ def test_the_docs_totals_are_the_vetting_record(vetted):
     for path in (OPS, WRITEUP):
         text = path.read_text(encoding="utf-8")
         assert "2,238,953 GSV grid points and 388 Mapillary z14 tiles" in text, path.name
-        assert "1,873,872" in text and "306" in text, path.name
+    ops, writeup = OPS.read_text(encoding="utf-8"), WRITEUP.read_text(encoding="utf-8")
+    assert "Duluth alone is 1,873,872 of those points and 306 of those tiles" in ops
+    assert "is 1,873,872 points and 306 tiles: 84% and 79% of the batch" in writeup
+    assert (round(100 * 1_873_872 / gsv), round(100 * 306 / tiles)) == (84, 79)
+
+
+def test_the_runbook_excludes_every_row_from_kartaview_before_enabling():
+    """
+    enable-city would enrol all six on KartaView (each estimate is under its
+    ceiling), against production's no-widening position at the anonymous pace;
+    the runbook pre-sets the exclusion on both channels, before the enable step.
+    """
+    ops = OPS.read_text(encoding="utf-8")
+    section = ops[ops.index("fourth tranche (`mapillary_discovery_cities_tranche4.csv`)") :]
+    section = section[: section.index("\n## ")]
+    exclude = section.index("**4. Exclude all six from both KartaView channels")
+    enable = section.index("**5. Enable, one night at a time")
+    assert exclude < enable
+    for channel in ("kartaview", "kartaview_streets"):
+        assert f'enroll-city "$c" --channel {channel} --remove' in section[exclude:enable]
+    assert "KartaView requests" not in section
