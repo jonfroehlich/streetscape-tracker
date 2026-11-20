@@ -19,6 +19,8 @@ python scripts/mapillary_discovery_rescore/tier3.py "$W" docs/experiments/mapill
 python scripts/build_mapillary_discovery_tranche3.py                                  # the manifest, from the committed record
 
 python scripts/mapillary_discovery_rescore/overlaps.py "$T/prod_snapshot.csv" docs/experiments/mapillary-discovery-screen_tranche3_overlaps.json
+# tranche 4 (curated, no re-score): the same facts on its vetted grids, catalog = that snapshot plus tranche 3's grids
+python scripts/mapillary_discovery_rescore/overlaps_tranche4.py "$T/prod_snapshot.csv" docs/experiments/mapillary-discovery-screen_tranche4_overlaps.json
 
 # grid fits for Kuna, Magna and Carmel-by-the-Sea (K holds <town>_poly.json and tiger/tl_2024_*_roads.zip)
 K=$T/boundaries
