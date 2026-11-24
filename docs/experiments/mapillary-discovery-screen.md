@@ -238,6 +238,43 @@ In lattice counts (`overlaps.json`, `gsv_lattice_points`), with the fits the tra
 Measured on the registration grids (fitted for the three above) against the 2026-11-05 catalog snapshot (`catalog_overlaps`): Magna's fitted grid lies 69% inside West Valley City's and 39% inside Salt Lake City's, Rio Linda's 47% inside Sacramento's, White City's 17% inside Cottonwood Heights', and four more overlap a neighbour by 1–7% (Fair Oaks with Orangevale, Royal Kunia with Honolulu, Delavan with tranche 2's Delavan Lake, Belmont with Foster City).
 Overlap is allowed, but each grid is its own census: none of these shares its neighbour's Mapillary tile downloads, because the census cache keys on geometry.
 
+## Tranche 4 (2026-11-19): six places from one uploader's sweep, unscreened
+
+A curated batch, not a ranked one, and the least-evidenced tranche so far.
+Tranche 2 admitted three of `GIS_ISG`'s towns by operator exception (Fergus Falls, Delavan Lake, Como) and tranche 3 ranked two more (Delavan, Pell Lake).
+On 2026-11-19 a finer time-windowed sweep of that one account's uploads was read for places where a whole town, not a corridor, had been driven.
+Six of the places it named were not in the catalog, and all six are in `mapillary_discovery_cities_tranche4.csv`:
+
+| Place | Capture window, as the sweep reported it | Why it is here |
+|---|---|---|
+| Beaver Dam, WI | 2026-08-20 | whole town, one day |
+| Lake Geneva, Williams Bay, Genoa City, Walworth, WI | 2025-12-02 to 12-03 | the Walworth County drive that also covered Delavan |
+| Duluth, MN | 2025-10-20 to 10-31 | **parts only**; included by the owner's decision, not on the sweep's evidence |
+
+**What is NOT established, and why this section quotes no image counts.**
+The capture windows above are the sweep's own report and have no committed record either; they are kept because they are why each place was picked, and are not a measurement of this writeup's.
+The sweep's raw output and its script are not committed and were not re-run for this batch, so its per-place image counts (lower bounds: some time windows hit the API's 2,000-image page limit) are deliberately left out rather than quoted without a committed record.
+None of the six has had a two-way-pass check, a street-coverage estimate or a capture-gap check.
+Whether these were driven in both directions is unknown, and Laurens' walk result is no guide to it.
+Unlike tranche 3 there is no score, so no advance prediction is recorded; each town's first Mapillary road walk is the measurement, and a low one is an expected outcome for Duluth in particular.
+
+### Geometry and price
+
+Vetted on 2026-11-19 with `scripts/vet_manifest_geometry.py` (Nominatim only): [`mapillary-discovery-screen_tranche4_vet.csv`](mapillary-discovery-screen_tranche4_vet.csv), and [`mapillary-discovery-screen_tranche4_vet_retry.csv`](mapillary-discovery-screen_tranche4_vet_retry.csv) for Walworth.
+Its bare query resolved 16 km from the GeoNames point, a second try, "Village of Walworth, Wisconsin, United States", resolved 20 km off (the retry file's failed row, whose query the tool does not record), and the county-qualified query resolved 1.0 km off.
+All six resolved on an administrative boundary, 0.4–2.1 km from their GeoNames points, none flagged.
+One collection of all six is 2,238,953 GSV grid points and 388 Mapillary z14 tiles, of which Duluth's 29.1 x 25.7 km grid is 1,873,872 points and 306 tiles: 84% and 79% of the batch.
+Duluth's grid is the bounding rectangle of its municipal boundary; it was not street-fitted, because where the driven parts lie is exactly what is unknown.
+That rectangle spans latitude 46.65 to 46.88 and longitude -92.30 to -91.92, so it contains Superior, Wisconsin (GeoNames 46.72077, -92.10408, population 26,579), a separate city in another state.
+Duluth's grid coverage and its walk's street-km denominator will therefore both include Superior, and a low Mapillary figure for "Duluth" may be Superior's streets.
+
+### Overlaps with grids already tracked
+
+From [`mapillary-discovery-screen_tranche4_overlaps.json`](mapillary-discovery-screen_tranche4_overlaps.json) (`generated_by`: `scripts/mapillary_discovery_rescore/overlaps_tranche4.py`), against the 2026-11-05 catalog snapshot plus tranche 3's registration grids as vetted (that snapshot predates tranche 3, so Pell Lake's grid here is its vetted one, not read back from production):
+5.7% of Lake Geneva's grid lies inside Como's and 11.3% of Genoa City's inside Pell Lake's; the other four overlap nothing.
+The nearest catalog centre to any row is Como's, 4.61 km from Lake Geneva's GeoNames point, which is why the runbook registers at `--overlap-km 3`.
+That catalog omits the two cities registered between 2026-11-05 and 2026-11-19 outside tranche 3 (neither in Wisconsin or Minnesota), so the production dry run is the authoritative reuse check.
+
 ## Caveats
 
 - **Screening signal, never coverage.** z6 geometry is simplified, so lengths are approximate, and length says nothing about which streets were driven. A walk is the only measurement.

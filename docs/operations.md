@@ -825,6 +825,76 @@ The KartaView and Panoramax columns are upper bounds: they use the vetted grids 
 Both KartaView channels were paused on production from 2026-10-23 to 2026-11-09 (#452), so for a tranche enabled in that window the KartaView column was enrolment, not collection, until the resume.
 Before night 2, read night 1's log as for tranche 2: every tranche city collected (or paused at a cap, exit 83), no Mapillary refusal or throttle (exit 75 or 87), no Overpass latch.
 
+## Registering the Mapillary discovery screen's fourth tranche (`mapillary_discovery_cities_tranche4.csv`)
+
+Six places from one uploader's sweep: five Wisconsin towns and Duluth, Minnesota.
+The selection and what is not yet known about it are in [`experiments/mapillary-discovery-screen.md`](experiments/mapillary-discovery-screen.md) ("Tranche 4").
+Landed the same way as the third tranche, without its street-fitting step.
+Every write below is gated: no `run-due` in flight, the night's `Done:` line in the scheduler log, and the owner's OK before `enable-city`.
+
+**1. Deploy a `main` that contains the manifest**, as for tranche 2.
+
+**2. Register, disabled.**
+
+```bash
+DATA=/projects/makeabilitylab/streetscape-tracker/data
+python scripts/register_frame.py --manifest mapillary_discovery_cities_tranche4.csv \
+    --db-path "$DATA/streetscape_tracker.db" \
+    --notes-label "mapillary discovery screen 2026-11-19 tranche 4" --overlap-km 3 --max-center-km 10
+# read the dry run: every row "-> NEW", and "newly-registered=6 failed=0"; then the same with --execute
+```
+
+- `--overlap-km 3`, not tranche 3's 4.
+  Lake Geneva's GeoNames point is 4.61 km from Como's frozen centre (tranche 2), and Genoa City's is 4.80 km from Pell Lake's (tranche 3); 3 km leaves every margin at least 1.5 km of headroom (`_tranche4_overlaps.json`, pinned by the manifest's test).
+  The nearest in-batch pair is Walworth, 7.06 km from Williams Bay's vetted centre.
+  The dry run since #460 warns about a row within `--overlap-km` + `--max-center-km` (13 km) of an earlier one by manifest points, so expect `WARNING` lines for Williams Bay (8.9 km from Lake Geneva) and Walworth (7.1 km from Williams Bay).
+  Neither binding margin depends on a geocode made on the day; the only margin one can move is in-batch, and it would take more than 4 km of drift to close.
+  Como's centre is the frozen one from the 2026-11-05 snapshot; Pell Lake's is tranche 3's VETTED centre, since that snapshot predates its registration, and the boundary audit can move a frozen centre away from a vetted one.
+  So a nonzero `reused-existing` means the catalog holds a city within 3 km that the overlap record's catalog did not; stop and find which.
+- `--max-center-km 10`: every row geocoded 0.4–2.1 km from its GeoNames point at vetting.
+  Walworth carries a county-qualified query, because the bare name matched Walworth County, 16 km off.
+- Each `--execute` line prints the frozen W x H; compare it with `docs/experiments/mapillary-discovery-screen_tranche4_vet*.csv` and stop on any difference.
+
+**3. Audit the boundaries**: tranche 2's step 3 verbatim, with the label `'mapillary discovery screen 2026-11-19 tranche 4%'`, the directory `audit/mdt4`, and 6 ids.
+Read the plan before `--execute`: a RESIZE changes that town's price (re-price it as tranche 2's step 3 says).
+
+**4. Exclude all six from both KartaView channels, while they are still disabled.**
+`enable-city` would otherwise enrol every one of them on KartaView, since each estimate is under its 1,000-request ceiling.
+Production's standing position is that no city beyond the set already enrolled joins KartaView at the anonymous 1.5/min (`config/scheduler.makelab1.toml`, above `[providers.kartaview]`; [`experiments/kartaview-endpoint-move.md`](experiments/kartaview-endpoint-move.md)).
+Duluth's fresh crawl (718 requests) is also over the 222-request window a fresh KartaView crawl must fit, so it would be skipped at every launch and never collected.
+`enable-city` never overwrites a membership that is already set, and an exclusion can be pre-set on a disabled city:
+
+```bash
+echo $IDS | wc -w   # 6; an empty $IDS makes the loop a silent no-op, so re-derive it as in step 3 if this is a new shell
+for c in $IDS; do
+  python -m streetscape_metadata_tracker.scheduler --config config/scheduler.makelab1.toml enroll-city "$c" --channel kartaview --remove
+  python -m streetscape_metadata_tracker.scheduler --config config/scheduler.makelab1.toml enroll-city "$c" --channel kartaview_streets --remove
+done
+```
+
+`$IDS` is the audit step's id list.
+Confirm afterwards with `scheduler --config config/scheduler.makelab1.toml enroll-city --channel kartaview --list --excluded`, and the same for `kartaview_streets`: each must list all six ids.
+Step 5's `enable-city --dry-run` must then report both KartaView channels as already set, not as enrolled; stop if it says otherwise.
+Clear the exclusions (`--clear`) when KartaView widening resumes.
+
+**5. Enable, one night at a time; then freeze the networks** exactly as tranche 2's steps 4 and 5.
+Never enable for a night whose UTC snapshot date is a Mapillary rest day (`[hosts.mapillary_tiles].rest_weekdays`, Wed and Sun on prod).
+
+**6. Pricing, and the nights.**
+One collection of all six is 2,238,953 GSV grid points and 388 Mapillary z14 tiles; the Mapillary walks are free on a paired night (#290).
+Duluth alone is 1,873,872 of those points and 306 of those tiles, so it gets its own night, after the five towns have shown a clean one:
+
+| Night | Cities | GSV points (h at 48k/min) | Mapillary tiles | Panoramax tiles (min at 60/min) |
+|---|---|---|---|---|
+| 1 | Walworth, Williams Bay, Genoa City, Lake Geneva, Beaver Dam | 365,081 (0.13) | 82 | ≤ 240 (4) |
+| 2 | Duluth | 1,873,872 (0.65) | 306 | ≤ 1,152 (19) |
+
+Mapillary is priced against the rolling-24 h tile pool (`[hosts.mapillary_tiles]`, #444), which also has to hold that night's due Mapillary demand; read `scheduler status` for the pool's room on the day rather than quoting a figure from here.
+The Panoramax column is an upper bound: the pair is enrolled only on a nonzero one-city screen.
+There is no KartaView column because step 4 excludes it.
+Duluth's GSV grid run (1,873,872 points) is its largest cost and is non-resumable: #373 defers it on a night whose remainder cannot hold it, and a deferred first channel defers the whole city.
+Before night 2, read night 1's log as for tranche 2: every tranche city collected (or paused at a cap, exit 83), no Mapillary refusal or throttle (exit 75 or 87), no Overpass latch.
+
 ## Keeping Overpass out of the night: `scripts/prefreeze_street_networks.py` (issue #341)
 
 A road walk on a frozen network never contacts Overpass — `fetch_graph` returns the cached GraphML before it takes the host lock or probes — and only a city's *first* walk fetches one.

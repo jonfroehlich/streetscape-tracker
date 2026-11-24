@@ -1,0 +1,7 @@
+query_string,city,admin,iso2,country,continent,size_band,population,coverage_regime,geonameid,lat,lon
+"Beaver Dam, Wisconsin, United States",Beaver Dam,Wisconsin,US,United States,NA,,16564,,5245193,43.45777,-88.83733
+"Lake Geneva, Wisconsin, United States",Lake Geneva,Wisconsin,US,United States,NA,,7778,,5259169,42.59168,-88.43343
+"Williams Bay, Wisconsin, United States",Williams Bay,Wisconsin,US,United States,NA,,2600,,5279098,42.57807,-88.54093
+"Genoa City, Wisconsin, United States",Genoa City,Wisconsin,US,United States,NA,,3029,,5254150,42.49835,-88.32815
+"Walworth, Walworth County, Wisconsin, United States",Walworth,Wisconsin,US,United States,NA,,2838,,5277801,42.53113,-88.59955
+"Duluth, Minnesota, United States",Duluth,Minnesota,US,United States,NA,,86110,,5024719,46.78327,-92.10658

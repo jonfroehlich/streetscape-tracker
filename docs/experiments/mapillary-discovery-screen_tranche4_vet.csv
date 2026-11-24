@@ -1,0 +1,7 @@
+n,city,geonameid,geocode_query,osm_match,center_lat,center_lon,width_m,height_m,gsv_points,gsv_streets_samples,mapillary_z14_tiles,kartaview_requests,panoramax_z15_tiles,offset_km,center,flags
+1,Beaver Dam,5245193,"Beaver Dam, Wisconsin, United States",boundary/administrative,43.473321,-88.824776,6371,9754,155672,30864,35,63,96,2.0,geocoded,
+2,Lake Geneva,5259169,"Lake Geneva, Wisconsin, United States",boundary/administrative,42.58032,-88.42649,5401,7727,104877,20727,20,43,63,1.4,geocoded,
+3,Williams Bay,5279098,"Williams Bay, Wisconsin, United States",boundary/administrative,42.580361,-88.545174,4273,3801,40874,8066,9,21,25,0.4,geocoded,
+4,Genoa City,5254150,"Genoa City, Wisconsin, United States",boundary/administrative,42.511852,-88.323158,4261,3803,40874,8048,9,21,36,1.6,geocoded,
+5,Walworth,5277801,,,,,,,,,,,,,,FAILED: geocoded center is 16 km from the GeoNames coordinates (> 10 km) — likely a province centroid; re-run with --center-from-geonames or fix by hand
+6,Duluth,5024719,"Duluth, Minnesota, United States",boundary/administrative,46.764865,-92.110708,29108,25725,1873872,371905,306,718,1152,2.1,geocoded,
