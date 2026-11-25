@@ -445,3 +445,88 @@ def test_the_writeups_overlaps_are_the_overlap_records():
         "(Fair Oaks with Orangevale, Royal Kunia with Honolulu, Delavan with tranche 2's "
         "Delavan Lake, Belmont with Foster City)"
     ) in text
+
+
+# ── The advance prediction's outcome (scripts/mapillary_discovery_tranche3_outcome.py) ──
+
+OUTCOME = EXP / "mapillary-discovery-screen_tranche3_outcome.json"
+
+
+def _walks(manifest_rows, overrides=None, drop=()):
+    """One passing walk per manifest town, with per-town (coverage, age) overrides."""
+    import pandas as pd
+
+    rows = []
+    for i, row in enumerate(manifest_rows):
+        if i in drop:
+            continue
+        coverage, age = (overrides or {}).get(i, (80.0, 1.0))
+        rows.append(
+            {
+                "city_id": db.derive_city_id(*frame_identity(row)),
+                "run_date": "2026-11-12",
+                "coverage_pct_by_length": coverage,
+                "median_covered_age_years": age,
+                "length_km": 100.0,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def test_outcome_strict_bar_is_inclusive_at_fifty_percent_and_two_years(manifest_rows):
+    from scripts import mapillary_discovery_tranche3_outcome as oc
+
+    edge = {0: (50.0, 2.0), 1: (49.99, 1.0), 2: (90.0, 2.001), 3: (10.0, 9.0)}
+    got = oc.outcome(manifest_rows, _walks(manifest_rows, edge), falsified_below=19)
+    towns = got["towns"]
+    assert [t["strict"] for t in towns[:4]] == [True, False, False, False]
+    assert (got["n"], got["walked"], got["strict_hits"]) == (25, 25, 22)
+    assert got["coverage_at_least_50pct"] == 23
+    assert got["missed_on_coverage"] == sorted([towns[1]["city_id"], towns[3]["city_id"]])
+    assert got["missed_on_age_only"] == [towns[2]["city_id"]]
+    assert got["verdict"] == "held"
+
+
+def test_outcome_verdict_turns_on_the_recorded_floor_and_waits_for_every_walk(manifest_rows):
+    from scripts import mapillary_discovery_tranche3_outcome as oc
+
+    seven_misses = dict.fromkeys(range(7), (10.0, 1.0))
+    assert (
+        oc.outcome(manifest_rows, _walks(manifest_rows, seven_misses), 19)["verdict"] == "falsified"
+    )
+    six_misses = dict.fromkeys(range(6), (10.0, 1.0))
+    assert oc.outcome(manifest_rows, _walks(manifest_rows, six_misses), 19)["verdict"] == "held"
+    # 24 hits of 24 walked is not a result: the 25th town has not been walked
+    partial = oc.outcome(manifest_rows, _walks(manifest_rows, drop={24}), 19)
+    assert (partial["walked"], partial["strict_hits"], partial["verdict"]) == (24, 24, "undecided")
+    assert partial["towns"][24] == {
+        "city_id": EXPECTED_CITY_IDS[manifest_rows[24]["geonameid"]],
+        "walked": False,
+    }
+
+
+def test_outcome_refuses_a_snapshot_that_cannot_show_first_walks(tmp_path):
+    from scripts import mapillary_discovery_tranche3_outcome as oc
+
+    argv = ["--prod-snapshot", "x", "--snapshot-label", "x", "--out", str(tmp_path / "o.json")]
+    with pytest.raises(SystemExit, match="FIRST"):
+        oc.main([*argv, "--walk-counts", "2"])
+    assert not (tmp_path / "o.json").exists()
+
+
+def test_committed_outcome_is_self_consistent_and_names_the_tranche(manifest_rows):
+    got = json.loads(OUTCOME.read_text())
+    prediction = json.loads(METRICS.read_text())["advance_prediction_tranche3"]
+    assert got["_about"]["prediction"] == prediction
+    assert got["falsified_below"] == prediction["falsified_below"] == 19
+    assert [t["city_id"] for t in got["towns"]] == list(EXPECTED_CITY_IDS.values())
+    assert all(t["walked"] for t in got["towns"])
+    for t in got["towns"]:
+        assert t["strict"] == (
+            t["coverage_pct_by_length"] >= 50 and t["median_covered_age_years"] <= 2
+        ), t["city_id"]
+    assert got["strict_hits"] == sum(t["strict"] for t in got["towns"]) == 20
+    assert got["verdict"] == "held"
+    # the writeup quotes the tally
+    text = WRITEUP.read_text()
+    assert "**20 of the 25**" in text

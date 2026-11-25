@@ -205,6 +205,25 @@ the screened tranches were already selected on V0 ≥ 3, while tranche 3 was sel
 and among *catalog* cities the same threshold gave only 9 strict hits of 30.
 The three re-gridded towns are scored on their fitted grids, since those are what will be walked.
 
+### Outcome (2026-11-25): the prediction held, 20 of 25
+
+Every number here traces to [`mapillary-discovery-screen_tranche3_outcome.json`](mapillary-discovery-screen_tranche3_outcome.json) (`generated_by`: `scripts/mapillary_discovery_tranche3_outcome.py`, over a read-only production snapshot labelled `makelab2-prod-9cd70ec-2026-11-25`).
+All 25 towns were walked between 2026-11-07 and 2026-11-12, and each had exactly one Mapillary drive walk at the snapshot, so its latest walk is its first.
+
+**20 of the 25** met the strict bar, against a falsification line of fewer than 19 and an expectation of 21.7; 22 of the 25 reached 50% coverage.
+The five misses, by reason:
+
+- **Coverage under 50%** (`missed_on_coverage`): Delavan, WI (37.8% at 0.94 yr), Longwood, FL (47.3% at 1.99 yr) and Colton, CA (49.6% at 0.29 yr).
+- **Age over two years, coverage met** (`missed_on_age_only`): North Tustin, CA (56.3% at 2.03 yr) and Worland, WY (61.9% at 2.06 yr).
+
+The five highest coverages (`towns`): east-palo-alto 95.7%, rio-linda 95.4%, belmont 94.9%, stanford 94.6%, evansdale 92.1%.
+
+What this does and does not show:
+the threshold survived the one test it was given, on towns chosen by it;
+it says nothing about places BELOW 0.7, since none was walked, so the selector's recall is as unmeasured as before;
+and one clean tranche at 20 of 25 does not separate the observed 0.87 rate from, say, 0.75.
+Delavan is the caution for anything picked by uploader alone: the ranked record names its top uploader as `GIS_ISG`, the account whose Laurens sweep is this screen's reference, and it walked at 37.8%.
+
 ### Grids fitted to the streets
 
 Registration sizes a grid from the geocoded boundary.

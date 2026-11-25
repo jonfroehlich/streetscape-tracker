@@ -1201,3 +1201,38 @@ def test_a_stale_sample_cache_is_rebuilt_not_trusted(tmp_path):
     np.savez(raw / "samples.npz", **z)
     out = _score(tmp_path, raw)
     assert pd.read_csv(out / "places_ranked.csv").name.tolist() == ["Sweptville"]
+
+
+def test_scorer_reports_what_the_collection_cost_and_its_calibration(tmp_path):
+    raw = _score_inputs(tmp_path)
+    log = [
+        {"host": "tiles", "status": 200, "bytes": 10, "token_var": "MAPILLARY_DISCOVERY_ACCESS_TOKEN"},
+        {"host": "tiles", "status": 204, "bytes": 0, "token_var": "MAPILLARY_DISCOVERY_ACCESS_TOKEN"},
+        {"status": 200, "bytes": 30},  # a pre-`host` entry is a tile request
+        {"host": "graph", "status": 200, "creator_id": "7"},
+    ]  # fmt: skip
+    (raw / "request_log.jsonl").write_text("\n".join(json.dumps(e) for e in log) + "\n")
+    town = {
+        "by_zoom": [
+            {"zoom": 6, "pano_recent": 9, "top_creator": 7},
+            {"zoom": 10, "pano_recent": 10, "top_creator": 8},
+        ]
+    }
+    empty = {"by_zoom": [{"zoom": z, "pano_recent": 0, "top_creator": None} for z in (6, 10)]}
+    (raw / "calibration.json").write_text(
+        json.dumps({"r_km": 3.0, "recent_since": "2024-11-25", "towns": {"a": town, "b": empty}})
+    )
+    out = _score(tmp_path, raw)
+    metrics = json.loads((out / "metrics.json").read_text())
+    assert metrics["collection"] == {
+        "by_host_and_status": {"graph:200": 1, "tiles:200": 2, "tiles:204": 1},
+        "tile_bytes": 40,
+        "largest_tile_bytes": 30,
+        "token_vars": ["MAPILLARY_DISCOVERY_ACCESS_TOKEN"],
+    }
+    assert metrics["calibration"]["towns"] == {
+        "a": {"z6_recent_pano": 9, "z10_recent_pano": 10, "ratio": 0.9, "same_top_creator": False},
+        "b": {"z6_recent_pano": 0, "z10_recent_pano": 0, "ratio": None, "same_top_creator": True},
+    }
+    validation = pd.read_csv(out / "validation.csv")
+    assert validation.city_id.tolist() == ["walked"] and not validation.strict[0]

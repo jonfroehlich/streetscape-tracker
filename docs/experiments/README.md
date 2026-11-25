@@ -139,6 +139,15 @@ Three things generalize.
 **(3) Score the unit you will act on.** Connected-cell clusters merged a statewide sweep into one 10,687 km blob; scoring each place from its own point is what ranks towns.
 It also registered its first 25 candidates on production and enabled them the same day, and found that the uploader, not the town, is the unit that generalizes.
 
+### `mapillary-europe-screen.md`
+
+The #383 discovery screen run over Europe (104 z6 tiles, 198 requests, all 200, from a laptop on a separate app's token): 176 uncatalogued places pass the tranche-3 selector, with no population cap.
+**The result is a list to test, not a validated one**: none of the 35 European catalog cities in the scanned tiles meets the strict bar, so the score's precision there is undefined and only a rank correlation (0.695, n = 35) can be quoted.
+Two things generalize.
+**(1) Prove a rewrite against the record before using it somewhere new**: the region-agnostic scorer was first run over the cached US tiles and matched all 105 committed tranche-3 rows to their rounding, and only then pointed at Europe.
+**(2) A validation set with no positives validates nothing**, however many rows it has; say so and let the first tranche be the measurement.
+It also records that z6 keeps a tile twice the densest US one (0.857 to 1.214 of z10's recent 360° sequences around eight city centres).
+
 ### `mapillary-image-quality.md`
 
 Whether Mapillary's per-image `quality_score` — the only visual-quality prediction any provider we collect publishes — can rank Sidewalk candidate cities.

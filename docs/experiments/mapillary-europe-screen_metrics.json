@@ -1,0 +1,191 @@
+{
+ "_about": {
+  "generated_by": "scripts/mapillary_discovery_score.py --raw-dir experiments/mapillary-discovery-europe --places experiments/mapillary-discovery-383/cities500.txt --prod-snapshot experiments/mapillary-discovery-europe/prod_snapshot.csv --scan-date 2026-11-25 --creators experiments/mapillary-discovery-europe/creators.json --out-dir experiments/mapillary-discovery-europe/score",
+  "scan_date": "2026-11-25",
+  "requests": 0
+ },
+ "scan": {
+  "regions": {
+   "europe": [
+    -11.0,
+    34.5,
+    32.0,
+    71.5
+   ]
+  },
+  "zoom": 6,
+  "tiles": 104,
+  "rows": 3570520,
+  "finished_at": "2026-11-25T18:14:40+00:00"
+ },
+ "samples": {
+  "n": 4258699,
+  "km": 693114.8
+ },
+ "collection": {
+  "by_host_and_status": {
+   "graph:200": 86,
+   "tiles:200": 112
+  },
+  "tile_bytes": 414519311,
+  "largest_tile_bytes": 20746184,
+  "token_vars": [
+   "MAPILLARY_DISCOVERY_ACCESS_TOKEN"
+  ]
+ },
+ "calibration": {
+  "r_km": 3.0,
+  "recent_since": "2024-11-25",
+  "towns": {
+   "brussels": {
+    "z6_recent_pano": 1485,
+    "z10_recent_pano": 1600,
+    "ratio": 0.928,
+    "same_top_creator": true
+   },
+   "antwerp": {
+    "z6_recent_pano": 586,
+    "z10_recent_pano": 620,
+    "ratio": 0.945,
+    "same_top_creator": true
+   },
+   "braga": {
+    "z6_recent_pano": 34,
+    "z10_recent_pano": 28,
+    "ratio": 1.214,
+    "same_top_creator": false
+   },
+   "paris": {
+    "z6_recent_pano": 0,
+    "z10_recent_pano": 0,
+    "ratio": null,
+    "same_top_creator": true
+   },
+   "amsterdam": {
+    "z6_recent_pano": 180,
+    "z10_recent_pano": 170,
+    "ratio": 1.059,
+    "same_top_creator": false
+   },
+   "budapest": {
+    "z6_recent_pano": 1397,
+    "z10_recent_pano": 1384,
+    "ratio": 1.009,
+    "same_top_creator": true
+   },
+   "belgrade": {
+    "z6_recent_pano": 24,
+    "z10_recent_pano": 28,
+    "ratio": 0.857,
+    "same_top_creator": true
+   },
+   "zurich": {
+    "z6_recent_pano": 44,
+    "z10_recent_pano": 51,
+    "ratio": 0.863,
+    "same_top_creator": true
+   }
+  }
+ },
+ "v4_of_scored_places": {
+  "p50": 0.0,
+  "p90": 0.1641,
+  "p99": 0.6018,
+  "p99.9": 1.0693
+ },
+ "rules": {
+  "v4_min": 0.7,
+  "top_share_min": 0.6,
+  "foot_share_max": 0.5,
+  "med_age_max": 2.0,
+  "catalog_km_min": 5.0,
+  "thin_km": 5.0,
+  "pop_max": null,
+  "countries": null
+ },
+ "funnel": {
+  "places_scored": 96767,
+  "places_v4_at_least_min": 642,
+  "of_which_inside_a_catalog_grid": 232,
+  "outside_grids_and_beyond_catalog_km_min": 410,
+  "pass_all_rules": 271,
+  "after_thinning": 176
+ },
+ "validation": {
+  "walked_catalog_cities_in_scanned_tiles": 35,
+  "strict_hits": 0,
+  "spearman_v4_vs_walk_coverage": 0.695,
+  "spearman_v0_vs_walk_coverage": 0.637,
+  "at_or_above_v4_min": {
+   "n": 7,
+   "strict_hits": 0
+  },
+  "below_v4_min": {
+   "n": 28,
+   "strict_hits": 0
+  }
+ },
+ "ranked_by_country": {
+  "DE": 37,
+  "BE": 29,
+  "FR": 20,
+  "AT": 17,
+  "PL": 12,
+  "GB": 10,
+  "IT": 9,
+  "GR": 6,
+  "PT": 5,
+  "HR": 5,
+  "NL": 4,
+  "LV": 4,
+  "HU": 3,
+  "SE": 2,
+  "FI": 1,
+  "DK": 1,
+  "BY": 1,
+  "TR": 1,
+  "BG": 1,
+  "RU": 1,
+  "ES": 1,
+  "RS": 1,
+  "IE": 1,
+  "SK": 1,
+  "CH": 1,
+  "MD": 1,
+  "NO": 1
+ },
+ "ranked_by_uploader": {
+  "sogefi": 15,
+  "european-panorama": 14,
+  "Eebie": 8,
+  "konink360": 7,
+  "Planungsgesellschaft_RV-K": 7,
+  "canfe": 6,
+  "usagersactifsrixensart": 5,
+  "Mobilitaetswerk": 5,
+  "Oderradler": 5,
+  "padididejurbise": 5,
+  "osminng": 3,
+  "ursus": 3,
+  "natebus": 3,
+  "nkrolo": 3,
+  "MarksMap": 3,
+  "filohipo": 3,
+  "HPejouan": 2,
+  "southglos": 2,
+  "mcliquid": 2,
+  "Atemiki": 2,
+  "bruno360": 2,
+  "di0v0n": 2,
+  "altaaro": 2,
+  "Davvid23": 2,
+  "inwazjamb": 2
+ },
+ "ranked_population": {
+  "p10": 934.5,
+  "p25": 4134.5,
+  "p50": 11070.0,
+  "p75": 31951.5,
+  "p90": 79639.0
+ }
+}

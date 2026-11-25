@@ -321,6 +321,50 @@ def uploader_record(val: pd.DataFrame) -> pd.DataFrame:
     return own.groupby("top").strict.agg(uploader_walked="count", uploader_strict="sum")
 
 
+def request_summary(raw_dir: Path) -> dict:
+    """What the collection cost, from its own ``request_log.jsonl``: requests by host and status."""
+    log = raw_dir / "request_log.jsonl"
+    if not log.exists():
+        return {}
+    entries = [json.loads(line) for line in log.read_text().splitlines() if line.strip()]
+    by: dict[str, int] = {}
+    for e in entries:
+        key = f"{e.get('host', 'tiles')}:{e['status']}"
+        by[key] = by.get(key, 0) + 1
+    tiles = [e for e in entries if e.get("host", "tiles") == "tiles"]
+    return {
+        "by_host_and_status": dict(sorted(by.items())),
+        "tile_bytes": int(sum(e.get("bytes", 0) for e in tiles)),
+        "largest_tile_bytes": int(max((e.get("bytes", 0) for e in tiles), default=0)),
+        "token_vars": sorted({e["token_var"] for e in entries if e.get("token_var")}),
+    }
+
+
+def calibration_summary(raw_dir: Path) -> dict:
+    """
+    ``collect calibrate``'s result, reduced to what it is for: per town, the
+    recent 360 sequences the screening zoom shows against the finer zoom's.
+    The two tiles cover different ground (the finer one is smaller than the
+    disc), so a ratio above 1 is expected and only a LOW one is a finding.
+    """
+    path = raw_dir / "calibration.json"
+    if not path.exists():
+        return {}
+    cal = json.loads(path.read_text())
+    towns = {}
+    for name, t in cal.get("towns", {}).items():
+        coarse, fine = t["by_zoom"][0], t["by_zoom"][-1]
+        towns[name] = {
+            f"z{coarse['zoom']}_recent_pano": coarse["pano_recent"],
+            f"z{fine['zoom']}_recent_pano": fine["pano_recent"],
+            "ratio": round(coarse["pano_recent"] / fine["pano_recent"], 3)
+            if fine["pano_recent"]
+            else None,
+            "same_top_creator": coarse["top_creator"] == fine["top_creator"],
+        }
+    return {"r_km": cal.get("r_km"), "recent_since": cal.get("recent_since"), "towns": towns}
+
+
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -359,6 +403,11 @@ def main(argv=None) -> int:
     cat_features.to_parquet(out / "catalog_features.parquet")
     val, val_summary = validation(cat_features, walks, args.v4_min)
     print(f"catalog cities in scanned tiles: {len(cat_in)}, walked: {len(val)}", flush=True)
+    val_cols = ["city_id", "v0", "v4", "top_share", "foot_share", "med_age"]
+    val_cols += ["coverage_pct_by_length", "median_covered_age_years", "length_km", "strict"]
+    val.sort_values("v4", ascending=False)[val_cols].round(4).to_csv(
+        out / "validation.csv", index=False
+    )
 
     places = load_places(args.places, tiles, zoom)
     print(f"{len(places):,} places in scanned tiles", flush=True)
@@ -415,6 +464,11 @@ def main(argv=None) -> int:
         },
         "scan": {k: manifest.get(k) for k in ("regions", "zoom", "tiles", "rows", "finished_at")},
         "samples": {"n": int(len(samples)), "km": round(float(samples.km.sum()), 1)},
+        "collection": request_summary(raw),
+        "calibration": calibration_summary(raw),
+        "v4_of_scored_places": {
+            f"p{q}": round(float(places.v4.quantile(q / 100)), 4) for q in (50, 90, 99, 99.9)
+        },
         "rules": rules,
         "funnel": funnel,
         "validation": val_summary,
