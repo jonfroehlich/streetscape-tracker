@@ -1,0 +1,26 @@
+query_string,city,admin,iso2,country,continent,size_band,population,coverage_regime,geonameid,lat,lon
+"Lievendaal, North Brabant, Netherlands",Lievendaal,North Brabant,NL,Netherlands,EU,,3175,,2751615,51.44219,5.43405
+"Keskusta, Joensuu, Finland",Joensuu,North Karelia,FI,Finland,EU,,78398,,655808,62.60118,29.76316
+"Cirie, Piedmont, Italy",Cirie,Piedmont,IT,Italy,EU,,17439,,3178650,45.23486,7.60125
+"Wilten, Tyrol, Austria",Wilten,Tyrol,AT,Austria,EU,,18142,,2761164,47.25829,11.38808
+"Budakalasz, Hungary",Budakalasz,Pest County,HU,Hungary,EU,,1003,,3054651,47.61667,19.05
+"Ballerup, Capital Region, Denmark",Ballerup,Capital Region,DK,Denmark,EU,,40000,,2624341,55.73165,12.36328
+"Szolnok, Jasz-Nagykun-Szolnok, Hungary",Szolnok,Jasz-Nagykun-Szolnok,HU,Hungary,EU,,71285,,715126,47.18066,20.19835
+"Sankt Johann in Tirol, Tyrol, Austria",Sankt Johann in Tirol,Tyrol,AT,Austria,EU,,9428,,2766636,47.5233,12.4232
+"Loerrach, Baden-Wurttemberg, Germany",Loerrach,Baden-Wurttemberg,DE,Germany,EU,,47002,,2875881,47.61497,7.66457
+"Plaisance-du-Touch, Occitanie, France",Plaisance-du-Touch,Occitanie,FR,France,EU,,18501,,2986933,43.56554,1.29645
+"Marupe, Latvia",Marupe,Marupe,LV,Latvia,EU,,19096,,864723,56.90544,24.05113
+"Rixensart, Wallonia, Belgium",Rixensart,Wallonia,BE,Belgium,EU,,21616,,2787989,50.71229,4.52529
+"Boom, Flanders, Belgium",Boom,Flanders,BE,Belgium,EU,,15810,,2801494,51.09242,4.3717
+"Kontich, Flanders, Belgium",Kontich,Flanders,BE,Belgium,EU,,20290,,2794117,51.13213,4.44706
+"Siegsdorf, Bavaria, Germany",Siegsdorf,Bavaria,DE,Germany,EU,,8230,,2832424,47.82278,12.64277
+"Leguevin, Occitanie, France",Leguevin,Occitanie,FR,France,EU,,6976,,3003874,43.60028,1.23236
+"Fonsorbes, Occitanie, France",Fonsorbes,Occitanie,FR,France,EU,,7745,,3018103,43.539,1.22882
+"Floeha, Saxony, Germany",Floeha,Saxony,DE,Germany,EU,,11143,,2926147,50.85613,13.07407
+"Caselle Torinese, Piedmont, Italy",Caselle Torinese,Piedmont,IT,Italy,EU,,11817,,3179911,45.17458,7.6429
+"Sint-Amandsberg, Flanders, Belgium",Sint-Amandsberg,Flanders,BE,Belgium,EU,,32115,,2786743,51.05947,3.74943
+"Gomel, Belarus",Gomel,Gomel Oblast,BY,Belarus,EU,,501102,,627907,52.4345,30.9754
+"Hoofddorp, North Holland, Netherlands",Hoofddorp,North Holland,NL,Netherlands,EU,,132734,,2753801,52.3025,4.68889
+"Salzburg, Austria",Salzburg,State of Salzburg,AT,Austria,EU,,157245,,2766824,47.79941,13.04399
+"Heilbronn, Baden-Wurttemberg, Germany",Heilbronn,Baden-Wurttemberg,DE,Germany,EU,,120733,,2907669,49.13995,9.22054
+"Cologne, North Rhine-Westphalia, Germany",Cologne,North Rhine-Westphalia,DE,Germany,EU,,1024621,,2886242,50.93333,6.95

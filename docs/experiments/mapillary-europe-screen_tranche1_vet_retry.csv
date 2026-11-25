@@ -1,0 +1,7 @@
+n,city,geonameid,geocode_query,osm_match,center_lat,center_lon,width_m,height_m,gsv_points,gsv_streets_samples,mapillary_z14_tiles,kartaview_requests,panoramax_z15_tiles,offset_km,center,flags
+1,Joensuu,655808,"Keskusta, Joensuu, Finland",place/suburb,62.601416,29.761591,2054,4458,22969,4547,15,14,36,0.1,geocoded,
+2,Budakalasz,3054651,"Budakalasz, Hungary",boundary/administrative,47.622837,19.033692,8725,3741,82156,16211,24,37,66,1.4,geocoded,
+3,Gomel,627907,"Gomel, Belarus",boundary/administrative,52.457121,30.959239,28861,25296,1826660,362600,360,680,1400,2.7,geocoded,
+4,Salzburg,2766824,"Salzburg, Austria",boundary/administrative,47.802802,13.056587,10627,11472,305368,60550,64,129,210,1.0,geocoded,
+5,Lievendaal,2751615,"Lievendaal, North Brabant, Netherlands",place/neighbourhood,51.442672,5.434239,1390,2225,7840,1536,4,3,12,0.1,geocoded,
+6,Hoofddorp,2753801,"Hoofddorp, North Holland, Netherlands",boundary/administrative,52.300625,4.678199,8129,9664,196988,39017,42,75,168,0.8,geocoded,

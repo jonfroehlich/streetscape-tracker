@@ -165,6 +165,51 @@ Much of it is weak: Munich, Vienna, Lisbon, Porto and Antwerp are large cities s
 Bath is the exception, a small city that misses coverage outright.
 Uploader identities are what the Graph API returns for one sample image each; nothing here establishes who an account belongs to.
 
+## First tranche
+
+The screen has no validated positive in Europe, so a first tranche is the measurement.
+[`mapillary_discovery_cities_europe1.csv`](../../mapillary_discovery_cities_europe1.csv) is written by `scripts/build_mapillary_discovery_europe1.py` from the ranked record above, and its record of what the selection knew is [`mapillary-europe-screen_tranche1_metrics.json`](mapillary-europe-screen_tranche1_metrics.json).
+Nothing is registered by this writeup; registering is the runbook in [`operations.md`](../operations.md) ("Registering the Mapillary discovery screen's first European tranche").
+
+It has two arms:
+
+- **Small (20 places, the arm the prediction covers).** The first 20 places under 100,000 people in V4 order, at most two per uploader. This is the kind of place the score was tested on in the US. The 20 come from 16 uploaders and 10 countries.
+- **Large (5 places, exploratory).** The first five of 100,000 people or more: Gomel, Hoofddorp, Salzburg, Heilbronn and Cologne. A large city is scored on a 3 km core only, and nothing says how that carries to its whole grid, so no prediction is made for them.
+
+Four of the small arm's places belong to uploaders with a record of 0 strict hits (`small_arm_with_an_uploader_record`): Wilten and Sankt Johann in Tirol (`european-panorama`), Boom and Kontich (`konink360`).
+They were kept, because whether that record matters is one of the things the tranche can show.
+
+### Advance prediction
+
+Written before any of the 25 was registered (`advance_prediction_small_arm`).
+The rate is the US record of screened places at V4 ≥ 0.7: 40 of 48 strict hits over tranches 1 to 3 (0.833).
+At that rate 20 places give 16.7 expected strict hits, and "the US rate carries to small European places" is **falsified below 14 strict hits** on the small arm's first Mapillary drive walks (the largest count whose lower tail is at most 5%; the tail below 14 is 0.037).
+Strict is the same bar as everywhere here: at least 50% of street-km covered by 360° imagery at a median age of at most two years.
+Four of the 20 already sit at a screen median age above 1.7 years (Rixensart, Boom, Kontich and Sint-Amandsberg), and both US age misses were places like that.
+
+### Vetting
+
+`scripts/vet_manifest_geometry.py` geocoded every row on 2026-11-25 ([`_tranche1_vet.csv`](mapillary-europe-screen_tranche1_vet.csv), re-vetted rows in [`_tranche1_vet_retry.csv`](mapillary-europe-screen_tranche1_vet_retry.csv)).
+Four rows needed a query override, each re-vetted before being committed:
+
+| Place | First pass | Override | Grid after |
+|---|---|---|---|
+| Joensuu | the 2,381 km² municipality's midpoint, 31 km off: refused | `Keskusta, Joensuu, Finland` (the centre district) | 2,054 x 4,458 m |
+| Gomel | a railway station, 680 x 1,112 m | `Gomel, Belarus` | 28,861 x 25,296 m |
+| Budakalasz | the county name matched nothing; the bare fallback won | `Budakalasz, Hungary` | unchanged |
+| Salzburg | likewise for "State of Salzburg" | `Salzburg, Austria` | unchanged |
+
+Three names depart from GeoNames, each asserted against the vendored value by the generator: Cologne (ASCII name `Koeln`) and Gomel (`Homyel'`), Gomel's region (`Homyel' Voblasc'`, written `Gomel Oblast`, because its apostrophes would reach the city id), and the country of the two Dutch rows (`Netherlands`, as the catalog's one Dutch city is registered, not GeoNames' `The Netherlands`).
+Three rows are districts, registered as the district: Lievendaal (a neighbourhood of Eindhoven), Wilten (a suburb of Innsbruck) and Joensuu's centre.
+
+One collection of all 25 is 7,654,613 GSV grid points and 1,553 Mapillary z14 tiles: 610 tiles for the 20 small places and 943 for the five large ones.
+Cologne and Gomel are 360 tiles each.
+
+From [`_tranche1_overlaps.json`](mapillary-europe-screen_tranche1_overlaps.json) (`generated_by`: `scripts/mapillary_discovery_europe1_overlaps.py`, against the 2026-11-25 production snapshot of 1,307 cities):
+
+- No row's GeoNames point is within 8.8 km of a catalog centre (Boom, 8.877 km from Mechelen), and the nearest in-batch pair is Fonsorbes, 5.116 km from Plaisance-du-Touch's vetted centre.
+- Three vetted grids share ground with a tracked neighbour: 23.5% of Budakalasz's grid lies inside Budapest's, 13.0% of Kontich's inside Antwerp's and 6.1% of Hoofddorp's inside Amsterdam's. Each place's point is outside the neighbour's grid, which is what the screen required; the municipal rectangle is wider than the point.
+
 ## Caveats
 
 - **Screening signal, never coverage.** z6 geometry is simplified and length says nothing about which streets were driven. A walk is the only measurement.

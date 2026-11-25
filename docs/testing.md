@@ -2055,6 +2055,14 @@ Added with the second region and the region-agnostic scorer (`scripts/mapillary_
 
 Not pinned by a test, because its inputs are gitignored: the scorer's parity with the committed tranche-3 record (`docs/experiments/mapillary-europe-screen.md`, "Parity").
 
+`tests/test_mapillary_discovery_europe1_manifest.py` holds `mapillary_discovery_cities_europe1.csv`, the first European tranche (`docs/experiments/mapillary-europe-screen.md`, "First tranche").
+The generator must reproduce the committed manifest and metrics byte for byte, and the selection is re-derived without the generator's `select`: the first 20 places under 100,000 people with at most two per uploader, then the first five of 100,000 or more.
+The advance prediction is recomputed from the US records it cites (40 of 48, floor 14 as the largest count inside a 5% lower tail), and the writeup must quote it.
+Each row joins its vendored GeoNames record with exactly the named name, region and country departures, each city id is a clean file-name stem (Gomel's region would otherwise carry two apostrophes into it), every query is the one the vetting record geocoded, and the first vetting pass is held as the reason for each of the four overrides.
+The reuse margins in `_tranche1_overlaps.json` must sit on the vetted grids and clear the runbook's `--overlap-km 3` by 1.5 km, with Fonsorbes–Plaisance-du-Touch named as the binding one and the in-batch margins recomputed.
+The runbook's night table, both docs' totals, the writeup's three overlap shares and the KartaView exclusion step are held to the committed records.
+It pins no frozen geometry, because nothing was registered when it was written.
+
 ## The Mapillary candidate probe (#406)
 
 **Added after the 2026-08-22 split.**

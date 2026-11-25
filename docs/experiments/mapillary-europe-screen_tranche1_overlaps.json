@@ -1,0 +1,413 @@
+{
+ "_about": {
+  "generated_by": "scripts/mapillary_discovery_europe1_overlaps.py",
+  "catalog_snapshot": "makelab2-prod-9cd70ec-2026-11-25",
+  "catalog_cities": 1307
+ },
+ "rows": [
+  {
+   "geonameid": "2751615",
+   "city": "Lievendaal",
+   "grid": [
+    51.442672,
+    5.434239,
+    1390,
+    2225
+   ],
+   "catalog_overlaps": {},
+   "nearest_catalog": "beringen--flanders--belgium",
+   "nearest_catalog_km": 44.632,
+   "gsv_lattice_points": 7840
+  },
+  {
+   "geonameid": "655808",
+   "city": "Joensuu",
+   "grid": [
+    62.601416,
+    29.761591,
+    2054,
+    4458
+   ],
+   "catalog_overlaps": {},
+   "nearest_catalog": "reinsletta--nordland--norway",
+   "nearest_catalog_km": 887.304,
+   "gsv_lattice_points": 22969,
+   "nearest_earlier_row": "Lievendaal",
+   "nearest_earlier_row_km": 1905.097
+  },
+  {
+   "geonameid": "3178650",
+   "city": "Cirie",
+   "grid": [
+    45.220134,
+    7.590163,
+    5850,
+    6264
+   ],
+   "catalog_overlaps": {},
+   "nearest_catalog": "milan--lombardy--italy",
+   "nearest_catalog_km": 124.347,
+   "gsv_lattice_points": 92002,
+   "nearest_earlier_row": "Lievendaal",
+   "nearest_earlier_row_km": 708.531
+  },
+  {
+   "geonameid": "2761164",
+   "city": "Wilten",
+   "grid": [
+    47.252929,
+    11.388894,
+    2393,
+    2259
+   ],
+   "catalog_overlaps": {},
+   "nearest_catalog": "munich--bavaria--germany",
+   "nearest_catalog_km": 100.357,
+   "gsv_lattice_points": 13560,
+   "nearest_earlier_row": "Cirie",
+   "nearest_earlier_row_km": 369.627
+  },
+  {
+   "geonameid": "3054651",
+   "city": "Budakalasz",
+   "grid": [
+    47.622837,
+    19.033692,
+    8725,
+    3741
+   ],
+   "catalog_overlaps": {
+    "budapest--budapest--hungary": 0.235
+   },
+   "nearest_catalog": "budapest--budapest--hungary",
+   "nearest_catalog_km": 16.194,
+   "gsv_lattice_points": 82156,
+   "nearest_earlier_row": "Wilten",
+   "nearest_earlier_row_km": 577.414
+  },
+  {
+   "geonameid": "2624341",
+   "city": "Ballerup",
+   "grid": [
+    55.730359,
+    12.361231,
+    5026,
+    8906
+   ],
+   "catalog_overlaps": {},
+   "nearest_catalog": "copenhagen--capital-region--denmark",
+   "nearest_catalog_km": 15.846,
+   "gsv_lattice_points": 112392,
+   "nearest_earlier_row": "Lievendaal",
+   "nearest_earlier_row_km": 660.164
+  },
+  {
+   "geonameid": "715126",
+   "city": "Szolnok",
+   "grid": [
+    47.180575,
+    20.183537,
+    17056,
+    18667
+   ],
+   "catalog_overlaps": {},
+   "nearest_catalog": "budapest--budapest--hungary",
+   "nearest_catalog_km": 87.182,
+   "gsv_lattice_points": 796702,
+   "nearest_earlier_row": "Budakalasz",
+   "nearest_earlier_row_km": 100.502
+  },
+  {
+   "geonameid": "2766636",
+   "city": "Sankt Johann in Tirol",
+   "grid": [
+    47.511566,
+    12.442939,
+    13094,
+    10524
+   ],
+   "catalog_overlaps": {},
+   "nearest_catalog": "munich--bavaria--germany",
+   "nearest_catalog_km": 96.222,
+   "gsv_lattice_points": 345185,
+   "nearest_earlier_row": "Wilten",
+   "nearest_earlier_row_km": 83.466
+  },
+  {
+   "geonameid": "2875881",
+   "city": "Loerrach",
+   "grid": [
+    47.634632,
+    7.681218,
+    7170,
+    9501
+   ],
+   "catalog_overlaps": {},
+   "nearest_catalog": "zurich--zurich--switzerland",
+   "nearest_catalog_km": 71.064,
+   "gsv_lattice_points": 170884,
+   "nearest_earlier_row": "Cirie",
+   "nearest_earlier_row_km": 266.355
+  },
+  {
+   "geonameid": "2986933",
+   "city": "Plaisance-du-Touch",
+   "grid": [
+    43.56259,
+    1.283324,
+    7363,
+    8207
+   ],
+   "catalog_overlaps": {},
+   "nearest_catalog": "girona--catalonia--spain",
+   "nearest_catalog_km": 216.308,
+   "gsv_lattice_points": 151659,
+   "nearest_earlier_row": "Cirie",
+   "nearest_earlier_row_km": 532.662
+  },
+  {
+   "geonameid": "864723",
+   "city": "Marupe",
+   "grid": [
+    56.903336,
+    24.032418,
+    6051,
+    5665
+   ],
+   "catalog_overlaps": {},
+   "nearest_catalog": "vilnius--lithuania",
+   "nearest_catalog_km": 256.403,
+   "gsv_lattice_points": 86052,
+   "nearest_earlier_row": "Joensuu",
+   "nearest_earlier_row_km": 708.917
+  },
+  {
+   "geonameid": "2787989",
+   "city": "Rixensart",
+   "grid": [
+    50.721887,
+    4.521985,
+    6314,
+    5986
+   ],
+   "catalog_overlaps": {},
+   "nearest_catalog": "brussels--belgium",
+   "nearest_catalog_km": 18.112,
+   "gsv_lattice_points": 94800,
+   "nearest_earlier_row": "Lievendaal",
+   "nearest_earlier_row_km": 103.091
+  },
+  {
+   "geonameid": "2801494",
+   "city": "Boom",
+   "grid": [
+    51.093431,
+    4.373233,
+    4623,
+    2843
+   ],
+   "catalog_overlaps": {},
+   "nearest_catalog": "mechelen--flanders--belgium",
+   "nearest_catalog_km": 8.877,
+   "gsv_lattice_points": 33176,
+   "nearest_earlier_row": "Rixensart",
+   "nearest_earlier_row_km": 42.528
+  },
+  {
+   "geonameid": "2794117",
+   "city": "Kontich",
+   "grid": [
+    51.121428,
+    4.441492,
+    6306,
+    6320
+   ],
+   "catalog_overlaps": {
+    "antwerp--flanders--belgium": 0.13
+   },
+   "nearest_catalog": "mechelen--flanders--belgium",
+   "nearest_catalog_km": 10.861,
+   "gsv_lattice_points": 100172,
+   "nearest_earlier_row": "Boom",
+   "nearest_earlier_row_km": 6.714
+  },
+  {
+   "geonameid": "2832424",
+   "city": "Siegsdorf",
+   "grid": [
+    47.807582,
+    12.670967,
+    10801,
+    8809
+   ],
+   "catalog_overlaps": {},
+   "nearest_catalog": "munich--bavaria--germany",
+   "nearest_catalog_km": 89.867,
+   "gsv_lattice_points": 238581,
+   "nearest_earlier_row": "Sankt Johann in Tirol",
+   "nearest_earlier_row_km": 37.702
+  },
+  {
+   "geonameid": "3003874",
+   "city": "Leguevin",
+   "grid": [
+    43.592807,
+    1.235225,
+    7598,
+    6090
+   ],
+   "catalog_overlaps": {},
+   "nearest_catalog": "girona--catalonia--spain",
+   "nearest_catalog_km": 222.482,
+   "gsv_lattice_points": 115900,
+   "nearest_earlier_row": "Plaisance-du-Touch",
+   "nearest_earlier_row_km": 5.866
+  },
+  {
+   "geonameid": "3018103",
+   "city": "Fonsorbes",
+   "grid": [
+    43.533493,
+    1.242965,
+    7623,
+    4296
+   ],
+   "catalog_overlaps": {},
+   "nearest_catalog": "girona--catalonia--spain",
+   "nearest_catalog_km": 217.231,
+   "gsv_lattice_points": 82130,
+   "nearest_earlier_row": "Plaisance-du-Touch",
+   "nearest_earlier_row_km": 5.116
+  },
+  {
+   "geonameid": "2926147",
+   "city": "Floeha",
+   "grid": [
+    50.854669,
+    13.086873,
+    7668,
+    5629
+   ],
+   "catalog_overlaps": {},
+   "nearest_catalog": "prague--czechia",
+   "nearest_catalog_km": 132.463,
+   "gsv_lattice_points": 108288,
+   "nearest_earlier_row": "Siegsdorf",
+   "nearest_earlier_row_km": 340.238
+  },
+  {
+   "geonameid": "3179911",
+   "city": "Caselle Torinese",
+   "grid": [
+    45.176571,
+    7.648817,
+    7142,
+    4802
+   ],
+   "catalog_overlaps": {},
+   "nearest_catalog": "milan--lombardy--italy",
+   "nearest_catalog_km": 122.79,
+   "gsv_lattice_points": 86278,
+   "nearest_earlier_row": "Cirie",
+   "nearest_earlier_row_km": 6.537
+  },
+  {
+   "geonameid": "2786743",
+   "city": "Sint-Amandsberg",
+   "grid": [
+    51.061901,
+    3.771523,
+    3961,
+    3449
+   ],
+   "catalog_overlaps": {},
+   "nearest_catalog": "antwerp--flanders--belgium",
+   "nearest_catalog_km": 48.292,
+   "gsv_lattice_points": 34427,
+   "nearest_earlier_row": "Boom",
+   "nearest_earlier_row_km": 43.743
+  },
+  {
+   "geonameid": "627907",
+   "city": "Gomel",
+   "grid": [
+    52.457121,
+    30.959239,
+    28861,
+    25296
+   ],
+   "catalog_overlaps": {},
+   "nearest_catalog": "kyiv--ukraine",
+   "nearest_catalog_km": 228.088,
+   "gsv_lattice_points": 1826660,
+   "nearest_earlier_row": "Marupe",
+   "nearest_earlier_row_km": 667.37
+  },
+  {
+   "geonameid": "2753801",
+   "city": "Hoofddorp",
+   "grid": [
+    52.300625,
+    4.678199,
+    8129,
+    9664
+   ],
+   "catalog_overlaps": {
+    "amsterdam--north-holland--netherlands": 0.061
+   },
+   "nearest_catalog": "amsterdam--north-holland--netherlands",
+   "nearest_catalog_km": 15.723,
+   "gsv_lattice_points": 196988,
+   "nearest_earlier_row": "Lievendaal",
+   "nearest_earlier_row_km": 108.439
+  },
+  {
+   "geonameid": "2766824",
+   "city": "Salzburg",
+   "grid": [
+    47.802802,
+    13.056587,
+    10627,
+    11472
+   ],
+   "catalog_overlaps": {},
+   "nearest_catalog": "munich--bavaria--germany",
+   "nearest_catalog_km": 118.593,
+   "gsv_lattice_points": 305368,
+   "nearest_earlier_row": "Siegsdorf",
+   "nearest_earlier_row_km": 27.875
+  },
+  {
+   "geonameid": "2907669",
+   "city": "Heilbronn",
+   "grid": [
+    49.151402,
+    9.173261,
+    18794,
+    13015
+   ],
+   "catalog_overlaps": {},
+   "nearest_catalog": "trier--rheinland-pfalz--germany",
+   "nearest_catalog_km": 198.891,
+   "gsv_lattice_points": 611940,
+   "nearest_earlier_row": "Loerrach",
+   "nearest_earlier_row_km": 202.322
+  },
+  {
+   "geonameid": "2886242",
+   "city": "Cologne",
+   "grid": [
+    50.957707,
+    6.967279,
+    27366,
+    28316
+   ],
+   "catalog_overlaps": {},
+   "nearest_catalog": "beringen--flanders--belgium",
+   "nearest_catalog_km": 121.001,
+   "gsv_lattice_points": 1938504,
+   "nearest_earlier_row": "Lievendaal",
+   "nearest_earlier_row_km": 119.86
+  }
+ ]
+}
