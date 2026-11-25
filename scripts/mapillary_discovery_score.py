@@ -381,7 +381,10 @@ def calibration_summary(raw_dir: Path) -> dict:
             "ratio": round(coarse["pano_recent"] / fine["pano_recent"], 3)
             if fine["pano_recent"]
             else None,
-            "same_top_creator": coarse["top_creator"] == fine["top_creator"],
+            # no recent 360 sequence at either zoom is no comparison, not agreement
+            "same_top_creator": coarse["top_creator"] == fine["top_creator"]
+            if coarse["top_creator"] is not None or fine["top_creator"] is not None
+            else None,
         }
     return {"r_km": cal.get("r_km"), "recent_since": cal.get("recent_since"), "towns": towns}
 

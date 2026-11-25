@@ -152,6 +152,12 @@ class TileFetcher:
             # in the query string: name the failure and drop the message
             # (`from None`), or the traceback writes the token into a log.
             self.requests += 1
+            # logged like any other request, or the cost summary undercounts a
+            # connection-level refusal and "every request returned 200" stays true
+            entry = {"t": round(t0, 3), "host": "tiles", "z": z, "x": x, "y": y}
+            entry |= {"status": None, "error": type(e).__name__, "token_var": self.token_var}
+            with self.log.open("a") as f:
+                f.write(json.dumps(entry) + "\n")
             raise StopProbe(f"STOP at {z}/{x}/{y}: {type(e).__name__} (no response)") from None
         self.requests += 1
         ctype = r.headers.get("Content-Type", "")
@@ -342,7 +348,10 @@ def cmd_resolve_creators(args) -> int:
     else:
         # a `fetch`-only directory: mapillary_discovery_score.py wrote each
         # uploader's newest 360 image while it read the cached tiles
-        seqs = pd.read_csv(out / "creator_images.csv")
+        images = out / "creator_images.csv"
+        if not images.exists():
+            raise SystemExit(f"{images} is missing: run mapillary_discovery_score.py first")
+        seqs = pd.read_csv(images)
     sample_image = dict(
         zip(seqs.creator_id.astype("int64").astype(str), seqs.image_id, strict=True)
     )

@@ -47,7 +47,7 @@ Recent 360° sequences within 3 km of eight city centres, at z6 against z10 (`ca
 | Brussels | 1,485 | 1,600 | 0.928 | yes |
 | Antwerp | 586 | 620 | 0.945 | yes |
 | Braga | 34 | 28 | 1.214 | no |
-| Paris | 0 | 0 | n/a | yes |
+| Paris | 0 | 0 | n/a | n/a |
 | Amsterdam | 180 | 170 | 1.059 | no |
 | Budapest | 1,397 | 1,384 | 1.009 | yes |
 | Belgrade | 24 | 28 | 0.857 | yes |
@@ -160,7 +160,9 @@ No uploader record is applied to this ranking, because no European uploader has 
 | `erias` | 1 | Vienna (9.0%, 0.99 yr) |
 | `sanjorgepinho` | 1 | Porto (21.0%, 1.94 yr) |
 
-Those 33 ranked places are the ones with evidence against them, though of a weak kind: five of the eight are large cities scored on a 3 km core, and Mechelen, Beringen and Antwerp miss the bar narrowly.
+Those 33 ranked places are the ones with evidence against them.
+Much of it is weak: Munich, Vienna, Lisbon, Porto and Antwerp are large cities scored on a 3 km core, Antwerp misses on age alone, and Mechelen and Beringen miss both coverage and age by small margins.
+Bath is the exception, a small city that misses coverage outright.
 Uploader identities are what the Graph API returns for one sample image each; nothing here establishes who an account belongs to.
 
 ## Caveats

@@ -208,7 +208,7 @@ The three re-gridded towns are scored on their fitted grids, since those are wha
 ### Outcome (2026-11-25): the prediction held, 20 of 25
 
 Every number here traces to [`mapillary-discovery-screen_tranche3_outcome.json`](mapillary-discovery-screen_tranche3_outcome.json) (`generated_by`: `scripts/mapillary_discovery_tranche3_outcome.py`, over a read-only production snapshot labelled `makelab2-prod-9cd70ec-2026-11-25`).
-All 25 towns were walked between 2026-11-07 and 2026-11-12, and each had exactly one Mapillary drive walk at the snapshot, so its latest walk is its first.
+All 25 towns were walked between 2026-11-07 and 2026-11-12, and each had exactly one Mapillary drive walk when the snapshot was taken, so its latest walk is its first (a count read on the catalog host and passed to the script; the snapshot itself holds only the latest walk).
 
 **20 of the 25** met the strict bar, against a falsification line of fewer than 19 and an expectation of 21.7; 22 of the 25 reached 50% coverage.
 The five misses, by reason:

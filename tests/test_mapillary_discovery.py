@@ -256,6 +256,10 @@ def test_a_failed_connection_never_carries_the_token_out(tmp_path, monkeypatch):
     # `from None`: nothing chained, so a printed traceback has no token either
     assert e.value.__cause__ is None and e.value.__suppress_context__
     assert f.requests == 1 and not (tmp_path / "tiles" / "6_1_1.mvt").exists()
+    # and it is in the request log, which is what every cost figure is counted from
+    (entry,) = _log(tmp_path)
+    assert (entry["status"], entry["error"], entry["y"]) == (None, "ConnectionError", 1)
+    assert "test-token" not in json.dumps(entry)
 
 
 def test_catalog_snapshot_exports_each_citys_latest_drive_walk(tmp_path):
@@ -1280,7 +1284,7 @@ def test_scorer_reports_what_the_collection_cost_and_its_calibration(tmp_path):
     }
     assert metrics["calibration"]["towns"] == {
         "a": {"z6_recent_pano": 9, "z10_recent_pano": 10, "ratio": 0.9, "same_top_creator": False},
-        "b": {"z6_recent_pano": 0, "z10_recent_pano": 0, "ratio": None, "same_top_creator": True},
+        "b": {"z6_recent_pano": 0, "z10_recent_pano": 0, "ratio": None, "same_top_creator": None},
     }
     validation = pd.read_csv(out / "validation.csv")
     assert validation.city_id.tolist() == ["walked"] and not validation.strict[0]
