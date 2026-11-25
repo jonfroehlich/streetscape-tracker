@@ -895,6 +895,96 @@ There is no KartaView column because step 4 excludes it.
 Duluth's GSV grid run (1,873,872 points) is its largest cost and is non-resumable: #373 defers it on a night whose remainder cannot hold it, and a deferred first channel defers the whole city.
 Before night 2, read night 1's log as for tranche 2: every tranche city collected (or paused at a cap, exit 83), no Mapillary refusal or throttle (exit 75 or 87), no Overpass latch.
 
+## Registering the Mapillary discovery screen's first European tranche (`mapillary_discovery_cities_europe1.csv`)
+
+25 European places from the 2026-11-25 screen: 20 small ones that carry an advance prediction and five large ones that do not.
+The selection, the prediction and the vetting are in [`experiments/mapillary-europe-screen.md`](experiments/mapillary-europe-screen.md) ("First tranche").
+Landed the same way as the fourth tranche, with one added step (4) that keeps three district rows at their vetted grids.
+Every write below is gated: no `run-due` in flight, the night's `Done:` line in the scheduler log, and the owner's OK before `enable-city`.
+
+**1. Deploy a `main` that contains the manifest**, as for tranche 2.
+
+**2. Register, disabled.**
+
+```bash
+DATA=/projects/makeabilitylab/streetscape-tracker/data
+python scripts/register_frame.py --manifest mapillary_discovery_cities_europe1.csv \
+    --db-path "$DATA/streetscape_tracker.db" \
+    --notes-label "mapillary discovery screen 2026-11-25 europe 1" --overlap-km 3 --max-center-km 10
+# read the dry run: every row "-> NEW", and "newly-registered=25 failed=0"; then the same with --execute
+```
+
+- `--overlap-km 3`: the binding margin is in-batch, Fonsorbes 5.116 km from Plaisance-du-Touch's vetted centre, then Leguevin (5.866 km from the same centre), Caselle Torinese (6.537 km from Cirie) and Kontich (6.714 km from Boom); the nearest catalog centre to any row is Mechelen, 8.877 km from Boom (`_tranche1_overlaps.json`, pinned by the manifest's test).
+  Those in-batch margins run to centres geocoded on the day, so they can move; 3 km leaves each at least 2.1 km.
+  The dry run warns about a row within 13 km of an earlier one by manifest points, so expect `WARNING` lines for exactly those four rows (Kontich, Leguevin, Fonsorbes, Caselle Torinese).
+  The distances it prints are between manifest points, so they differ a little from the vetted-centre margins quoted here.
+  A nonzero `reused-existing` means the catalog holds a city within 3 km that the overlap record's catalog did not; stop and find which.
+- `--max-center-km 10`: every row geocoded within 3.7 km of its GeoNames point at vetting.
+  Four rows carry a query override (Joensuu, Gomel, Budakalasz, Salzburg); Joensuu's bare name is the whole municipality, 31 km off, and must fail the guard rather than register if the override ever stops matching.
+  `--center-from-geonames` is deliberately NOT passed, for the same reason: it would freeze that municipality's dimensions around the GeoNames point instead of failing.
+- Each `--execute` line prints the frozen W x H; compare it with `docs/experiments/mapillary-europe-screen_tranche1_vet*.csv` (a row in the retry file replaces its first attempt) and stop on any difference.
+
+**3. Audit the boundaries**: tranche 2's step 3 verbatim, with the label `'mapillary discovery screen 2026-11-25 europe 1 (%'`, the directory `audit/mde1`, and 25 ids.
+The ` (` keeps a later "europe 10" batch out of the match.
+Read the plan before `--execute`: a RESIZE changes that place's price (re-price it as tranche 2's step 3 says).
+The audit looks up each row's catalog city, region and country, not the manifest's override query, so expect some DEFER rows and decide each "keep current":
+Budakalasz and Salzburg (their region names matched nothing at vetting), and possibly the three districts, which step 4 restores in any case.
+Gomel's vetted grid (28,861 x 25,296 m) is large for the city and came from the same boundary the audit will find, so it will most likely grade `OK` and not appear on the review page: read its row in `boundary_audit_report.csv`, look at the rectangle on a map, and fit it with `resize_city.py` (as in step 4) if it takes in much more than the city.
+`$IDS` below is this step's id list.
+
+**4. Restore the three district rows to their vetted grids, AFTER the audit.**
+Lievendaal, Wilten and Joensuu's centre are districts by choice.
+The audit looks each name up again as city/state/country, and `reregister_boundaries.py --execute` grows a grid it grades `UNDER` to the OSM bbox unattended when that is under 30 km, so a district can come out of step 3 as its parent municipality.
+`resize_city.py` puts each back and stamps the note that stops a later audit growing it again (tranche 3's step 4 has the detail):
+
+```bash
+python scripts/resize_city.py lievendaal--north-brabant--netherlands --width 1390 --height 2225 --center-lat 51.442672 --center-lon 5.434239 --data-dir "$DATA"
+python scripts/resize_city.py joensuu--north-karelia--finland --width 2054 --height 4458 --center-lat 62.601416 --center-lon 29.761591 --data-dir "$DATA"
+python scripts/resize_city.py wilten--tyrol--austria --width 2393 --height 2259 --center-lat 47.252929 --center-lon 11.388894 --data-dir "$DATA"
+# each is a dry run; read it, then repeat with --execute
+```
+
+Run all three whether or not the audit changed them, so each carries the note.
+The numbers are `DISTRICT_GRIDS` in `scripts/build_mapillary_discovery_europe1.py`, which the manifest's test holds to the vetting record.
+
+**5. Exclude all 25 from both KartaView channels, while they are still disabled.**
+`enable-city` would otherwise enrol every one of them on KartaView, since each estimate is under its 1,000-request ceiling.
+Production's standing position is that no city beyond the set already enrolled joins KartaView at the anonymous 1.5/min (`config/scheduler.makelab1.toml`, above `[providers.kartaview]`; [`experiments/kartaview-endpoint-move.md`](experiments/kartaview-endpoint-move.md)).
+`enable-city` never overwrites a membership that is already set, and an exclusion can be pre-set on a disabled city:
+
+```bash
+echo $IDS | wc -w   # 25; an empty $IDS makes the loop a silent no-op, so re-derive it as in step 3 if this is a new shell
+for c in $IDS; do
+  python -m streetscape_metadata_tracker.scheduler --config config/scheduler.makelab1.toml enroll-city "$c" --channel kartaview --remove
+  python -m streetscape_metadata_tracker.scheduler --config config/scheduler.makelab1.toml enroll-city "$c" --channel kartaview_streets --remove
+done
+```
+
+Confirm afterwards with `scheduler --config config/scheduler.makelab1.toml enroll-city --channel kartaview --list --excluded`, and the same for `kartaview_streets`: each must list all 25 ids.
+Step 6's `enable-city --dry-run` must then report both KartaView channels as already set, not as enrolled; stop if it says otherwise.
+Clear the exclusions (`--clear`) when KartaView widening resumes.
+
+**6. Enable, one night at a time; then freeze the networks** exactly as tranche 2's steps 4 and 5.
+Never enable for a night whose UTC snapshot date is a Mapillary rest day (`[hosts.mapillary_tiles].rest_weekdays`, Wed and Sun on prod).
+
+**7. Pricing, and the nights.**
+One collection of all 25 is 7,654,613 GSV grid points and 1,553 Mapillary z14 tiles; the Mapillary walks are free on a paired night (#290).
+The small arm goes first, because it is the arm the prediction is about:
+
+| Night | Cities | GSV points (h at 48k/min) | Mapillary tiles | Panoramax tiles (min at 60/min) |
+|---|---|---|---|---|
+| 1 | Lievendaal, Joensuu, Cirie, Wilten, Budakalasz, Ballerup, Loerrach, Plaisance-du-Touch, Marupe, Rixensart, Boom, Kontich, Leguevin, Fonsorbes, Floeha, Caselle Torinese, Sint-Amandsberg | 1,394,685 (0.48) | 355 | ≤ 1,129 (19) |
+| 2 | Szolnok, Sankt Johann in Tirol, Siegsdorf, Hoofddorp, Salzburg | 1,882,824 (0.65) | 361 | ≤ 1,312 (22) |
+| 3 | Heilbronn, Cologne | 2,550,444 (0.89) | 477 | ≤ 1,776 (30) |
+| 4 | Gomel | 1,826,660 (0.63) | 360 | ≤ 1,400 (23) |
+
+Mapillary is priced against the rolling-24 h tile pool (`[hosts.mapillary_tiles]`, #444), which also has to hold that night's due Mapillary demand; read `scheduler status` for the pool's room on the day rather than quoting a figure from here, and split a night that does not fit.
+The Panoramax column is an upper bound: the pair is enrolled only on a nonzero one-city screen.
+There is no KartaView column because step 5 excludes it.
+Cologne's and Gomel's GSV grid runs are non-resumable: #373 defers one on a night whose remainder cannot hold it, and a deferred first channel defers the whole city.
+Before each next night, read the last one's log as for tranche 2: every tranche city collected (or paused at a cap, exit 83), no Mapillary refusal or throttle (exit 75 or 87), no Overpass latch.
+The prediction is scored on each small-arm place's FIRST Mapillary drive walk, so record the outcome before any of them is walked a second time.
+
 ## Keeping Overpass out of the night: `scripts/prefreeze_street_networks.py` (issue #341)
 
 A road walk on a frozen network never contacts Overpass — `fetch_graph` returns the cached GraphML before it takes the host lock or probes — and only a city's *first* walk fetches one.

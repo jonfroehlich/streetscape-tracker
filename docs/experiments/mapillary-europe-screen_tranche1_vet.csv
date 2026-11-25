@@ -1,0 +1,26 @@
+n,city,geonameid,geocode_query,osm_match,center_lat,center_lon,width_m,height_m,gsv_points,gsv_streets_samples,mapillary_z14_tiles,kartaview_requests,panoramax_z15_tiles,offset_km,center,flags
+1,Lievendaal,2751615,"Lievendaal, North Brabant, The Netherlands",place/neighbourhood,51.442672,5.434239,1390,2225,7840,1536,4,3,12,0.1,geocoded,
+2,Joensuu,655808,,,,,,,,,,,,,,FAILED: geocoded center is 31 km from the GeoNames coordinates (> 10 km) — likely a province centroid; re-run with --center-from-geonames or fix by hand
+3,Cirie,3178650,"Cirie, Piedmont, Italy",boundary/administrative,45.220134,7.590163,5850,6264,92002,18200,25,45,64,1.9,geocoded,
+4,Wilten,2761164,"Wilten, Tyrol, Austria",place/suburb,47.252929,11.388894,2393,2259,13560,2684,6,7,12,0.6,geocoded,
+5,Budakalasz,3054651,"Budakalasz, Hungary",boundary/administrative,47.622837,19.033692,8725,3741,82156,16211,24,37,66,1.4,geocoded,FALLBACK-QUERY
+6,Ballerup,2624341,"Ballerup, Capital Region, Denmark",place/town,55.730359,12.361231,5026,8906,112392,22231,35,50,112,0.2,geocoded,
+7,Szolnok,715126,"Szolnok, Jasz-Nagykun-Szolnok, Hungary",boundary/administrative,47.180575,20.183537,17056,18667,796702,158130,143,327,528,1.1,geocoded,
+8,Sankt Johann in Tirol,2766636,"Sankt Johann in Tirol, Tyrol, Austria",boundary/administrative,47.511566,12.442939,13094,10524,345185,68441,63,144,238,2.0,geocoded,
+9,Loerrach,2875881,"Loerrach, Baden-Wurttemberg, Germany",boundary/administrative,47.634632,7.681218,7170,9501,170884,33834,30,75,120,2.5,geocoded,
+10,Plaisance-du-Touch,2986933,"Plaisance-du-Touch, Occitanie, France",boundary/administrative,43.56259,1.283324,7363,8207,151659,30012,30,64,90,1.1,geocoded,
+11,Marupe,864723,"Marupe, Latvia",boundary/administrative,56.903336,24.032418,6051,5665,86052,17025,30,45,110,1.2,geocoded,
+12,Rixensart,2787989,"Rixensart, Wallonia, Belgium",boundary/administrative,50.721887,4.521985,6314,5986,94800,18771,20,45,72,1.1,geocoded,
+13,Boom,2801494,"Boom, Flanders, Belgium",boundary/administrative,51.093431,4.373233,4623,2843,33176,6527,12,21,35,0.2,geocoded,
+14,Kontich,2794117,"Kontich, Flanders, Belgium",boundary/administrative,51.121428,4.441492,6306,6320,100172,19794,25,45,81,1.3,geocoded,
+15,Siegsdorf,2832424,"Siegsdorf, Bavaria, Germany",boundary/administrative,47.807582,12.670967,10801,8809,238581,47255,49,100,168,2.7,geocoded,
+16,Leguevin,3003874,"Leguevin, Occitanie, France",boundary/administrative,43.592807,1.235225,7598,6090,115900,22981,20,54,72,0.9,geocoded,
+17,Fonsorbes,3018103,"Fonsorbes, Occitanie, France",boundary/administrative,43.533493,1.242965,7623,4296,82130,16265,20,43,60,1.3,geocoded,
+18,Floeha,2926147,"Floeha, Saxony, Germany",boundary/administrative,50.854669,13.086873,7668,5629,108288,21437,30,43,88,0.9,geocoded,
+19,Caselle Torinese,3179911,"Caselle Torinese, Piedmont, Italy",boundary/administrative,45.176571,7.648817,7142,4802,86278,17033,20,43,63,0.5,geocoded,
+20,Sint-Amandsberg,2786743,"Sint-Amandsberg, Flanders, Belgium",boundary/administrative,51.061901,3.771523,3961,3449,34427,6785,9,16,36,1.6,geocoded,
+21,Gomel,627907,"Gomel, Homyel' Voblasc', Belarus",railway/station,52.430696,30.990783,680,1112,1960,375,2,1,4,1.1,geocoded,
+22,Hoofddorp,2753801,"Hoofddorp, North Holland, The Netherlands",boundary/administrative,52.300625,4.678199,8129,9664,196988,39017,42,75,168,0.8,geocoded,
+23,Salzburg,2766824,"Salzburg, Austria",boundary/administrative,47.802802,13.056587,10627,11472,305368,60550,64,129,210,1.0,geocoded,FALLBACK-QUERY
+24,Heilbronn,2907669,"Heilbronn, Baden-Wurttemberg, Germany",boundary/administrative,49.151402,9.173261,18794,13015,611940,121486,117,252,408,3.7,geocoded,
+25,Cologne,2886242,"Cologne, North Rhine-Westphalia, Germany",boundary/administrative,50.957707,6.967279,27366,28316,1938504,384864,360,756,1368,3.0,geocoded,

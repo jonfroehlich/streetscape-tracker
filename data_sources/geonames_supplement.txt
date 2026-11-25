@@ -29,3 +29,11 @@
 5279098	Williams Bay	Williams Bay	Villiams Behj,Виллиамс Бэй	42.57807	-88.54093	P	PPL	US		WI	127	87200		2600	268	269	America/Chicago	2026-09-17
 5254150	Genoa City	Genoa City	Genoa City,Genoa Junction,Genoa Siti,Геноа Сити	42.49835	-88.32815	P	PPL	US		WI	127	28675		3029	253	255	America/Chicago	2026-09-17
 5277801	Walworth	Walworth	Douglass Corners,Valvors,Walworth,Валворс	42.53113	-88.59955	P	PPL	US		WI	127	83250		2838	304	307	America/Chicago	2026-09-17
+2766636	Sankt Johann in Tirol	Sankt Johann in Tirol	Sankt Johann,Sankt-Jokhann (Tirol'),St. Johann in Tirol,Санкт-Йоханн (Тироль)	47.5233	12.4232	P	PPLA3	AT		07	704	70416		9428		659	Europe/Vienna	2019-09-16
+2832424	Siegsdorf	Siegsdorf	Siagsdorf,Zigsdorf,xi ge si duo fu,zygsdwrf,Зигсдорф,Зігсдорф,Զիգսդորֆ,زیگسدورف,锡格斯多夫	47.82278	12.64277	P	PPLA4	DE		02	091	09189	09189145	8230		605	Europe/Berlin	2015-02-05
+2926147	Flöha	Floeha	Flea,Flekha,Fljoa,Floeha,Flöha,Flēa,flwha,fu lei ha,Флеа,Флеха,Флёа,Флөа,فلوها,弗勒哈	50.85613	13.07407	P	PPL	DE		13	00	14522	14522140	11143		273	Europe/Berlin	2015-09-05
+3003874	Léguevin	Leguevin	Legavin,Legeven,Leguevin,Léguevin,lai gai wan,Легевен,莱盖万	43.60028	1.23236	P	PPL	FR		76	31	313	31291	6976		195	Europe/Paris	2016-02-18
+3018103	Fonsorbes	Fonsorbes	Fonsorbes	43.539	1.22882	P	PPL	FR		76	31	311	31187	7745		200	Europe/Paris	2020-05-07
+3054651	Budakalász	Budakalasz	Budakalasz,Budakalász,Kalasch	47.61667	19.05	P	PPL	HU		16				1003		124	Europe/Budapest	2021-05-28
+3179911	Caselle Torinese	Caselle Torinese	Caseli,Caselle,Caselle Torinese,カゼッレ・トリネーゼ	45.17458	7.6429	P	PPLA3	IT		12	TO	001063		11817	277	280	Europe/Rome	2014-04-13
+2751615	Lievendaal	Lievendaal		51.44219	5.43405	P	PPLX	NL		06	0772			3175		19	Europe/Amsterdam	2017-03-24
