@@ -182,9 +182,9 @@ They were kept, because whether that record matters is one of the things the tra
 ### Advance prediction
 
 Written before any of the 25 was registered (`advance_prediction_small_arm`).
-The rate is tranche 3's outcome, 20 of 25 strict hits (0.80), from the US and Canada.
+The rate is tranche 3's outcome, 20 of 25 strict hits (0.80), all 25 of them US towns.
 Tranches 1 and 2 are left out: the V4 ≥ 0.7 threshold was read off their own walks, so their 20 of 23 is in-sample, and tranche 3 is the one test made after the threshold was fixed.
-At that rate 20 places give 16.0 expected strict hits, and "the North American rate carries to small European places" is **falsified below 13 strict hits** on the small arm's first Mapillary drive walks (the largest count whose lower tail is at most 5%; the tail below 13 is 0.032).
+At that rate 20 places give 16.0 expected strict hits, and "the US rate carries to small European places" is **falsified below 13 strict hits** on the small arm's first Mapillary drive walks (the largest count whose lower tail is at most 5%; the tail below 13 is 0.032).
 Strict is the same bar as everywhere here: at least 50% of street-km covered by 360° imagery at a median age of at most two years.
 Four of the 20 already sit at a screen median age above 1.7 years (Rixensart, Boom, Kontich and Sint-Amandsberg), and both of tranche 3's age misses were places like that.
 

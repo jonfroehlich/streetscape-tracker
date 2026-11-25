@@ -9,7 +9,7 @@
  },
  "advance_prediction_small_arm": {
   "n": 20,
-  "basis": "tranche 3 (US and Canada), the out-of-sample test of V4 >= 0.7: 20/25 strict hits",
+  "basis": "tranche 3 (25 US towns), the out-of-sample test of V4 >= 0.7: 20/25 strict hits",
   "rate": 0.8,
   "expected_strict_hits": 16.0,
   "falsified_below": 13,

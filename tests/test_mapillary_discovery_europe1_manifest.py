@@ -10,7 +10,7 @@ Held here:
 * the SELECTION, re-derived independently of the generator from the ranked
   record: a small arm (first 20 places under 100,000 people, at most two per
   uploader) and a large arm (first five of 100,000 or more);
-* the advance prediction, recomputed from the committed US records it cites;
+* the advance prediction, recomputed from the committed tranche-3 outcome it cites;
 * each row's VALUES, a join against vendored GeoNames by geonameid, with the
   named departures and no others;
 * each row's query, which must be the one the committed vetting record
@@ -345,7 +345,13 @@ def test_district_rows_are_restored_to_their_vetted_grids_after_the_audit(vetted
     ops = OPS.read_text(encoding="utf-8")
     section = ops[ops.index("first European tranche (`mapillary_discovery_cities_europe1.csv`)") :]
     section = section[: section.index("\n## ")]
-    assert section.index("**3. Audit the boundaries") < section.index("**4. Restore the three")
+    restore = section.index("**4. Restore the three")
+    assert section.index("**3. Audit the boundaries") < restore
+    # the COMMANDS sit inside step 4, not merely under a later header: run before
+    # the audit, the audit would undo them
+    assert section.count("resize_city.py ") >= 3
+    first_cmd = section.index("python scripts/resize_city.py ")
+    assert restore < first_cmd < section.index("**5. Exclude all 25")
     for gid, (lat, lon, w, h) in gen.DISTRICT_GRIDS.items():
         v = vetted[gid]
         assert (float(v["center_lat"]), float(v["center_lon"])) == (lat, lon), gid

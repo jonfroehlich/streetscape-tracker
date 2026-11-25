@@ -36,7 +36,7 @@ the one OUT-OF-SAMPLE test of V4 >= 0.7: the threshold was read off tranches
 1-2's own walks, so their 20 of 23 is in-sample and is left out. The floor is
 the largest count whose lower tail at that rate is at most ``FLOOR_TAIL_MAX``;
 fewer strict hits than that among the small arm's FIRST Mapillary drive walks
-falsifies "the North American rate carries to small European places".
+falsifies "the US rate carries to small European places".
 
 Each kept row is joined to vendored GeoNames by geonameid (cities15000 plus
 ``EUROPE1_SUPPLEMENT_IDS``, this tranche's rows of the shared
@@ -165,7 +165,7 @@ def prediction(n, hits, walked):
     floor = max(k for k in range(n + 1) if lower_tail(k, n, rate) <= FLOOR_TAIL_MAX)
     return {
         "n": n,
-        "basis": "tranche 3 (US and Canada), the out-of-sample test of V4 >= 0.7: "
+        "basis": "tranche 3 (25 US towns), the out-of-sample test of V4 >= 0.7: "
         f"{hits}/{walked} strict hits",
         "rate": round(rate, 4),
         "expected_strict_hits": round(n * rate, 1),

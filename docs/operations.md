@@ -899,7 +899,7 @@ Before night 2, read night 1's log as for tranche 2: every tranche city collecte
 
 25 European places from the 2026-11-25 screen: 20 small ones that carry an advance prediction and five large ones that do not.
 The selection, the prediction and the vetting are in [`experiments/mapillary-europe-screen.md`](experiments/mapillary-europe-screen.md) ("First tranche").
-Landed the same way as the fourth tranche.
+Landed the same way as the fourth tranche, with one added step (4) that keeps three district rows at their vetted grids.
 Every write below is gated: no `run-due` in flight, the night's `Done:` line in the scheduler log, and the owner's OK before `enable-city`.
 
 **1. Deploy a `main` that contains the manifest**, as for tranche 2.
@@ -924,8 +924,12 @@ python scripts/register_frame.py --manifest mapillary_discovery_cities_europe1.c
   `--center-from-geonames` is deliberately NOT passed, for the same reason: it would freeze that municipality's dimensions around the GeoNames point instead of failing.
 - Each `--execute` line prints the frozen W x H; compare it with `docs/experiments/mapillary-europe-screen_tranche1_vet*.csv` (a row in the retry file replaces its first attempt) and stop on any difference.
 
-**3. Audit the boundaries**: tranche 2's step 3 verbatim, with the label `'mapillary discovery screen 2026-11-25 europe 1%'`, the directory `audit/mde1`, and 25 ids.
+**3. Audit the boundaries**: tranche 2's step 3 verbatim, with the label `'mapillary discovery screen 2026-11-25 europe 1 (%'`, the directory `audit/mde1`, and 25 ids.
+The ` (` keeps a later "europe 10" batch out of the match.
 Read the plan before `--execute`: a RESIZE changes that place's price (re-price it as tranche 2's step 3 says).
+The audit looks up each row's catalog city, region and country, not the manifest's override query, so expect some DEFER rows and decide each "keep current":
+Budakalasz and Salzburg (their region names matched nothing at vetting), and possibly the three districts, which step 4 restores in any case.
+Gomel's vetted grid (28,861 x 25,296 m) is large for the city and came from the same boundary the audit will find, so it will most likely grade `OK` and not appear on the review page: read its row in `boundary_audit_report.csv`, look at the rectangle on a map, and fit it with `resize_city.py` (as in step 4) if it takes in much more than the city.
 `$IDS` below is this step's id list.
 
 **4. Restore the three district rows to their vetted grids, AFTER the audit.**
@@ -942,7 +946,6 @@ python scripts/resize_city.py wilten--tyrol--austria --width 2393 --height 2259 
 
 Run all three whether or not the audit changed them, so each carries the note.
 The numbers are `DISTRICT_GRIDS` in `scripts/build_mapillary_discovery_europe1.py`, which the manifest's test holds to the vetting record.
-Gomel's vetted grid (28,861 x 25,296 m) is large for the city; read its row on the review page before accepting it.
 
 **5. Exclude all 25 from both KartaView channels, while they are still disabled.**
 `enable-city` would otherwise enrol every one of them on KartaView, since each estimate is under its 1,000-request ceiling.
