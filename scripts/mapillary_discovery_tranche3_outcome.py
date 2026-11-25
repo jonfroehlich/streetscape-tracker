@@ -33,6 +33,7 @@ import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from scripts.mapillary_discovery_analyze import strict_json  # noqa: E402
 from scripts.mapillary_discovery_score import (  # noqa: E402
     STRICT_AGE_YR,
     STRICT_COVERAGE_PCT,
@@ -120,18 +121,20 @@ def main(argv=None) -> int:
     result = outcome(rows, walks, prediction["falsified_below"])
     result = {
         "_about": {
-            "generated_by": "scripts/mapillary_discovery_tranche3_outcome.py",
+            "generated_by": "scripts/mapillary_discovery_tranche3_outcome.py "
+            + " ".join(sys.argv[1:] if argv is None else argv),
             "catalog_snapshot": args.snapshot_label,
             "prediction": prediction,
             "strict_bar": {
                 "coverage_pct_at_least": STRICT_COVERAGE_PCT,
                 "age_yr_at_most": STRICT_AGE_YR,
             },
-            "first_walk_basis": "every town had exactly one Mapillary drive walk at the snapshot",
+            "first_walk_basis": "stated by the caller (--walk-counts 1) from a count on the catalog "
+            "host; the snapshot holds only each town's latest walk, so it cannot check this",
         },
         **result,
     }
-    Path(args.out).write_text(json.dumps(result, indent=1) + "\n")
+    Path(args.out).write_text(strict_json(result) + "\n")
     print({k: result[k] for k in ("n", "walked", "strict_hits", "verdict")})
     return 0
 

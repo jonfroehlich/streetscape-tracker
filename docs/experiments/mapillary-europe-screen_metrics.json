@@ -112,6 +112,7 @@
   "after_thinning": 176
  },
  "validation": {
+  "catalog_cities_in_scanned_tiles": 35,
   "walked_catalog_cities_in_scanned_tiles": 35,
   "strict_hits": 0,
   "spearman_v4_vs_walk_coverage": 0.695,
@@ -122,6 +123,38 @@
   },
   "below_v4_min": {
    "n": 28,
+   "strict_hits": 0
+  }
+ },
+ "ranked_uploader_record": {
+  "Eebie": {
+   "ranked_places": 8,
+   "walked_cities": 1,
+   "strict_hits": 0
+  },
+  "erias": {
+   "ranked_places": 1,
+   "walked_cities": 1,
+   "strict_hits": 0
+  },
+  "european-panorama": {
+   "ranked_places": 14,
+   "walked_cities": 1,
+   "strict_hits": 0
+  },
+  "konink360": {
+   "ranked_places": 7,
+   "walked_cities": 2,
+   "strict_hits": 0
+  },
+  "sanjorgepinho": {
+   "ranked_places": 1,
+   "walked_cities": 1,
+   "strict_hits": 0
+  },
+  "southglos": {
+   "ranked_places": 2,
+   "walked_cities": 2,
    "strict_hits": 0
   }
  },

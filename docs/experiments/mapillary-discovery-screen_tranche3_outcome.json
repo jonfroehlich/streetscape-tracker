@@ -1,6 +1,6 @@
 {
  "_about": {
-  "generated_by": "scripts/mapillary_discovery_tranche3_outcome.py",
+  "generated_by": "scripts/mapillary_discovery_tranche3_outcome.py --prod-snapshot experiments/mapillary-discovery-europe/prod_snapshot.csv --snapshot-label makelab2-prod-9cd70ec-2026-11-25 --walk-counts 1 --out docs/experiments/mapillary-discovery-screen_tranche3_outcome.json",
   "catalog_snapshot": "makelab2-prod-9cd70ec-2026-11-25",
   "prediction": {
    "n": 25,
@@ -14,7 +14,7 @@
    "coverage_pct_at_least": 50.0,
    "age_yr_at_most": 2.0
   },
-  "first_walk_basis": "every town had exactly one Mapillary drive walk at the snapshot"
+  "first_walk_basis": "stated by the caller (--walk-counts 1) from a count on the catalog host; the snapshot holds only each town's latest walk, so it cannot check this"
  },
  "n": 25,
  "walked": 25,

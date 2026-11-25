@@ -21,7 +21,7 @@ Per CLAUDE.md the Mapillary API documentation and forum were re-read first: the 
 Requests were serial at the production channels' jittered 40/min, with the stop-at-first-refusal rule, from a residential address that production does not use, on a separate free app's token (`collection.token_vars`).
 
 **All 198 requests returned 200** (`collection.by_host_and_status`): 112 tile requests (104 z6 for the scan and 8 z10 for calibration) and 86 Graph API lookups 3 s apart.
-The tiles total 415 MB; the largest is 20.7 MB, about twice the densest US tile.
+The tiles total 415 MB and the largest is 20.7 MB (`collection.tile_bytes`, `collection.largest_tile_bytes`).
 The scan holds 3,570,520 sequence rows, of which the 360° ones sample to 4,258,699 points over 693,115 km (`samples`).
 
 ## What changed in the tooling
@@ -39,7 +39,7 @@ The new ranking differs from the old in two deliberate ways: it orders by V4 whe
 
 ## Calibration: z6 keeps Europe's dense tiles
 
-The US calibration could not say whether a z6 tile twice as large drops sequences.
+The US calibration was made around small towns, so it could not say whether z6 drops sequences in a dense European city centre.
 Recent 360° sequences within 3 km of eight city centres, at z6 against z10 (`calibration.towns`):
 
 | City | z6 | z10 | z6 / z10 | Same top uploader |
@@ -60,7 +60,7 @@ The lowest is 0.857; the densest centres, Brussels and Budapest, keep 0.928 and 
 
 V4 over all 96,767 scored places is p50 0.0, p90 0.1641, p99 0.6018, p99.9 1.0693 (`v4_of_scored_places`), so the 0.7 cut is above the 99th percentile here as it was in the US.
 
-35 catalog cities sit in the scanned tiles and all have a Mapillary drive walk.
+35 catalog cities sit in the scanned tiles and all have a Mapillary drive walk (`validation.catalog_cities_in_scanned_tiles`, `validation.walked_catalog_cities_in_scanned_tiles`).
 **0 of them meet the strict bar** (≥ 50% of street-km in 360° at a median age ≤ 2 years), so average precision is undefined and the only agreement measure is rank correlation: ρ(V4, walk coverage) = 0.695, ρ(V0, walk coverage) = 0.637.
 The 7 at V4 ≥ 0.7:
 
@@ -148,7 +148,19 @@ The 176 ranked places have 86 distinct top uploaders, 27 of whom top at least tw
 | `padididejurbise` | 5 | BE | Strepy-Bracquegnies, Saint-Ghislain, Havre |
 
 In the US the uploader was the unit that generalized, and the number of towns an uploader holds did not predict how they walk.
-No European uploader has a walked town yet, so no uploader record is applied to this ranking.
+No uploader record is applied to this ranking, because no European uploader has a strict hit to its name.
+**Six ranked uploaders do have a record, and it is 0 strict hits in 8 walked catalog cities** (`ranked_uploader_record`; an uploader's cities are the walked ones where it holds at least half the weighted 360° length, the `user` column of the validation record):
+
+| Uploader | Ranked places | Walked cities it dominates (street-km covered, median age) |
+|---|---|---|
+| `european-panorama` | 14 | Munich (24.7%, 1.23 yr) |
+| `Eebie` | 8 | Beringen (48.2%, 2.09 yr) |
+| `konink360` | 7 | Mechelen (48.3%, 2.22 yr), Antwerp (58.5%, 2.21 yr) |
+| `southglos` | 2 | Lisbon (27.9%, 2.45 yr), Bath (6.6%, 0.07 yr) |
+| `erias` | 1 | Vienna (9.0%, 0.99 yr) |
+| `sanjorgepinho` | 1 | Porto (21.0%, 1.94 yr) |
+
+Those 33 ranked places are the ones with evidence against them, though of a weak kind: five of the eight are large cities scored on a 3 km core, and Mechelen, Beringen and Antwerp miss the bar narrowly.
 Uploader identities are what the Graph API returns for one sample image each; nothing here establishes who an account belongs to.
 
 ## Caveats

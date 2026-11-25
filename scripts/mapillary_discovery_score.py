@@ -57,6 +57,7 @@ from scripts.mapillary_discovery_analyze import (  # noqa: E402
     strict_json,
 )
 from scripts.mapillary_discovery_common import (  # noqa: E402
+    FEATURE_STEP_KM,
     YEAR_MS,
     PanoSamples,
     decode_sequences,
@@ -143,6 +144,8 @@ def build_sample_cache(raw_dir: Path, tiles: list[tuple[int, int]], zoom: int) -
         )
     lon, lat, km, cap, cre, foot = (np.concatenate(c) for c in zip(*parts, strict=True))
     return {
+        "tile_bytes": tile_sizes(raw_dir, tiles, zoom),
+        "step_km": np.array(FEATURE_STEP_KM),
         "lon": lon,
         "lat": lat,
         "km": km.astype(np.float32),
@@ -156,15 +159,31 @@ def build_sample_cache(raw_dir: Path, tiles: list[tuple[int, int]], zoom: int) -
     }
 
 
+def tile_sizes(raw_dir: Path, tiles: list[tuple[int, int]], zoom: int) -> np.ndarray:
+    """Each cached tile's size in bytes, -1 for one that is missing."""
+    paths = [raw_dir / "tiles" / f"{zoom}_{x}_{y}.mvt" for x, y in tiles]
+    return np.array([p.stat().st_size if p.exists() else -1 for p in paths], dtype=np.int64)
+
+
 def load_samples(raw_dir: Path, manifest: dict, rebuild: bool = False) -> dict:
-    """The sample cache for this manifest's tiles, built (and saved) if absent or stale."""
+    """
+    The sample cache for this manifest's tiles, built (and saved) if absent or
+    stale. Stale means: other tiles, a tile whose size on disk differs from the
+    one the cache was built from (a re-scan into the same directory), or another
+    sample spacing. A cache from before those were recorded is rebuilt.
+    """
     tiles = sorted(scan_tiles(manifest))
     cache = raw_dir / "samples.npz"
     if cache.exists() and not rebuild:
         z = dict(np.load(cache))
-        if z["tiles"].tolist() == [list(t) for t in tiles]:
+        if (
+            z["tiles"].tolist() == [list(t) for t in tiles]
+            and "tile_bytes" in z
+            and z["tile_bytes"].tolist() == tile_sizes(raw_dir, tiles, manifest["zoom"]).tolist()
+            and float(z.get("step_km", np.nan)) == FEATURE_STEP_KM
+        ):
             return z
-        print("samples.npz covers other tiles than the manifest; rebuilding", flush=True)
+        print("samples.npz was built from other tiles or settings; rebuilding", flush=True)
     z = build_sample_cache(raw_dir, tiles, manifest["zoom"])
     np.savez(cache, **z)
     pd.DataFrame(
@@ -192,6 +211,8 @@ def pano_samples(z: dict, scan_date: str) -> PanoSamples:
 def feature_table(samples: PanoSamples, points: pd.DataFrame) -> pd.DataFrame:
     """``points`` (lat, lon, any other columns) with ``place_features`` joined on, row for row."""
     feats = pd.DataFrame([place_features(samples, r.lat, r.lon) for r in points.itertuples()])
+    if not len(points):  # no rows still needs the columns (a region with no catalog city)
+        feats = pd.DataFrame(columns=list(place_features(samples, 0.0, 0.0)))
     return pd.concat([points.reset_index(drop=True), feats], axis=1)
 
 
@@ -403,7 +424,13 @@ def main(argv=None) -> int:
     cat_features.to_parquet(out / "catalog_features.parquet")
     val, val_summary = validation(cat_features, walks, args.v4_min)
     print(f"catalog cities in scanned tiles: {len(cat_in)}, walked: {len(val)}", flush=True)
-    val_cols = ["city_id", "v0", "v4", "top_share", "foot_share", "med_age"]
+    names = json.loads(Path(args.creators).read_text()) if args.creators else {}
+
+    def username(i) -> str:
+        return names.get(str(i)) or ("" if i == -1 else str(i))
+
+    val["user"] = val.top.map(username)
+    val_cols = ["city_id", "v0", "v4", "user", "top_share", "foot_share", "med_age"]
     val_cols += ["coverage_pct_by_length", "median_covered_age_years", "length_km", "strict"]
     val.sort_values("v4", ascending=False)[val_cols].round(4).to_csv(
         out / "validation.csv", index=False
@@ -418,8 +445,7 @@ def main(argv=None) -> int:
     places[["uploader_walked", "uploader_strict"]] = (
         places[["uploader_walked", "uploader_strict"]].fillna(0).astype(int)
     )
-    names = json.loads(Path(args.creators).read_text()) if args.creators else {}
-    places["user"] = places.top.map(lambda i: names.get(str(i)) or ("" if i == -1 else str(i)))
+    places["user"] = places.top.map(username)
     places.to_parquet(out / "place_features.parquet")
 
     rules = {
@@ -471,7 +497,16 @@ def main(argv=None) -> int:
         },
         "rules": rules,
         "funnel": funnel,
-        "validation": val_summary,
+        "validation": {"catalog_cities_in_scanned_tiles": int(len(cat_in)), **val_summary},
+        # the walked catalog cities each ranked uploader dominates, and how they walked
+        "ranked_uploader_record": {
+            user: {
+                "ranked_places": int(len(g)),
+                "walked_cities": int(g.uploader_walked.iloc[0]),
+                "strict_hits": int(g.uploader_strict.iloc[0]),
+            }
+            for user, g in ranked[ranked.uploader_walked > 0].groupby("user")
+        },
         "ranked_by_country": ranked.cc.value_counts().to_dict(),
         "ranked_by_uploader": ranked.user.value_counts().head(25).to_dict(),
         "ranked_population": {

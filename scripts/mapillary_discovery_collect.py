@@ -140,12 +140,19 @@ class TileFetcher:
         if wait > 0:
             time.sleep(wait)
         self._last = t0 = time.time()
-        r = self.session.get(
-            TILE_URL_TEMPLATE.format(z=z, x=x, y=y),
-            params={"access_token": self._token},
-            allow_redirects=False,  # a 302 -> login IS the per-IP block (#199)
-            timeout=120,
-        )
+        try:
+            r = self.session.get(
+                TILE_URL_TEMPLATE.format(z=z, x=x, y=y),
+                params={"access_token": self._token},
+                allow_redirects=False,  # a 302 -> login IS the per-IP block (#199)
+                timeout=120,
+            )
+        except requests.RequestException as e:
+            # requests puts the full URL in the exception text, and the token is
+            # in the query string: name the failure and drop the message
+            # (`from None`), or the traceback writes the token into a log.
+            self.requests += 1
+            raise StopProbe(f"STOP at {z}/{x}/{y}: {type(e).__name__} (no response)") from None
         self.requests += 1
         ctype = r.headers.get("Content-Type", "")
         entry = {

@@ -67,7 +67,12 @@ R_KM = 2.0  # radius of the disc a place is scored over
 
 # The #441 re-score ("V4"), as scripts/mapillary_discovery_rescore/features.py
 # ran it on 2026-11-05. Those scripts are a frozen record; these constants and
-# ``place_features`` are the same maths, importable and tested.
+# ``place_features`` are the same maths, importable and tested, with ONE
+# difference: an undated sample. The record's ``np.minimum.at`` lets a NaN age
+# poison its cell (a cell holding dated and undated imagery scored 0) and its
+# newest age; here a NaN never wins (``np.fmin``), so the cell scores by its
+# dated imagery. Neither scan holds an undated 360 sample, so no recorded
+# number depends on it.
 FEATURE_STEP_KM = 0.2  # sample spacing along a sequence
 FEATURE_CELL_KM = 0.25  # side of the cells whose occupancy is the score
 FEATURE_DISCS_KM = (1, 2, 3)  # V4 is the best of these discs

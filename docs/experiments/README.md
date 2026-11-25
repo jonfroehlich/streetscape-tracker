@@ -146,7 +146,7 @@ The #383 discovery screen run over Europe (104 z6 tiles, 198 requests, all 200, 
 Two things generalize.
 **(1) Prove a rewrite against the record before using it somewhere new**: the region-agnostic scorer was first run over the cached US tiles and matched all 105 committed tranche-3 rows to their rounding, and only then pointed at Europe.
 **(2) A validation set with no positives validates nothing**, however many rows it has; say so and let the first tranche be the measurement.
-It also records that z6 keeps a tile twice the densest US one (0.857 to 1.214 of z10's recent 360° sequences around eight city centres).
+It also records that z6 holds up in dense European city centres (0.857 to 1.214 of z10's recent 360° sequences around eight of them).
 
 ### `mapillary-image-quality.md`
 

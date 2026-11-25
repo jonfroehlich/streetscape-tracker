@@ -240,6 +240,24 @@ def test_fetcher_never_exceeds_max_requests(tmp_path, monkeypatch):
     assert f.get(6, 0, 0) == b"tile"
 
 
+def test_a_failed_connection_never_carries_the_token_out(tmp_path, monkeypatch):
+    import requests
+
+    class _Dead:
+        def get(self, url, **kwargs):
+            # requests' own message quotes the URL, query string included
+            raise requests.ConnectionError(f"{url}?access_token={kwargs['params']['access_token']}")
+
+    f = _fetcher(tmp_path, monkeypatch, [])
+    f.session = _Dead()
+    with pytest.raises(mdcol.StopProbe) as e:
+        f.get(6, 1, 1)
+    assert "ConnectionError" in str(e.value) and "test-token" not in str(e.value)
+    # `from None`: nothing chained, so a printed traceback has no token either
+    assert e.value.__cause__ is None and e.value.__suppress_context__
+    assert f.requests == 1 and not (tmp_path / "tiles" / "6_1_1.mvt").exists()
+
+
 def test_catalog_snapshot_exports_each_citys_latest_drive_walk(tmp_path):
     db = tmp_path / "catalog.db"
     conn = sqlite3.connect(db)
@@ -1200,6 +1218,36 @@ def test_a_stale_sample_cache_is_rebuilt_not_trusted(tmp_path):
         z[k] = z[k][:0]
     np.savez(raw / "samples.npz", **z)
     out = _score(tmp_path, raw)
+    assert pd.read_csv(out / "places_ranked.csv").name.tolist() == ["Sweptville"]
+
+
+def test_a_valid_sample_cache_is_reused_and_a_refetched_tile_rebuilds_it(tmp_path, monkeypatch):
+    raw = _score_inputs(tmp_path)
+    _score(tmp_path, raw)
+    built = []
+    real = mds.build_sample_cache
+    monkeypatch.setattr(mds, "build_sample_cache", lambda *a: built.append(1) or real(*a))
+    _score(tmp_path, raw)
+    assert built == []  # same tiles, same sizes: no decode
+    # a re-scan into the same directory: same tile list, other bytes
+    lat, lon = _HONOLULU
+    props = {"id": "s", "is_pano": True, "creator_id": 7, "captured_at": 0, "image_id": 11}
+    (raw / "tiles" / "6_4_28.mvt").write_bytes(
+        _sequence_tile([([(lon, lat), (lon + 0.01, lat)], props)], 4, 28)
+    )
+    out = _score(tmp_path, raw)
+    assert built == [1]
+    assert pd.read_csv(out / "places_ranked.csv").empty  # the old sweep is no longer scored
+
+
+def test_scorer_runs_where_no_catalog_city_is_in_the_scanned_tiles(tmp_path):
+    raw = _score_inputs(tmp_path)
+    snap = pd.read_csv(tmp_path / "snap.csv")
+    snap.loc[snap.table == "cities", ["lat", "lon"]] = [48.85, 2.35]
+    snap.to_csv(tmp_path / "snap.csv", index=False)
+    out = _score(tmp_path, raw)
+    v = json.loads((out / "metrics.json").read_text())["validation"]
+    assert v["catalog_cities_in_scanned_tiles"] == 0 and v["strict_hits"] == 0
     assert pd.read_csv(out / "places_ranked.csv").name.tolist() == ["Sweptville"]
 
 
