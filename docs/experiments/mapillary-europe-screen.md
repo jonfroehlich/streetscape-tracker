@@ -182,10 +182,11 @@ They were kept, because whether that record matters is one of the things the tra
 ### Advance prediction
 
 Written before any of the 25 was registered (`advance_prediction_small_arm`).
-The rate is the US record of screened places at V4 ≥ 0.7: 40 of 48 strict hits over tranches 1 to 3 (0.833).
-At that rate 20 places give 16.7 expected strict hits, and "the US rate carries to small European places" is **falsified below 14 strict hits** on the small arm's first Mapillary drive walks (the largest count whose lower tail is at most 5%; the tail below 14 is 0.037).
+The rate is tranche 3's outcome, 20 of 25 strict hits (0.80), from the US and Canada.
+Tranches 1 and 2 are left out: the V4 ≥ 0.7 threshold was read off their own walks, so their 20 of 23 is in-sample, and tranche 3 is the one test made after the threshold was fixed.
+At that rate 20 places give 16.0 expected strict hits, and "the North American rate carries to small European places" is **falsified below 13 strict hits** on the small arm's first Mapillary drive walks (the largest count whose lower tail is at most 5%; the tail below 13 is 0.032).
 Strict is the same bar as everywhere here: at least 50% of street-km covered by 360° imagery at a median age of at most two years.
-Four of the 20 already sit at a screen median age above 1.7 years (Rixensart, Boom, Kontich and Sint-Amandsberg), and both US age misses were places like that.
+Four of the 20 already sit at a screen median age above 1.7 years (Rixensart, Boom, Kontich and Sint-Amandsberg), and both of tranche 3's age misses were places like that.
 
 ### Vetting
 
@@ -199,8 +200,10 @@ Four rows needed a query override, each re-vetted before being committed:
 | Budakalasz | the county name matched nothing; the bare fallback won | `Budakalasz, Hungary` | unchanged |
 | Salzburg | likewise for "State of Salzburg" | `Salzburg, Austria` | unchanged |
 
-Three names depart from GeoNames, each asserted against the vendored value by the generator: Cologne (ASCII name `Koeln`) and Gomel (`Homyel'`), Gomel's region (`Homyel' Voblasc'`, written `Gomel Oblast`, because its apostrophes would reach the city id), and the country of the two Dutch rows (`Netherlands`, as the catalog's one Dutch city is registered, not GeoNames' `The Netherlands`).
-Three rows are districts, registered as the district: Lievendaal (a neighbourhood of Eindhoven), Wilten (a suburb of Innsbruck) and Joensuu's centre.
+Three names depart from GeoNames, each asserted against the vendored value by the generator: Cologne (ASCII name `Koeln`) and Gomel (`Homyel'`), Gomel's region (`Homyel' Voblasc'`, written `Gomel Oblast`; left as GeoNames spells it, its apostrophes would reach the city id, and respelled it repeats the city's name, so identity drops it and the id is `gomel--belarus`), and the country of the two Dutch rows (`Netherlands`, as the catalog's one Dutch city is registered, not GeoNames' `The Netherlands`).
+Three rows geocode to a district rather than a municipality and are registered as the district: Lievendaal (a neighbourhood of Eindhoven), Wilten (a suburb of Innsbruck) and Joensuu's centre.
+The runbook restores each to its vetted grid after the boundary audit, which could otherwise grow it to the parent city.
+Sint-Amandsberg is a district of Ghent too, but geocodes to its own administrative boundary.
 
 One collection of all 25 is 7,654,613 GSV grid points and 1,553 Mapillary z14 tiles: 610 tiles for the 20 small places and 943 for the five large ones.
 Cologne and Gomel are 360 tiles each.

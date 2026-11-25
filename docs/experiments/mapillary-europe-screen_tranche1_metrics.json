@@ -9,11 +9,11 @@
  },
  "advance_prediction_small_arm": {
   "n": 20,
-  "basis": "US screened places at V4 >= 0.7, tranches 1-3: 40/48 strict hits",
-  "rate": 0.8333,
-  "expected_strict_hits": 16.7,
-  "falsified_below": 14,
-  "p_below_floor_at_rate": 0.037
+  "basis": "tranche 3 (US and Canada), the out-of-sample test of V4 >= 0.7: 20/25 strict hits",
+  "rate": 0.8,
+  "expected_strict_hits": 16.0,
+  "falsified_below": 13,
+  "p_below_floor_at_rate": 0.032
  },
  "large_arm": "exploratory: scored on a 3 km core only, no prediction",
  "small_arm_uploaders": 16,

@@ -182,7 +182,7 @@ def test_selection_rederives_from_the_ranked_record(manifest_rows, ranked, metri
     large = [r["geonameid"] for r in ranked if int(r["pop"]) >= 100_000][:5]
     ids = [r["geonameid"] for r in manifest_rows]
     assert ids[:SMALL_N] == small[:SMALL_N] and ids[SMALL_N:] == large
-    assert max(held.values()) == 2
+    assert max(held[r["user"]] for r in ranked if r["geonameid"] in ids[:SMALL_N]) == 2
     assert [r["arm"] for r in metrics["rows"]] == ["small"] * SMALL_N + ["large"] * 5
     assert [r["geonameid"] for r in metrics["rows"]] == ids
     by_id = {r["geonameid"]: r for r in ranked}
@@ -197,24 +197,25 @@ def test_selection_rederives_from_the_ranked_record(manifest_rows, ranked, metri
     assert metrics["small_arm_with_an_uploader_record"] == 4
 
 
-def test_advance_prediction_is_recomputed_from_the_us_records(metrics):
+def test_advance_prediction_is_recomputed_from_the_out_of_sample_record(metrics):
+    """Tranche 3 only: tranches 1-2 set the V4 threshold, so their rate is in-sample."""
     pred = metrics["advance_prediction_small_arm"]
     t3 = json.loads((EXP / "mapillary-discovery-screen_tranche3_outcome.json").read_text())
-    hits, walked = 20 + t3["strict_hits"], 23 + t3["walked"]
-    assert (hits, walked) == (40, 48)
+    hits, walked = t3["strict_hits"], t3["walked"]
+    assert (hits, walked) == (20, 25)
     assert pred["basis"].endswith(f"{hits}/{walked} strict hits")
     rate = hits / walked
 
     def tail(k):
         return sum(math.comb(20, i) * rate**i * (1 - rate) ** (20 - i) for i in range(k))
 
-    assert (pred["n"], pred["falsified_below"]) == (SMALL_N, 14)
-    assert tail(14) <= 0.05 < tail(15)  # the floor is the largest count inside the 5% tail
-    assert pred["p_below_floor_at_rate"] == round(tail(14), 3) == 0.037
-    assert pred["expected_strict_hits"] == round(20 * rate, 1) == 16.7
+    assert (pred["n"], pred["falsified_below"]) == (SMALL_N, 13)
+    assert tail(13) <= 0.05 < tail(14)  # the floor is the largest count inside the 5% tail
+    assert pred["p_below_floor_at_rate"] == round(tail(13), 3) == 0.032
+    assert pred["expected_strict_hits"] == round(20 * rate, 1) == 16.0
     writeup = WRITEUP.read_text(encoding="utf-8")
-    assert "falsified below 14 strict hits" in writeup
-    assert "40 of 48" in writeup and "16.7" in writeup and "0.037" in writeup
+    assert "falsified below 13 strict hits" in writeup
+    assert "20 of 25" in writeup and "16.0 expected" in writeup and "0.032" in writeup
 
 
 def test_every_row_joins_its_vendored_geonames_record(manifest_rows, geonames):
@@ -323,7 +324,36 @@ def test_registration_reuse_margins_leave_headroom_at_the_runbooks_radius(
     assert fonsorbes["nearest_earlier_row_km"] == pytest.approx(5.116, abs=0.001)
     assert min(margins) == fonsorbes["nearest_earlier_row_km"]
     ops = OPS.read_text(encoding="utf-8")
-    assert '--notes-label "mapillary discovery screen 2026-11-25 europe 1" --overlap-km 3 ' in ops
+    # the whole guard, not just the radius: at a wider centre guard, or recentred on
+    # the GeoNames point, Joensuu's bare-name fallback (the municipality, 31 km off) registers
+    assert (
+        '--notes-label "mapillary discovery screen 2026-11-25 europe 1" '
+        "--overlap-km 3 --max-center-km 10\n" in ops
+    )
+    section = ops[ops.index("first European tranche (`mapillary_discovery_cities_europe1.csv`)") :]
+    section = section[: section.index("\n## ")]
+    assert "--center-from-geonames` is deliberately NOT passed" in section
+    assert section.count("--center-from-geonames") == 1
+
+
+def test_district_rows_are_restored_to_their_vetted_grids_after_the_audit(vetted):
+    """
+    The audit may grow a district to its parent municipality unattended; the
+    runbook puts each back with resize_city.py, at exactly the vetted grid.
+    """
+    assert set(gen.DISTRICT_GRIDS) == {g for g, m in DISTRICT_MATCHES.items() if "town" not in m}
+    ops = OPS.read_text(encoding="utf-8")
+    section = ops[ops.index("first European tranche (`mapillary_discovery_cities_europe1.csv`)") :]
+    section = section[: section.index("\n## ")]
+    assert section.index("**3. Audit the boundaries") < section.index("**4. Restore the three")
+    for gid, (lat, lon, w, h) in gen.DISTRICT_GRIDS.items():
+        v = vetted[gid]
+        assert (float(v["center_lat"]), float(v["center_lon"])) == (lat, lon), gid
+        assert (int(v["width_m"]), int(v["height_m"])) == (w, h), gid
+        assert (
+            f"python scripts/resize_city.py {EXPECTED_CITY_IDS[gid]} --width {w} --height {h} "
+            f'--center-lat {lat} --center-lon {lon} --data-dir "$DATA"' in section
+        ), gid
 
 
 def test_the_writeups_overlaps_are_the_overlap_record(overlap_rows):
@@ -383,8 +413,8 @@ def test_the_runbook_excludes_every_row_from_kartaview_before_enabling(vetted):
     ops = OPS.read_text(encoding="utf-8")
     section = ops[ops.index("first European tranche (`mapillary_discovery_cities_europe1.csv`)") :]
     section = section[: section.index("\n## ")]
-    exclude = section.index("**4. Exclude all 25 from both KartaView channels")
-    enable = section.index("**5. Enable, one night at a time")
+    exclude = section.index("**5. Exclude all 25 from both KartaView channels")
+    enable = section.index("**6. Enable, one night at a time")
     assert exclude < enable
     step = section[exclude:enable]
     assert "for c in $IDS; do" in step

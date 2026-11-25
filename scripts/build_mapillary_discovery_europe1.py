@@ -31,11 +31,12 @@ THE PREDICTION
 --------------
 Written by this script, before any of the places is registered, into
 ``docs/experiments/mapillary-europe-screen_tranche1_metrics.json``. Its rate is
-the US record of screened places at V4 >= 0.7: tranches 1-2 (20 of 23) plus
-tranche 3 (20 of 25, ``mapillary-discovery-screen_tranche3_outcome.json``). The
-floor is the largest count whose lower tail at that rate is at most
-``FLOOR_TAIL_MAX``; fewer strict hits than that among the small arm's FIRST
-Mapillary drive walks falsifies "the US rate carries to small European places".
+tranche 3's outcome (20 of 25, ``mapillary-discovery-screen_tranche3_outcome.json``),
+the one OUT-OF-SAMPLE test of V4 >= 0.7: the threshold was read off tranches
+1-2's own walks, so their 20 of 23 is in-sample and is left out. The floor is
+the largest count whose lower tail at that rate is at most ``FLOOR_TAIL_MAX``;
+fewer strict hits than that among the small arm's FIRST Mapillary drive walks
+falsifies "the North American rate carries to small European places".
 
 Each kept row is joined to vendored GeoNames by geonameid (cities15000 plus
 ``EUROPE1_SUPPLEMENT_IDS``, this tranche's rows of the shared
@@ -70,7 +71,6 @@ DATA_SOURCES = os.path.join(REPO_ROOT, "data_sources")
 EXP = os.path.join(REPO_ROOT, "docs", "experiments")
 RANKED = os.path.join(EXP, "mapillary-europe-screen_ranked.csv")
 TRANCHE3_OUTCOME = os.path.join(EXP, "mapillary-discovery-screen_tranche3_outcome.json")
-TRANCHE3_METRICS = os.path.join(EXP, "mapillary-discovery-screen_tranche3_metrics.json")
 
 SMALL_N = 20
 LARGE_N = 5
@@ -110,6 +110,17 @@ ADMIN_DEPARTURES = {"627907": ("Homyel' Voblasc'", "Gomel Oblast")}
 # under "Netherlands", and a second spelling would split the country.
 # iso2 -> (GeoNames country name, manifest country).
 COUNTRY_DEPARTURES = {"NL": ("The Netherlands", "Netherlands")}
+
+# The three rows registered as a DISTRICT, at the grid vetting geocoded. The
+# boundary audit looks a name up as city/state/country and may grow a district
+# to its parent municipality unattended, so the runbook restores each with
+# scripts/resize_city.py after the audit (which also stamps the note that stops
+# a later audit growing it again). geonameid -> (center_lat, center_lon, width_m, height_m).
+DISTRICT_GRIDS = {
+    "2751615": (51.442672, 5.434239, 1390, 2225),  # Lievendaal, a neighbourhood of Eindhoven
+    "655808": (62.601416, 29.761591, 2054, 4458),  # Joensuu's centre district
+    "2761164": (47.252929, 11.388894, 2393, 2259),  # Wilten, a suburb of Innsbruck
+}
 
 # Geocode-query overrides found by scripts/vet_manifest_geometry.py (the _vet
 # CSV) and re-vetted before being committed (the _vet_retry CSV).
@@ -154,7 +165,8 @@ def prediction(n, hits, walked):
     floor = max(k for k in range(n + 1) if lower_tail(k, n, rate) <= FLOOR_TAIL_MAX)
     return {
         "n": n,
-        "basis": f"US screened places at V4 >= 0.7, tranches 1-3: {hits}/{walked} strict hits",
+        "basis": "tranche 3 (US and Canada), the out-of-sample test of V4 >= 0.7: "
+        f"{hits}/{walked} strict hits",
         "rate": round(rate, 4),
         "expected_strict_hits": round(n * rate, 1),
         "falsified_below": floor,
@@ -162,15 +174,12 @@ def prediction(n, hits, walked):
     }
 
 
-def us_record():
-    """(strict hits, walked) over the US screened tranches, from the committed records."""
-    with open(TRANCHE3_METRICS, encoding="utf-8") as f:
-        basis = json.load(f)["advance_prediction_tranche3"]["basis"]
-    hits12, walked12 = (int(x) for x in basis.rsplit(": ", 1)[1].split(" ")[0].split("/"))
+def out_of_sample_record():
+    """(strict hits, walked) of tranche 3, from its committed outcome."""
     with open(TRANCHE3_OUTCOME, encoding="utf-8") as f:
         t3 = json.load(f)
     assert t3["verdict"] != "undecided" and t3["walked"] == t3["n"]
-    return hits12 + t3["strict_hits"], walked12 + t3["walked"]
+    return t3["strict_hits"], t3["walked"]
 
 
 def manifest_row(geonameid, cities, admin, countries):
@@ -259,7 +268,7 @@ def main(argv=None) -> int:
         for row in small + large:
             w.writerow(manifest_row(row["geonameid"], cities, admin, countries))
 
-    hits, walked = us_record()
+    hits, walked = out_of_sample_record()
     metrics = {
         "generated_by": "scripts/build_mapillary_discovery_europe1.py",
         "ranked_record": "docs/experiments/mapillary-europe-screen_ranked.csv",
