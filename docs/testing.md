@@ -2038,6 +2038,17 @@ Added after the final review, which found seven more surviving:
 
 The final review's 48 mutations (its two against the replaced subtraction re-aimed at the set-difference code) and eight more against this round's fixes, run after this change, all fail at least one test.
 
+Added with the second region and the region-agnostic scorer (`scripts/mapillary_discovery_score.py`):
+
+- **`europe` is an extra region, never part of the default frame**: it is in `EXTRA_REGIONS` and not `REGIONS`, its frame is pinned at 104 z6 tiles, `scan`'s default regions are still exactly `REGIONS`, and `fetch` has no default region at all.
+- **The discovery token outranks production's wherever either is set** (a `.env` discovery token beats an environment production token), the environment outranks `.env` for one variable, no token is refused naming the variables, and the request log carries the variable's NAME and never its value. `ENV_FILE` is monkeypatched, so the tests never read a real `.env`.
+- **`collect fetch`**, through the fake session over Hawaii's four tiles: it caches every tile and writes a manifest the analyzer's reader accepts, with the decoded sequence count and no `sequences.parquet`; a second run makes no request; `--dry-run` makes no request, writes no manifest and no log, and reports the cached count; a refusal or the request cap stops it, exits nonzero and records the stop, which the scorer then refuses as a partial scan.
+- **The lifted V4 maths** (`place_features`): the age weight's steps at exactly 2, 3 and 5 years and 0 for an undated sample; `sample_polyline` equal to `split_samples` piece for piece; a cell counted by its NEWEST imagery (new over old in one cell is one recent cell, a 4-year-only cell weighs 0.25, an undated-only or 9-year-only one nothing); each disc reading only its own samples, the cell share falling with radius and V4 the best disc; V0 as length, not cells; the top uploader by AGE-WEIGHTED length (a longer 8-year-old sweep loses) and the median age by length.
+- **The scorer's own seams**: `tile_samples` dropping flat sequences, keeping an uploaderless undated one as -1/NaN and recording each uploader's newest image; `catalog_relation` as rectangle membership plus nearest centre; `rank_places` dropping a row for each rule in turn (with the base row, a five-million-person Italian city, passing under the defaults), ordering by V4, thinning, and its funnel counts; a manifest tile absent from the cache refused rather than read as empty.
+- **End to end over a synthetic tile cache**: a swept place is ranked from the cache alone, a GeoNames row with country code `NA` is not read as missing, a place in no scanned tile is not scored, the metrics are strict JSON reporting zero requests, `creator_images.csv` holds the uploader's newest image, `--pop-max` and `--scan-date` each change the result, and a sample cache built over other tiles than the manifest's is rebuilt.
+
+Not pinned by a test, because its inputs are gitignored: the scorer's parity with the committed tranche-3 record (`docs/experiments/mapillary-europe-screen.md`, "Parity").
+
 ## The Mapillary candidate probe (#406)
 
 **Added after the 2026-08-22 split.**

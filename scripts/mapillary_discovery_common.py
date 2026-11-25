@@ -47,6 +47,14 @@ REGIONS: dict[str, tuple[float, float, float, float]] = {
     "anchorage_fairbanks": (-151.5, 60.5, -146.5, 65.5),
     "hawaii": (-160.5, 18.8, -154.7, 22.4),
 }
+# Regions added after the 2026-10-02 run. They are NOT part of ``REGIONS`` on
+# purpose: that dict is the pinned 97-tile frame the committed US/Canada numbers
+# trace to, and it is ``scan``'s default. Iceland, the Canaries, Cyprus and
+# everything east of 32 E are outside "europe" and left for a later pass.
+EXTRA_REGIONS: dict[str, tuple[float, float, float, float]] = {
+    "europe": (-11.0, 34.5, 32.0, 71.5),
+}
+ALL_REGIONS: dict[str, tuple[float, float, float, float]] = {**REGIONS, **EXTRA_REGIONS}
 
 # Pacing, as the production Mapillary channels run (#292): mean 40/min, gaps
 # drawn as mean * ((1 - j) + j * Exp(1)) so the mean rate is unchanged and
@@ -57,6 +65,15 @@ JITTER = 0.6
 SAMPLE_KM = 0.5  # a simplified segment is split into pieces no longer than this
 R_KM = 2.0  # radius of the disc a place is scored over
 
+# The #441 re-score ("V4"), as scripts/mapillary_discovery_rescore/features.py
+# ran it on 2026-11-05. Those scripts are a frozen record; these constants and
+# ``place_features`` are the same maths, importable and tested.
+FEATURE_STEP_KM = 0.2  # sample spacing along a sequence
+FEATURE_CELL_KM = 0.25  # side of the cells whose occupancy is the score
+FEATURE_DISCS_KM = (1, 2, 3)  # V4 is the best of these discs
+FEATURE_REACH_KM = 3.0  # latitude window searched around a place (the largest disc)
+YEAR_MS = 365.25 * 86400e3
+
 
 def jittered_gap(rng: random.Random, mean_s: float = MEAN_GAP_S, jitter: float = JITTER) -> float:
     """One inter-request gap, in seconds."""
@@ -64,8 +81,8 @@ def jittered_gap(rng: random.Random, mean_s: float = MEAN_GAP_S, jitter: float =
 
 
 def region_tiles(names: Iterable[str], zoom: int = SCREEN_ZOOM) -> list[tuple[int, int]]:
-    """The sorted, de-duplicated (x, y) tiles covering the named REGIONS."""
-    return sorted({t for n in names for t in tiles_for_bbox(*REGIONS[n], zoom)})
+    """The sorted, de-duplicated (x, y) tiles covering the named regions."""
+    return sorted({t for n in names for t in tiles_for_bbox(*ALL_REGIONS[n], zoom)})
 
 
 def local_km(lon0: float, lat0: float, lon1: float, lat1: float) -> float:
@@ -198,3 +215,146 @@ def thin_by_distance(df: pd.DataFrame, min_km: float) -> pd.DataFrame:
         if all(local_km(r.lon, r.lat, df.lon.iat[k], df.lat.iat[k]) >= min_km for k in kept):
             kept.append(i)
     return df.iloc[kept].reset_index(drop=True)
+
+
+def age_weight(age_yr):
+    """
+    The V4 weight of imagery ``age_yr`` years old at the scan: 1 up to 2 years,
+    0.75 up to 3, 0.25 up to 5, 0 beyond (and 0 for an unknown age).
+
+    >>> age_weight(np.array([0.5, 2.0, 2.5, 4.0, 6.0])).tolist()
+    [1.0, 1.0, 0.75, 0.25, 0.0]
+    """
+    a = np.asarray(age_yr, dtype=float)
+    return np.select([a <= 2, a <= 3, a <= 5], [1.0, 0.75, 0.25], 0.0)
+
+
+def sample_polyline(pts, step_km: float = FEATURE_STEP_KM):
+    """
+    Vectorized ``split_samples``: cut each segment of a (lon, lat) polyline
+    into ``ceil(len / step_km)`` equal pieces and return three arrays, the
+    piece midpoints' lon and lat and each piece's length in km. The lengths
+    sum to the polyline's length; zero-length segments yield nothing.
+    """
+    a = np.asarray(pts, dtype=float).reshape(-1, 2)
+    empty = np.empty(0)
+    if len(a) < 2:
+        return empty, empty, empty
+    d = a[1:] - a[:-1]
+    c = np.cos(np.radians((a[1:, 1] + a[:-1, 1]) / 2))
+    length = np.hypot(d[:, 0] * 111.32 * c, d[:, 1] * 110.57)
+    m = length > 0
+    if not m.any():
+        return empty, empty, empty
+    n = np.maximum(1, np.ceil(length[m] / step_km)).astype(int)
+    seg = np.repeat(np.arange(int(m.sum())), n)
+    j = np.concatenate([np.arange(k) for k in n])
+    f = (j + 0.5) / n[seg]
+    a0, dm = a[:-1][m], d[m]
+    return a0[seg, 0] + dm[seg, 0] * f, a0[seg, 1] + dm[seg, 1] * f, length[m][seg] / n[seg]
+
+
+class PanoSamples:
+    """
+    Every 360-degree sample of a scan, sorted by latitude so a place's
+    neighbourhood is one ``searchsorted`` slice. ``age`` is in years before the
+    scan date (NaN when the sequence carries no capture time), ``creator`` is
+    the uploader id (-1 when absent) and ``foot`` the on-foot flag.
+    """
+
+    def __init__(self, lon, lat, km, age, creator, foot):
+        o = np.argsort(lat, kind="stable")
+        self.lon = np.asarray(lon, dtype=float)[o]
+        self.lat = np.asarray(lat, dtype=float)[o]
+        self.km = np.asarray(km, dtype=float)[o]
+        self.age = np.asarray(age, dtype=float)[o]
+        self.creator = np.asarray(creator, dtype=np.int64)[o]
+        self.foot = np.asarray(foot, dtype=bool)[o]
+
+    def __len__(self) -> int:
+        return len(self.lat)
+
+
+def place_features(s: PanoSamples, plat: float, plon: float) -> dict:
+    """
+    The #441 re-score's features for one point, from the 360-degree samples
+    around it. Keys:
+
+    - ``v0``: km of imagery at most 2 years old within 2 km, per km^2 (the
+      original #383 score); ``v1``: the same length, age-weighted.
+    - ``occ{r}_recent`` / ``occ{r}_aw`` for r in 1, 2, 3 km: of the 250 m cells
+      a disc of radius r could hold, the share whose NEWEST imagery is at most
+      2 years old, and that share with each cell weighted by ``age_weight``.
+      Not a true fraction: cells are counted against the disc's area, so it can
+      exceed 1.
+    - ``v4``: the largest ``occ{r}_aw``, the score the tranche-3 prediction used.
+    - within 2 km: ``top`` (the uploader with the most age-weighted length, -1
+      if none), ``top_share``, ``n_cre``, ``foot_share``, ``med_age`` (the
+      length-weighted median age), ``newest_age`` and ``km2`` (total length).
+    """
+    out = {"v0": 0.0, "v1": 0.0}
+    for r in FEATURE_DISCS_KM:
+        out[f"occ{r}_recent"] = 0.0
+        out[f"occ{r}_aw"] = 0.0
+    out.update(
+        v4=0.0,
+        top=-1,
+        top_share=np.nan,
+        foot_share=np.nan,
+        med_age=np.nan,
+        newest_age=np.nan,
+        km2=0.0,
+        n_cre=0,
+    )
+    dl = FEATURE_REACH_KM / 110.57
+    a, b = np.searchsorted(s.lat, [plat - dl, plat + dl])
+    if a == b:
+        return out
+    c = math.cos(math.radians(plat))
+    x = (s.lon[a:b] - plon) * 111.32 * c
+    y = (s.lat[a:b] - plat) * 110.57
+    d = np.hypot(x, y)
+    age, km = s.age[a:b], s.km[a:b]
+    w = age_weight(age)
+    m2 = d <= 2
+    disc2 = math.pi * 4
+    out["v0"] = float(km[m2 & (age <= 2)].sum() / disc2)
+    out["v1"] = float((km[m2] * w[m2]).sum() / disc2)
+    cell = np.floor(x / FEATURE_CELL_KM).astype(np.int64) * 100000 + np.floor(
+        y / FEATURE_CELL_KM
+    ).astype(np.int64)
+    for r in FEATURE_DISCS_KM:
+        m = d <= r
+        if not m.any():
+            continue
+        cells_in_disc = math.pi * r * r / (FEATURE_CELL_KM * FEATURE_CELL_KM)
+        uniq, inv = np.unique(cell[m], return_inverse=True)
+        newest = np.full(len(uniq), 99.0)
+        # NaN ages never win a minimum, so a cell holding only undated imagery
+        # keeps the 99-year sentinel and weighs 0
+        np.fmin.at(newest, inv, age[m])
+        out[f"occ{r}_recent"] = float((newest <= 2).sum() / cells_in_disc)
+        out[f"occ{r}_aw"] = float(age_weight(newest).sum() / cells_in_disc)
+    out["v4"] = max(out[f"occ{r}_aw"] for r in FEATURE_DISCS_KM)
+    if m2.any():
+        tot = float(km[m2].sum())
+        out["km2"] = tot
+        by = (
+            pd.Series(km[m2] * np.maximum(w[m2], 0.01))
+            .groupby(s.creator[a:b][m2])
+            .sum()
+            .sort_values(ascending=False)
+        )
+        out["top"] = int(by.index[0])
+        out["top_share"] = float(by.iloc[0] / by.sum())
+        out["n_cre"] = int(len(by))
+        out["foot_share"] = float(km[m2][s.foot[a:b][m2]].sum() / tot)
+        dated = m2 & ~np.isnan(age)
+        if dated.any():
+            order = np.argsort(age[dated], kind="stable")
+            cum = np.cumsum(km[dated][order])
+            out["med_age"] = float(
+                age[dated][order][min(np.searchsorted(cum, cum[-1] / 2), len(cum) - 1)]
+            )
+            out["newest_age"] = float(age[dated].min())
+    return out

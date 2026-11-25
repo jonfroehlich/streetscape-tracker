@@ -13,12 +13,14 @@ import random
 import sqlite3
 
 import mapbox_vector_tile
+import numpy as np
 import pandas as pd
 import pytest
 
 from scripts import mapillary_discovery_analyze as mda
 from scripts import mapillary_discovery_collect as mdcol
 from scripts import mapillary_discovery_common as mdc
+from scripts import mapillary_discovery_score as mds
 from streetscape_metadata_tracker.download_common import lonlat_to_tile_frac, tile_frac_to_lonlat
 
 
@@ -695,3 +697,507 @@ def test_analyzer_writes_strict_metrics_when_a_reference_town_has_no_score(tmp_p
     )
     assert wasta["km_per_km2"] == 0.0
     assert refs["honolulu--hawaii--united-states"]["top_creator"] == 7
+
+
+# ── A second region, the fetch-only path and the region-agnostic scorer ──
+
+
+def test_europe_is_an_extra_region_and_never_part_of_the_default_frame():
+    # REGIONS is the pinned 2026-10-02 frame; a region added to it would change
+    # the committed population and `scan`'s default at once.
+    assert "europe" in mdc.EXTRA_REGIONS and "europe" not in mdc.REGIONS
+    assert len(mdc.region_tiles(["europe"])) == 104
+    assert mdcol.parse_args(["scan", "--out-dir", "x"]).regions == list(mdc.REGIONS)
+    with pytest.raises(SystemExit):
+        mdcol.parse_args(["fetch", "--out-dir", "x"])  # fetch has no default region
+
+
+@pytest.mark.parametrize(
+    ("env", "file_lines", "expected"),
+    [
+        ({"MAPILLARY_DISCOVERY_ACCESS_TOKEN": "d", "MAPILLARY_ACCESS_TOKEN": "p"}, [], ("d", 0)),
+        ({"MAPILLARY_ACCESS_TOKEN": "p"}, [], ("p", 1)),
+        # the discovery token in .env outranks production's in the environment
+        ({"MAPILLARY_ACCESS_TOKEN": "p"}, ["MAPILLARY_DISCOVERY_ACCESS_TOKEN='d'"], ("d", 0)),
+        ({}, ["MAPILLARY_STREETS_ACCESS_TOKEN=s", "MAPILLARY_ACCESS_TOKEN=p"], ("p", 1)),
+        # the environment outranks .env for the same variable
+        (
+            {"MAPILLARY_DISCOVERY_ACCESS_TOKEN": "env"},
+            ["MAPILLARY_DISCOVERY_ACCESS_TOKEN=file"],
+            ("env", 0),
+        ),
+    ],
+)
+def test_the_discovery_token_outranks_the_production_one(
+    tmp_path, monkeypatch, env, file_lines, expected
+):
+    for var in mdcol.TOKEN_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+    for var, value in env.items():
+        monkeypatch.setenv(var, value)
+    (tmp_path / ".env").write_text("\n".join(file_lines) + "\n")
+    monkeypatch.setattr(mdcol, "ENV_FILE", tmp_path / ".env")
+    token, var = mdcol.load_token_named()
+    assert (token, var) == (expected[0], mdcol.TOKEN_ENV_VARS[expected[1]])
+
+
+def test_no_token_anywhere_is_refused_by_name(tmp_path, monkeypatch):
+    for var in mdcol.TOKEN_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(mdcol, "ENV_FILE", tmp_path / "absent.env")
+    with pytest.raises(SystemExit, match="MAPILLARY_DISCOVERY_ACCESS_TOKEN"):
+        mdcol.load_token_named()
+
+
+def test_the_request_log_names_the_token_variable_and_never_its_value(tmp_path, monkeypatch):
+    monkeypatch.setattr(mdcol, "ENV_FILE", tmp_path / "absent.env")
+    monkeypatch.setenv("MAPILLARY_DISCOVERY_ACCESS_TOKEN", "MLY|secret-value")
+    f = _fetcher(tmp_path, monkeypatch, [_FakeResponse(200)])
+    f.get(6, 1, 1)
+    assert f.session.calls[0][1]["params"] == {"access_token": "MLY|secret-value"}
+    assert _log(tmp_path)[0]["token_var"] == "MAPILLARY_DISCOVERY_ACCESS_TOKEN"
+    assert "secret-value" not in (tmp_path / "request_log.jsonl").read_text()
+
+
+def _tile_local(lon, lat, x, y, zoom=6, extent=4096):
+    """(lon, lat) as the y-up tile-local integer pair `mapbox_vector_tile.encode` takes."""
+    fx, fy = lonlat_to_tile_frac(lon, lat, zoom)
+    return round((fx - x) * extent), round((1 - (fy - y)) * extent)
+
+
+def _sequence_tile(sequences, x, y):
+    """A tile whose `sequence` layer holds (lonlat_points, properties) features."""
+    features = []
+    for pts, props in sequences:
+        local = ", ".join("{} {}".format(*_tile_local(lon, lat, x, y)) for lon, lat in pts)
+        features.append({"geometry": f"LINESTRING ({local})", "properties": props})
+    return mapbox_vector_tile.encode([{"name": "sequence", "features": features}])
+
+
+_HONOLULU = (21.30, -157.85)  # in z6 tile (4, 28), one of hawaii's four
+_HAWAII_TILES = mdc.region_tiles(["hawaii"])
+
+
+def _fetch_session(monkeypatch, responses):
+    session = _FakeSession(responses)
+    session.headers = {}
+    monkeypatch.setattr(mdcol.requests, "Session", lambda: session)
+    monkeypatch.setenv("MAPILLARY_ACCESS_TOKEN", "test-token")
+    monkeypatch.setattr(mdcol.time, "sleep", lambda s: None)
+    return session
+
+
+def test_fetch_caches_tiles_and_writes_a_manifest_without_the_parquet(tmp_path, monkeypatch):
+    lat, lon = _HONOLULU
+    tile = _sequence_tile(
+        [([(lon, lat), (lon + 0.01, lat)], {"id": "s1", "is_pano": True, "creator_id": 7})], 4, 28
+    )
+    assert (4, 28) in _HAWAII_TILES and len(_HAWAII_TILES) == 4
+    session = _fetch_session(
+        monkeypatch,
+        [
+            _FakeResponse(200, content=tile) if t == (4, 28) else _FakeResponse(204, "", b"")
+            for t in _HAWAII_TILES
+        ],
+    )
+    rc = mdcol.main(["fetch", "--out-dir", str(tmp_path), "--regions", "hawaii", "--seed", "0"])
+    assert rc == 0 and len(session.calls) == 4
+    manifest = json.loads((tmp_path / "scan_manifest.json").read_text())
+    assert manifest["stopped"] is None
+    assert (manifest["tiles"], manifest["requests"], manifest["rows"]) == (4, 4, 1)
+    assert manifest["regions"] == {"hawaii": list(mdc.REGIONS["hawaii"])}
+    assert manifest["token_var"] == "MAPILLARY_ACCESS_TOKEN"
+    assert not (tmp_path / "sequences.parquet").exists()
+    assert sorted(p.name for p in (tmp_path / "tiles").iterdir()) == sorted(
+        f"6_{x}_{y}.mvt" for x, y in _HAWAII_TILES
+    )
+    # the analyzer's manifest reader accepts it, and names the same tiles
+    assert mda.scan_tiles(mda.load_scan_manifest(tmp_path)) == set(_HAWAII_TILES)
+    # a second run is free: every tile is a cache hit
+    session.responses = []
+    assert mdcol.main(["fetch", "--out-dir", str(tmp_path), "--regions", "hawaii"]) == 0
+    assert len(session.calls) == 4
+
+
+def test_fetch_dry_run_makes_no_request_and_writes_nothing(tmp_path, monkeypatch, capsys):
+    session = _fetch_session(monkeypatch, [])
+    (tmp_path / "tiles").mkdir()
+    x, y = _HAWAII_TILES[0]
+    (tmp_path / "tiles" / f"6_{x}_{y}.mvt").write_bytes(b"")
+    rc = mdcol.main(["fetch", "--out-dir", str(tmp_path), "--regions", "hawaii", "--dry-run"])
+    assert rc == 0 and session.calls == []
+    assert "4 z6 tiles over hawaii; 1 cached, 3 to request" in capsys.readouterr().out
+    assert not (tmp_path / "scan_manifest.json").exists()
+    assert not (tmp_path / "request_log.jsonl").exists()
+
+
+@pytest.mark.parametrize(
+    ("responses", "argv", "calls", "stopped"),
+    [
+        ([_FakeResponse(204, "", b""), _FakeResponse(302, "text/html")], [], 2, "302"),
+        ([_FakeResponse(204, "", b"")] * 4, ["--max-requests", "2"], 2, "max-requests 2"),
+    ],
+    ids=["refusal", "request-cap"],
+)
+def test_fetch_records_a_stop_and_the_scorer_refuses_it(
+    tmp_path, monkeypatch, responses, argv, calls, stopped
+):
+    session = _fetch_session(monkeypatch, responses)
+    rc = mdcol.main(["fetch", "--out-dir", str(tmp_path), "--regions", "hawaii", *argv])
+    assert rc != 0 and len(session.calls) == calls
+    assert stopped in json.loads((tmp_path / "scan_manifest.json").read_text())["stopped"]
+    with pytest.raises(SystemExit, match="partial scan"):
+        mds.main(
+            [
+                "--raw-dir",
+                str(tmp_path),
+                "--places",
+                "x",
+                "--prod-snapshot",
+                "x",
+                "--scan-date",
+                "2026-11-25",
+                "--out-dir",
+                str(tmp_path / "out"),
+            ]
+        )
+
+
+def test_age_weight_steps_at_two_three_and_five_years():
+    ages = [0.0, 2.0, 2.001, 3.0, 3.001, 5.0, 5.001, float("nan")]
+    assert mdc.age_weight(ages).tolist() == [1.0, 1.0, 0.75, 0.75, 0.25, 0.25, 0.0, 0.0]
+
+
+def test_sample_polyline_agrees_with_split_samples_and_conserves_length():
+    pts = [(-94.85, 42.84), (-94.80, 42.84), (-94.80, 42.84), (-94.80, 42.86), (-94.7995, 42.86)]
+    lon, lat, km = mdc.sample_polyline(pts, 0.2)
+    want = list(mdc.split_samples(pts, 0.2))
+    assert len(km) == len(want) > 20
+    assert lon.tolist() == pytest.approx([w[0] for w in want])
+    assert lat.tolist() == pytest.approx([w[1] for w in want])
+    assert km.tolist() == pytest.approx([w[2] for w in want])
+    assert km.max() <= 0.2 + 1e-9
+    assert all(len(a) == 0 for a in mdc.sample_polyline([(1.0, 2.0)]))
+    assert all(len(a) == 0 for a in mdc.sample_polyline([(1.0, 2.0), (1.0, 2.0)]))
+
+
+_P_LAT, _P_LON = 45.0, 10.0
+
+
+def _at(east_km, north_km):
+    """(lon, lat) a given offset from the test place, in place_features' own projection."""
+    return (
+        _P_LON + east_km / (111.32 * math.cos(math.radians(_P_LAT))),
+        _P_LAT + north_km / 110.57,
+    )
+
+
+def _pano(rows):
+    """PanoSamples from (east_km, north_km, km, age_yr, creator, foot) rows."""
+    lon, lat = zip(*[_at(r[0], r[1]) for r in rows], strict=True)
+    return mdc.PanoSamples(lon, lat, *zip(*[r[2:] for r in rows], strict=True))
+
+
+def test_place_features_count_cells_by_their_newest_imagery():
+    cells_in_1km = math.pi / 0.25**2
+    s = _pano(
+        [
+            (0.10, 0.10, 0.2, 1.0, 7, False),  # a cell with new imagery ...
+            (0.12, 0.12, 0.2, 6.0, 8, False),  # ... and old imagery too: counted by the newest
+            (0.40, 0.10, 0.2, 4.0, 7, False),  # a cell holding only 4-year-old imagery
+            (0.10, 0.60, 0.2, 2.5, 7, False),  # only 2.5-year-old imagery
+            (0.60, 0.60, 0.2, 9.0, 7, False),  # only imagery past 5 years: weighs nothing
+            (0.85, 0.10, 0.2, float("nan"), 7, False),  # undated: weighs nothing
+        ]
+    )
+    f = mdc.place_features(s, _P_LAT, _P_LON)
+    assert f["occ1_recent"] == pytest.approx(1 / cells_in_1km)
+    assert f["occ1_aw"] == pytest.approx((1 + 0.25 + 0.75) / cells_in_1km)
+    # the same cells against a larger disc's area: the score falls with radius,
+    # and V4 is the best disc
+    assert f["occ2_aw"] == pytest.approx(f["occ1_aw"] / 4)
+    assert f["v4"] == f["occ1_aw"] > f["occ2_aw"] > f["occ3_aw"] > 0
+    # V0 is recent LENGTH per km^2 of the 2 km disc, not cells
+    assert f["v0"] == pytest.approx(0.2 / (math.pi * 4))
+    assert f["newest_age"] == 1.0 and f["km2"] == pytest.approx(1.2)
+
+
+def test_place_features_read_each_disc_only():
+    s = _pano(
+        [
+            (0.5, 0.0, 1.0, 1.0, 7, False),
+            (1.5, 0.0, 1.0, 1.0, 7, True),
+            (2.5, 0.0, 1.0, 1.0, 8, False),  # outside the 2 km disc: no V0, share or foot
+            (3.5, 0.0, 9.0, 1.0, 9, True),  # outside every disc
+        ]
+    )
+    f = mdc.place_features(s, _P_LAT, _P_LON)
+    cell = 0.25**2
+    assert f["occ1_recent"] == pytest.approx(1 * cell / math.pi)
+    assert f["occ2_recent"] == pytest.approx(2 * cell / (math.pi * 4))
+    assert f["occ3_recent"] == pytest.approx(3 * cell / (math.pi * 9))
+    assert f["v0"] == pytest.approx(2.0 / (math.pi * 4))
+    assert (f["top"], f["top_share"], f["n_cre"]) == (7, 1.0, 1)
+    assert f["foot_share"] == pytest.approx(0.5)
+    # nothing within reach: zeros and NaNs, never an exception
+    far = mdc.place_features(s, _P_LAT + 1.0, _P_LON)
+    assert far["v4"] == 0.0 and far["top"] == -1 and math.isnan(far["top_share"])
+
+
+def test_place_features_top_uploader_is_by_age_weighted_length_and_median_by_length():
+    s = _pano(
+        [
+            (0.1, 0.1, 3.0, 8.0, 1, False),  # the longest, but 8 years old: weight floor 0.01
+            (0.4, 0.1, 1.0, 1.0, 2, False),
+            (0.1, 0.4, 0.5, 2.5, 3, False),
+        ]
+    )
+    f = mdc.place_features(s, _P_LAT, _P_LON)
+    weighted = {1: 3.0 * 0.01, 2: 1.0 * 1.0, 3: 0.5 * 0.75}
+    assert f["top"] == 2
+    assert f["top_share"] == pytest.approx(weighted[2] / sum(weighted.values()))
+    assert f["n_cre"] == 3
+    # 4.5 km in all; the half-length point (2.25 km) falls in the 8-year-old 3 km
+    assert f["med_age"] == 8.0 and f["newest_age"] == 1.0
+
+
+def test_tile_samples_keep_only_panos_and_each_uploaders_newest_image():
+    lat, lon = _HONOLULU
+    line = [(lon, lat), (lon + 0.02, lat)]
+    t = pd.Timestamp("2026-01-15").value // 10**6
+    raw = _sequence_tile(
+        [
+            (line, {"id": "a", "is_pano": True, "creator_id": 7, "captured_at": t, "image_id": 1}),
+            (
+                line,
+                {"id": "b", "is_pano": True, "creator_id": 7, "captured_at": t + 5, "image_id": 2},
+            ),
+            (line, {"id": "c", "is_pano": False, "creator_id": 9, "captured_at": t, "image_id": 3}),
+            (line, {"id": "d", "is_pano": True, "foot": True}),  # no uploader, no date
+        ],
+        4,
+        28,
+    )
+    slon, slat, km, cap, cre, foot, newest = mds.tile_samples(raw, 4, 28, 6)
+    assert sorted(set(cre.tolist())) == [-1, 7]  # the flat sequence's uploader never appears
+    per_sequence = km[cre == -1].sum()
+    # a tile-local unit is ~150 m at z6, so the encoded 2 km line is exact only to that grid
+    assert per_sequence == pytest.approx(mdc.local_km(lon, lat, lon + 0.02, lat), rel=0.1)
+    assert km.sum() == pytest.approx(3 * per_sequence)
+    assert np.isnan(cap[cre == -1]).all() and foot[cre == -1].all() and not foot[cre == 7].any()
+    assert newest == {7: (float(t + 5), 2)}
+    assert abs(slat.mean() - lat) < 0.01 and abs(slon.mean() - (lon + 0.01)) < 0.01
+
+
+def test_catalog_relation_is_grid_membership_and_nearest_centre():
+    cat = pd.DataFrame(
+        {"lat": [45.0, 50.0], "lon": [10.0, 10.0], "grid_width_m": [20000, 1000],
+         "grid_height_m": [4000, 1000]}
+    )  # fmt: skip
+    places = pd.DataFrame(
+        {"lat": [_at(8, 0)[1], _at(0, 3)[1], _at(8, 3)[1]],
+         "lon": [_at(8, 0)[0], _at(0, 3)[0], _at(8, 3)[0]]}
+    )  # fmt: skip
+    rel = mds.catalog_relation(places, cat)
+    # 8 km east is inside the 20 km-wide grid; 3 km north is outside its 4 km height
+    assert rel.in_grid.tolist() == [True, False, False]
+    assert rel.catalog_km.tolist() == pytest.approx([8.0, 3.0, math.hypot(8, 3)], rel=1e-3)
+
+
+_RULES = {
+    "v4_min": 0.7,
+    "top_share_min": 0.6,
+    "foot_share_max": 0.5,
+    "med_age_max": 2.0,
+    "catalog_km_min": 5.0,
+    "thin_km": 5.0,
+    "pop_max": None,
+    "countries": None,
+}
+
+
+def _place(**overrides):
+    row = {
+        "geonameid": 1,
+        "lat": 45.0,
+        "lon": 10.0,
+        "cc": "IT",
+        "pop": 5_000_000,
+        "v4": 0.9,
+        "top_share": 0.8,
+        "foot_share": 0.1,
+        "med_age": 1.0,
+        "in_grid": False,
+        "catalog_km": 50.0,
+    }
+    return {**row, **overrides}
+
+
+@pytest.mark.parametrize(
+    ("override", "rules"),
+    [
+        ({"v4": 0.69}, {}),
+        ({"top_share": 0.59}, {}),
+        ({"foot_share": 0.5}, {}),
+        ({"med_age": 2.01}, {}),
+        ({"in_grid": True}, {}),
+        ({"catalog_km": 5.0}, {}),
+        ({}, {"pop_max": 60000}),
+        ({}, {"countries": ["US", "CA"]}),
+    ],
+)
+def test_rank_places_applies_every_rule(override, rules):
+    # the base row passes with the defaults -- a five-million-person city in
+    # Italy included, since neither a population cap nor a country list is set
+    base = pd.DataFrame([_place()])
+    assert len(mds.rank_places(base, _RULES)[0]) == 1
+    ranked, funnel = mds.rank_places(pd.DataFrame([_place(**override)]), {**_RULES, **rules})
+    assert len(ranked) == 0 and funnel["after_thinning"] == 0
+
+
+def test_rank_places_orders_by_v4_thins_and_reports_the_funnel():
+    lon_3km = _at(3, 0)[0]
+    places = pd.DataFrame(
+        [
+            _place(geonameid=1, v4=0.8),
+            _place(geonameid=2, v4=1.1, lon=lon_3km),  # 3 km away and better: it survives
+            _place(geonameid=3, v4=0.75, lat=46.0),
+            _place(geonameid=4, v4=0.95, lat=47.0, in_grid=True),
+            _place(geonameid=5, v4=0.2, lat=48.0),
+        ]
+    )
+    ranked, funnel = mds.rank_places(places, _RULES)
+    assert ranked.geonameid.tolist() == [2, 3]
+    assert funnel == {
+        "places_scored": 5,
+        "places_v4_at_least_min": 4,
+        "of_which_inside_a_catalog_grid": 1,
+        "outside_grids_and_beyond_catalog_km_min": 3,
+        "pass_all_rules": 3,
+        "after_thinning": 2,
+    }
+
+
+def test_the_sample_cache_refuses_a_manifest_tile_missing_from_the_cache(tmp_path):
+    (tmp_path / "tiles").mkdir()
+    (tmp_path / "tiles" / "6_4_28.mvt").write_bytes(b"")
+    with pytest.raises(SystemExit, match="not in the tile cache"):
+        mds.build_sample_cache(tmp_path, [(4, 28), (4, 29)], 6)
+
+
+def _score_inputs(tmp_path):
+    """A fetched hawaii directory holding one dense 360 sweep around Honolulu, and its inputs."""
+    lat, lon = _HONOLULU
+    raw = tmp_path / "raw"
+    (raw / "tiles").mkdir(parents=True)
+    t = pd.Timestamp("2026-06-01").value // 10**6
+    # a serpentine over +-1.5 km: rows 300 m apart, so most 250 m cells are occupied
+    rows = [lat + (i * 0.3 - 1.5) / 110.57 for i in range(11)]
+    half = 1.5 / (111.32 * math.cos(math.radians(lat)))
+    sweep = []
+    for i, r in enumerate(rows):
+        ends = (lon - half, lon + half) if i % 2 == 0 else (lon + half, lon - half)
+        sweep += [(e, r) for e in ends]
+    props = {"id": "s", "is_pano": True, "creator_id": 7, "captured_at": t, "image_id": 11}
+    for x, y in _HAWAII_TILES:
+        tile = _sequence_tile([(sweep, props)], x, y) if (x, y) == (4, 28) else b""
+        (raw / "tiles" / f"6_{x}_{y}.mvt").write_bytes(tile)
+    (raw / "scan_manifest.json").write_text(
+        json.dumps({"regions": {"hawaii": mdc.REGIONS["hawaii"]}, "zoom": 6, "tiles": 4, "rows": 1})
+    )
+
+    def place(gid, name, plat, plon, cc):
+        row = [str(gid), name, name, "", str(plat), str(plon), "P", "PPL", cc, "", "HI"]
+        return "\t".join(row + ["", "", "", "900000", "", "", "", ""])
+
+    (tmp_path / "places.txt").write_text(
+        "\n".join(
+            [
+                place(1, "Sweptville", lat, lon, "US"),
+                place(2, "Emptyton", lat + 0.5, lon, "NA"),  # Namibia's code is not a NaN
+                place(3, "Elsewhere", 48.85, 2.35, "FR"),  # in no scanned tile
+            ]
+        )
+        + "\n"
+    )
+    snap = pd.DataFrame(
+        [
+            {"table": "cities", "city_id": "walked", "lat": lat + 0.2, "lon": lon, "enabled": 1,
+             "grid_width_m": 1000, "grid_height_m": 1000},
+            {"table": "walk", "city_id": "walked", "run_date": "2026-09-01",
+             "coverage_pct_by_length": 3.0, "median_covered_age_years": 0.5, "length_km": 10.0},
+        ]
+    )  # fmt: skip
+    snap.to_csv(tmp_path / "snap.csv", index=False)
+    return raw
+
+
+def _score(tmp_path, raw, *extra):
+    out = tmp_path / "out"
+    rc = mds.main(
+        [
+            "--raw-dir",
+            str(raw),
+            "--places",
+            str(tmp_path / "places.txt"),
+            "--prod-snapshot",
+            str(tmp_path / "snap.csv"),
+            "--scan-date",
+            "2026-11-25",
+            "--out-dir",
+            str(out),
+            *extra,
+        ]
+    )
+    assert rc == 0
+    return out
+
+
+def test_scorer_end_to_end_ranks_the_swept_place_from_the_tile_cache(tmp_path):
+    raw = _score_inputs(tmp_path)
+    out = _score(tmp_path, raw)
+    ranked = pd.read_csv(out / "places_ranked.csv", keep_default_na=False)
+    # a 900,000-person place is ranked: no population cap by default
+    assert ranked.name.tolist() == ["Sweptville"]
+    row = ranked.iloc[0]
+    assert row.v4 >= 0.7 and str(row.user) == "7" and row.top_share == 1.0
+    assert 0.4 < row.med_age < 0.6  # 2026-06-01 seen from the 2026-11-25 scan date
+    features = pd.read_parquet(out / "place_features.parquet").set_index("name")
+    assert sorted(features.index) == ["Emptyton", "Sweptville"]  # Elsewhere is in no scanned tile
+    assert features.cc["Emptyton"] == "NA" and features.v4["Emptyton"] == 0.0
+
+    def refuse(const):
+        raise AssertionError(f"non-strict JSON constant {const}")
+
+    metrics = json.loads((out / "metrics.json").read_text(), parse_constant=refuse)
+    assert metrics["funnel"]["places_scored"] == 2 and metrics["funnel"]["after_thinning"] == 1
+    assert metrics["validation"]["walked_catalog_cities_in_scanned_tiles"] == 1
+    assert metrics["_about"]["requests"] == 0
+    # resolve-creators' input: each uploader's newest 360 image
+    assert pd.read_csv(raw / "creator_images.csv").to_dict("records") == [
+        {"creator_id": 7, "image_id": 11, "captured_at": pd.Timestamp("2026-06-01").value / 1e6}
+    ]
+
+
+def test_scorer_population_cap_and_scan_date_are_arguments(tmp_path):
+    raw = _score_inputs(tmp_path)
+    assert len(pd.read_csv(_score(tmp_path, raw, "--pop-max", "60000") / "places_ranked.csv")) == 0
+    # the same tiles read from a scan date three years on: the sweep has aged out
+    late = _score(tmp_path, raw, "--scan-date", "2029-11-25")
+    assert len(pd.read_csv(late / "places_ranked.csv")) == 0
+    features = pd.read_parquet(late / "place_features.parquet").set_index("name")
+    assert 3.4 < features.med_age["Sweptville"] < 3.6
+
+
+def test_a_stale_sample_cache_is_rebuilt_not_trusted(tmp_path):
+    raw = _score_inputs(tmp_path)
+    _score(tmp_path, raw)
+    z = dict(np.load(raw / "samples.npz"))
+    assert len(z["km"]) > 0
+    # a cache built over other tiles than the manifest's must not be scored
+    z["tiles"] = z["tiles"][:1]
+    for k in ("lon", "lat", "km", "captured_ms", "creator", "foot"):
+        z[k] = z[k][:0]
+    np.savez(raw / "samples.npz", **z)
+    out = _score(tmp_path, raw)
+    assert pd.read_csv(out / "places_ranked.csv").name.tolist() == ["Sweptville"]

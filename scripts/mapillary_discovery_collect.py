@@ -5,6 +5,11 @@ Collection half of the Mapillary discovery screen (issue #383).
     # z6 sequence tiles over the regions -> <out>/sequences.parquet
     python scripts/mapillary_discovery_collect.py scan --out-dir experiments/mapillary-discovery-383
 
+    # the same tiles, cached only (no parquet) -- for a region too dense to hold
+    # in memory; mapillary_discovery_score.py then reads the cache tile by tile
+    python scripts/mapillary_discovery_collect.py fetch --out-dir experiments/mapillary-discovery-europe \\
+        --regions europe --dry-run
+
     # recall of z6 against finer zooms around known towns -> <out>/calibration.json
     python scripts/mapillary_discovery_collect.py calibrate --out-dir experiments/mapillary-discovery-383 \\
         --zooms 6,10 --town laurens--iowa=42.8468,-94.8515 ...
@@ -29,8 +34,11 @@ undocumented per-IP throttle that answers HTTP 302 -> login, so
   * ``--max-requests`` bounds a run.
 
 Graph API lookups (resolve-creators) are 3 s apart, same stop rule.
-The access token comes from MAPILLARY_ACCESS_TOKEN (or .env) and is never
-written to any output.
+The access token comes from MAPILLARY_DISCOVERY_ACCESS_TOKEN when that is set
+(a separate free app, so discovery traffic is not attributed to production's),
+else MAPILLARY_ACCESS_TOKEN -- from the environment, then .env -- and is never
+written to any output. The token changes which APP a request counts against;
+the limit that has blocked us is per IP, so pacing is the same either way.
 """
 
 from __future__ import annotations
@@ -49,6 +57,7 @@ import requests
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from scripts.mapillary_discovery_common import (  # noqa: E402
+    ALL_REGIONS,
     REGIONS,
     SCREEN_ZOOM,
     TILE_URL_TEMPLATE,
@@ -72,16 +81,33 @@ class StopProbe(RuntimeError):
     """A response that ends the run: a block, an auth failure, or the request cap."""
 
 
+# Preference order: the discovery app's token, then production's grid token.
+TOKEN_ENV_VARS = ("MAPILLARY_DISCOVERY_ACCESS_TOKEN", "MAPILLARY_ACCESS_TOKEN")
+ENV_FILE = Path(__file__).resolve().parents[1] / ".env"
+
+
+def load_token_named() -> tuple[str, str]:
+    """
+    The access token and the NAME of the variable it came from (the name is
+    safe to log; the value never is). The discovery token outranks
+    production's wherever either is set; for one variable, the environment
+    outranks ``.env``.
+    """
+    in_file = {}
+    if ENV_FILE.exists():
+        for line in ENV_FILE.read_text().splitlines():
+            name, sep, value = line.partition("=")
+            if sep and name.strip() in TOKEN_ENV_VARS:
+                in_file[name.strip()] = value.strip().strip("'\"")
+    for var in TOKEN_ENV_VARS:
+        tok = os.environ.get(var) or in_file.get(var)
+        if tok:
+            return tok, var
+    raise SystemExit(f"none of {', '.join(TOKEN_ENV_VARS)} is set (environment or .env)")
+
+
 def load_token() -> str:
-    tok = os.environ.get("MAPILLARY_ACCESS_TOKEN")
-    if tok:
-        return tok
-    env = Path(__file__).resolve().parents[1] / ".env"
-    if env.exists():
-        for line in env.read_text().splitlines():
-            if line.startswith("MAPILLARY_ACCESS_TOKEN="):
-                return line.split("=", 1)[1].strip().strip("'\"")
-    raise SystemExit("MAPILLARY_ACCESS_TOKEN is not set (environment or .env)")
+    return load_token_named()[0]
 
 
 class TileFetcher:
@@ -97,6 +123,7 @@ class TileFetcher:
         self.rng = random.Random(seed)
         self._last = 0.0
         self._token: str | None = None
+        self.token_var: str | None = None  # which variable the token came from
         self.session = requests.Session()
         self.session.headers["User-Agent"] = USER_AGENT
 
@@ -108,7 +135,7 @@ class TileFetcher:
         if self.requests >= self.max_requests:
             raise StopProbe(f"--max-requests {self.max_requests} reached")
         if self._token is None:
-            self._token = load_token()
+            self._token, self.token_var = load_token_named()
         wait = self._last + jittered_gap(self.rng) - time.time()
         if wait > 0:
             time.sleep(wait)
@@ -131,6 +158,7 @@ class TileFetcher:
             "bytes": len(r.content),
             "ctype": ctype,
             "elapsed_s": round(time.time() - t0, 3),
+            "token_var": self.token_var,
         }
         with self.log.open("a") as f:
             f.write(json.dumps(entry) + "\n")
@@ -174,13 +202,61 @@ def cmd_scan(args) -> int:
             print(f"{i}/{len(tiles)} {x},{y} sequences={len(seqs)}", flush=True)
     pd.DataFrame(rows).to_parquet(out / "sequences.parquet")
     manifest = {
-        "regions": {n: REGIONS[n] for n in args.regions},
+        "regions": {n: ALL_REGIONS[n] for n in args.regions},
         "zoom": SCREEN_ZOOM,
         "tiles": len(tiles),
         "requests": fetcher.requests,
         "cache_hits": fetcher.cache_hits,
         "stopped": stopped,
         "rows": len(rows),
+        "finished_at": pd.Timestamp.now(tz="UTC").isoformat(timespec="seconds"),
+    }
+    (out / "scan_manifest.json").write_text(json.dumps(manifest, indent=1) + "\n")
+    print(json.dumps(manifest))
+    return 1 if stopped else 0
+
+
+def cmd_fetch(args) -> int:
+    """
+    Cache the regions' z6 tiles and write ``scan_manifest.json``, WITHOUT
+    building ``sequences.parquet``: each tile is decoded only to count its
+    sequences and then dropped, so memory stays at one tile. ``--dry-run``
+    prints how many tiles the regions need and how many are already cached,
+    and makes no request.
+    """
+    out = Path(args.out_dir)
+    tiles = region_tiles(args.regions, SCREEN_ZOOM)
+    cached = sum((out / "tiles" / f"{SCREEN_ZOOM}_{x}_{y}.mvt").exists() for x, y in tiles)
+    print(
+        f"{len(tiles)} z{SCREEN_ZOOM} tiles over {', '.join(args.regions)}; "
+        f"{cached} cached, {len(tiles) - cached} to request",
+        flush=True,
+    )
+    if args.dry_run:
+        return 0
+    fetcher = TileFetcher(out, args.max_requests, args.seed)
+    rows = 0
+    stopped = None
+    with host_lock(HOST_MAPILLARY_TILES):
+        for i, (x, y) in enumerate(tiles, 1):
+            try:
+                raw = fetcher.get(SCREEN_ZOOM, x, y)
+            except StopProbe as e:
+                stopped = str(e)
+                print(stopped, flush=True)
+                break
+            n = len(decode_sequences(raw, x, y, SCREEN_ZOOM))
+            rows += n
+            print(f"{i}/{len(tiles)} {x},{y} bytes={len(raw)} sequences={n}", flush=True)
+    manifest = {
+        "regions": {n: ALL_REGIONS[n] for n in args.regions},
+        "zoom": SCREEN_ZOOM,
+        "tiles": len(tiles),
+        "requests": fetcher.requests,
+        "cache_hits": fetcher.cache_hits,
+        "stopped": stopped,
+        "rows": rows,
+        "token_var": fetcher.token_var,
         "finished_at": pd.Timestamp.now(tz="UTC").isoformat(timespec="seconds"),
     }
     (out / "scan_manifest.json").write_text(json.dumps(manifest, indent=1) + "\n")
@@ -247,12 +323,19 @@ def cmd_resolve_creators(args) -> int:
         ids = pd.read_csv(path)[col].dropna().astype("int64").astype(str).tolist()
         want += ids[: int(n)]
     want = list(dict.fromkeys(want))
-    seqs = pd.read_parquet(
-        out / "sequences.parquet", columns=["creator_id", "image_id", "is_pano", "captured_at"]
-    )
-    seqs = (
-        seqs[seqs.is_pano].sort_values("captured_at", ascending=False).drop_duplicates("creator_id")
-    )
+    if (out / "sequences.parquet").exists():
+        seqs = pd.read_parquet(
+            out / "sequences.parquet", columns=["creator_id", "image_id", "is_pano", "captured_at"]
+        )
+        seqs = (
+            seqs[seqs.is_pano]
+            .sort_values("captured_at", ascending=False)
+            .drop_duplicates("creator_id")
+        )
+    else:
+        # a `fetch`-only directory: mapillary_discovery_score.py wrote each
+        # uploader's newest 360 image while it read the cached tiles
+        seqs = pd.read_csv(out / "creator_images.csv")
     sample_image = dict(
         zip(seqs.creator_id.astype("int64").astype(str), seqs.image_id, strict=True)
     )
@@ -350,7 +433,7 @@ def parse_args(argv=None):
     snap = sub.add_parser("catalog-snapshot")
     snap.add_argument("--db", required=True, help="catalog path, opened read-only")
     snap.add_argument("--out", required=True)
-    for name in ("scan", "calibrate", "resolve-creators"):
+    for name in ("scan", "fetch", "calibrate", "resolve-creators"):
         s = sub.add_parser(name)
         s.add_argument(
             "--out-dir",
@@ -360,7 +443,13 @@ def parse_args(argv=None):
         s.add_argument("--max-requests", type=int, default=300)
         s.add_argument("--seed", type=int, default=None, help="pacing RNG seed")
         if name == "scan":
-            s.add_argument("--regions", nargs="+", default=list(REGIONS), choices=list(REGIONS))
+            # the default stays the pinned 2026-10-02 frame, never every region
+            s.add_argument("--regions", nargs="+", default=list(REGIONS), choices=list(ALL_REGIONS))
+        if name == "fetch":
+            s.add_argument("--regions", nargs="+", required=True, choices=list(ALL_REGIONS))
+            s.add_argument(
+                "--dry-run", action="store_true", help="count tiles and cache hits; no request"
+            )
         if name == "calibrate":
             s.add_argument("--zooms", default="6,10")
             s.add_argument(
@@ -382,6 +471,7 @@ def main(argv=None) -> int:
     args = parse_args(argv)
     return {
         "scan": cmd_scan,
+        "fetch": cmd_fetch,
         "calibrate": cmd_calibrate,
         "resolve-creators": cmd_resolve_creators,
         "catalog-snapshot": cmd_catalog_snapshot,
