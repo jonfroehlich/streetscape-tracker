@@ -542,7 +542,7 @@ Mapillary's API documentation and forum were re-read for this stage on 2026-10-2
 1. pool 1,200 → 1,500 and the fill ceiling 600 → 750 together (one number's two faces), with the daily budgets scaled so the pool stays the binding term;
 2. pool 1,875, fill ceiling 940;
 3. only then the rest schedule (drop Wednesday, keep Sunday), because that tests a different axis (presence days) and must not share a step with volume.
-   **Taken first on 2026-11-26** under the third revert trigger below; see "Step 3 first".
+   **Taken first, decided 2026-11-26**, under the third revert trigger below; see "Step 3 first", which records the deploy date once it happens.
 
 Each step is +25% and one knob at a time.
 **Revert triggers, mechanical:**
@@ -565,13 +565,15 @@ What changes is the number of active nights: five a week becomes six, about **+2
 The staged schedule above puts the volume steps first, and its third revert trigger says when to reorder them: a growing Mapillary-only-due backlog means the pool is too small for the rest schedule, and the next step is step 3 rather than a volume step.
 Read from prod on 2026-11-26 with `scripts/mapillary_night_report.py --since 2026-11-09`:
 
-- **The pool binds on every active night.** All 13 active nights from 11-09 to 11-26 served at the design point (11-10 served 1,058; every other night served exactly 1,200).
+- **The pool binds on 12 of 13 active nights.** All 13 active nights from 11-09 to 11-26 served at the design point: 12 served exactly 1,200 and deferred work, and 11-10 served 1,058 with no deferral.
 - **Nothing pushed back.** 0 tile-CDN rows in `host_refusals`, and 0 429, 0 5xx and 0 3xx in the summed tile statuses of every one of those nights.
   All 7 `host_refusals` rows on prod are Overpass's.
 - **The work left over grows.** Launches deferred for the rolling pool, per active night: 32, 0, 107, 93, 74, 99, 88, 128, 127, 90, 155, 162, 273.
-  On the active nights among the last four, the `Done:` lines' "mapillary N due not attempted" read 44, 49 and 105 (11-23, 11-24, 11-26), and `mapillary_streets` read 112, 115 and 174.
-  The rest nights between them (11-22 Sun, 11-25 Wed) are left out, because a hold leaves every due pair unattempted whatever the pool.
+  By week of active nights that is a mean of about 61 (11-09..11-14), 106 (11-16..11-21) and 197 (11-23..11-26, three nights).
+  On the active nights among the last five (11-22..11-26), the `Done:` lines' "mapillary N due not attempted" read 44, 49 and 105 (11-23, 11-24, 11-26), and `mapillary_streets` read 112, 115 and 174.
+  The rest nights among them (11-22 Sun, 11-25 Wed) are left out, because a hold leaves every due pair unattempted whatever the pool.
 - **The backlog is about eight full nights.** The Mapillary-only-due population is 176 cities (105 grid-due, 71 walk-only), priced at ≤ 9,258 requests.
+  That is one reading: the trigger's own metric is that population growing week over week, and it cannot be read back for earlier nights, so the growth evidence here is the deferrals and the due-not-attempted counts, not the population.
 
 **This is not the clean case the trigger describes.**
 It asks for growth "while enrolments stand still", and they did not: tranche 3 was enabled from 2026-11-06 and the five Wisconsin towns of tranche 4 on 2026-11-25.
@@ -584,14 +586,16 @@ Any single rest night a week allows a run of 6, so this is inherent to step 3, n
 It matters because of the October diagnosis above: the blocks began on the sixth back-to-back ~2k-request night (H1, presence days).
 The case that 6 nights at today's volume differ from the October runs is volume, not presence.
 The blocked onsets sat at 1,631–2,287 in the rolling 24 h, against today's 1,200 pool.
-Presence on the 13 design nights was 0.9–10.2 h, no shorter than the October nights' 6–9 h, so presence is not what separates them.
-In favour of trying: #292's window ran eleven consecutive nights (2026-08-30..09-09) clean at up to 2,260 combined, so a run of consecutive nights alone has not been enough to trigger a block.
+Presence on the 13 design nights was 0.9–10.2 h, overlapping the October nights' at both ends (2.6–8.8 h in the Stage 1 read-out below, 6–9 h in the diagnosis above), so presence is not what separates them.
+In favour of trying: #292's window ran eleven consecutive nights (2026-08-30..09-09) clean, with a recorded high of 2,260 combined, so a run of consecutive nights alone has not been enough to trigger a block.
 **The H1 signature to watch for is a refusal late in a run**: a tile-CDN `refused` row on a Friday or Saturday (the 5th or 6th consecutive night), above all in the first two weeks.
 The revert puts the longest run back to 3, and the 36 h cooldown holds the host meanwhile.
 
 **The Stage 1 clock, at the time of the decision.**
 The clock is read `--since 2026-11-09`, not from the last Mapillary step (10-27's `opt_in_cities_per_day` 10 → 20), because the criterion above starts it only at the design volume, and 11-09 is the first night since that step to serve the full pool.
 From 10-28 the report reads 13 of 21 active nights at the design point, and that cumulative ratio would not reach 4 in 5 for about 19 more design nights.
+**This relaxes the rule above** ("run the script with `--since` at a step's first night", and 15 nights "since the previous step"), which taken literally means 10-28.
+The heading of the criterion ("the clock starts only at the design volume") supports reading from 11-09, but which reading governs is the Maintainer's call, not a mechanical result.
 Since 11-09 the report reads 13 of 13 active nights at the design point, 0 refusals, 0 429/5xx/3xx, `criterion met: no`, because 15 design nights are required.
 **Deploy only once `scripts/mapillary_night_report.py --since 2026-11-09` reads `criterion met: yes`**, which is the 11-28 night at the earliest if 11-27 and 11-28 are clean, so the first un-rested Wednesday is 2026-12-02.
 A config change reaches prod with whatever deploy comes next, since `config/scheduler.makelab1.toml` is tracked, so do not merge this before then either.
@@ -604,13 +608,14 @@ Thread 10644 still ends at this project's 2026-08-28 question, with no reply.
 No forum thread between 10-27 and 11-26 is about tile limits, IP blocks or login redirects.
 "Inconsistent API error states" (10-28) is about the Graph API's `ids=` batching, and the "Maps 2.0" thread is about map layers, not the tile API.
 
-**Revert triggers** are the three above, unchanged.
+**Revert triggers:** the first two above are unchanged; the third is spent by this step, and the falsifier below replaces it.
 A tile-CDN `refused` row puts `rest_weekdays` back to `["Wed", "Sun"]` in the next PR, and six consecutive active nights become the recorded ceiling.
 Volume steps 1 and 2 stay where they were: each needs 15 design nights after this step, and they never share a step with it.
-**This step uses up the third revert trigger**, which pointed at step 3, so the falsifier below takes its place.
-**Falsifier for this step:** if the per-night pool deferrals keep rising across three weeks at six nights, the extra night was not enough, and the next move is step 1.
+**Falsifier for this step:** if the weekly mean of the per-night pool deferrals keeps rising across three weeks at six nights, the extra night was not enough, and the next move is step 1.
+Compare weekly means, not first and last nights: dropping the Wednesday rest removes one post-rest night a week, the highest-deferral kind (11-26 read 273), so a single night can fall mechanically.
 Enrolments will not stand still in that window either: Duluth and the 25-place European tranche are registered disabled and are expected to be enabled night by night.
 So read the deferrals beside the enabling dates, and count only a rise across a week in which nothing new was enabled.
+If the three weeks contain no such week, extend the window until they hold two, rather than reading the falsifier on confounded weeks.
 
 ## Per-IP hosts and the cross-process host lock (issue #208)
 

@@ -846,8 +846,8 @@ network_type = "drive"
 # above the ~800/day a steady catalog refresh needs, but THINLY once the two
 # rest nights below are counted: ~800 x 7/5 = ~1,120 per Mapillary night, 93%
 # of this pool, and a cooldown night costs a sixth (Stage 1, two rest nights;
-# ~930, 78%, with the one rest night since #444's step 3). Watch the due backlog over
-# the 3-week Stage 1 window; growth week over week means this is too small for
+# ~930, 78%, with the one rest night since #444's step 3). Watch the due
+# backlog over the 3-week Stage 1 window; growth week over week means this is too small for
 # the rest schedule (see [providers.mapillary]). The figure is about
 # hours of presence on the host per night (#444's H1), not a threshold we
 # believe Mapillary enforces.
@@ -894,11 +894,13 @@ network_type = "drive"
 # rest_weekdays ["Wed", "Sun"] -> ["Sun"]: #444's staged schedule, step 3,
 # taken FIRST (docs/provider-access.md, "Step 3 first: Wednesday is no longer
 # a rest night"). Every active night 11-09..11-26 served at the design point
-# (12 of 13 the full 1,200; 11-10 served 1,058) with 0 refusals and 0 429/5xx/3xx, while the nightly pool deferrals rose
-# from 32 to 273 and the Mapillary-only-due population reached 176 cities;
-# the plan's falsifier for that case names this step, not a volume step. It
-# adds a sixth Mapillary night a week (+20% weekly volume) and leaves each
-# night's shape -- pool, fill ceiling, budgets, 40/min at CV 0.6 -- unchanged.
+# (12 of 13 the full 1,200; 11-10 served 1,058) with 0 refusals and 0
+# 429/5xx/3xx, while the weekly mean of the pool deferrals rose 61 -> 106 ->
+# 197 and the Mapillary-only-due population reached 176 cities. The plan's
+# falsifier for that case names this step, not a volume step (enrolments did
+# not stand still; see the doc). It adds a sixth Mapillary night a week (+20%
+# weekly volume) and leaves each night's shape -- pool, fill ceiling,
+# budgets, 40/min at CV 0.6 -- unchanged.
 # It DOES lengthen the longest run of consecutive Mapillary nights from 3
 # (Thu-Sat) to 6 (Mon-Sat), the count at which October's blocks began (H1);
 # a refusal on a Fri/Sat is that signature. Revert to ["Wed", "Sun"] on the
