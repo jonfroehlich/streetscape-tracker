@@ -570,7 +570,7 @@ Unset means no hold, and the night reads exactly as it did before #444.
 It lives on the breaker (`HostBreaker.holds`, `held`, `held_launches`) but outside its set, so `bool(breaker)`, which drives the alert and the exit status, never sees it.
 A held launch records no attempt, trips nothing, alerts nobody and touches no `consecutive_failures`, so the city stays due and leads a later night.
 It is not a stranding either: a hold covers every channel on the host, so a walk's grid sibling on the same host is held too.
-It is the same posture as the fill's "holding <channel>" backlog, and it is reported the same way: once at WARNING when the run starts, at INFO per skipped launch, and as `HELD <host>: rest night (Wed), N launch(es) held, cities stay due` (or `cooling down until <T> (...)`) on the `Done:` line, in `run-due --dry-run` and in `assess-city`'s summary.
+It is the same posture as the fill's "holding <channel>" backlog, and it is reported the same way: once at WARNING when the run starts, at INFO per skipped launch, and as `HELD <host>: rest night (Sun), N launch(es) held, cities stay due` (or `cooling down until <T> (...)`) on the `Done:` line, in `run-due --dry-run` and in `assess-city`'s summary.
 `scheduler status` prints each host's rest weekdays (and whether today is one) and whether it is cooling down.
 
 **One gate, every SCHEDULER path.**
