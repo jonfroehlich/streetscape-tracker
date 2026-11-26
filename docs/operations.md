@@ -809,7 +809,7 @@ python scripts/resize_city.py carmel-by-the-sea--california--united-states --wid
 The numbers are `GRID_FITS` in `scripts/build_mapillary_discovery_tranche3.py`, which the manifest's test holds to the committed fit record.
 
 **5. Enable, one night at a time; then freeze the networks** exactly as tranche 2's steps 4 and 5.
-Never enable for a night whose UTC snapshot date is a Mapillary rest day (`[hosts.mapillary_tiles].rest_weekdays`, Wed and Sun on prod): the GSV channels would collect and Mapillary would be held, un-pairing the towns' first runs.
+Never enable for a night whose UTC snapshot date is a Mapillary rest day (`[hosts.mapillary_tiles].rest_weekdays`, Sun on prod, and Wed too before #444's step 3): the GSV channels would collect and Mapillary would be held, un-pairing the towns' first runs.
 
 **6. Pricing, and the nights.**
 With the fits, one collection of all 25 is 1,951,348 GSV grid points and 368 Mapillary z14 tiles; the Mapillary walks are free on a paired night (#290).
@@ -878,7 +878,7 @@ Step 5's `enable-city --dry-run` must then report both KartaView channels as alr
 Clear the exclusions (`--clear`) when KartaView widening resumes.
 
 **5. Enable, one night at a time; then freeze the networks** exactly as tranche 2's steps 4 and 5.
-Never enable for a night whose UTC snapshot date is a Mapillary rest day (`[hosts.mapillary_tiles].rest_weekdays`, Wed and Sun on prod).
+Never enable for a night whose UTC snapshot date is a Mapillary rest day (`[hosts.mapillary_tiles].rest_weekdays`, Sun on prod, and Wed too before #444's step 3).
 
 **6. Pricing, and the nights.**
 One collection of all six is 2,238,953 GSV grid points and 388 Mapillary z14 tiles; the Mapillary walks are free on a paired night (#290).
@@ -965,7 +965,7 @@ Step 6's `enable-city --dry-run` must then report both KartaView channels as alr
 Clear the exclusions (`--clear`) when KartaView widening resumes.
 
 **6. Enable, one night at a time; then freeze the networks** exactly as tranche 2's steps 4 and 5.
-Never enable for a night whose UTC snapshot date is a Mapillary rest day (`[hosts.mapillary_tiles].rest_weekdays`, Wed and Sun on prod).
+Never enable for a night whose UTC snapshot date is a Mapillary rest day (`[hosts.mapillary_tiles].rest_weekdays`, Sun on prod, and Wed too before #444's step 3).
 
 **7. Pricing, and the nights.**
 One collection of all 25 is 7,654,613 GSV grid points and 1,553 Mapillary z14 tiles; the Mapillary walks are free on a paired night (#290).

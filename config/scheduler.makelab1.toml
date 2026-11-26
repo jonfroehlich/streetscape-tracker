@@ -476,7 +476,8 @@ enabled = true
 # from claiming the whole pool when the walk is un-paired. Falsifier: blocks
 # continue at <= 1,200/night with the two rest nights a week -> volume and
 # daily presence are not the inputs. Clean for 3 weeks -> step up <= 25%/week,
-# one knob at a time.
+# one knob at a time. Since #444's step 3 there is ONE rest night (Sun), so a
+# Mapillary night needs ~800 x 7/6 = ~930, 78% of the pool.
 daily_request_budget = 1500
 # Client-side tile pacing (issue #198). Shared per-IP with mapillary_streets
 # below and with any manual run on this host — the host lock (#208) is what
@@ -885,9 +886,19 @@ network_type = "drive"
 # `scheduler probe-host` does NOT shorten it; only the newest REFUSAL counts.
 # Falsifier for H3: if blocks clear in the same time whether or not we probed
 # at ~20 h, probing does not extend them and this can shrink.
+#
+# rest_weekdays ["Wed", "Sun"] -> ["Sun"]: #444's staged schedule, step 3,
+# taken FIRST (docs/provider-access.md, "Step 3 first: Wednesday is no longer
+# a rest night"). Every active night 11-09..11-26 served the full 1,200 pool
+# with 0 refusals and 0 429/5xx/3xx, while the nightly pool deferrals rose
+# from 32 to 273 and the Mapillary-only-due population reached 176 cities;
+# the plan's falsifier for that case names this step, not a volume step. It
+# adds a sixth Mapillary night a week (+20% weekly volume) and leaves each
+# night's shape -- pool, fill ceiling, budgets, 40/min at CV 0.6 -- unchanged.
+# Revert to ["Wed", "Sun"] on the first tile-CDN `refused` row.
 [hosts.mapillary_tiles]
 rolling_24h_request_budget = 1200
-rest_weekdays = ["Wed", "Sun"]
+rest_weekdays = ["Sun"]
 refusal_cooldown_h = 36
 
 # KartaView night allowance (issue #464) -- SHIPPED UNSET, deliberately. When

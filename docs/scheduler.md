@@ -560,7 +560,7 @@ Re-deploying after such a rollback does **not** re-backfill (the table is no lon
 **A HOLD keeps a per-IP host's channels from launching without anything having refused us.**
 There are two kinds, both configured per host token beside the rolling budget:
 
-- `rest_weekdays = ["Wed", "Sun"]` — on a run dated one of these weekdays, no channel that touches the host launches.
+- `rest_weekdays = ["Sun"]` (prod; `["Wed", "Sun"]` before #444's step 3) — on a run dated one of these weekdays, no channel that touches the host launches.
 - `refusal_cooldown_h = 36` — for this many hours after the newest `refused` row in `host_refusals`, no channel that touches the host launches.
 
 Prod sets both on `[hosts.mapillary_tiles]`, so they hold `mapillary` and `mapillary_streets` and nothing else; GSV, KartaView and Panoramax run every night.

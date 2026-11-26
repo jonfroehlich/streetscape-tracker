@@ -455,7 +455,7 @@ Read its week-over-week trend, not its level; if it grows while those enrolments
 The dry run does not split M by channel: its per-city rows list each previewed city's due channels, so the Mapillary-only cities inside tonight's cap are the rows naming only `mapillary`/`mapillary_streets`, and the ones past the cap are not shown.
 **Falsifier:** blocks continue at ≤ 1,200/night with two rest nights a week → volume and daily presence are not the inputs. Clean for three weeks → step up at most 25% a week, one knob at a time.
 
-**Rest nights (`rest_weekdays = ["Wed", "Sun"]`):** two nights a week with zero Mapillary presence, on the run's UTC snapshot date, while every other channel runs.
+**Rest nights (`rest_weekdays = ["Wed", "Sun"]`; `["Sun"]` since step 3 was taken first, below):** two nights a week with zero Mapillary presence, on the run's UTC snapshot date, while every other channel runs.
 A Mapillary-only rest, by the Maintainer's choice, so a rested city's Mapillary snapshot lands on a later night than its GSV one; the alternative (rest every channel through the timer) keeps pairing and costs GSV two nights a week.
 A rest night is a standing hold, not a refusal: no alert, no breaker trip, no failure, and the cities stay due.
 **Staying due is not leading the queue**: a city due on gsv and Mapillary still collects gsv on a rest night, so its held Mapillary channels re-enter through the stranded (Mapillary-only-due) tier — the bounded opt-in reservation — not at the head of the next night's queue (see the sizing falsifier above).
@@ -541,6 +541,7 @@ Mapillary's API documentation and forum were re-read for this stage on 2026-10-2
 1. pool 1,200 → 1,500 and the fill ceiling 600 → 750 together (one number's two faces), with the daily budgets scaled so the pool stays the binding term;
 2. pool 1,875, fill ceiling 940;
 3. only then the rest schedule (drop Wednesday, keep Sunday), because that tests a different axis (presence days) and must not share a step with volume.
+   **Taken first on 2026-11-26** under the third revert trigger below; see "Step 3 first".
 
 Each step is +25% and one knob at a time.
 **Revert triggers, mechanical:**
@@ -552,6 +553,46 @@ Each step is +25% and one knob at a time.
 **Open: the 0-walk nights.** 10-22..10-24 ran 40 Mapillary grid runs and **0** walks, while 10-26 paired 18 of 18.
 Either the September walk catch-ups un-paired the walk clocks (a walk due on a different night from its grid pays its own census or waits), or walks were deferred; the pull cannot tell.
 The read-out script answers it on the next read: `walk_clock_unpaired` counts cities whose two Mapillary clocks last succeeded on different dates, and the population block splits grid-due from walk-only-due cities.
+
+## Step 3 first: Wednesday is no longer a rest night (issue #444, decided 2026-11-26)
+
+`[hosts.mapillary_tiles].rest_weekdays` goes from `["Wed", "Sun"]` to **`["Sun"]`** on prod.
+Nothing else moves: the 1,200 pool, the 600 fill ceiling, both daily budgets, the 36 h cooldown and 40/min at CV 0.6 are unchanged, so each Mapillary night keeps exactly the shape that has run clean.
+What changes is the number of active nights: five a week becomes six, about **+20%** weekly volume (6,000 → 7,200 at a full pool).
+
+**Why step 3 and not step 1.**
+The staged schedule above puts the volume steps first, and its third revert trigger says when to reorder them: a growing Mapillary-only-due backlog means the pool is too small for the rest schedule, and the next step is step 3 rather than a volume step.
+Read from prod on 2026-11-26 with `scripts/mapillary_night_report.py --since 2026-11-09`:
+
+- **The pool binds on every active night.** All 13 active nights from 11-09 to 11-26 served at the design point (11-10 served 1,058; every other night served exactly 1,200).
+- **Nothing pushed back.** 0 tile-CDN rows in `host_refusals`, and 0 429, 0 5xx and 0 3xx in the summed tile statuses of every one of those nights.
+  All 7 `host_refusals` rows on prod are Overpass's.
+- **The work left over grows.** Launches deferred for the rolling pool, per active night: 32, 0, 107, 93, 74, 99, 88, 128, 127, 90, 155, 162, 273.
+  The `Done:` lines' "mapillary N due not attempted" read 31, 44, 49 and 69 on 11-22..11-25, and `mapillary_streets` read 98, 112, 115 and 135.
+- **The backlog is about eight full nights.** The Mapillary-only-due population is 176 cities (105 grid-due, 71 walk-only), priced at ≤ 9,258 requests.
+
+**This is not the clean case the trigger describes.**
+It asks for growth "while enrolments stand still", and they did not: tranche 3 was enabled from 2026-11-06 and the five Wisconsin towns of tranche 4 on 2026-11-25.
+Some of the growth is cities we added on purpose, and this read cannot say how much.
+The step is taken anyway because it is the smaller change of the two candidates.
+A volume step changes every Mapillary night, while this one adds a night whose shape the last 13 nights have already measured.
+
+**The Stage 1 clock, at the time of the decision.** Since 11-09 the report reads 13 of 13 active nights at the design point, 0 refusals, 0 429/5xx/3xx, `criterion met: no`, because 15 design nights are required.
+**Deploy only once the report reads `criterion met: yes`**, which is the 11-28 night at the earliest if 11-27 and 11-28 are clean, so the first un-rested Wednesday is 2026-12-02.
+A config change reaches prod with whatever deploy comes next, since `config/scheduler.makelab1.toml` is tracked, so do not merge this before then either.
+
+**Re-read before deploying, as this file's opening rule requires**, on 2026-11-26 through a web fetcher, never from a collecting host.
+The documentation's tile figure is unchanged: 50,000 requests a day, "(not per minute)", and status code 4xx on excess.
+It still says nothing on 429, `Retry-After`, `User-Agent` or IP blocking.
+The rate-limits section was read through the fetcher's summary, not verbatim.
+Thread 10644 still ends at this project's 2026-08-28 question, with no reply.
+No forum thread between 10-27 and 11-26 is about tile limits, IP blocks or login redirects.
+"Inconsistent API error states" (10-28) is about the Graph API's `ids=` batching, and the "Maps 2.0" thread is about map layers, not the tile API.
+
+**Revert triggers** are the three above, unchanged.
+A tile-CDN `refused` row puts `rest_weekdays` back to `["Wed", "Sun"]` in the next PR, and six consecutive active nights become the recorded ceiling.
+Volume steps 1 and 2 stay where they were: each needs 15 design nights after this step, and they never share a step with it.
+**Falsifier for this step:** if the per-night pool deferrals keep rising across three weeks at six nights while enrolments stand still, presence days were not what the backlog needed, and the next move is step 1.
 
 ## Per-IP hosts and the cross-process host lock (issue #208)
 
