@@ -1262,7 +1262,7 @@ A hold keeps a host's channels from launching without anything having refused us
 - Rest nights (`[hosts.<token>].rest_weekdays`):
   - `test_rest_weekdays_load_canonical_and_in_weekday_order`, `test_a_rest_only_section_loads_without_a_budget`, `test_an_empty_rest_list_means_no_rest_night`.
   - `test_an_invalid_rest_list_fails_closed` — six bad spellings, one of them beside a valid budget, are each recorded, logged, load NEITHER key, and refuse `run-due` and `assess-city` before the catalog opens.
-  - `test_makelab1_rests_the_tile_cdn_on_wednesday_and_sunday` — prod's list pinned exactly and read through `_host_holds` (the pass-through), with nothing else resting.
+  - `test_makelab1_rests_the_tile_cdn_on_sunday_only` — prod's list pinned exactly and read through `_host_holds` (the pass-through): Sunday holds, Wednesday no longer does since #444's step 3, and nothing else rests.
   - `test_a_rest_night_holds_only_the_hosts_channels_and_is_not_a_failure` — gsv runs, the Mapillary pair launches nothing, `last_attempt_at` and `consecutive_failures` stay untouched, and the `Done:` line says HELD and never "refused".
   - `test_a_non_rest_night_launches_the_pair` and `test_a_rest_night_with_nothing_due_on_the_host_still_reaches_the_done_line`.
   - `test_the_limit_catch_up_honours_the_rest_night` — `run-due --provider mapillary --limit 5`.

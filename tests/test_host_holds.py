@@ -147,18 +147,19 @@ def test_an_invalid_rest_list_fails_closed(conn, monkeypatch, tmp_path, caplog, 
     assert connected == []
 
 
-def test_makelab1_rests_the_tile_cdn_on_wednesday_and_sunday():
+def test_makelab1_rests_the_tile_cdn_on_sunday_only():
     """Pinned exactly, with the pass-through: the PROD config's rest list is the
-    one `_host_holds` reads, so a Wednesday and a Sunday hold the tile CDN and
-    a Thursday does not."""
+    one `_host_holds` reads, so a Sunday holds the tile CDN and a Wednesday no
+    longer does (#444's step 3, taken first), nor a Thursday."""
     cfg = load_scheduler_config(PROD_CONFIG)
+    sunday = date(2026, 10, 18)
     assert cfg.host_budget_errors == []
-    assert cfg.host_rest_weekdays == {HOST_MAPILLARY_TILES: ("Wed", "Sun")}
-    assert sched._host_holds(cfg, WEDNESDAY).active(HOST_MAPILLARY_TILES).detail == "Wed"
-    assert sched._host_holds(cfg, date(2026, 10, 18)).active(HOST_MAPILLARY_TILES) is not None
+    assert cfg.host_rest_weekdays == {HOST_MAPILLARY_TILES: ("Sun",)}
+    assert sched._host_holds(cfg, sunday).active(HOST_MAPILLARY_TILES).detail == "Sun"
+    assert sched._host_holds(cfg, WEDNESDAY).active(HOST_MAPILLARY_TILES) is None
     assert sched._host_holds(cfg, THURSDAY).active(HOST_MAPILLARY_TILES) is None
     # Nothing else rests: GSV, KartaView and Panoramax run every night.
-    assert sched._host_holds(cfg, WEDNESDAY).hosts() == {HOST_MAPILLARY_TILES}
+    assert sched._host_holds(cfg, sunday).hosts() == {HOST_MAPILLARY_TILES}
 
 
 # ── the night ────────────────────────────────────────────────────────────

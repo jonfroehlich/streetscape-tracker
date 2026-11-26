@@ -560,7 +560,7 @@ Re-deploying after such a rollback does **not** re-backfill (the table is no lon
 **A HOLD keeps a per-IP host's channels from launching without anything having refused us.**
 There are two kinds, both configured per host token beside the rolling budget:
 
-- `rest_weekdays = ["Wed", "Sun"]` — on a run dated one of these weekdays, no channel that touches the host launches.
+- `rest_weekdays = ["Sun"]` (prod; `["Wed", "Sun"]` before #444's step 3) — on a run dated one of these weekdays, no channel that touches the host launches.
 - `refusal_cooldown_h = 36` — for this many hours after the newest `refused` row in `host_refusals`, no channel that touches the host launches.
 
 Prod sets both on `[hosts.mapillary_tiles]`, so they hold `mapillary` and `mapillary_streets` and nothing else; GSV, KartaView and Panoramax run every night.
@@ -570,7 +570,7 @@ Unset means no hold, and the night reads exactly as it did before #444.
 It lives on the breaker (`HostBreaker.holds`, `held`, `held_launches`) but outside its set, so `bool(breaker)`, which drives the alert and the exit status, never sees it.
 A held launch records no attempt, trips nothing, alerts nobody and touches no `consecutive_failures`, so the city stays due and leads a later night.
 It is not a stranding either: a hold covers every channel on the host, so a walk's grid sibling on the same host is held too.
-It is the same posture as the fill's "holding <channel>" backlog, and it is reported the same way: once at WARNING when the run starts, at INFO per skipped launch, and as `HELD <host>: rest night (Wed), N launch(es) held, cities stay due` (or `cooling down until <T> (...)`) on the `Done:` line, in `run-due --dry-run` and in `assess-city`'s summary.
+It is the same posture as the fill's "holding <channel>" backlog, and it is reported the same way: once at WARNING when the run starts, at INFO per skipped launch, and as `HELD <host>: rest night (Sun), N launch(es) held, cities stay due` (or `cooling down until <T> (...)`) on the `Done:` line, in `run-due --dry-run` and in `assess-city`'s summary.
 `scheduler status` prints each host's rest weekdays (and whether today is one) and whether it is cooling down.
 
 **One gate, every SCHEDULER path.**
@@ -940,7 +940,7 @@ What the code already does, read from it rather than assumed:
 
 1. **The whole-city rule asks the latch of the city's RUN SET, never of the night.** `_fill_prebudget_refusal` declines a city only when a channel it would run sits on a latched or held host, so a city excluded from both Mapillary channels (#301), and a city whose Mapillary already succeeded tonight in the due phase, are still admitted on gsv after a latch (both pinned since #443).
 2. **On 2026-10-12 that recovered nothing, and could not have.** Every one of the 239 declines needed Mapillary (any latched or throttled per-IP host earns that token, but the 10-12 log named only the tile CDN), the partly collected cities run first and were done by 3 h in, and a Mapillary-excluded candidate would have been admitted rather than counted there (prod's catalog was not read for this); so alignment-preserving recovery was **0 cities**.
-3. **An idle GSV clock after the fill is not a block-night phenomenon.** Since #444 stage 1 (2026-10-17) prod has `fill_host_ceilings = { mapillary_tiles = 600 }`, rest weekdays (Wed, Sun) and a 36 h refusal cooldown on the tile CDN: on a rest or cooldown night every Mapillary-member city is declined as `host held`.
+3. **An idle GSV clock after the fill is not a block-night phenomenon.** Since #444 stage 1 (2026-10-17) prod has `fill_host_ceilings = { mapillary_tiles = 600 }`, rest weekdays (Wed and Sun until #444's step 3, Sun since) and a 36 h refusal cooldown on the tile CDN: on a rest or cooldown night every Mapillary-member city is declined as `host held`.
    On the other nights the ceiling is not a 600-tile allowance for the fill: `_fill_host_room` takes `600 - the host's rolling-24 h usage`, the due slate's spend INCLUDED (and the due slate may itself spend up to the 1,200 `[hosts.mapillary_tiles]` budget), so after a due night that spent 600 or more the room is gone from the first candidate and the fill ends by `budget (mapillary_tiles)`.
    Only a light due night leaves the fill any Mapillary room; nothing here measured how often that happens.
    A block is therefore just one more way the room is gone from the first candidate, so the real question is whether the fill should EVER refresh GSV alone.
