@@ -481,7 +481,7 @@ Per this file's opening rule, Mapillary's API docs and forum must be re-read bef
 
 Read from a read-only prod pull of 2026-10-27, taken while that night's `run-due` was still in flight, so 10-27 is partial.
 Served is `api_usage` for both Mapillary channels on the UTC date (the walk row is 0 or absent every night, because paired walks are census-cache hits).
-Tile statuses come from the per-attempt child logs, and the pull caught 4 of about 59 crawls, so that column is a sample, not a night total.
+Tile statuses come from the per-attempt child logs, and the pull caught 4 of about 59 crawls, so that column is a sample, not a night total (superseded in the 10-28..11-19 read-out below: every crawl of these nights wrote its status line, and the full set matches the ledger).
 `host_refusals` has **no rows** since it was deployed on 2026-10-21.
 
 | Night (UTC) | Served | Grid runs / walks | Refusal / hold / throttle | Tile statuses seen | Fill | Ended by | Cities (due / fill), length |
@@ -508,7 +508,7 @@ The rest night and the cooldown machinery work as specified (10-25 held, `host_r
 The four crawls with a status line saw only 200s, with zero 429, 503 or 3xx: weak evidence, at this volume, that the CDN gives no warning before the wall (H2).
 
 **What they do not show: they do not test Stage 1's hypothesis.**
-The five active post-deploy nights served 1,200 / 695 / 372 / 221 / 374, a mean of about 570, against 1,236–2,445 on the nights of 10-05..10-16 and the ~1,120 per active night the pool was sized for above; presence was 0.3–1.1 h against 2.6–8.8 h.
+The five active post-deploy nights served 1,200 / 695 / 372 / 221 / 374, a mean of about 570, against 1,236–2,445 on the nights of 10-05..10-16 other than 10-10 (blocked after 182) and the ~1,120 per active night the pool was sized for above; presence was 0.3–1.1 h against 2.6–8.8 h.
 Those comparators are not all blocked nights (corrected in the 10-28..11-19 read-out below): the 2.6–8.8 h of presence belongs to 10-05..10-09, the five consecutive **clean** fill nights before the first block, and the 1,236–2,445 range mixes clean nights (2,445 on 10-09) with block onsets (1,236 on 10-12), per #444's per-night list.
 Every hypothesis in #444, "nothing changed" included, predicts clean nights at this volume, and 10-22 is the only night at the design point (n = 1, against a block interval that was itself about two nights).
 Named confounders: KartaView's dead endpoint filled the 80-city cap on 10-22/23 with failed runs ([#452](https://github.com/jonfroehlich/streetscape-tracker/issues/452)), so the fill was never reached; 10-24/25 hit the cap with gsv refreshes of cities whose Mapillary half was already caught up; 10-25 was a rest night; 10-26's fill was throttled to 69 requests by the tomorrow-reserve term; 10-27 is partial.
@@ -558,11 +558,13 @@ The read-out script answers it on the next read: `walk_clock_unpaired` counts ci
 
 Read on 2026-11-19 from read-only prod pulls, after that night's `run-due` had finished: `scripts/mapillary_night_report.py --since 2026-10-28` (and `--since 2026-11-09`), plus one batched read-only command that summed the child logs' status lines, matched them against `api_usage`, read the scheduler log for the hand runs, and queried the catalog for the due-date projection below.
 The catalog was opened the way `open_catalog_readonly` opens it (`mode=rw` plus `PRAGMA query_only`), nothing was written on the host, and no request went to any Mapillary host.
-No config changed in this window after the 10-28 step (`opt_in_cities_per_day` 10 → 20), and this read-out changes none.
+"The 10-28 step" below is `opt_in_cities_per_day` 10 → 20 ([#455](https://github.com/jonfroehlich/streetscape-tracker/pull/455)), merged at 14:11 UTC on 10-28, after that night's 09:00 UTC start; 10-28 was a rest night anyway, so the step's first active night was 10-29 at the earliest (the deploy time is not recorded here), and every count from `--since 2026-10-28` is the same as from 10-29.
+No Mapillary knob changed after the 10-28 step, and this read-out changes none.
+Two other things did change in the window, and both fall at the start of the design-volume nights (11-09 on), so these nights cannot separate either from the volume rise: both KartaView channels resumed at the anonymous 1.5/min on 11-09 ([#452](https://github.com/jonfroehlich/streetscape-tracker/issues/452), `4f162bc`; the first nightly with them was 11-10, the 11-09 starts being hand runs), and tranche 3's 25 cities ([#457](https://github.com/jonfroehlich/streetscape-tracker/pull/457)) were enabled in two batches on 11-06 and 11-09, first collected on the 11-07 and 11-10 nights.
 
 | Night (UTC) | Served (grid / walk) | Crawls with a status line / Mapillary child logs | Pool deferrals | Presence | Note |
 |---|---|---|---|---|---|
-| 10-28 (Wed) | 0 | — | 0 | — | rest night |
+| 10-28 (Wed) | 0 | — | — | — | rest night |
 | 10-29 | 681 (681 / 0) | 4 / 4 | 0 | 0.5 h | fill ended by its tile-CDN budget |
 | 10-30 | 35 (35 / 0) | 14 / 14 | 0 | 0.1 h | |
 | 10-31 | 595 (595 / 0) | 22 / 22 | 0 | 6.5 h | |
@@ -588,6 +590,8 @@ No config changed in this window after the 10-28 step (`opt_in_cities_per_day` 1
 
 Served is `api_usage` for both Mapillary channels on the UTC date.
 On every night of the window, 10-22 through 11-19, it equals the sum of the `requests=` fields of that date's status lines exactly, and every Mapillary child log carries one, so the status counts in this read-out are night totals rather than a sample.
+That supersedes the earlier read-out's "4 of about 59 crawls" for 10-22..10-27 as well: those nights' status lines all exist and sum to the ledger, though their status counts are not tabulated here.
+A rest night holds every Mapillary launch before the pool is asked, so its pool-deferral cell is `—`, not a measured 0.
 `host_refusals` has **0 rows** for the tile CDN since 2026-10-28, and the last block is still 10-17.
 
 ### Clean, and what that does and does not show
@@ -598,8 +602,8 @@ Summed over the window: **0 refusals, 0 429/5xx, 0 3xx**.
 Eight active nights since 11-09 ran at the pool (≥ 900 served; seven at exactly 1,200).
 
 What that rules out is narrow: that **1,200 a night, with runs of at most three active nights between rest nights, still gets blocked**.
-It does not discriminate between the hypotheses: H1 (presence-fed reputation), H10, and "nothing changed" all predict this result.
-Twenty-eight clean days since Stage 1's first night is also inside the pre-Stage-1 base rate: eleven clean nights ran 08-30..09-09 at up to 2,260 combined, and the 31-day gap 08-28..09-28 contained them.
+It does not discriminate between the hypotheses: H1 (presence-fed reputation), H10 (a Mapillary-side tightening around 10-10, which only their forum or support can answer), and "nothing changed" all predict this result.
+Twenty-nine clean nights since Stage 1's first night (10-22..11-19 inclusive) are also inside the pre-Stage-1 base rate: eleven clean nights ran 08-30..09-09 with a highest recorded combined night of 2,260 (the last five are floors, per the jitter section above), and the 31-day gap 08-28..09-28 contained them.
 **Presence is not traffic.**
 The `Done:` line's presence runs from the first launch to the last finish of any channel on the host, cache-hit walks included, and a pool-bound night spreads its ~30 minutes of fetching across hours as the rolling window releases credit, so 11-10's 10.2 h is not 10 h of requests.
 This read-out makes **no claim about presence versus volume**; the 1.9–10.2 h range on the design nights is reported, as the criterion says, not gated.
@@ -630,10 +634,12 @@ Assuming every later active night is a design night, the rest nights stay Wednes
 | `--since` | Why that night | Today | Earliest pass |
 |---|---|---|---|
 | 2026-11-09 | first design-volume night ("Stage 1's three-week clock starts only at the design volume") | 8 of 8 | **Sat 2026-11-28** |
-| 2026-10-28 | first night of the `opt_in_cities_per_day` 10 → 20 step ("`--since` at a step's first night"; "the 15 nights since the previous step") | 8 of 16 | **Tue 2026-12-22** |
+| 2026-10-28 | first night of the `opt_in_cities_per_day` 10 → 20 step, a rest night ("`--since` at a step's first night"; "the 15 nights since the previous step") | 8 of 16 | **Tue 2026-12-22** |
 | 2026-10-22 | Stage 1's first night | 9 of 21 (10-27 finished at 374) | about **Tue 2027-01-12** |
 
-**The choice is the operator's, and this PR does not edit the criterion.**
+The 12-22 and 01-12 dates assume Wednesday and Sunday rests and are superseded once step 3 deploys ([#485](https://github.com/jonfroehlich/streetscape-tracker/pull/485)): a Wednesday then becomes an active night, and, since the staged schedule takes a step only once the criterion holds for the 15 nights since the previous step, each later volume step counts its own nights from step 3's first night.
+
+**The choice is the operator's, and this read-out does not edit the criterion.**
 The file's literal text favours 10-28: the staged schedule says a step is taken once the criterion "holds for the 15 nights since the previous step", and the previous step was `opt_in_cities_per_day` 10 → 20, first night 10-28.
 Choosing 11-09 means reading "the clock starts only at the design volume" over that sentence, and should come with an amendment here that settles the conflict.
 Starting the window on the first design night also makes its ratio 100% by construction, so at 11-09 the 80% clause tests nothing until a later night falls short.
@@ -652,6 +658,8 @@ An un-paired walk pays a full census once its city's cache entry is older than 7
 A pool-bound night therefore cannot re-pair a clock that a rest night, a deferral or a hold has split.
 
 **An inflow that is about to rise.**
+Provenance of both tables below: they were computed on 2026-11-19 by the batched read-only command named at the top of this read-out, on the catalog host, from `cities` (the enabled set), `schedule_state` (`last_success_at`, `member`, `consecutive_failures`) and `runs.api_requests` for the projection, and from `runs`/`street_walks` dates and `api_usage` for the backward series.
+That query and its output were **not committed**, so these figures cannot be re-derived from the repo; the next read-out should commit the query and its JSON under `docs/experiments/` (never `data/`).
 The table projects Mapillary due dates forward from `schedule_state`: `last_success_at` + 83 days per channel (the first UTC date at least 83 days on), for enabled cities that are members of the channel and not quarantined (1,301 on each channel, none quarantined, none with a NULL `last_success_at`).
 A city whose two channels fall due in the same week counts once, as the paired walk is free; otherwise each channel is an entry of its own.
 Each entry is priced at the city's latest Mapillary `runs.api_requests`, which for a census run is the cumulative sweep total, the right full-census figure; every city has one.
@@ -676,7 +684,7 @@ For scale, five active nights at the pool are **6,000 a week**.
 After 2027-01-31: 111 entries, 9,587 requests.
 The seven weeks from 11-23 through 01-04 sum to about **65,100**, about **9,300 a week against the pool's 6,000**, so even at the pool every active night the Mapillary due work should grow through December and shrink only in mid-January (*inferred* from the upper bound, not measured).
 The bunching is the series' own history: cities collected in the September catch-ups and in the 10-05..10-09 fills come due from about 12-01 and in the 12-28 week respectively (*inferred* from the date arithmetic, not traced city by city).
-Summed over the whole cycle the projection prices about **90,000** for 1,301 cities, against the ~66,400 for 1,205 that #385 summed on 2026-09-28; the difference is more cities and un-paired walks priced twice, not a change in per-city cost.
+Summed over the whole cycle the projection prices about **90,000** for 1,301 cities, against the ~66,400 for 1,205 that #385 summed on 2026-09-28; the difference is more cities and un-paired walks priced twice, not a change in per-city cost (*inferred*: the per-city prices of the two sums were not compared).
 **So the sizing falsifier above ("the Mapillary-only-due population growing week over week → the pool is too small") cannot be read raw over the next six weeks**: growth there is predicted by inflow alone, and has to be normalised against a projection like this one before it says anything about the pool.
 
 A backward weekly series, rebuilt from `runs`/`street_walks` dates (a channel is due on a Thursday if its latest run on or before it is at least 84 days old, or it has none; walks on the `drive` network only), with the Mapillary requests ledgered in the seven nights to each Thursday:
@@ -700,22 +708,24 @@ Its last row reproduces the script's live figure exactly (100: 30 grid-due, 70 w
 Its caveats: it applies **today's** enabled set and memberships to every past week (the catalog keeps no history of enables, exclusions or quarantines), it dates a success by `run_date` rather than `last_success_at`, and fill runs count as successes, as they do in the scheduler.
 It was rebuilt from the catalog's dates, never with `--as-of <past>`, which reads today's `schedule_state` and so cannot reproduce a past night.
 Read beside the projection, 104 → 100 over the first week at the pool is flat, at a time when the inflow was low.
-No script, `Done:` line or schema changes here; saving the script's `--json` once a week (after the Wednesday rest) would make this series a direct read next time, and as in the previous read-out no JSON is committed.
+No script, `Done:` line or schema changes here; saving the script's `--json` once a week (after a rest night) would make this series a direct read next time, and as in the previous read-out no JSON is committed.
 
 ### No move inside the unchanged pool drains faster
 
 The pool bound every night from 11-12 on (74–128 launches deferred for it, and 32 on 11-09), so slate order, hoist slots and reservations change **which** cities get the 1,200, never how many requests are served.
 A daytime `run-due --provider mapillary --limit N` would add a second presence window per day, the shape H1 names, and draws on the same rolling pool anyway, so it is still not recommended.
 
-### What the next step is not yet
+### What the next step was, as of 2026-11-19
 
-Two things are recorded here and deliberately not resolved:
+Two things were recorded here on 2026-11-19 and deliberately left unresolved:
 
 - The staged schedule above orders step 3 (drop the Wednesday rest) after two volume steps, while its third revert trigger sends a growing backlog **straight to step 3**.
-  With the inflow above, that trigger will very likely fire on inflow alone, so the order has to be settled before it does.
-- Dropping Wednesday makes Monday through Saturday **six consecutive active nights**, the run length that preceded the October blocks (they began on the sixth consecutive fill night) and blocks 2 and 3 in August.
+  With the inflow above, that trigger will very likely fire on inflow alone, so the order had to be settled before it did.
+  It was settled on 2026-11-26: step 3 first ([#485](https://github.com/jonfroehlich/streetscape-tracker/pull/485), issue [#444](https://github.com/jonfroehlich/streetscape-tracker/issues/444)).
+- Dropping Wednesday makes Monday through Saturday **six consecutive active nights**, the run length that preceded the October blocks (they began on the sixth consecutive fill night) and blocks 2 and 3 in August (n = 2 at best).
 
 When a volume step is taken, the grid channel's daily budget must rise **above** the new pool, not to it: today `[providers.mapillary].daily_request_budget` is 1,500, so step 1's 1,500 pool would tie it, and on a tie the launch names the channel budget as the governing term rather than the pool (`_combine_remainder` takes the pool only when it is strictly smaller).
+Step 2's 1,875 pool also exceeds `[providers.mapillary_streets].daily_request_budget` (1,750), so at step 2 both channel budgets have to move.
 Re-reading Mapillary's docs and forum belongs to that step's own PR at deploy time, per this file's opening rule; this read-out changes nothing about how, how often or how much we ask.
 
 ## Per-IP hosts and the cross-process host lock (issue #208)
