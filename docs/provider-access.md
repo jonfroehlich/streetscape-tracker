@@ -558,9 +558,12 @@ The read-out script answers it on the next read: `walk_clock_unpaired` counts ci
 
 Read on 2026-11-19 from read-only prod pulls, after that night's `run-due` had finished: `scripts/mapillary_night_report.py --since 2026-10-28` (and `--since 2026-11-09`), plus one batched read-only command that summed the child logs' status lines, matched them against `api_usage`, read the scheduler log for the hand runs, and queried the catalog for the due-date projection below.
 The catalog was opened the way `open_catalog_readonly` opens it (`mode=rw` plus `PRAGMA query_only`), nothing was written on the host, and no request went to any Mapillary host.
-"The 10-28 step" below is `opt_in_cities_per_day` 10 → 20 ([#455](https://github.com/jonfroehlich/streetscape-tracker/pull/455)), merged at 14:11 UTC on 10-28, after that night's 09:00 UTC start; 10-28 was a rest night anyway, so the step's first active night was 10-29 at the earliest (the deploy time is not recorded here), and every count from `--since 2026-10-28` is the same as from 10-29.
-No Mapillary knob changed after the 10-28 step, and this read-out changes none.
-Two other things did change in the window, and both fall at the start of the design-volume nights (11-09 on), so these nights cannot separate either from the volume rise: both KartaView channels resumed at the anonymous 1.5/min on 11-09 ([#452](https://github.com/jonfroehlich/streetscape-tracker/issues/452), `4f162bc`; the first nightly with them was 11-10, the 11-09 starts being hand runs), and tranche 3's 25 cities ([#457](https://github.com/jonfroehlich/streetscape-tracker/pull/457)) were enabled in two batches on 11-06 and 11-09, first collected on the 11-07 and 11-10 nights.
+"The 10-28 step" below is `opt_in_cities_per_day` 10 → 20 ([#455](https://github.com/jonfroehlich/streetscape-tracker/pull/455)), merged at 14:11 UTC on 10-28, after that night's 09:00 UTC start; 10-28 was a rest night anyway, so the step's first active night was 10-29 at the earliest, and every count from `--since 2026-10-28` is the same as from 10-29.
+Its deploy time is not recorded, but it is bounded: [`kartaview-endpoint-move_production.json`](experiments/kartaview-endpoint-move_production.json) reads `opt_in_cities_per_day: 20` on prod at `bf27faf` on 2026-11-09, so it was deployed by then at the latest.
+No Mapillary knob changed after the 10-28 step, and this read-out changes none; [#456](https://github.com/jonfroehlich/streetscape-tracker/pull/456), merged later on 10-28, changed the KartaView collector and how the fill treats KartaView, a scheduler change rather than a knob.
+Two other things did change in the window, and both fall at the start of the design-volume nights (11-09 on), so these nights cannot separate either from the volume rise.
+Both KartaView channels resumed at the anonymous 1.5/min with [#461](https://github.com/jonfroehlich/streetscape-tracker/pull/461) (`379b192`, merged 2026-11-09 18:08 UTC, for [#452](https://github.com/jonfroehlich/streetscape-tracker/issues/452)); the first nightly with them was 11-10, the 11-09 starts being hand runs.
+Tranche 3's 25 cities ([#457](https://github.com/jonfroehlich/streetscape-tracker/pull/457), merged 2026-11-06) were enabled in two batches from 11-06 on, per the two-night runbook in [`operations.md`](operations.md) (its third-tranche section, step 5), and all 25 were first walked 2026-11-07..11-12 ([`mapillary-discovery-screen.md`](experiments/mapillary-discovery-screen.md), "Outcome (2026-11-25)", from `mapillary-discovery-screen_tranche3_outcome.json`); the second batch's enable date is in no repo record.
 
 | Night (UTC) | Served (grid / walk) | Crawls with a status line / Mapillary child logs | Pool deferrals | Presence | Note |
 |---|---|---|---|---|---|
@@ -603,7 +606,7 @@ Eight active nights since 11-09 ran at the pool (≥ 900 served; seven at exactl
 
 What that rules out is narrow: that **1,200 a night, with runs of at most three active nights between rest nights, still gets blocked**.
 It does not discriminate between the hypotheses: H1 (presence-fed reputation), H10 (a Mapillary-side tightening around 10-10, which only their forum or support can answer), and "nothing changed" all predict this result.
-Twenty-nine clean nights since Stage 1's first night (10-22..11-19 inclusive) are also inside the pre-Stage-1 base rate: eleven clean nights ran 08-30..09-09 with a highest recorded combined night of 2,260 (the last five are floors, per the jitter section above), and the 31-day gap 08-28..09-28 contained them.
+None of the 29 nights since Stage 1's first night (10-22..11-19 inclusive) wrote a `host_refusals` row, and the 23 from 10-28, whose statuses are tabulated here, carry no 429, 5xx or 3xx (10-22..10-27's status lines exist and sum to the ledger, but the earlier read-out saw the statuses of only 4 crawls); that run is also inside the pre-Stage-1 base rate: eleven clean nights ran 08-30..09-09 with a highest recorded combined night of 2,260 (the last five are floors, per the jitter section above), and the 31-day gap 08-28..09-28 contained them.
 **Presence is not traffic.**
 The `Done:` line's presence runs from the first launch to the last finish of any channel on the host, cache-hit walks included, and a pool-bound night spreads its ~30 minutes of fetching across hours as the rolling window releases credit, so 11-10's 10.2 h is not 10 h of requests.
 This read-out makes **no claim about presence versus volume**; the 1.9–10.2 h range on the design nights is reported, as the criterion says, not gated.
@@ -616,7 +619,9 @@ The script counts every other `run-due` start on the same UTC date as a hand run
 - **11-06**: two starts after the 02:00 nightly, at 08:50:50 PST (unfiltered, 300 due, capped at 80) and 30 s later at 08:51:20 PST (`--provider kartaview`).
   Neither wrote a `Done:` line or launched a Mapillary channel; the first is consistent with a `--dry-run` (*inferred* from a start line with no launches and no `Done:`), and the second was filtered to KartaView.
 - **11-09**: three starts after the nightly finished at 04:28 PST: two filtered to `kartaview,kartaview_streets` (05:10:11 and 05:10:24, the day the KartaView channels resumed) and one unfiltered at 05:37:30.
-  None wrote a `Done:` line or launched a Mapillary channel; the unfiltered one is consistent with a `--dry-run` (*inferred*, same shape).
+  None wrote a `Done:` line or launched a Mapillary channel.
+  Two of them are recorded, not inferred: [`kartaview-endpoint-move_production.json`](experiments/kartaview-endpoint-move_production.json) holds the 05:10:24 start as `run-due --dry-run --provider kartaview,kartaview_streets --limit 1000` (read at 13:10:24 UTC) and the 05:37:30 one as an unfiltered `run-due --dry-run` (13:37:30 UTC), both on prod at `bf27faf` against a process-substituted config with KartaView enabled.
+  The 05:10:11 start is not in that record; it is consistent with a filtered `--dry-run` (*inferred*, same shape).
 - **11-17**: one unfiltered start at 14:10:25 PST, after the nightly finished at 13:27, right after a new city was registered disabled and screened against Panoramax.
   No launches and no `Done:`: consistent with the checklist's evening `--dry-run` (*inferred*).
 
@@ -634,13 +639,13 @@ Assuming every later active night is a design night, the rest nights stay Wednes
 | `--since` | Why that night | Today | Earliest pass |
 |---|---|---|---|
 | 2026-11-09 | first design-volume night ("Stage 1's three-week clock starts only at the design volume") | 8 of 8 | **Sat 2026-11-28** |
-| 2026-10-28 | first night of the `opt_in_cities_per_day` 10 → 20 step, a rest night ("`--since` at a step's first night"; "the 15 nights since the previous step") | 8 of 16 | **Tue 2026-12-22** |
+| 2026-10-28 | the `opt_in_cities_per_day` 10 → 20 step's merge date (first night under it 10-29 at the earliest; the counts are unchanged since 10-28 was a rest night) ("`--since` at a step's first night"; "the 15 nights since the previous step") | 8 of 16 | **Tue 2026-12-22** |
 | 2026-10-22 | Stage 1's first night | 9 of 21 (10-27 finished at 374) | about **Tue 2027-01-12** |
 
 The 12-22 and 01-12 dates assume Wednesday and Sunday rests and are superseded once step 3 deploys ([#485](https://github.com/jonfroehlich/streetscape-tracker/pull/485)): a Wednesday then becomes an active night, and, since the staged schedule takes a step only once the criterion holds for the 15 nights since the previous step, each later volume step counts its own nights from step 3's first night.
 
 **The choice is the operator's, and this read-out does not edit the criterion.**
-The file's literal text favours 10-28: the staged schedule says a step is taken once the criterion "holds for the 15 nights since the previous step", and the previous step was `opt_in_cities_per_day` 10 → 20, first night 10-28.
+The file's literal text favours 10-28: the staged schedule says a step is taken once the criterion "holds for the 15 nights since the previous step", and the previous step was `opt_in_cities_per_day` 10 → 20, merged 10-28 (first night under it 10-29 at the earliest; the counts are unchanged since 10-28 was a rest night).
 Choosing 11-09 means reading "the clock starts only at the design volume" over that sentence, and should come with an amendment here that settles the conflict.
 Starting the window on the first design night also makes its ratio 100% by construction, so at 11-09 the 80% clause tests nothing until a later night falls short.
 
@@ -687,7 +692,7 @@ The bunching is the series' own history: cities collected in the September catch
 Summed over the whole cycle the projection prices about **90,000** for 1,301 cities, against the ~66,400 for 1,205 that #385 summed on 2026-09-28; the difference is more cities and un-paired walks priced twice, not a change in per-city cost (*inferred*: the per-city prices of the two sums were not compared).
 **So the sizing falsifier above ("the Mapillary-only-due population growing week over week → the pool is too small") cannot be read raw over the next six weeks**: growth there is predicted by inflow alone, and has to be normalised against a projection like this one before it says anything about the pool.
 
-A backward weekly series, rebuilt from `runs`/`street_walks` dates (a channel is due on a Thursday if its latest run on or before it is at least 84 days old, or it has none; walks on the `drive` network only), with the Mapillary requests ledgered in the seven nights to each Thursday:
+A backward weekly series, rebuilt from `runs`/`street_walks` dates (a channel is due on a Thursday if its latest run on or before it is at least 84 days old, or it has none; walks on the `drive` network only; 84 is the same wall as the projection's 83, counted from the run's date rather than its success time: a run dated R succeeds after R's 00:00 UTC, and `get_due_cities` compares that timestamp with the night's date at 00:00, so the channel first falls due on R + 84), with the Mapillary requests ledgered in the seven nights to each Thursday:
 
 | Thursday | Mapillary-only-due (grid / walk only) | Ledgered, previous 7 nights |
 |---|---|---|
@@ -721,7 +726,7 @@ Two things were recorded here on 2026-11-19 and deliberately left unresolved:
 
 - The staged schedule above orders step 3 (drop the Wednesday rest) after two volume steps, while its third revert trigger sends a growing backlog **straight to step 3**.
   With the inflow above, that trigger will very likely fire on inflow alone, so the order had to be settled before it did.
-  It was settled on 2026-11-26: step 3 first ([#485](https://github.com/jonfroehlich/streetscape-tracker/pull/485), issue [#444](https://github.com/jonfroehlich/streetscape-tracker/issues/444)).
+  It was decided on 2026-11-26 in [#485](https://github.com/jonfroehlich/streetscape-tracker/pull/485) (open; its merge is gated on the 11-28 night): step 3 first (issue [#444](https://github.com/jonfroehlich/streetscape-tracker/issues/444)).
 - Dropping Wednesday makes Monday through Saturday **six consecutive active nights**, the run length that preceded the October blocks (they began on the sixth consecutive fill night) and blocks 2 and 3 in August (n = 2 at best).
 
 When a volume step is taken, the grid channel's daily budget must rise **above** the new pool, not to it: today `[providers.mapillary].daily_request_budget` is 1,500, so step 1's 1,500 pool would tie it, and on a tie the launch names the channel budget as the governing term rather than the pool (`_combine_remainder` takes the pool only when it is strictly smaller).
@@ -1005,11 +1010,11 @@ The fourth column is a DEPLOY fact, not a merge fact, so the repo cannot derive 
   The per-IP sum is 16,000 un-paired, ~5.6 h of the host lock at the 0.8 achieved fraction.
   The weekly growth screen paces from the same block, so it runs twice as fast too.
 - **Enrolment of the 41 screen-positive tracked cities proceeds in tranches only after stage 1 holds.**
-- **The Panoramax pair's share of the night roughly doubled on 2026-10-27, a side effect of #444, not a Panoramax decision.**
+- **The Panoramax pair's share of the night roughly doubled on 2026-10-28 ([#455](https://github.com/jonfroehlich/streetscape-tracker/pull/455), merged after that night began; first night 10-29 at the earliest), a side effect of #444, not a Panoramax decision.**
   Prod's `opt_in_cities_per_day` went 10 → 20 to drain the Mapillary-only-due backlog, and the 442 tranche-2 enrolments are kind 1 of the same hoist, so on the prod-shaped test slate kind 1 goes from about 4 hoisted slots a night to 8 (6 plus the 2 live-checkpoint resumers).
   Those 8 were Panoramax's only while both KartaView channels were paused: kind 1 round-robins across its opt-in channels, so the night KartaView is re-enabled (2026-11-09, by the resume config PR) the Panoramax sub-queue's share roughly halves at first, and falls further once capped KartaView crawls become live-checkpoint resumers, which are taken ahead of the round-robin; the city count this stage is judged at moves again on that date.
   The 8,000/day per-channel budget still bounds the requests; what moves is the CITY count per night inside this stage's window.
-  Judge the nights from 2026-10-27 on at that city count, and do not read a change in this gate's request totals across that date as a pacing effect.
+  Judge the nights from 2026-10-29 on at that city count, and do not read a change in this gate's request totals across that date as a pacing effect.
 - Whole-catalog screening should move to the weekly parquet dump for 0 API requests; that is a separate ticket.
 
 **One host, not twenty-five.** `api.panoramax.xyz` is a meta-catalog that harvests metadata from every registered instance (23 on 2026-09-04), so a collector would query one host regardless of how many instances join — one `host_lock.py` entry, no per-instance fan-out, and no per-instance rate question.
