@@ -684,7 +684,8 @@ Counting resume minutes directly does the reserve's job: fresh crawls stop once 
 
 **The cost, and the operator's decision: the night can overshoot the allowance by the resumes launched after it is spent.**
 Resumers do not lead the slate: within the opt-in hoist the chosen cities keep union order, a paused city and a never-collected one both have a NULL `last_success_at`, and the fill resumes its paused crawls only after the due loop.
-So the worst case is R × one launch past the allowance, R being the night's live checkpoints, each launch about 25 min at prod's pace and at most 60 min (`max_city_minutes`); total host time is up to A + R × launch, bounded in practice by the 12 h window.
+So the night can run past the allowance by one launch per exempt resume after the crossing: R (the slate's live checkpoints, which the opening line and the dry run count) plus the fill's resumes of its own paused crawls (`_fill_resumers`), which are exempt too but are not in R; each launch is about 25 min at prod's pace and at most 60 min (`max_city_minutes`), so total host time is up to A + (R + fill resumes) × launch, bounded in practice by the 12 h window.
+R is not fixed from night to night: a fresh crawl admitted under the allowance that pauses becomes an exempt resumer on each following night until it finishes or reaches the 7-day wall, so R can grow as admitted crawls pause.
 The reserve kept total host time nearer max(A, R × launch) by holding fresh crawls early, at the price of over-holding for resumers the night never reached.
 The `Done:` clause reports the overshoot every night (`N min over the allowance`), which is the figure the key is sized from.
 A possible follow-up, not done: sort live resumers first within the hoisted prefix, which would make the overshoot small but changes the hoist's round-robin contract (#348, #393).
@@ -693,7 +694,7 @@ A possible follow-up, not done: sort live resumers first within the hoisted pref
 The run's start logs one INFO line with the allowance and R, the slate cities that resume a live checkpoint there (an upper bound, since the slate is never truncated).
 The crossing logs one WARNING; each held launch logs at INFO, `left for a later night`.
 The `Done:` line gets its own clause: `ALLOWANCE the KartaView API (api.kartaview.org): 56 of 40 min in launches, 16 min over the allowance (fresh 31 min over 1 launch(es); resumes 25 min over 1), 1 launch(es) left for a later night, 0 city(ies) exempt with a checkpoint or cached census there, cities stay due`.
-"Over the allowance" is charged minus allowance: the tail of the launch that spent it plus every exempt launch that ran after.
+"Over the allowance" is charged minus allowance: the tail of the launch that spent it plus every charged launch that ran after (the resumes, and the rest of the city in flight); a cached census is never charged, so it is never in it.
 It never contains `HELD`, and the counts never reach `held_launches`, because `scripts/mapillary_night_report.py` reads the HELD clause as the tile CDN's rest-night series.
 **These minutes are launch wall clock, not the host-presence span.**
 The `on the KartaView API ... (N h)` clause is first launch to last finish, and it will still read long: exempt resumes behind the gsv block, cached walks, the stranded-walk retry and the fill's KartaView launches all run late.
@@ -722,7 +723,7 @@ A value of at least `max_batch_hours × 60` is accepted but can never be spent, 
   Read the enrolled count from `scheduler enroll-city --channel kartaview --list`.
   The mean in the repo is 38.9 requests (12,180 grid requests over the 313 never-collected cities, the prod config's RESUMED 2026-11-09 note); the issue's median of 16 understates it.
   At about 853 enrolled cities that is about 400 requests a day, about 267 min at 1.5/min, for the grid alone (a paired walk is free, an unpaired one adds).
-- **R, tonight's live checkpoints**, from the `ALLOWANCE` line of a prod `run-due --dry-run`; R × ~25 min is the worst case the night runs past A.
+- **R, tonight's live checkpoints**, from the `ALLOWANCE` line of a prod `run-due --dry-run`; the night runs past A by up to (R plus the fill's paused-crawl resumes) × ~25 min, and R can grow night over night as admitted crawls pause.
 
 Nights to drain a backlog are `backlog_requests / (1.5 × A − S)`, A in minutes; S already counts every crawl's resumed launches, and resumes are charged inside A, so the more of A they take, the less is left for fresh crawls.
 **Any value below S never drains**, and KartaView refreshes then miss their cycle, which this project counts as permanent holes.

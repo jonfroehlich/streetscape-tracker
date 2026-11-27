@@ -346,7 +346,8 @@ class AllowanceUsage(NamedTuple):
     @property
     def over_s(self) -> float:
         """Charged time past the allowance: the crossing launch's tail plus every
-        exempt launch (resumes, cached walks) that ran after it was spent."""
+        charged launch (the resumes, the rest of the city in flight) that ran
+        after it was spent. A cached census is never charged, so never in it."""
         return max(0.0, self.charged_s - self.allowance_s)
 
 
@@ -726,10 +727,13 @@ def _note_night_allowances(
     reaches it. What is counted here is R, the slate cities with a live
     checkpoint on a due channel touching the host (cities, not channels: a
     walk behind its grid's checkpoint defers, so the pair is one launch).
-    Each of them runs past a spent allowance, so R x one launch bounds how far
-    the night's host time can overshoot it -- the figure an operator sizes
-    the key from, printed by the dry run too. The slate is never truncated,
-    so R counts resumers past the city cap: an upper bound.
+    Each of them runs past a spent allowance, so the night can overshoot it
+    by up to (R plus the fill's paused-crawl resumes, which are exempt too
+    but not counted here) x one launch -- the figure an operator sizes the
+    key from, printed by the dry run too. R can grow night over night as
+    fresh crawls admitted under the allowance pause. The slate is never
+    truncated, so R counts slate resumers past the city cap: an upper bound
+    on those.
 
     Also WARNS when an allowance is at least the batch window: accepted (the
     loader's bound is a units-typo guard, a day), but a run cannot launch for
@@ -12532,7 +12536,11 @@ def _run_city_channels(
                                 logger.info(f"{city.city_id} [{provider}]: {plan.message}")
                                 skipped_budget += 1
                                 continue
-                            if plan.message:
+                            # Not for an allowance fallthrough the plan let
+                            # through: the spent allowance holds it below, and
+                            # "launching capped" would then contradict the
+                            # "left for a later night" line that follows.
+                            if plan.message and not allowance_fallthrough:
                                 logger.info(f"{city.city_id} [{provider}]: {plan.message}")
                         elif est > budget:
                             # This city can NEVER fit the daily budget — skipping (not

@@ -896,8 +896,8 @@ refusal_cooldown_h = 36
 # used it (issue #477: no reserve). A city with a live checkpoint or a cached
 # census is never held, so every resume launched after the allowance is spent
 # runs on top of it: the night can overshoot it by up to one launch per live
-# checkpoint, and the Done line reports those minutes as "over the
-# allowance". A dead checkpoint (7 days or older, or unstamped) is held as the
+# checkpoint plus one per fill resume of a paused crawl, and the Done line
+# reports those minutes as "over the allowance". A dead checkpoint (7 days or older, or unstamped) is held as the
 # fresh crawl it is, after the age wall has had its say. A held crawl is no
 # attempt and no failure; the city stays due. It
 # lowers KartaView's nightly volume and launch minutes. It does NOT shorten
@@ -910,7 +910,9 @@ refusal_cooldown_h = 36
 #     mean is 12,180 grid requests / 313 cities = 38.9 (the RESUMED 2026-11-09
 #     note above). At ~853 enrolled: ~400 requests/day = ~267 min at 1.5/min.
 #   R, live checkpoints tonight, from `run-due --dry-run`'s ALLOWANCE line;
-#     R x ~25 min is the worst case the night runs past the allowance.
+#     the night runs past the allowance by up to (R plus the fill's
+#     paused-crawl resumes) x ~25 min, and R can grow night over night as
+#     crawls admitted under the allowance pause.
 # Nights to drain = backlog requests / (1.5 x A - S); S already counts resumed
 # launches. Below S (in minutes) the backlog NEVER drains and KartaView
 # refreshes miss their cycle: permanent holes. 360 is ~1.35 x S: 540 - 400 =

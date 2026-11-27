@@ -409,24 +409,32 @@ def test_an_unset_allowance_with_kartaview_enabled_leaves_the_night_as_it_was(
     Albany resumes a live grid checkpoint (its walk defers behind it), Bend is
     a fresh pair, Corvallis's walk reuses a cached census, Dalles is gsv-only;
     every KartaView launch takes 31 minutes, which would spend any allowance
-    under the 4 h this night runs. Every #464-only helper is patched to RAISE
-    (`raising=False`, so this file's test also runs unchanged against an
-    origin/main tree, where it passes: that is how its literals were checked),
-    and the launches, the `Done:` line, the failure counts and the absence of
-    any allowance log line are the pre-change values.
+    under the 4 h this night runs. Every allowance helper (#464, #477) is
+    patched to RAISE, and the launches, the `Done:` line, the failure counts
+    and the absence of any allowance log line are the pre-change values (the
+    literals were checked against an origin/main tree before #464 landed).
+    The patches are strict (no `raising=False`), so renaming a helper fails
+    here loudly instead of leaving a patch that guards nothing.
     Mutation: key `_allowance_charge`'s early return on the channel's hosts
     alone (`if not set(CHANNEL_HOSTS.get(provider, ())) & {HOST_KARTAVIEW}:`),
     so an unset run classes each KartaView launch (`_allowance_checkpoint`
-    then raises). The reserve and `_city_holds` are each gated twice
-    (`has_allowance()` at the caller and inside), so no one-line mutation of
-    either reaches this night."""
+    then raises); or call `_note_night_allowances` without its caller's
+    `has_allowance()` gate (the patch raises). `_city_holds` is gated twice
+    (`has_allowance()` at the caller and inside), and
+    `_stamped_dead_checkpoint` is asked only of a channel a spent allowance
+    holds, so no one-line mutation of either reaches this night."""
 
     def boom(*args, **kwargs):
         raise AssertionError("a #464 helper the unset night must not reach")
 
-    for name in ("_paid_for_on_host", "_allowance_checkpoint", "_allowance_launch_s"):
-        monkeypatch.setattr(sched, name, boom, raising=False)
-    monkeypatch.setattr(sched.HostBreaker, "start_charge", boom, raising=False)
+    for name in (
+        "_paid_for_on_host",
+        "_allowance_checkpoint",
+        "_stamped_dead_checkpoint",
+        "_note_night_allowances",
+    ):
+        monkeypatch.setattr(sched, name, boom)
+    monkeypatch.setattr(sched.HostBreaker, "start_charge", boom)
     cfg = _cfg(tmp_path, None, channels=KV_PAIR)
     a = _kv_only(conn, cfg, "Albany", KV_PAIR)
     b = _kv_only(conn, cfg, "Bend", KV_PAIR)
@@ -940,6 +948,42 @@ def test_a_dead_checkpoint_that_fits_is_held_as_the_fresh_crawl_it_is(
         return
     assert launches == [(a, "kartaview"), (b, "kartaview")], launches
     assert "(fresh 30 min over 2 launch(es); resumes 0 min over 0)" in done
+
+
+@pytest.mark.parametrize("spent", [True, False], ids=["spent", "not-spent"])
+def test_a_held_dead_checkpoint_never_logs_that_it_is_launching_capped(
+    conn, monkeypatch, tmp_path, caplog, spent
+):
+    """Round-1 review, finding 3: Bend's checkpoint is 7 days + 1 h old, half
+    done, ~60 requests estimated, so the age-wall arm lets it through (~30
+    left fit tonight) and the plan says it is "launching capped" (60 is over
+    one launch's cap). Spent, the allowance then holds it, and only "left for
+    a later night" may be logged: the plan's line would claim a launch that
+    never happens. Not spent, it launches and the same line IS logged, which
+    is what keeps the spent arm from passing on a message that never exists.
+    Mutation: drop `and not allowance_fallthrough` from the plan-message log
+    in `_run_city_channels` (spent: both lines are logged)."""
+    cfg = _cfg(tmp_path, 30)
+    a = _kv_only(conn, cfg, "Albany")
+    b = _kv_only(conn, cfg, "Bend")
+    _aged(monkeypatch, {b: DEAD_AGE_S})
+    _cached(monkeypatch, set())
+    _kv_estimates(monkeypatch, {b: 60}, 20)
+    times = {a: 31 if spent else 5, b: 25}
+    with caplog.at_level(logging.INFO, logger="streetscape_scheduler"):
+        rc, launches, alerts = _night(monkeypatch, conn, cfg, minutes=lambda cid, p: times[cid])
+    assert rc == 0 and alerts == []
+    assert set(_failures(conn).values()) == {0}
+    capped = _messages(caplog, f"{b} [kartaview]: ~60 estimated requests exceeds")
+    left = _messages(caplog, f"{b} [kartaview]: left for a later night")
+    if spent:
+        assert launches == [(a, "kartaview")], launches
+        assert len(left) == 1
+        assert capped == []
+        return
+    assert launches == [(a, "kartaview"), (b, "kartaview")], launches
+    assert left == []
+    assert len(capped) == 1 and "launching capped" in capped[0]
 
 
 def test_a_dead_checkpoint_that_cannot_finish_records_the_age_wall_failure(

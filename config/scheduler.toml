@@ -675,7 +675,8 @@ network_type = "drive"
 # KartaView launches, both channels together, one run-due charges before FRESH
 # crawls are held. Resumes of live checkpoints count toward it (issue #477) and
 # are never held, nor is a city whose census is already cached, so resumes
-# after it is spent overshoot it (reported on the Done line). A held crawl is
+# after it is spent, the fill's resumes of its paused crawls included,
+# overshoot it (reported on the Done line). A held crawl is
 # not a failure: no attempt, no alert, the city stays due. Unset (the
 # default) means no allowance. Accepted on [hosts.kartaview] only, in (0, 1440].
 # Choosing a value needs two production reads first (docs/scheduler.md).
