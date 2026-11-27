@@ -334,17 +334,19 @@ for u in streetscape-tracker streetscape-prefreeze streetscape-screen-provider; 
   s=$(systemctl --user is-active "$u.service" || true); echo "$u.service: $s"
   case $s in inactive|failed) ;; *) echo "STOP: $u.service is running; wait, then re-paste"; exit 1 ;; esac
 done
-ps -eo pid=,args= | awk '/streetscape_metadata_tracker[.]scheduler/ && /run-due/ {print; f=1} END {exit f}'
+ps -eo pid=,args= | awk '/streetscape_metadata_tracker[.]scheduler/ && /run-due/ {print; f=1} END {exit f}' \
+  || { echo "STOP: a run-due is in flight (above); wait, then re-paste"; exit 1; }
 # 2b. Back up the catalog; refuses to overwrite an earlier pre-pass copy.
-test ! -e backups/pre_rediff_394.db
-test -s data/streetscape_tracker.db
+declare -F rediff_394_names >/dev/null || { echo "STOP: define rediff_394_names first"; exit 1; }
+test ! -e backups/pre_rediff_394.db || { echo "STOP: backups/pre_rediff_394.db exists"; exit 1; }
+test -s data/streetscape_tracker.db || { echo "STOP: no catalog here; wrong directory?"; exit 1; }
 sqlite3 data/streetscape_tracker.db ".backup backups/pre_rediff_394.db"
-test -s backups/pre_rediff_394.db
+test -s backups/pre_rediff_394.db || { echo "STOP: the catalog backup is empty"; exit 1; }
 # 2c. List and tar every file the pass can touch; both refuse to overwrite.
-test ! -e backups/pre_rediff_394_files.txt
-test ! -e backups/pre_rediff_394_files.tar.gz
+test ! -e backups/pre_rediff_394_files.txt || { echo "STOP: backups/pre_rediff_394_files.txt exists"; exit 1; }
+test ! -e backups/pre_rediff_394_files.tar.gz || { echo "STOP: backups/pre_rediff_394_files.tar.gz exists"; exit 1; }
 rediff_394_names > backups/pre_rediff_394_files.txt
-test -s backups/pre_rediff_394_files.txt
+test -s backups/pre_rediff_394_files.txt || { echo "STOP: the file list is empty"; exit 1; }
 tar -czf backups/pre_rediff_394_files.tar.gz -C data -T backups/pre_rediff_394_files.txt
 echo "backups OK"
 )
@@ -353,48 +355,74 @@ zfs list -H -o name,mountpoint | grep makeabilitylab
 # zfs list -H -t snapshot -o name -s creation DATASET_FROM_ABOVE | tail -1
 ```
 
-**Step 2d runs in the FOREGROUND inside `tmux new -s rediff394`** (or `screen`), so an ssh drop detaches it rather than killing it, and its exit status lands in the log:
+If 2b or 2c failed and 2d has never run, clear the partial backups and re-paste the block: `grep -qs '^== rediff_394 start' logs/rediff_394.log || rm -v backups/pre_rediff_394*`.
+
+**Step 2d runs in the FOREGROUND inside `tmux new -s rediff394`** (or `screen`), so an ssh drop detaches it rather than killing it, and its exit status lands in the log.
+It refuses without both backups, and `-u` keeps the aggregate tail's stderr from splitting the summary line the gate matches:
 
 ```bash
 # 2d. Apply to the catalog and the detail files, and rebuild the affected per-run JSONs.
 cd /projects/makeabilitylab/streetscape-tracker
 echo "== rediff_394 start $(date -u '+%F %T') UTC" >> logs/rediff_394.log
-.venv-makelab2/bin/python -B scripts/recompute_run_diffs.py --data-dir "$PWD/data" --provider gsv \
-    --execute --regenerate-json >> logs/rediff_394.log 2>&1
+if test -s backups/pre_rediff_394.db && test -s backups/pre_rediff_394_files.tar.gz; then
+  .venv-makelab2/bin/python -B -u scripts/recompute_run_diffs.py --data-dir "$PWD/data" --provider gsv \
+      --execute --regenerate-json >> logs/rediff_394.log 2>&1
+else
+  echo "STOP: no pre-pass backup; run 2b-2c first" | tee -a logs/rediff_394.log; false
+fi
 echo "rediff_394 exit $?" >> logs/rediff_394.log
 ```
 
 Read the log's closing summary (`N diffs scanned, … M failed`) and the exit line before going on.
 Exit 0 means every row was recomputed, left alone or skipped.
 Exit 1 means a row FAILED or a stray stored detail file was KEPT (whether a stray is kept or removed is decided only under `--execute`, so the dry run cannot predict it): read the `FAILED:` and `KEPT, NOT DELETED:` lines, fix the cause, and re-run 2d.
+Exit 1 with neither line, and a traceback after the summary, is a crash in the aggregate rebuild that follows it: re-run 2d, which then changes nothing, skips that rebuild and exits 0 (step 3 rebuilds the aggregate).
+A row that fails on every re-run can never pass the gate; the operator may accept it as failed and run steps 3 and 4 by hand.
 Exit 64 is a refusal that changed nothing (the catalog's schema, an unknown `--city`, or a `run-due` in flight).
-**Resuming a crashed or failed pass re-runs 2d only**: never re-paste 2a–2c, whose guards refuse anyway, because the backups must stay the PRE-pass state.
+**Resuming a pass 2d has started re-runs 2d only**: never re-paste 2a–2c, whose guards refuse anyway, because the backups must stay the PRE-pass state.
 
 ```bash
 ( set -euo pipefail
 cd /projects/makeabilitylab/streetscape-tracker
 # Gate: the LAST 2d run printed its summary and exited 0.
-awk '/^== rediff_394 start/ {s=0} /^[0-9]+ diffs scanned, / {s=1} END {exit !s}' logs/rediff_394.log
-tail -n 1 logs/rediff_394.log | grep -qx 'rediff_394 exit 0'
+awk '/^== rediff_394 start/ {s=0} /^[0-9]+ diffs scanned, / {s=1} END {exit !s}' logs/rediff_394.log \
+  || { echo "STOP: the last 2d run printed no summary; read logs/rediff_394.log"; exit 1; }
+tail -n 1 logs/rediff_394.log | grep -qx 'rediff_394 exit 0' \
+  || { echo "STOP: the last 2d run did not exit 0; read logs/rediff_394.log"; exit 1; }
 # 3. Rebuild the aggregate from the repaired catalog and publish it.
 .venv-makelab2/bin/python -m streetscape_metadata_tracker.scheduler \
     --config config/scheduler.makelab1.toml regenerate-aggregate --publish
-# 4. Re-arm both timers and confirm them.
-systemctl --user enable --now streetscape-tracker.timer streetscape-screen-provider.timer
-.venv-makelab2/bin/python -m streetscape_metadata_tracker.scheduler \
-    --config config/scheduler.makelab1.toml timer-status
 )
 ```
 
-Both timers are `Persistent=true`, so re-enabling one after a fire it missed (any 02:00, or a Monday 23:00 Pacific) starts that run at once ([`deploy/README.md`](../deploy/README.md)).
-When one was missed, time step 4 so a full night (up to `max_batch_hours` plus its tail) ends before the next 02:00, or that fire is skipped; if a Monday was missed too, re-enable the screen's timer only after that night ends, since both take the Panoramax host lock and a screen that overlaps the night exits busy (85) and records nothing that week.
+**Step 4 runs even when step 3 failed** (it exits 1 when an artifact rebuild or the publish fails), unless you are rolling back: nothing alerts on a disabled timer, since `timer-status` reads it as a deliberate pause and `backup-status` alerts only after 48 h, and the next night's tail rebuilds and republishes.
+Both timers are `Persistent=true`, so re-enabling one after a fire it missed starts that run at once ([`deploy/README.md`](../deploy/README.md)), and both take the Panoramax host lock, so a screen that overlaps a night exits busy (85) and records nothing that week:
+
+```bash
+# 4a. Nightly timer. If an 02:00 was missed, this starts that night now: run it only when a
+#     full night (up to max_batch_hours plus its tail) still ends before the next 02:00.
+systemctl --user enable --now streetscape-tracker.timer
+cd /projects/makeabilitylab/streetscape-tracker && .venv-makelab2/bin/python -m \
+    streetscape_metadata_tracker.scheduler --config config/scheduler.makelab1.toml timer-status
+```
+
+```bash
+# 4b. Screen timer. If a Monday 23:00 Pacific was missed, this starts the screen now: run it
+#     only after any night 4a started has ended (streetscape-tracker.service inactive).
+systemctl --user enable --now streetscape-screen-provider.timer
+cd /projects/makeabilitylab/streetscape-tracker && .venv-makelab2/bin/python -m \
+    streetscape_metadata_tracker.scheduler --config config/scheduler.makelab1.toml timer-status
+```
+
 `--provider gsv` matters for the same memory reason as above.
 The dry run and step 2d each load two GSV CSVs per diff row over every series, so budget hours rather than minutes for EACH; drive them into a file, never a pipe.
 Run no hand collect, `assess-city` or `import-bundle` from step 2a to step 4.
 The timer is disabled whatever the estimate says: the script checks for an in-flight `run-due` only when it starts (`--execute` is refused then), and the nightly batch never checks for this script, so a pass still running at 02:00 would race a night that catalogs new runs and diffs beside a half re-diffed series.
 The publish never passes rsync `--delete`, so a detail file the pass REMOVES stays on the web server until removed there; the pass lists those names.
 
-**Rollback**, with both timers still disabled:
+**Rollback is valid only until step 4 re-enables a timer.**
+Once any night or hand run has written the catalog, roll FORWARD (fix the cause, re-run 2d), never restore `pre_rediff_394.db`: it would silently drop every run, diff, walk and `schedule_state` change since.
+With both timers still disabled:
 
 1. Move the live catalog AND its `-wal`/`-shm` sidecars aside (`restore-backup` refuses an existing destination, and a sidecar left behind would be replayed into the restored copy).
 2. `scheduler restore-backup backups/pre_rediff_394.db --to data/streetscape_tracker.db`.
@@ -403,12 +431,19 @@ The publish never passes rsync `--delete`, so a detail file the pass REMOVES sta
    They are exactly the names `rediff_394_names` finds now that the pre-pass list lacks (the pass adds no row, so the restored catalog names the same candidates):
 
    ```bash
+   # 4i. List them, and read the list before 4ii.
    cd /projects/makeabilitylab/streetscape-tracker
    rediff_394_names | LC_ALL=C comm -13 backups/pre_rediff_394_files.txt - > backups/rediff_394_created.txt
-   cat backups/rediff_394_created.txt                     # dry run: read it first
-   (cd data && xargs -r -d '\n' rm -v -- < ../backups/rediff_394_created.txt)
+   cat backups/rediff_394_created.txt
    ```
 
+   ```bash
+   # 4ii. Delete them.
+   (cd /projects/makeabilitylab/streetscape-tracker/data && xargs -r -d '\n' rm -v -- \
+       < /projects/makeabilitylab/streetscape-tracker/backups/rediff_394_created.txt)
+   ```
+
+   If step 3 published, those files are on the web server too, and the publish never passes rsync `--delete`: `rediff_394_created.txt` is the list to delete there as well.
 5. `scheduler regenerate-aggregate --publish`, then re-enable both timers as in step 4.
 
 ### Schema v20 and the `runs.total_grid_points` backfill (issue #289)
