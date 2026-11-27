@@ -260,9 +260,9 @@ Whether and when to run it on prod is the operator's call; until it runs, the pa
 Run it only AFTER the #367 stats repair above (`recompute_run_stats.py --provider gsv --execute --regenerate-json`) has completed and its aggregate has been published, so the series' stats and diffs move to the new definition in that order and never the other way round.
 A whole-series `--provider gsv` pass also covers the Amsterdam and Auckland rows that #245's phantom-diff repair targets, so no separate `--city` pass is needed for them.
 
-**The dry run writes nothing, and it prints nothing until it ends — so shard it.**
+**The dry run writes nothing, and its report is lost if it is interrupted — so shard it.**
 A dry run opens the catalog the orphan sweep's way (`open_catalog_readonly`: `mode=rw` plus `PRAGMA query_only`), refuses any schema version but its own rather than migrating, and takes no lock and writes no log, temp, detail or JSON file (pinned by `test_a_dry_run_leaves_data_byte_identical`, run with `--regenerate-json` over a stale JSON).
-But it collects its whole report in memory and prints it after the last row, so a dry run that is interrupted, or still running when the night has to start, yields NOTHING.
+But it collects its whole report in memory and prints it after the last row (only a failed row's traceback and the in-flight warning reach stderr live), so a dry run that is interrupted, or still running when the night has to start, yields no report.
 Run it in shards of cities instead: `--city` is repeatable, a `--city` selection is always the WHOLE series, and each row reads only its own two CSVs and its own to-run's JSON, so a city's rows come out the same whether it is dry-run alone or in the whole-series pass.
 Size the shards from the summed bytes of each city's diff CSVs (two per row), largest first, so one shard takes 10–20 minutes, and give each shard its own output file; an interruption then loses one shard, not the pass.
 Each shard runs in the FOREGROUND under `timeout --signal=INT --kill-after=120` (never `&` or `nohup`: a backgrounded process starts with SIGINT ignored, so the clean close never runs, and a SIGKILL can leave `-wal`/`-shm` sidecars behind), at `ionice -c3 nice -n 10`, and with `python -B`, because importing the package otherwise writes `__pycache__` into the checkout.
@@ -273,66 +273,143 @@ Any ad-hoc catalog query made to size or check the pass opens the catalog the sa
 Never `mode=ro`: on a WAL catalog with no other connection open it creates `-wal`/`-shm` and cannot remove them (measured; see that function's docstring).
 Never anything that calls `db.connect`, which switches the journal mode and migrates.
 
-**Size the `--execute` window at twice the dry run's measured wall clock**, because two things the dry run does not predict:
-
-- its "per-run JSON(s) already disagree" count is only the JSONs ALREADY stale, while `--execute --regenerate-json` also rebuilds the JSON of every changed row that is the newest diff into its to-run, one more CSV load each;
-- whether a stray stored detail file is kept or removed is decided only under `--execute`.
+**Size the `--execute` window at twice the dry run's measured wall clock**, because its "per-run JSON(s) already disagree" count is only the JSONs ALREADY stale, while `--execute --regenerate-json` also rebuilds the JSON of every changed row that is the newest diff into its to-run, one more CSV load each.
 
 **Backups come first, because a catalog restore restores no file.**
-`--execute --regenerate-json` overwrites detail files in place, deletes some, rebuilds whole per-run JSONs and rewrites `cities.json.gz` and `driving_plan.json.gz`; a restored catalog brings back none of those.
-Take all three before step 2:
+`--execute --regenerate-json` overwrites detail files in place, deletes some, writes new ones, rebuilds or creates whole per-run JSONs and rewrites `cities.json.gz` and `driving_plan.json.gz`; a restored catalog brings back none of those.
+Take all three before 2d:
 
 - **The catalog**, to a fixed name outside `data/`.
   Not with `catalog_backup.write_backup`, which names its file by DATE and would replace that night's nightly copy; no scheduler command takes an ad-hoc backup.
   The full path and the `test -s` matter: from the wrong directory `sqlite3` creates an empty database, backs THAT up, and reports success.
 - **A tar of every file the pass can overwrite or delete**, written to `backups/`, never into `data/`: every stored GSV `run_diffs.detail_filename`; every deterministic `generate_diff_filename(...)` name that EXISTS on disk for a GSV row, even where the stored pointer is NULL (removal fires on the deterministic name); every GSV to-run's per-run JSON at the CSV's SIBLING name (`json_summarizer.generate_city_metadata_summary_as_json` derives it from the CSV path, and `runs.json_filename` can be NULL); `cities.json.gz`; `driving_plan.json.gz`.
-  Build the file list from the catalog (opened as above) plus `os.path.exists` on each derived name; never a glob of `data/`.
-- **The newest ZFS snapshot name** of the makeabilitylab dataset (`zfs list -t snapshot`, unprivileged), as a second line of defence.
+  `rediff_394_names` below lists exactly those that exist, from the catalog opened as above plus a stat of each derived name, never a glob of `data/`; its saved output is also what rollback diffs against.
+- **The newest ZFS snapshot name** of the dataset holding the checkout, as a second line of defence (unprivileged; find the dataset first, since its name is not written down here).
+
+The blocks are **bash** (paste them into a bash shell, not zsh), and each guarded block runs in a `( set -euo pipefail … )` subshell, so its first failing line stops the rest.
+Define the function once in every shell you paste into, rollback's included:
 
 ```bash
-cd ~/streetscape-tracker
-PY="ionice -c3 nice -n 10 .venv-makelab2/bin/python -B"
-DATA=/projects/makeabilitylab/streetscape-tracker/data
+cd /projects/makeabilitylab/streetscape-tracker
+# Every file the pass can touch that EXISTS now, one per line, C-sorted (so `comm` can diff two lists).
+rediff_394_names() {
+  .venv-makelab2/bin/python -B - data <<'PYEOF' | LC_ALL=C sort
+import os, sys
+from scripts.sweep_orphan_diff_details import open_catalog_readonly
+from streetscape_metadata_tracker.diff import generate_diff_filename
+data = sys.argv[1]
+conn = open_catalog_readonly(os.path.join(data, "streetscape_tracker.db"))
+names = {"cities.json.gz", "driving_plan.json.gz"}
+for r in conn.execute(
+    "SELECT d.city_id, d.detail_filename, f.run_date AS f_date, t.run_date AS t_date,"
+    " t.csv_filename, t.json_filename FROM run_diffs d"
+    " JOIN runs f ON f.run_id = d.from_run_id JOIN runs t ON t.run_id = d.to_run_id"
+    " WHERE t.provider = 'gsv'"
+):
+    names.update(n for n in (r["detail_filename"], r["json_filename"]) if n)
+    names.add(generate_diff_filename(r["city_id"], r["f_date"], r["t_date"]))
+    names.add(r["csv_filename"].rsplit(".csv.gz", 1)[0] + ".json.gz")
+conn.close()
+print("\n".join(n for n in names if os.path.isfile(os.path.join(data, n))))
+PYEOF
+}
+```
+
+```bash
 # 1. Dry run, ONE SHARD per command (repeat --city), each into its own file. Read every shard before step 2.
-timeout --signal=INT --kill-after=120 1800 $PY scripts/recompute_run_diffs.py \
-    --data-dir $DATA --provider gsv --regenerate-json \
+cd /projects/makeabilitylab/streetscape-tracker
+timeout --signal=INT --kill-after=120 1800 ionice -c3 nice -n 10 .venv-makelab2/bin/python -B \
+    scripts/recompute_run_diffs.py --data-dir "$PWD/data" --provider gsv --regenerate-json \
     --city CITY_ID_A --city CITY_ID_B > logs/rediff_394_dry_01.log 2>&1
-# 2a. Pause the nightly batch, UNCONDITIONALLY (never `stop`: the #369 watchdog re-arms a stopped timer).
-systemctl --user disable --now streetscape-tracker.timer
-# 2b. Back up the catalog (full path; test -s guards against backing up an empty file).
-cd /projects/makeabilitylab/streetscape-tracker && test -s data/streetscape_tracker.db \
-    && sqlite3 data/streetscape_tracker.db ".backup backups/pre_rediff_394.db"
-# 2c. Tar the file list built from the catalog (see above), then note the newest snapshot.
+```
+
+```bash
+( set -euo pipefail
+cd /projects/makeabilitylab/streetscape-tracker
+# 2a. Pause every writer of the catalog and data/, UNCONDITIONALLY (never `stop`: the #369 watchdog re-arms a stopped timer).
+systemctl --user disable --now streetscape-tracker.timer streetscape-screen-provider.timer
+# Disabling a timer does not stop a unit it already started (a night can run into the afternoon Pacific, and
+# its end chains the prefreeze pass): each must read inactive or failed, never active or activating.
+for u in streetscape-tracker streetscape-prefreeze streetscape-screen-provider; do
+  s=$(systemctl --user is-active "$u.service" || true); echo "$u.service: $s"
+  case $s in inactive|failed) ;; *) echo "STOP: $u.service is running; wait, then re-paste"; exit 1 ;; esac
+done
+ps -eo pid=,args= | awk '/streetscape_metadata_tracker[.]scheduler/ && /run-due/ {print; f=1} END {exit f}'
+# 2b. Back up the catalog; refuses to overwrite an earlier pre-pass copy.
+test ! -e backups/pre_rediff_394.db
+test -s data/streetscape_tracker.db
+sqlite3 data/streetscape_tracker.db ".backup backups/pre_rediff_394.db"
+test -s backups/pre_rediff_394.db
+# 2c. List and tar every file the pass can touch; both refuse to overwrite.
+test ! -e backups/pre_rediff_394_files.txt
+test ! -e backups/pre_rediff_394_files.tar.gz
+rediff_394_names > backups/pre_rediff_394_files.txt
+test -s backups/pre_rediff_394_files.txt
 tar -czf backups/pre_rediff_394_files.tar.gz -C data -T backups/pre_rediff_394_files.txt
-zfs list -H -t snapshot -o name -s creation make2pool/makeabilitylab_parent/makeabilitylab | tail -1
+echo "backups OK"
+)
+# Then record the newest snapshot: find the dataset holding the checkout, and list its snapshots.
+zfs list -H -o name,mountpoint | grep makeabilitylab
+# zfs list -H -t snapshot -o name -s creation DATASET_FROM_ABOVE | tail -1
+```
+
+**Step 2d runs in the FOREGROUND inside `tmux new -s rediff394`** (or `screen`), so an ssh drop detaches it rather than killing it, and its exit status lands in the log:
+
+```bash
 # 2d. Apply to the catalog and the detail files, and rebuild the affected per-run JSONs.
-cd ~/streetscape-tracker
-nohup .venv-makelab2/bin/python -B scripts/recompute_run_diffs.py \
-    --data-dir $DATA --provider gsv \
-    --execute --regenerate-json >> logs/rediff_394.log 2>&1 &
+cd /projects/makeabilitylab/streetscape-tracker
+echo "== rediff_394 start $(date -u '+%F %T') UTC" >> logs/rediff_394.log
+.venv-makelab2/bin/python -B scripts/recompute_run_diffs.py --data-dir "$PWD/data" --provider gsv \
+    --execute --regenerate-json >> logs/rediff_394.log 2>&1
+echo "rediff_394 exit $?" >> logs/rediff_394.log
+```
+
+Read the log's closing summary (`N diffs scanned, … M failed`) and the exit line before going on.
+Exit 0 means every row was recomputed, left alone or skipped.
+Exit 1 means a row FAILED or a stray stored detail file was KEPT (whether a stray is kept or removed is decided only under `--execute`, so the dry run cannot predict it): read the `FAILED:` and `KEPT, NOT DELETED:` lines, fix the cause, and re-run 2d.
+Exit 64 is a refusal that changed nothing (the catalog's schema, an unknown `--city`, or a `run-due` in flight).
+**Resuming a crashed or failed pass re-runs 2d only**: never re-paste 2a–2c, whose guards refuse anyway, because the backups must stay the PRE-pass state.
+
+```bash
+( set -euo pipefail
+cd /projects/makeabilitylab/streetscape-tracker
+# Gate: the LAST 2d run printed its summary and exited 0.
+awk '/^== rediff_394 start/ {s=0} /^[0-9]+ diffs scanned, / {s=1} END {exit !s}' logs/rediff_394.log
+tail -n 1 logs/rediff_394.log | grep -qx 'rediff_394 exit 0'
 # 3. Rebuild the aggregate from the repaired catalog and publish it.
 .venv-makelab2/bin/python -m streetscape_metadata_tracker.scheduler \
     --config config/scheduler.makelab1.toml regenerate-aggregate --publish
-# 4. Re-arm the nightly batch and confirm it.
-systemctl --user enable --now streetscape-tracker.timer
+# 4. Re-arm both timers and confirm them.
+systemctl --user enable --now streetscape-tracker.timer streetscape-screen-provider.timer
 .venv-makelab2/bin/python -m streetscape_metadata_tracker.scheduler \
     --config config/scheduler.makelab1.toml timer-status
+)
 ```
 
+Both timers are `Persistent=true`, so re-enabling one after a fire it missed (any 02:00, or a Monday 23:00 Pacific) starts that run at once ([`deploy/README.md`](../deploy/README.md)).
+When one was missed, time step 4 so a full night (up to `max_batch_hours` plus its tail) ends before the next 02:00, or that fire is skipped; if a Monday was missed too, re-enable the screen's timer only after that night ends, since both take the Panoramax host lock and a screen that overlaps the night exits busy (85) and records nothing that week.
 `--provider gsv` matters for the same memory reason as above.
 The dry run and step 2d each load two GSV CSVs per diff row over every series, so budget hours rather than minutes for EACH; drive them into a file, never a pipe.
 Run no hand collect, `assess-city` or `import-bundle` from step 2a to step 4.
 The timer is disabled whatever the estimate says: the script checks for an in-flight `run-due` only when it starts (`--execute` is refused then), and the nightly batch never checks for this script, so a pass still running at 02:00 would race a night that catalogs new runs and diffs beside a half re-diffed series.
 The publish never passes rsync `--delete`, so a detail file the pass REMOVES stays on the web server until removed there; the pass lists those names.
 
-**Rollback**, with the timer still disabled:
+**Rollback**, with both timers still disabled:
 
 1. Move the live catalog AND its `-wal`/`-shm` sidecars aside (`restore-backup` refuses an existing destination, and a sidecar left behind would be replayed into the restored copy).
 2. `scheduler restore-backup backups/pre_rediff_394.db --to data/streetscape_tracker.db`.
-3. Untar the file backup into `data/`.
-4. Delete every detail file the execute log lists as newly written (`detail file write ...`): those did not exist before the pass, so the tar cannot cover them.
-   The log's report prints only when the pass ends, so after a pass that died, take the names from the dry-run shards' `detail file write` lines and delete those that now exist.
-5. `scheduler regenerate-aggregate --publish`, then re-enable the timer as in step 4.
+3. Untar the file backup into `data/` (`tar -xzf backups/pre_rediff_394_files.tar.gz -C data`).
+4. Delete every file the pass CREATED, which the tar cannot cover: a detail file written by a row that then failed, and a per-run JSON the pass built where none existed included, so neither the log nor the dry run lists them all.
+   They are exactly the names `rediff_394_names` finds now that the pre-pass list lacks (the pass adds no row, so the restored catalog names the same candidates):
+
+   ```bash
+   cd /projects/makeabilitylab/streetscape-tracker
+   rediff_394_names | LC_ALL=C comm -13 backups/pre_rediff_394_files.txt - > backups/rediff_394_created.txt
+   cat backups/rediff_394_created.txt                     # dry run: read it first
+   (cd data && xargs -r -d '\n' rm -v -- < ../backups/rediff_394_created.txt)
+   ```
+
+5. `scheduler regenerate-aggregate --publish`, then re-enable both timers as in step 4.
 
 ### Schema v20 and the `runs.total_grid_points` backfill (issue #289)
 
