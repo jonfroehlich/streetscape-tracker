@@ -1320,36 +1320,44 @@ A hold keeps a host's channels from launching without anything having refused us
   - `test_the_production_fetch_never_follows_a_redirect` (`allow_redirects=False` reaches `requests.get`) and `test_the_token_comes_from_the_existing_loader`.
 - `test_the_done_line_names_each_metered_hosts_presence_and_the_gap_before_it` — first launch to last finish on the tile CDN, the gap back to the newest ledger stamp from BEFORE the run (tonight's own stamps are seeded and must be ignored), and neither GSV nor Overpass named; killed by marking the launch after the inline child, by dropping the finish mark, by reading tonight's stamps, and by letting Overpass in.
 
-## The KartaView night allowance (issue #464)
+## The KartaView night allowance (issues #464, #477)
 
 `tests/test_kartaview_night_allowance.py`.
 Its fake child MOVES the frozen UTC clock by the minutes a launch should take, which is what the allowance charges, and it fakes checkpoints and cached censuses at their two readers (`_sweep_checkpoint_progress`, `channel_census_cache_marker`).
-Each docstring names the one-line mutation that turns it red; all were run red before the PR.
+Each docstring names the one-line mutation that turns it red; all were run red before each PR.
 
 - Config: `test_a_night_allowance_loads_for_the_kartaview_host`; `test_an_invalid_night_allowance_fails_closed` (0, −5, a bool, a string, 1441, and a valid value on the tile CDN and on Panoramax: exit 64 before connecting); `test_makelab1_ships_the_allowance_commented_out` (prod unset, the commented line present).
 - `test_an_unset_allowance_probes_nothing_and_leaves_the_night_as_it_was` — both probes RAISE for a census channel on a Mapillary rest night with the key unset, and the launches and the HELD clause are the pre-change values; killed by computing the paid-for set before the short-circuit.
 - The hold: `test_a_spent_allowance_leaves_fresh_crawls_due_and_takes_no_slot` (no attempt, no failure, no alert, still due, one crossing WARNING; the unset control launches the city); `test_a_spent_allowance_is_never_counted_as_attempted` (a two-city night where the held city must not take the gsv city's slot; the hoist order is asserted).
-- Pairing and paid-for work: `test_an_allowance_spent_mid_city_never_splits_the_grid_from_its_walk` (killed by a per-launch read); `test_a_resumed_grid_that_completes_is_followed_by_its_free_walk` and `test_a_resumed_grid_that_pauses_still_defers_its_walk` (the fake grid clears its checkpoint and promotes the census, or exits 83); `test_a_cached_walk_is_exempt_and_a_fresh_one_is_not`; `test_the_stranded_walk_retry_is_exempt_through_the_retry_pass` (driven through `_retry_stranded_walks` itself); `test_an_unhoisted_resumer_still_runs_when_the_reserve_fills_the_allowance`.
+- Pairing and paid-for work: `test_an_allowance_spent_mid_city_never_splits_the_grid_from_its_walk` (killed by a per-launch read); `test_a_resumed_grid_that_completes_is_followed_by_its_free_walk` and `test_a_resumed_grid_that_pauses_still_defers_its_walk` (the fake grid clears its checkpoint and promotes the census, or exits 83); `test_a_cached_walk_is_exempt_and_a_fresh_one_is_not`; `test_the_stranded_walk_retry_is_exempt_through_the_retry_pass` (driven through `_retry_stranded_walks` itself); `test_an_unhoisted_resumer_still_runs_behind_a_held_fresh_city`.
 - `test_an_unfinishable_city_is_skipped_as_unfinishable_never_held` — the #456 WARNING and `ceiling_skipped`, and `allowance_skipped` stays 0.
-- The reserve and the charge: `test_resumes_are_reserved_out_of_the_allowance_first` (killed by skipping the reserve); `test_a_resume_does_not_spend_the_fresh_allowance` (killed by charging every launch as fresh); `test_a_launch_on_the_pool_path_is_charged` (two lanes, as prod; killed by dropping `end_charge`).
+- The charge: `test_a_resume_spends_the_allowance_with_the_fresh_crawls` (killed in one direction by a hold on fresh minutes alone, in the other by any reserve carved out of the allowance); `test_a_launch_on_the_pool_path_is_charged` (two lanes, as prod; killed by dropping `end_charge`).
 - Reporting: `test_the_done_clause_carries_the_numbers_and_never_the_held_token` (the exact clause, and `mapillary_night_report._HELD_RE` matches nothing); `test_a_rest_night_beside_a_spent_allowance_keeps_the_held_count_mapillarys` (the regex's `n` is the Mapillary launches alone); `test_the_dry_run_holds_what_the_night_would_hold`; `test_status_names_the_night_allowance`; `test_ignore_host_holds_lifts_the_night_allowance`.
 - `test_a_spent_night_allowance_leaves_kartaview_not_the_city` (`tests/test_fill_underfull_nights.py`) — through `_fill_admission`: `held_left` on a real night's backlog, `host_left` on the edge path, and a live checkpoint never left.
-- Review 1 of the PR added four more.
-  - `test_a_kartaview_rest_or_cooldown_outranks_its_spent_allowance` (rest and cooldown arms): the same host carries both holds, its reserve spends the allowance, and the live checkpoint is neither exempted nor launched. It is killed by reordering `HostHolds.active`.
+- Review 1 of #464's PR added four more.
+  - `test_a_kartaview_rest_or_cooldown_outranks_its_spent_allowance` (rest and cooldown arms): the same host carries both holds, an earlier charge spends the allowance, and the live checkpoint is neither exempted nor launched. It is killed by reordering `HostHolds.active`.
   - `test_an_exempt_city_run_twice_is_counted_once`: the exempt tally is distinct cities.
   - `test_the_fill_names_a_spent_allowance_only_where_it_is_the_reason`: the unset test also pins the fill's decline line to the #444 text, byte for byte.
   - `test_fill_admission_judges_the_allowance_exemption_over_what_it_launches` (in the fill file): a backlogged `kartaview` checkpoint does not exempt a `kartaview_streets` that has none.
 - Review 2 added five more.
   - `test_the_fill_preview_charges_the_night_allowance` (in the fill file, with an unset control): the dry run's fill section charges the allowance as its due rows do.
-  - `test_the_reserve_counts_cities_not_channels`: a city with checkpoints on both channels reserves one launch.
-  - `test_the_reserve_is_silent_on_a_run_that_touches_no_kartaview_channel`.
-  - `test_the_dry_run_never_lists_a_spent_allowance_as_held_tonight`.
+  - `test_the_opening_line_is_silent_on_a_run_that_touches_no_kartaview_channel` (was `test_the_reserve_is_silent_...`, and absorbs `test_the_reserve_counts_cities_not_channels`): the run's opening allowance line counts slate resumers as cities, not channels, and says nothing on a run with no KartaView channel.
+  - `test_the_dry_run_never_lists_a_spent_allowance_as_held_tonight`: defensive since #477 (no run starts spent), so it wraps `_host_holds` to hand the run a spent allowance.
 - Review round 3 replaced one test, added three and extended four.
-  - `test_a_checkpoint_at_the_age_wall_reaches_the_age_wall_arm` (6.5 days and 7 days + 1 h, each unfinishable and fitting) replaces review 2's `test_a_checkpoint_past_the_age_wall_is_not_paid_for_work`, which pinned the opposite: a checkpoint of any age is never held, so the age-wall arm records its failure, and one past the discard that launches is charged fresh. It is killed by exempting on the aged predicate, and by charging on `progress is not None`.
-  - `test_a_checkpoint_with_no_first_commit_stamp_is_charged_fresh_not_crashed`: `age_s = None` raised `TypeError` in the city loop before the fix.
-  - `test_an_allowance_as_long_as_the_batch_window_is_warned_as_bounding_nothing` (720 and 719 min against a 12 h window).
-  - `test_an_unset_allowance_with_kartaview_enabled_leaves_the_night_as_it_was`: both KartaView channels enabled, a resumer, a fresh pair, a cached walk and a gsv city, with every #464-only helper patched to raise; the launches and the whole `Done:` line are literals, and the same file run against an extracted `origin/main` tree passes this test unchanged.
+  - `test_a_checkpoint_at_the_age_wall_reaches_the_age_wall_arm` (6.5 days and 7 days + 1 h, each unfinishable and fitting): the age-wall arm records its failure at both ages. Its 7 days + 1 h arms changed with #477: that city is no longer exempt, and the one that fits is held rather than launched. It is killed by dropping the dead-checkpoint fallthrough and by restoring the any-readable-checkpoint exemption.
+  - `test_a_checkpoint_with_no_first_commit_stamp_is_held_not_crashed` (rewritten by #477 as a whole night, was `..._is_charged_fresh_not_crashed`): `age_s = None` raised `TypeError` in the city loop before the fix; now held with the allowance spent and charged fresh with it unspent.
+  - `test_an_allowance_as_long_as_the_batch_window_is_warned_as_bounding_nothing` (720 and 719 min against a 12 h window; the warning moved to `_note_night_allowances` with #477).
+  - `test_an_unset_allowance_with_kartaview_enabled_leaves_the_night_as_it_was`: both KartaView channels enabled, a resumer, a fresh pair, a cached walk and a gsv city, with every allowance helper (#464's and #477's `_stamped_dead_checkpoint` and `_note_night_allowances`) patched to raise; the launches and the whole `Done:` line are literals, checked against an extracted `origin/main` tree before #464 landed.
+    The patches are strict (no `raising=False`, since #481's review), so a renamed helper fails the test instead of leaving a patch that guards nothing.
   - It also extended four: `test_an_invalid_night_allowance_fails_closed` covers `assess-city`, `test_the_dry_run_holds_what_the_night_would_hold` counts allowance-only cities apart from #444's, `test_ignore_host_holds_lifts_the_night_allowance` pins the narrow `--provider` form in the WARNING, and the fill file's live-checkpoint arm asserts the city is admitted whole.
+- Issue #477 removed the resume reserve (and with it `test_resumes_are_reserved_out_of_the_allowance_first`) and the dead-checkpoint exemption, and added six whole-night tests through `cmd_run_due` (a seventh came with its review).
+  - `test_resumes_that_run_first_spend_the_allowance_and_a_later_resumer_still_runs`: two resumes use the allowance up, the fresh city behind them is held and the resumer behind it runs.
+  - `test_a_paid_charge_that_crosses_the_allowance_logs_the_crossing_once`: the crossing WARNING on a resume's charge, once.
+  - `test_the_done_clause_reports_the_minutes_over_the_allowance`: the overshoot equals the resume that ran after an exact crossing, and is neither the fresh nor the paid total.
+  - `test_a_dead_checkpoint_that_fits_is_held_as_the_fresh_crawl_it_is` (spent and unspent arms) and `test_a_dead_checkpoint_that_cannot_finish_records_the_age_wall_failure`.
+  - `test_the_dry_run_and_the_night_hold_the_same_cities`: one slate previewed and then run, at a pace that makes the preview's charges the night's; the held, priced and age-wall cities agree.
+  - `test_a_held_dead_checkpoint_never_logs_that_it_is_launching_capped` (added in #481's review; spent and unspent arms): a dead checkpoint the age-wall arm lets through and the plan would launch capped, then held by the spent allowance, logs only `left for a later night`, never the plan's `launching capped` line.
+    The unspent arm asserts the capped line IS logged, so the spent arm cannot pass on a message that never exists; killed by dropping `and not allowance_fallthrough` from the plan-message log.
 
 ## The Mapillary night report (issue #444)
 
